@@ -103,20 +103,28 @@ def make_image_grid(imgs, rows, cols, row_labels: list[str], col_labels: list[st
     return grid
 
 
-def render_row(prompts: list[str], repo_id_or_path: str) -> list[Image]:
+def chunk_list(list, batch_size):
+    for i in range(0, len(list), batch_size):
+        yield list[i:i+batch_size]
+
+
+def render_row(prompts: list[str],
+               repo_id_or_path: str,
+               device: str='cuda',
+               batch_size=1) -> list[Image]:
     sample_w = 512
     sample_h = 512
 
-    # pipeline = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4")
-
+    pipeline = StableDiffusionPipeline.from_pretrained(repo_id_or_path)
     # ddpm++2m
-    # pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config,
-    #                                                             algorithm_type="dpmsolver++")
+    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config,
+                                                                 algorithm_type="dpmsolver++")
+    pipeline = pipeline.to("cuda")
+    images = []
+    for batch in chunk_list(prompts, batch_size):
+        images.extend(pipeline(batch, num_inference_steps=15))
 
-    dummy_images = [Image.new('RGB', (sample_w, sample_h), color=(random.randint(0, 256),
-                                                                  random.randint(0, 256),
-                                                                  random.randint(0, 256))) for _ in range(len(prompts))]
-    return dummy_images
+    return images
 
 
 def render_all(prompts: list[str], repo_ids_or_paths: list[str]) -> Image:
