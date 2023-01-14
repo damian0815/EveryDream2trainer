@@ -17,6 +17,7 @@
 import argparse
 import os
 import re
+from dataclasses import dataclass
 
 import torch
 
@@ -779,75 +780,21 @@ def convert_open_clip_checkpoint(checkpoint):
     return text_model
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+@dataclass
+class Args:
+    checkpoint_path: str
+    original_config_file: None # path to the original config file; can be automatically inferred and downloaded
+    image_size: int = 512 # 512 for SD1.x and 2.0@512, 768 for SD2.0@768 and SD2.1
+    prediction_type: str = None # 'epsilon' or 'v_prediction'
+    text_model_type: str = None # None to automatically infer, or one of ["FrozenOpenCLIPEmbedder", "FrozneCLIPEmbedder", "PaintByExample"]
+    extract_ema: bool = False # whether to use EMA weights. EMA is better for inference, non-EMA (if present) is better for continuing training.
+    scheduler_type: str = 'pndm' # valid values are ["pndm", "lms", "heun", "euler", "euler-ancestral", "dpm", "ddim"]
+    num_in_channels: int = None # number of input channels, or None to automatically infer
+    upcast_attention: bool = None # must be True for SD2.1; can be automatically inferred from *original* SD ckpts
 
-    parser.add_argument(
-        "--checkpoint_path", default=None, type=str, required=True, help="Path to the checkpoint to convert."
-    )
-    # !wget https://raw.githubusercontent.com/CompVis/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml
-    parser.add_argument(
-        "--original_config_file",
-        default=None,
-        type=str,
-        help="The YAML config file corresponding to the original architecture.",
-    )
-    parser.add_argument(
-        "--num_in_channels",
-        default=None,
-        type=int,
-        help="The number of input channels. If `None` number of input channels will be automatically inferred.",
-    )
-    parser.add_argument(
-        "--scheduler_type",
-        default="pndm",
-        type=str,
-        help="Type of scheduler to use. Should be one of ['pndm', 'lms', 'ddim', 'euler', 'euler-ancest', 'dpm']",
-    )
-    parser.add_argument(
-        "--pipeline_type",
-        default=None,
-        type=str,
-        help="The pipeline type. If `None` pipeline will be automatically inferred.",
-    )
-    parser.add_argument(
-        "--image_size",
-        default=None,
-        type=int,
-        help=(
-            "The image size that the model was trained on. Use 512 for Stable Diffusion v1.X and Stable Siffusion v2"
-            " Base. Use 768 for Stable Diffusion v2."
-        ),
-    )
-    parser.add_argument(
-        "--prediction_type",
-        default=None,
-        type=str,
-        help=(
-            "The prediction type that the model was trained on. Use 'epsilon' for Stable Diffusion v1.X and Stable"
-            " Siffusion v2 Base. Use 'v-prediction' for Stable Diffusion v2."
-        ),
-    )
-    parser.add_argument(
-        "--extract_ema",
-        action="store_true",
-        help=(
-            "Only relevant for checkpoints that have both EMA and non-EMA weights. Whether to extract the EMA weights"
-            " or not. Defaults to `False`. Add `--extract_ema` to extract the EMA weights. EMA weights usually yield"
-            " higher quality images for inference. Non-EMA weights are usually better to continue fine-tuning."
-        ),
-    )
-    parser.add_argument(
-        "--upcast_attn",
-        default=False,
-        type=bool,
-        help=(
-            "Whether the attention computation should always be upcasted. This is necessary when running stable"
-            " diffusion 2.1."
-        ),
-    )
-    parser.add_argument("--dump_path", default=None, type=str, required=True, help="Path to the output model.")
-    args = parser.parse_args()
+
+
+def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableDiffusionPipeline:
 
     image_size = args.image_size
     prediction_type = args.prediction_type
@@ -868,7 +815,7 @@ if __name__ == "__main__":
         print("load_state_dict from directly")
         checkpoint = checkpoint
 
-    upcast_attention = False
+    upcast_attention = args.upcast_attention
     if args.original_config_file is None:
         key_name = "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_k.weight"
 
@@ -883,6 +830,8 @@ if __name__ == "__main__":
 
             if global_step == 110000:
                 # v2.1 needs to upcast attention
+                if args.upcast_attention == False:
+                    raise ValueError("This appears to be an SD2.1 model but upcast_attention==False was passed as argument")
                 upcast_attention = True
         else:
             if not os.path.isfile("v1-inference.yaml"):
@@ -971,7 +920,7 @@ if __name__ == "__main__":
     vae.load_state_dict(converted_vae_checkpoint)
 
     # Convert the text model.
-    model_type = args.pipeline_type
+    model_type = args.text_model_type
     if model_type is None:
         model_type = original_config.model.params.cond_stage_config.target.split(".")[-1]
 
@@ -1020,5 +969,78 @@ if __name__ == "__main__":
         tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
         pipe = LDMTextToImagePipeline(vqvae=vae, bert=text_model, tokenizer=tokenizer, unet=unet, scheduler=scheduler)
 
+    return pipe
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--checkpoint_path", default=None, type=str, required=True, help="Path to the checkpoint to convert."
+    )
+    # !wget https://raw.githubusercontent.com/CompVis/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml
+    parser.add_argument(
+        "--original_config_file",
+        default=None,
+        type=str,
+        help="The YAML config file corresponding to the original architecture.",
+    )
+    parser.add_argument(
+        "--num_in_channels",
+        default=None,
+        type=int,
+        help="The number of input channels. If `None` number of input channels will be automatically inferred.",
+    )
+    parser.add_argument(
+        "--scheduler_type",
+        default="pndm",
+        type=str,
+        help="Type of scheduler to use. Should be one of ['pndm', 'lms', 'ddim', 'euler', 'euler-ancest', 'dpm']",
+    )
+    parser.add_argument(
+        "--pipeline_type",
+        default=None,
+        type=str,
+        help="The pipeline type. If `None` pipeline will be automatically inferred.",
+    )
+    parser.add_argument(
+        "--image_size",
+        default=None,
+        type=int,
+        help=(
+            "The image size that the model was trained on. Use 512 for Stable Diffusion v1.X and Stable Siffusion v2"
+            " Base. Use 768 for Stable Diffusion v2."
+        ),
+    )
+    parser.add_argument(
+        "--prediction_type",
+        default=None,
+        type=str,
+        help=(
+            "The prediction type that the model was trained on. Use 'epsilon' for Stable Diffusion v1.X and Stable"
+            " Siffusion v2 Base. Use 'v-prediction' for Stable Diffusion v2."
+        ),
+    )
+    parser.add_argument(
+        "--extract_ema",
+        action="store_true",
+        help=(
+            "Only relevant for checkpoints that have both EMA and non-EMA weights. Whether to extract the EMA weights"
+            " or not. Defaults to `False`. Add `--extract_ema` to extract the EMA weights. EMA weights usually yield"
+            " higher quality images for inference. Non-EMA weights are usually better to continue fine-tuning."
+        ),
+    )
+    parser.add_argument(
+        "--upcast_attn",
+        default=False,
+        type=bool,
+        help=(
+            "Whether the attention computation should always be upcasted. This is necessary when running stable"
+            " diffusion 2.1."
+        ),
+    )
+    parser.add_argument("--dump_path", default=None, type=str, required=True, help="Path to the output model.")
+    args = parser.parse_args()
+    pipe = load_stable_diffusion_pipeline_from_compvis_ckpt_file(args)
     pipe.save_pretrained(args.dump_path)
     print(" * Converted model to diffusers for training: ", args.dump_path)
