@@ -782,31 +782,60 @@ def convert_open_clip_checkpoint(checkpoint):
 
 @dataclass
 class Args:
-    checkpoint_path: str
-    original_config_file: None # path to the original config file; can be automatically inferred and downloaded
-    image_size: int = 512 # 512 for SD1.x and 2.0@512, 768 for SD2.0@768 and SD2.1
-    prediction_type: str = None # 'epsilon' or 'v_prediction'
-    text_model_type: str = None # None to automatically infer, or one of ["FrozenOpenCLIPEmbedder", "FrozneCLIPEmbedder", "PaintByExample"]
-    extract_ema: bool = False # whether to use EMA weights. EMA is better for inference, non-EMA (if present) is better for continuing training.
-    scheduler_type: str = 'pndm' # valid values are ["pndm", "lms", "heun", "euler", "euler-ancestral", "dpm", "ddim"]
-    num_in_channels: int = None # number of input channels, or None to automatically infer
-    upcast_attention: bool = None # must be True for SD2.1; can be automatically inferred from *original* SD ckpts
+    pass
 
 
+def load_stable_diffusion_pipeline_from_compvis_ckpt_file(
+        checkpoint_path: str,
+        original_config_file: None,
+        image_size: int = 512,
+        prediction_type: str = None,
+        model_type: str = None,
+        extract_ema: bool = False,
+        scheduler_type: str = 'pndm',
+        num_in_channels: int = None,
+        upcast_attention: bool = None
+) -> StableDiffusionPipeline:
+    """
+    Load a Stable Diffusion pipeline object from a CompVis-style ckpt file + yaml config file.
 
-def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableDiffusionPipeline:
+    Although many of the arguments can be automatically inferred, some of these rely on a brittle check against the
+    global step count, which will likely not hold for models that have already undergone fine-tuning. Therefore, it is
+    recommended that you supply non-default arguments as much as possible.
 
-    image_size = args.image_size
-    prediction_type = args.prediction_type
+    :param checkpoint_path: Path to .ckpt file.
+    :param original_config_file: Path to .yaml config file corresponding to the original architecture. If None, will be
+            automatically inferred by looking for a key that only exists in SD2.0 models.
+    :param image_size: The image size that the model was trained on. Use 512 for Stable Diffusion v1.X and Stable Siffusion v2
+            Base. Use 768 for Stable Diffusion v2.
+    :param prediction_type: The prediction type that the model was trained on. Use 'epsilon' for Stable Diffusion v1.X and Stable
+            Siffusion v2 Base. Use 'v-prediction' for Stable Diffusion v2.
+    :param num_in_channels: The number of input channels. If `None` number of input channels will be automatically inferred.
+    :param scheduler_type: Type of scheduler to use. Should be one of ["pndm", "lms", "heun", "euler", "euler-ancestral", "dpm", "ddim"].
+    :param model_type: The pipeline type. `None` to automatically infer, or one of ["FrozenOpenCLIPEmbedder", "FrozenCLIPEmbedder", "PaintByExample"].
+    :param extract_ema: Only relevant for checkpoints that have both EMA and non-EMA weights. Whether to extract the EMA weights
+            or not. Defaults to `False`. Add `--extract_ema` to extract the EMA weights. EMA weights usually yield
+            higher quality images for inference. Non-EMA weights are usually better to continue fine-tuning.
+    :param upcast_attention: Whether the attention computation should always be upcasted. This is necessary when running
+                    stable diffusion 2.1.
+    :return: A StableDiffusionPipeline object for the passed-in ckpt file.
+    """
 
-    checkpoint = torch.load(args.checkpoint_path)
+    checkpoint = torch.load(checkpoint_path)
 
     # Sometimes models don't have the global_step item
     if "global_step" in checkpoint:
         global_step = checkpoint["global_step"]
+        if original_config_file is None or image_size is None or prediction_type is None:
+            if global_step not in [110000, 875000]:
+                raise ValueError(
+                    f"Cannot automatically infer original_config_file, image_size or prediction_type from model global_step {global_step}")
+
     else:
         print("global_step key not found in model")
         global_step = None
+        if original_config_file is None or image_size is None or prediction_type is None:
+            raise ValueError("Model does not have a global_step key, cannot automatically infer original_config_file, image_size or prediction_type")
 
     if "state_dict" in checkpoint:
         print("load_state_dict from state_dict")
@@ -815,8 +844,7 @@ def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableD
         print("load_state_dict from directly")
         checkpoint = checkpoint
 
-    upcast_attention = args.upcast_attention
-    if args.original_config_file is None:
+    if original_config_file is None:
         key_name = "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_k.weight"
 
         if key_name in checkpoint and checkpoint[key_name].shape[-1] == 1024:
@@ -826,11 +854,11 @@ def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableD
                     "wget https://raw.githubusercontent.com/Stability-AI/stablediffusion/main/configs/stable-diffusion/v2-inference-v.yaml"
                     " -O v2-inference-v.yaml"
                 )
-            args.original_config_file = "./v2-inference-v.yaml"
+            original_config_file = "./v2-inference-v.yaml"
 
             if global_step == 110000:
                 # v2.1 needs to upcast attention
-                if args.upcast_attention == False:
+                if upcast_attention == False:
                     raise ValueError("This appears to be an SD2.1 model but upcast_attention==False was passed as argument")
                 upcast_attention = True
         else:
@@ -840,12 +868,12 @@ def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableD
                     "wget https://raw.githubusercontent.com/CompVis/stable-diffusion/main/configs/stable-diffusion/v1-inference.yaml"
                     " -O v1-inference.yaml"
                 )
-            args.original_config_file = "./v1-inference.yaml"
+            original_config_file = "./v1-inference.yaml"
 
-    original_config = OmegaConf.load(args.original_config_file)
+    original_config = OmegaConf.load(original_config_file)
 
-    if args.num_in_channels is not None:
-        original_config["model"]["params"]["unet_config"]["params"]["in_channels"] = args.num_in_channels
+    if num_in_channels is not None:
+        original_config["model"]["params"]["unet_config"]["params"]["in_channels"] = num_in_channels
 
     if (
         "parameterization" in original_config["model"]["params"]
@@ -882,24 +910,24 @@ def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableD
     # make sure scheduler works correctly with DDIM
     scheduler.register_to_config(clip_sample=False)
 
-    if args.scheduler_type == "pndm":
+    if scheduler_type == "pndm":
         config = dict(scheduler.config)
         config["skip_prk_steps"] = True
         scheduler = PNDMScheduler.from_config(config)
-    elif args.scheduler_type == "lms":
+    elif scheduler_type == "lms":
         scheduler = LMSDiscreteScheduler.from_config(scheduler.config)
-    elif args.scheduler_type == "heun":
+    elif scheduler_type == "heun":
         scheduler = HeunDiscreteScheduler.from_config(scheduler.config)
-    elif args.scheduler_type == "euler":
+    elif scheduler_type == "euler":
         scheduler = EulerDiscreteScheduler.from_config(scheduler.config)
-    elif args.scheduler_type == "euler-ancestral":
+    elif scheduler_type == "euler-ancestral":
         scheduler = EulerAncestralDiscreteScheduler.from_config(scheduler.config)
-    elif args.scheduler_type == "dpm":
+    elif scheduler_type == "dpm":
         scheduler = DPMSolverMultistepScheduler.from_config(scheduler.config)
-    elif args.scheduler_type == "ddim":
+    elif scheduler_type == "ddim":
         scheduler = scheduler
     else:
-        raise ValueError(f"Scheduler of type {args.scheduler_type} doesn't exist!")
+        raise ValueError(f"Scheduler of type {scheduler_type} doesn't exist!")
 
     # Convert the UNet2DConditionModel model.
     unet_config = create_unet_diffusers_config(original_config, image_size=image_size)
@@ -907,7 +935,7 @@ def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableD
     unet = UNet2DConditionModel(**unet_config)
 
     converted_unet_checkpoint = convert_ldm_unet_checkpoint(
-        checkpoint, unet_config, path=args.checkpoint_path, extract_ema=args.extract_ema
+        checkpoint, unet_config, path=checkpoint_path, extract_ema=extract_ema
     )
 
     unet.load_state_dict(converted_unet_checkpoint)
@@ -920,7 +948,6 @@ def load_stable_diffusion_pipeline_from_compvis_ckpt_file(args: Args) -> StableD
     vae.load_state_dict(converted_vae_checkpoint)
 
     # Convert the text model.
-    model_type = args.text_model_type
     if model_type is None:
         model_type = original_config.model.params.cond_stage_config.target.split(".")[-1]
 
@@ -1041,6 +1068,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dump_path", default=None, type=str, required=True, help="Path to the output model.")
     args = parser.parse_args()
-    pipe = load_stable_diffusion_pipeline_from_compvis_ckpt_file(args)
+    pipe = load_stable_diffusion_pipeline_from_compvis_ckpt_file(
+        checkpoint_path=args.checkpoint_path,
+        original_config_file=args.original_config_file,
+        image_size=args.image_dsize,
+        prediction_type=args.prediction_type,
+        model_type=args.pipeline_type,
+        extract_ema=args.extract_ema,
+        scheduler_type=args.scheduler_type,
+        num_in_channels=args.num_in_channels,
+        upcast_attention=args.upcast_attention
+    )
     pipe.save_pretrained(args.dump_path)
     print(" * Converted model to diffusers for training: ", args.dump_path)
