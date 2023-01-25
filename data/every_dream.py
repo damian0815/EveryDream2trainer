@@ -17,14 +17,9 @@ import logging
 import torch
 from torch.utils.data import Dataset
 from data.data_loader import DataLoaderMultiAspect as dlma
-import math
-import data.dl_singleton as dls
 from data.image_train_item import ImageTrainItem
 import random
 from torchvision import transforms
-from transformers import CLIPTokenizer
-import torch.nn.functional as F
-import numpy
 
 class EveryDreamBatch(Dataset):
     """
@@ -36,6 +31,7 @@ class EveryDreamBatch(Dataset):
     conditional_dropout: probability of dropping the caption for a given image
     resolution: max resolution (relative to square)
     jitter: number of pixels to jitter the crop by, only for non-square images
+    name: the name of this dataset (only used for logging)
     """
     def __init__(self,
                  data_root,
@@ -52,7 +48,8 @@ class EveryDreamBatch(Dataset):
                  write_schedule=False,
                  shuffle_tags=False,
                  rated_dataset=False,
-                 rated_dataset_dropout_target=0.5
+                 rated_dataset_dropout_target=0.5,
+                 name='train'
                  ):
         self.data_root = data_root
         self.batch_size = batch_size
@@ -70,13 +67,12 @@ class EveryDreamBatch(Dataset):
         self.seed = seed
         self.rated_dataset = rated_dataset
         self.rated_dataset_dropout_target = rated_dataset_dropout_target
+        self.name = name
 
         if seed == -1:
             seed = random.randint(0, 99999)
-        
-        if not dls.shared_dataloader:
-            logging.info(" * Creating new dataloader singleton")
-            dls.shared_dataloader = dlma(data_root=data_root,
+
+        self.dataloader = dlma(data_root=data_root,
                                          seed=seed,
                                          debug_level=debug_level,
                                          batch_size=self.batch_size,
@@ -85,36 +81,30 @@ class EveryDreamBatch(Dataset):
                                          log_folder=self.log_folder,
                                         )
 
-        self.image_train_items = dls.shared_dataloader.get_shuffled_image_buckets(1.0) # First epoch always trains on all images
+        self.image_train_items = self.dataloader.get_shuffled_image_buckets(1.0) # First epoch always trains on all images
 
         num_images = len(self.image_train_items)
 
-        logging.info(f" ** Trainer Set: {num_images / batch_size:.0f}, num_images: {num_images}, batch_size: {self.batch_size}")
+        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f}, num_images: {num_images}, batch_size: {self.batch_size}")
         if self.write_schedule:
             self.__write_batch_schedule(0)
 
     def __write_batch_schedule(self, epoch_n):
-        with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule.txt", "w", encoding='utf-8') as f:
+        with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
             for i in range(len(self.image_train_items)):
                 try:
                     f.write(f"step:{int(i / self.batch_size):05}, wh:{self.image_train_items[i].target_wh}, r:{self.image_train_items[i].runt_size}, path:{self.image_train_items[i].pathname}\n")
                 except Exception as e:
                     logging.error(f" * Error writing to batch schedule for file path: {self.image_train_items[i].pathname}")
 
-    def get_runts():
-        return dls.shared_dataloader.runts
-
     def shuffle(self, epoch_n: int, max_epochs: int):
         self.seed += 1
-        if dls.shared_dataloader:
-            if self.rated_dataset:
-                dropout_fraction = (max_epochs - (epoch_n * self.rated_dataset_dropout_target)) / max_epochs
-            else:
-                dropout_fraction = 1.0
-
-            self.image_train_items = dls.shared_dataloader.get_shuffled_image_buckets(dropout_fraction)
+        if self.rated_dataset:
+            dropout_fraction = (max_epochs - (epoch_n * self.rated_dataset_dropout_target)) / max_epochs
         else:
-            raise Exception("No dataloader singleton to shuffle")
+            dropout_fraction = 1.0
+
+        self.image_train_items = self.dataloader.get_shuffled_image_buckets(dropout_fraction)
 
         if self.write_schedule:
             self.__write_batch_schedule(epoch_n + 1)

@@ -563,6 +563,20 @@ def main(args):
         rated_dataset=args.rated_dataset,
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0))
     )
+    if args.validation_data_root is None:
+        val_batch = None
+    else:
+        val_batch = EveryDreamBatch(
+            data_root=args.validation_data_root,
+            debug_level=1,
+            batch_size=args.batch_size,
+            conditional_dropout=args.cond_dropout,
+            resolution=args.resolution,
+            tokenizer=tokenizer,
+            seed=seed,
+            log_folder=log_folder,
+            write_schedule=args.write_schedule,
+        )
 
     torch.cuda.benchmark = False
 
@@ -672,6 +686,16 @@ def main(args):
         num_workers=0,
         collate_fn=collate_fn
     )
+    if val_batch is None:
+        val_dataloader = None
+    else:
+        val_dataloader = torch.utils.data.DataLoader(
+            val_batch,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn
+        )
 
     unet.train() if not args.disable_unet_training else unet.eval()
     text_encoder.train() if not args.disable_textenc_training else text_encoder.eval() 
@@ -709,7 +733,49 @@ def main(args):
     loss_log_step = []
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
-    
+
+    ## actual prediction function - shared between train and validate
+    def get_prediction_and_target(image, tokens):
+        with torch.no_grad():
+            with autocast(enabled=args.amp):
+                pixel_values = image.to(memory_format=torch.contiguous_format).to(unet.device)
+                latents = vae.encode(pixel_values, return_dict=False)
+            del pixel_values
+            latents = latents[0].sample() * 0.18215
+
+            noise = torch.randn_like(latents)
+            bsz = latents.shape[0]
+
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
+
+            cuda_caption = tokens.to(text_encoder.device)
+
+        # with autocast(enabled=args.amp):
+        encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
+
+        if args.clip_skip > 0:
+            encoder_hidden_states = text_encoder.text_model.final_layer_norm(
+                encoder_hidden_states.hidden_states[-args.clip_skip])
+        else:
+            encoder_hidden_states = encoder_hidden_states.last_hidden_state
+
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+        del noise, latents, cuda_caption
+
+        with autocast(enabled=args.amp):
+            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        return model_pred, target
+
+
     try:
         # # dummy batch to pin memory to avoid fragmentation in torch, uses square aspect which is maximum bytes size per aspects.py
         # pixel_values = torch.randn_like(torch.zeros([args.batch_size, 3, args.resolution, args.resolution]))
@@ -741,41 +807,7 @@ def main(args):
             for step, batch in enumerate(train_dataloader):
                 step_start_time = time.time()
 
-                with torch.no_grad():
-                    with autocast(enabled=args.amp):     
-                        pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
-                        latents = vae.encode(pixel_values, return_dict=False)
-                    del pixel_values
-                    latents = latents[0].sample() * 0.18215
-
-                    noise = torch.randn_like(latents)
-                    bsz = latents.shape[0]
-
-                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                    timesteps = timesteps.long()
-
-                    cuda_caption = batch["tokens"].to(text_encoder.device)
-
-                #with autocast(enabled=args.amp):
-                encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
-
-                if args.clip_skip > 0:
-                    encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states.hidden_states[-args.clip_skip])
-                else:
-                    encoder_hidden_states = encoder_hidden_states.last_hidden_state
-
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                del noise, latents, cuda_caption
-
-                with autocast(enabled=args.amp):
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred, target = get_prediction_and_target(batch["image"], batch["tokens"])
 
                 #del timesteps, encoder_hidden_states, noisy_latents
                 #with autocast(enabled=args.amp):
@@ -868,9 +900,12 @@ def main(args):
                 del batch
                 global_step += 1
                 update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
+
                 # end of step
 
             steps_pbar.close()
+
+            # end of epoch
 
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
             epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
@@ -882,6 +917,30 @@ def main(args):
 
             loss_local = sum(loss_epoch) / len(loss_epoch)
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
+
+            # validate
+            if val_batch is not None:
+                epoch_len = math.ceil(len(train_batch) / args.batch_size)
+                steps_pbar = tqdm(range(epoch_len), position=1)
+                steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
+
+                with torch.no_grad():
+                    loss_epoch_val = []
+                    for step, batch in enumerate(val_dataloader):
+                        step_start_time = time.time()
+
+                        model_pred, target = get_prediction_and_target(batch["image"], batch["tokens"])
+
+                        # del timesteps, encoder_hidden_states, noisy_latents
+                        # with autocast(enabled=args.amp):
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        loss_step = loss.detach().item()
+
+                        loss_epoch_val.append(loss_step)
+
+                    loss_local = sum(loss_epoch_val) / len(loss_epoch_val)
+                    log_writer.add_scalar(tag="loss/epoch_val", scalar_value=loss_local, global_step=global_step)
+
             gc.collect()
             # end of epoch
 
@@ -955,6 +1014,7 @@ if __name__ == "__main__":
         argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
         argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
         argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
+        argparser.add_argument("--validation_data_root", type=str, default=None, help="folder where you validation images are (optional)")
         argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
         argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
         argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")
