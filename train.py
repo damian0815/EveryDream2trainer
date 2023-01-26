@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
         argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
         argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
         argparser.add_argument("--val_data_root", type=str, default=None, help="(optional) folder where your validation images are")
-        argparser.add_argumnet("--val_every_n_epochs", type=int, default=1, help="(optional) how often to run the validation supplied by --val_data_root, default=1 i.e. validate after every epoch")
+        argparser.add_argument("--val_every_n_epochs", type=int, default=1, help="(optional) how often to run the validation supplied by --val_data_root, default=1 i.e. validate after every epoch")
         argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
         argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
         argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")
