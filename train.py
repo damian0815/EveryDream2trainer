@@ -699,6 +699,17 @@ def main(args):
             num_workers=0,
             collate_fn=collate_fn
         )
+    if args.val_self_percent is not None:
+        val_self_count = int(len(train_batch) * args.val_self_percent)
+        if val_self_count > 0:
+            val_self_dataloader = torch.utils.data.DataLoader(
+                # train_batch has been shuffled on load
+                train_batch[0:val_self_count],
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_works=0,
+                collate_fn=collate_fn
+            )
 
     unet.train() if not args.disable_unet_training else unet.eval()
     text_encoder.train() if not args.disable_textenc_training else text_encoder.eval() 
@@ -923,14 +934,14 @@ def main(args):
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
 
             # validate
-            if val_dataloader is not None and (epoch % args.val_every_n_epochs) == 0:
+            def do_validate(dataloader, tag):
                 with torch.no_grad(), isolate_rng():
                     loss_validation_epoch = []
-                    validate_epoch_len = math.ceil(len(val_batch) / args.batch_size)
+                    validate_epoch_len = math.ceil(len(dataloader) / args.batch_size)
                     steps_pbar = tqdm(range(validate_epoch_len), position=1)
-                    steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate Steps{Style.RESET_ALL}")
+                    steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps ({tag}){Style.RESET_ALL}")
 
-                    for step, batch in enumerate(val_dataloader):
+                    for step, batch in enumerate(dataloader):
                         # ok to override seed here because we are in an isolate_rng() 'with' block
                         torch.manual_seed(seed + step)
                         model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
@@ -942,16 +953,23 @@ def main(args):
                         del target, model_pred
 
                         loss_step = loss.detach().item()
-                        steps_pbar.set_postfix({"loss/val step": loss_step}, {"gs": global_step})
+                        steps_pbar.set_postfix({f"loss/{tag} step": loss_step}, {"gs": global_step})
                         steps_pbar.update(1)
 
                         loss_validation_epoch.append(loss_step)
 
+                    steps_pbar.close()
+
                 loss_validation_local = sum(loss_validation_epoch) / len(loss_validation_epoch)
-                log_writer.add_scalar(tag="loss/val", scalar_value=loss_validation_local, global_step=global_step)
+                log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=loss_validation_local, global_step=global_step)
 
-                steps_pbar.close()
 
+
+            if (epoch % args.val_every_n_epochs) == 0:
+                if val_dataloader is not None:
+                    do_validate(dataloader=val_dataloader, tag="val")
+                if val_self_dataloader is not None:
+                    do_validate(dataloader=val_self_dataloader, tag="val-self")
 
             gc.collect()
 
@@ -1032,6 +1050,7 @@ if __name__ == "__main__":
         argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
         argparser.add_argument("--val_data_root", type=str, default=None, help="(optional) folder where your validation images are")
         argparser.add_argument("--val_every_n_epochs", type=int, default=1, help="(optional) how often to run the validation supplied by --val_data_root, default=1 i.e. validate after every epoch")
+        argparser.add_argument("--val_self_pct", type=float, default=None, help="(optional) if set, what percentage of the train dataset [0=none, 1=all] to use for self-validation")
         argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
         argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
         argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")
