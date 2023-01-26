@@ -561,21 +561,23 @@ def main(args):
         write_schedule=args.write_schedule,
         shuffle_tags=args.shuffle_tags,
         rated_dataset=args.rated_dataset,
-        rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0))
+        rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
+        name='train'
     )
-    if args.validation_data_root is None:
+    if args.val_data_root is None:
         val_batch = None
     else:
         val_batch = EveryDreamBatch(
-            data_root=args.validation_data_root,
+            data_root=args.val_data_root,
             debug_level=1,
             batch_size=args.batch_size,
-            conditional_dropout=args.cond_dropout,
+            conditional_dropout=0,
             resolution=args.resolution,
             tokenizer=tokenizer,
             seed=seed,
             log_folder=log_folder,
             write_schedule=args.write_schedule,
+            name='val',
         )
 
     torch.cuda.benchmark = False
@@ -734,8 +736,8 @@ def main(args):
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
-    ## actual prediction function - shared between train and validate
-    def get_prediction_and_target(image, tokens):
+    # actual prediction function - shared between train and validate
+    def get_model_prediction_and_target(image, tokens):
         with torch.no_grad():
             with autocast(enabled=args.amp):
                 pixel_values = image.to(memory_format=torch.contiguous_format).to(unet.device)
@@ -795,6 +797,10 @@ def main(args):
         # # discard the grads, just want to pin memory
         # optimizer.zero_grad(set_to_none=True)
 
+
+
+
+
         for epoch in range(args.max_epochs):
             loss_epoch = []
             epoch_start_time = time.time()
@@ -807,7 +813,7 @@ def main(args):
             for step, batch in enumerate(train_dataloader):
                 step_start_time = time.time()
 
-                model_pred, target = get_prediction_and_target(batch["image"], batch["tokens"])
+                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
                 #del timesteps, encoder_hidden_states, noisy_latents
                 #with autocast(enabled=args.amp):
@@ -900,12 +906,9 @@ def main(args):
                 del batch
                 global_step += 1
                 update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
-
                 # end of step
 
             steps_pbar.close()
-
-            # end of epoch
 
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
             epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
@@ -919,29 +922,37 @@ def main(args):
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
 
             # validate
-            if val_batch is not None:
-                epoch_len = math.ceil(len(train_batch) / args.batch_size)
-                steps_pbar = tqdm(range(epoch_len), position=1)
-                steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
-
+            do_validation = (val_dataloader is not None) # todo: val every N epochs
+            if do_validation:
                 with torch.no_grad():
-                    loss_epoch_val = []
-                    for step, batch in enumerate(val_dataloader):
-                        step_start_time = time.time()
+                    loss_validation_epoch = []
+                    validate_epoch_len = math.ceil(len(val_batch) / args.batch_size)
+                    steps_pbar = tqdm(range(validate_epoch_len), position=1)
+                    steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate Steps{Style.RESET_ALL}")
 
-                        model_pred, target = get_prediction_and_target(batch["image"], batch["tokens"])
+                    for step, batch in enumerate(val_dataloader):
+                        model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
                         # del timesteps, encoder_hidden_states, noisy_latents
                         # with autocast(enabled=args.amp):
                         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                        del target, model_pred
+
                         loss_step = loss.detach().item()
+                        steps_pbar.set_postfix({"loss/val step": loss_step}, {"gs": global_step})
+                        steps_pbar.update(1)
 
-                        loss_epoch_val.append(loss_step)
+                        loss_validation_epoch.append(loss_step)
 
-                    loss_local = sum(loss_epoch_val) / len(loss_epoch_val)
-                    log_writer.add_scalar(tag="loss/epoch_val", scalar_value=loss_local, global_step=global_step)
+                loss_validation_local = sum(loss_validation_epoch) / len(loss_validation_epoch)
+                log_writer.add_scalar(tag="loss/val", scalar_value=loss_validation_local, global_step=global_step)
+
+                steps_pbar.close()
+
 
             gc.collect()
+
             # end of epoch
 
         # end of training
@@ -1014,7 +1025,7 @@ if __name__ == "__main__":
         argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
         argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
         argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
-        argparser.add_argument("--validation_data_root", type=str, default=None, help="folder where you validation images are (optional)")
+        argparser.add_argument("--val_data_root", type=str, default=None, help="(optional) folder where your validation images are")
         argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
         argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
         argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")
