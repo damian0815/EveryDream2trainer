@@ -890,9 +890,6 @@ def update_old_args(t_args):
     if not hasattr(t_args, "rated_dataset_target_dropout_percent"):
         print(f" Config json is missing 'rated_dataset_target_dropout_percent' flag")
         t_args.__dict__["rated_dataset_target_dropout_percent"] = 50
-    if not hasattr(t_args, "val_every_n_epochs"):
-        print(f" Config json is missing 'val_every_n_epochs' flag")
-        t_args.__dict__["val_every_n_epochs"] = 1
 
 
 if __name__ == "__main__":
