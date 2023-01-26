@@ -53,6 +53,7 @@ from data.every_dream import EveryDreamBatch
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.gpu import GPU
+from utils.isolate_rng import isolate_rng
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
@@ -923,13 +924,15 @@ def main(args):
 
             # validate
             if val_dataloader is not None and (epoch % args.val_every_n_epochs) == 0:
-                with torch.no_grad():
+                with torch.no_grad(), isolate_rng():
                     loss_validation_epoch = []
                     validate_epoch_len = math.ceil(len(val_batch) / args.batch_size)
                     steps_pbar = tqdm(range(validate_epoch_len), position=1)
                     steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate Steps{Style.RESET_ALL}")
 
                     for step, batch in enumerate(val_dataloader):
+                        # ok to override seed here because we are in an isolate_rng() 'with' block
+                        torch.manual_seed(seed + step)
                         model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
                         # del timesteps, encoder_hidden_states, noisy_latents
