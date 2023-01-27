@@ -699,8 +699,8 @@ def main(args):
             num_workers=0,
             collate_fn=collate_fn
         )
-    if args.val_self_percent is not None:
-        val_self_count = int(len(train_batch) * args.val_self_percent)
+    if args.val_self_pct is not None:
+        val_self_count = int(len(train_batch) * args.val_self_pct)
         if val_self_count > 0:
             val_self_dataloader = torch.utils.data.DataLoader(
                 # train_batch has been shuffled on load
@@ -1021,6 +1021,9 @@ def update_old_args(t_args):
     if not hasattr(t_args, "val_every_n_epochs"):
         print(f" Config json is missing 'val_every_n_epochs' flag")
         t_args.__dict__["val_every_n_epochs"] = 1
+    if not hasattr(t_args, "val_self_pct"):
+        print(f" Config json is missing 'val_self_pct' flag")
+        t_args.__dict__["val_self_pct"] = None
 
 
 if __name__ == "__main__":
