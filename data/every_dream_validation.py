@@ -38,13 +38,15 @@ class EveryDreamValidator:
         self.seed = val_config.get('seed', 555)
 
         with isolate_rng():
-            self.train_overlapping_dataloader = self._build_dataloader_from_automatic_split(train_batch,
-                                                            split_proportion=stabilize_split_proportion,
-                                                            enforce_split=False) if stabilize_training_loss else None
             self.val_dataloader = self._build_validation_dataloader(val_split_mode,
                                                                     split_proportion=val_split_proportion,
                                                                     val_data_root=self.val_data_root,
                                                                     train_batch=train_batch)
+            # order is important - if we're removing images from train, this needs to happen before making
+            # the overlapping dataloader
+            self.train_overlapping_dataloader = self._build_dataloader_from_automatic_split(train_batch,
+                                                            split_proportion=stabilize_split_proportion,
+                                                            enforce_split=False) if stabilize_training_loss else None
 
 
     def do_validation_if_appropriate(self, epoch: int, global_step: int,

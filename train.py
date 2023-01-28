@@ -648,7 +648,7 @@ def main(args):
     logging.info(f" saving ckpts every {args.ckpt_every_n_minutes} minutes")
     logging.info(f" saving ckpts every {args.save_every_n_epochs } epochs")
 
-    validator = EveryDreamValidator(args.val_config_path,
+    validator = EveryDreamValidator(args.validation_config,
                                     train_batch=train_batch,
                                     log_writer=log_writer)
 
