@@ -114,6 +114,8 @@ class EveryDreamValidator:
         """
         val_item_count_nonbatched = split_proportion * len(train_batch)
         val_item_count_batched = ((val_item_count_nonbatched // train_batch.batch_size) + 1) * train_batch.batch_size
+        print(f"* building automatic validation split by taking {val_item_count_batched} items (of {len(train_batch)}) from train_batch")
+
         # train_batch has been shuffled on load - bake its order here by converting from iterator to list
         val_items = list(itertools.islice(train_batch, val_item_count_batched))
         if enforce_split:
