@@ -120,6 +120,7 @@ class EveryDreamValidator:
         # train_batch has been shuffled on load - bake its order here by converting from iterator to list
         val_items = list(itertools.islice(train_batch, val_item_count_batched))
         if enforce_split:
+            print(f" ** Removing {val_item_count_batched} from '{train_batch.name}' and using them for validation instead")
             del train_batch[0:val_item_count_batched]
         if len(train_batch) == 0:
             raise ValueError(f"validation split used up all of the training data. try a lower split proportion than {split_proportion}")
