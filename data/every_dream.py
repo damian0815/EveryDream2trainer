@@ -21,6 +21,7 @@ from data.image_train_item import ImageTrainItem
 import random
 from torchvision import transforms
 
+
 class EveryDreamBatch(Dataset):
     """
     data_root: root path of all your training images, will be recursively searched for images
@@ -79,6 +80,7 @@ class EveryDreamBatch(Dataset):
                                          flip_p=flip_p,
                                          resolution=resolution,
                                          log_folder=self.log_folder,
+                                         name=self.name
                                         )
 
         self.image_train_items = self.dataloader.get_shuffled_image_buckets(1.0) # First epoch always trains on all images
@@ -97,6 +99,7 @@ class EveryDreamBatch(Dataset):
                 except Exception as e:
                     logging.error(f" * Error writing to batch schedule for file path: {self.image_train_items[i].pathname}")
 
+
     def shuffle(self, epoch_n: int, max_epochs: int):
         self.seed += 1
         if self.rated_dataset:
@@ -111,6 +114,13 @@ class EveryDreamBatch(Dataset):
 
     def __len__(self):
         return len(self.image_train_items)
+
+    def __delitem__(self, key):
+        if (len(key) % self.batch_size) != 0:
+            raise ValueError(f"cannot remove {len(key)} images from '{self.name}' because it is not a multiple of batch_size ({self.batch_size})")
+        logging.info(f" ** EveryDreamBatch Set '{self.name}': {len(key)} images removed, num_images now: {len(self)}")
+        del self.image_train_items[key]
+
 
     def __getitem__(self, i):
         example = {}
@@ -167,3 +177,38 @@ class EveryDreamBatch(Dataset):
         example["caption"] = image_train_tmp.caption
         example["runt_size"] = image_train_tmp.runt_size
         return example
+
+
+def build_torch_dataloader(items, batch_size) -> torch.utils.data.DataLoader:
+    dataloader = torch.utils.data.DataLoader(
+        items,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn
+    )
+    return dataloader
+
+
+def collate_fn(batch):
+    """
+    Collates batches
+    """
+    images = [example["image"] for example in batch]
+    captions = [example["caption"] for example in batch]
+    tokens = [example["tokens"] for example in batch]
+    runt_size = batch[0]["runt_size"]
+
+    images = torch.stack(images)
+    images = images.to(memory_format=torch.contiguous_format).float()
+
+    ret = {
+        "tokens": torch.stack(tuple(tokens)),
+        "image": images,
+        "captions": captions,
+        "runt_size": runt_size,
+    }
+    del batch
+    return ret
+
+

@@ -49,7 +49,8 @@ from accelerate.utils import set_seed
 import wandb
 from torch.utils.tensorboard import SummaryWriter
 
-from data.every_dream import EveryDreamBatch
+from data.every_dream import EveryDreamBatch, build_torch_dataloader
+from data.every_dream_validation import EveryDreamValidator
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.gpu import GPU
@@ -289,6 +290,7 @@ def update_grad_scaler(scaler: GradScaler, global_step, epoch, step):
         scaler.set_growth_factor(factor)
         scaler.set_backoff_factor(1/factor)
         scaler.set_growth_interval(100)
+
 
 def main(args):
     """
@@ -565,21 +567,7 @@ def main(args):
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
         name='train'
     )
-    if args.val_data_root is None:
-        val_batch = None
-    else:
-        val_batch = EveryDreamBatch(
-            data_root=args.val_data_root,
-            debug_level=1,
-            batch_size=args.batch_size,
-            conditional_dropout=0,
-            resolution=args.resolution,
-            tokenizer=tokenizer,
-            seed=seed,
-            log_folder=log_folder,
-            write_schedule=args.write_schedule,
-            name='val',
-        )
+
 
     torch.cuda.benchmark = False
 
@@ -660,45 +648,11 @@ def main(args):
     logging.info(f" saving ckpts every {args.ckpt_every_n_minutes} minutes")
     logging.info(f" saving ckpts every {args.save_every_n_epochs } epochs")
 
+    validator = EveryDreamValidator(args.val_config_path,
+                                    train_batch=train_batch,
+                                    log_writer=log_writer)
 
-    def collate_fn(batch):
-        """
-        Collates batches
-        """
-        images = [example["image"] for example in batch]
-        captions = [example["caption"] for example in batch]
-        tokens = [example["tokens"] for example in batch]
-        runt_size = batch[0]["runt_size"]
-
-        images = torch.stack(images)
-        images = images.to(memory_format=torch.contiguous_format).float()
-
-        ret = {
-            "tokens": torch.stack(tuple(tokens)),
-            "image": images,
-            "captions": captions,
-            "runt_size": runt_size,
-        }
-        del batch
-        return ret
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_batch,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn
-    )
-    if val_batch is None:
-        val_dataloader = None
-    else:
-        val_dataloader = torch.utils.data.DataLoader(
-            val_batch,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=collate_fn
-        )
+    train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size)
 
     unet.train() if not args.disable_unet_training else unet.eval()
     text_encoder.train() if not args.disable_textenc_training else text_encoder.eval() 
@@ -923,35 +877,7 @@ def main(args):
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
 
             # validate
-            if val_dataloader is not None and (epoch % args.val_every_n_epochs) == 0:
-                with torch.no_grad(), isolate_rng():
-                    loss_validation_epoch = []
-                    validate_epoch_len = math.ceil(len(val_batch) / args.batch_size)
-                    steps_pbar = tqdm(range(validate_epoch_len), position=1)
-                    steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate Steps{Style.RESET_ALL}")
-
-                    for step, batch in enumerate(val_dataloader):
-                        # ok to override seed here because we are in an isolate_rng() 'with' block
-                        torch.manual_seed(seed + step)
-                        model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
-
-                        # del timesteps, encoder_hidden_states, noisy_latents
-                        # with autocast(enabled=args.amp):
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                        del target, model_pred
-
-                        loss_step = loss.detach().item()
-                        steps_pbar.set_postfix({"loss/val step": loss_step}, {"gs": global_step})
-                        steps_pbar.update(1)
-
-                        loss_validation_epoch.append(loss_step)
-
-                loss_validation_local = sum(loss_validation_epoch) / len(loss_validation_epoch)
-                log_writer.add_scalar(tag="loss/val", scalar_value=loss_validation_local, global_step=global_step)
-
-                steps_pbar.close()
-
+            validator.do_validation_if_appropriate(epoch, global_step, get_model_prediction_and_target)
 
             gc.collect()
 
@@ -1000,9 +926,9 @@ def update_old_args(t_args):
     if not hasattr(t_args, "rated_dataset_target_dropout_percent"):
         print(f" Config json is missing 'rated_dataset_target_dropout_percent' flag")
         t_args.__dict__["rated_dataset_target_dropout_percent"] = 50
-    if not hasattr(t_args, "val_every_n_epochs"):
-        print(f" Config json is missing 'val_every_n_epochs' flag")
-        t_args.__dict__["val_every_n_epochs"] = 1
+    if not hasattr(t_args, "validation_config"):
+        print(f" Config json is missing 'validation_config' flag")
+        t_args.__dict__["validation_config"] = None
 
 
 if __name__ == "__main__":
@@ -1030,8 +956,7 @@ if __name__ == "__main__":
         argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
         argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
         argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
-        argparser.add_argument("--val_data_root", type=str, default=None, help="(optional) folder where your validation images are")
-        argparser.add_argument("--val_every_n_epochs", type=int, default=1, help="(optional) how often to run the validation supplied by --val_data_root, default=1 i.e. validate after every epoch")
+        argparser.add_argument("--validation_config", type=str, default=None, help="(optional) path to the validation config file (.json)")
         argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
         argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
         argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")

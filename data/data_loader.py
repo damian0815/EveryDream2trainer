@@ -36,7 +36,7 @@ class DataLoaderMultiAspect():
     batch_size: number of images per batch
     flip_p: probability of flipping image horizontally (i.e. 0-0.5)
     """
-    def __init__(self, data_root, seed=555, debug_level=0, batch_size=1, flip_p=0.0, resolution=512, log_folder=None):
+    def __init__(self, data_root, seed=555, debug_level=0, batch_size=1, flip_p=0.0, resolution=512, log_folder=None, name='train'):
         self.data_root = data_root
         self.debug_level = debug_level
         self.flip_p = flip_p
@@ -44,6 +44,7 @@ class DataLoaderMultiAspect():
         self.seed = seed
         self.batch_size = batch_size
         self.has_scanned = False
+        self.name = name
         self.aspects = aspects.get_aspect_buckets(resolution=resolution, square_only=False)
         
         logging.info(f"* DLMA resolution {resolution}, buckets: {self.aspects}")
@@ -179,7 +180,7 @@ class DataLoaderMultiAspect():
         undersized_items = [item for item in items if item.is_undersized]
 
         if len(undersized_items) > 0:
-            underized_log_path = os.path.join(self.log_folder, "undersized_images.txt")
+            underized_log_path = os.path.join(self.log_folder, f"undersized_images_{self.name}.txt")
             logging.warning(f"{Fore.LIGHTRED_EX} ** Some images are smaller than the target size, consider using larger images{Style.RESET_ALL}")
             logging.warning(f"{Fore.LIGHTRED_EX} ** Check {underized_log_path} for more information.{Style.RESET_ALL}")
             with open(underized_log_path, "w") as undersized_images_file:
