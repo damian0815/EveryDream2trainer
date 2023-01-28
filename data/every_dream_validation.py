@@ -5,7 +5,7 @@ from typing import Callable, Any, Optional
 
 import torch
 from colorama import Fore, Style
-from torch.autograd.grad_mode import F
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
