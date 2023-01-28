@@ -84,13 +84,10 @@ class EveryDreamBatch(Dataset):
                                          name=self.name
                                         )
 
-        self.image_train_items = self.dataloader.get_shuffled_image_buckets(1.0) # First epoch always trains on all images
-
         num_images = len(self.image_train_items)
-
         logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f}, num_images: {num_images}, batch_size: {self.batch_size}")
-        if self.write_schedule:
-            self.__write_batch_schedule(0)
+
+        self.__update_image_train_items(1.0, 0)
 
     def __write_batch_schedule(self, epoch_n):
         with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
@@ -107,11 +104,14 @@ class EveryDreamBatch(Dataset):
             dropout_fraction = (max_epochs - (epoch_n * self.rated_dataset_dropout_target)) / max_epochs
         else:
             dropout_fraction = 1.0
+        self.__update_image_train_items(dropout_fraction, epoch_n)
 
+
+    def __update_image_train_items(self, dropout_fraction: float, epoch_n: int):
         self.image_train_items = self.dataloader.get_shuffled_image_buckets(dropout_fraction)
-
         if self.write_schedule:
             self.__write_batch_schedule(epoch_n + 1)
+
 
     def __len__(self):
         return len(self.image_train_items)

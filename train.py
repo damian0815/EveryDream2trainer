@@ -526,6 +526,11 @@ def main(args):
         logging.info(f"{Fore.CYAN} * Training Text and Unet *{Style.RESET_ALL}")
         params_to_train = itertools.chain(unet.parameters(), text_encoder.parameters())
 
+    log_writer = SummaryWriter(log_dir=log_folder,
+                                   flush_secs=5,
+                                   comment="EveryDream2FineTunes",
+                                  )
+
     betas = (0.9, 0.999)
     epsilon = 1e-8
     if args.amp:
@@ -549,6 +554,7 @@ def main(args):
             amsgrad=False,
         )
 
+
     log_optimizer(optimizer, betas, epsilon)
 
     train_batch = EveryDreamBatch(
@@ -567,6 +573,9 @@ def main(args):
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
         name='train'
     )
+    validator = EveryDreamValidator(args.validation_config,
+                                    train_batch=train_batch,
+                                    log_writer=log_writer)
 
 
     torch.cuda.benchmark = False
@@ -594,10 +603,7 @@ def main(args):
     if args.wandb is not None and args.wandb:
         wandb.init(project=args.project_name, sync_tensorboard=True, )
   
-    log_writer = SummaryWriter(log_dir=log_folder, 
-                                   flush_secs=5,
-                                   comment="EveryDream2FineTunes",
-                                  )
+
 
     def log_args(log_writer, args):
         arglog = "args:\n"
@@ -647,10 +653,6 @@ def main(args):
     logging.info(f" Pretraining GPU Memory: {gpu_used_mem} / {gpu_total_mem} MB")
     logging.info(f" saving ckpts every {args.ckpt_every_n_minutes} minutes")
     logging.info(f" saving ckpts every {args.save_every_n_epochs } epochs")
-
-    validator = EveryDreamValidator(args.validation_config,
-                                    train_batch=train_batch,
-                                    log_writer=log_writer)
 
     train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size)
 
