@@ -112,7 +112,7 @@ class EveryDreamValidator:
         Build a validation dataloader by copying data from the given `train_batch`. If `enforce_split` is `True`, remove
         the copied items from train_batch so that there is no overlap between `train_batch` and the new dataloader.
         """
-        val_item_count_nonbatched = split_proportion * len(train_batch)
+        val_item_count_nonbatched = round(split_proportion * len(train_batch))
         val_item_count_batched = ((val_item_count_nonbatched // train_batch.batch_size) + 1) * train_batch.batch_size
         print(f"* building automatic validation split by taking {val_item_count_batched} items (of {len(train_batch)}) from train_batch")
 
