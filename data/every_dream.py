@@ -118,8 +118,13 @@ class EveryDreamBatch(Dataset):
 
     def __delitem__(self, key):
         old_count = len(self)
+        items_to_delete = self.image_train_items[key]
+        self.dataloader.delete_items(items_to_delete)
+         this needs to be better
+        self.image_train_items = self.dataloader.get_shuffled_image_buckets(1.0) # First epoch always trains on all images
+
         del self.image_train_items[key]
-        removed_count = len(self)-old_count
+        removed_count = old_count-len(self)
         if (removed_count % self.batch_size) != 0:
             raise ValueError(
                 f"cannot remove {removed_count} images from '{self.name}' because it is not a multiple of batch_size ({self.batch_size})")

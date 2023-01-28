@@ -46,10 +46,21 @@ class DataLoaderMultiAspect():
         self.has_scanned = False
         self.name = name
         self.aspects = aspects.get_aspect_buckets(resolution=resolution, square_only=False)
-        
+
         logging.info(f"* DLMA resolution {resolution}, buckets: {self.aspects}")
+
         self.__prepare_train_data()
+        self.__update_ratings()
+
+    def __update_ratings(self):
         (self.rating_overall_sum, self.ratings_summed) = self.__sort_and_precalc_image_ratings()
+
+
+    def delete_items(self, items: list[ImageTrainItem]):
+        for i in items:
+            self.prepared_train_data.remove(i)
+        print(f"DLMA deleted {len(items)} items, now have len(self.prepared_train_data) items")
+        self.__update_ratings()
 
 
     def __pick_multiplied_set(self, randomizer):
@@ -89,7 +100,7 @@ class DataLoaderMultiAspect():
         del data_copy
         return picked_images
 
-    def get_shuffled_image_buckets(self, dropout_fraction: float = 1.0):
+    def get_shuffled_image_buckets(self, dropout_fraction: float = 1.0) -> list[ImageTrainItem]:
         """
         returns the current list of images including their captions in a randomized order,
         sorted into buckets with same sized images
@@ -135,7 +146,7 @@ class DataLoaderMultiAspect():
                     buckets[bucket].extend(runt_bucket)
 
         # flatten the buckets
-        image_caption_pairs = []
+        image_caption_pairs: list[ImageTrainItem] = []
         for bucket in buckets:
             image_caption_pairs.extend(buckets[bucket])
 
@@ -156,7 +167,6 @@ class DataLoaderMultiAspect():
         """
         Create ImageTrainItem objects with metadata for hydration later
         """
-
         if not self.has_scanned:
             self.has_scanned = True
             
@@ -170,7 +180,8 @@ class DataLoaderMultiAspect():
             self.prepared_train_data = items
             random.Random(self.seed).shuffle(self.prepared_train_data)
             self.__report_errors(items)
-    
+
+
     def __report_errors(self, items: list[ImageTrainItem]):
         for item in items:
             if item.error is not None:
@@ -188,7 +199,7 @@ class DataLoaderMultiAspect():
                 for undersized_item in undersized_items:
                     message = f" *** {undersized_item.pathname} with size: {undersized_item.image_size} is smaller than target size: {undersized_item.target_wh}, consider using larger images"
                     undersized_images_file.write(message)
-                    
+
 
 
     def __pick_random_subset(self, dropout_fraction: float, picker: random.Random) -> list[ImageTrainItem]:
