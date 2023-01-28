@@ -57,13 +57,15 @@ class DataLoaderMultiAspect():
 
 
     def delete_items(self, items: list[ImageTrainItem]):
-        print(f"removing {items}...")
-        for i in items:
+        print(f"removing {len(items)} ImageTrainItems from DLMA '{self.name}'...")
+        old_item_count = len(self.prepared_train_data)
+        for item_to_delete in items:
             try:
-                self.prepared_train_data.remove(i)
-            except ValueError as e:
-                print(f"tried to remove {i} but couldn't find it")
-        print(f"DLMA deleted {len(items)} items, now have len(self.prepared_train_data) items")
+                matching_item = next(i for i in self.prepared_train_data if i.pathname==item_to_delete.pathname)
+                self.prepared_train_data.remove(matching_item)
+            except StopIteration:
+                print(f"tried to remove {item_to_delete} but couldn't find it")
+        print(f"DLMA deleted {old_item_count-len(self.prepared_train_data)} items, now have len(self.prepared_train_data) items")
         self.__update_ratings()
 
 
