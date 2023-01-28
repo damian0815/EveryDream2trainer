@@ -84,10 +84,10 @@ class EveryDreamBatch(Dataset):
                                          name=self.name
                                         )
 
-        num_images = len(self.image_train_items)
-        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f}, num_images: {num_images}, batch_size: {self.batch_size}")
 
         self.__update_image_train_items(1.0, 0)
+        num_images = len(self.image_train_items)
+        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f}, num_images: {num_images}, batch_size: {self.batch_size}")
 
     def __write_batch_schedule(self, epoch_n):
         with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
