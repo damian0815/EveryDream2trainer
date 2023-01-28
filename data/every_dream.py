@@ -57,6 +57,7 @@ class EveryDreamBatch(Dataset):
         self.debug_level = debug_level
         self.conditional_dropout = conditional_dropout
         self.crop_jitter = crop_jitter
+        self.resolution = resolution
         self.unloaded_to_idx = 0
         self.tokenizer = tokenizer
         self.log_folder = log_folder

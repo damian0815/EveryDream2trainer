@@ -136,7 +136,7 @@ class EveryDreamValidator:
             debug_level=1,
             batch_size=reference_train_batch.batch_size,
             conditional_dropout=0,
-            resolution=reference_train_batch.dataloader.resolution,
+            resolution=reference_train_batch.resolution,
             tokenizer=reference_train_batch.tokenizer,
             seed=reference_train_batch.seed,
             log_folder=reference_train_batch.log_folder,
