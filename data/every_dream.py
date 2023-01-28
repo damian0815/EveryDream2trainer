@@ -116,8 +116,6 @@ class EveryDreamBatch(Dataset):
         return len(self.image_train_items)
 
     def __delitem__(self, key):
-        if (len(key) % self.batch_size) != 0:
-            raise ValueError(f"cannot remove {len(key)} images from '{self.name}' because it is not a multiple of batch_size ({self.batch_size})")
         logging.info(f" ** EveryDreamBatch Set '{self.name}': {len(key)} images removed, num_images now: {len(self)}")
         del self.image_train_items[key]
 
