@@ -704,10 +704,10 @@ def main(args):
         if val_self_count > 0:
             val_self_dataloader = torch.utils.data.DataLoader(
                 # train_batch has been shuffled on load
-                train_batch[0:val_self_count],
+                list(train_batch)[0:val_self_count],
                 batch_size=args.batch_size,
                 shuffle=False,
-                num_works=0,
+                num_workers=0,
                 collate_fn=collate_fn
             )
 
