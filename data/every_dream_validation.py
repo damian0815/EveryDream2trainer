@@ -114,12 +114,12 @@ class EveryDreamValidator:
         the copied items from train_batch so that there is no overlap between `train_batch` and the new dataloader.
         """
         # train_batch has been shuffled on load - bake its order here by converting from iterator to list
-        val_items = train_batch.extract_split(split_proportion, remove_from_dataset=enforce_split)
+        val_items = train_batch.get_split(split_proportion, remove_from_dataset=enforce_split)
         if enforce_split:
             print(
             f"  * Removed {len(val_items)} items from from '{train_batch.name}' for validation split")
-        if len(val_items) == 0:
-            raise ValueError(f"validation split used up all of the training data. try a lower split proportion than {split_proportion}")
+        if len(train_batch) == 0:
+            raise ValueError(f"Validation split used up all of the training data. Try a lower split proportion than {split_proportion}")
         return build_torch_dataloader(
             items=val_items,
             batch_size=train_batch.batch_size,

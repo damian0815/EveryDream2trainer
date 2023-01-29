@@ -116,7 +116,7 @@ class EveryDreamBatch(Dataset):
             self.__write_batch_schedule(epoch_n + 1)
 
 
-    def extract_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
+    def get_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
         items = self.dataloader.get_split(split_proportion, remove_from_dataset=remove_from_dataset)
         self.__update_image_train_items()
         return items

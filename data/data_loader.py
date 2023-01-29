@@ -58,10 +58,12 @@ class DataLoaderMultiAspect():
 
     def get_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
         item_count = math.ceil(split_proportion * len(self.prepared_train_data) // self.batch_size) * self.batch_size
-        items = random.shuffle(self.prepared_train_data.copy())[:item_count]
+        items_copy = self.prepared_train_data.copy()
+        random.shuffle(items_copy)
+        split_items = items_copy[:item_count]
         if remove_from_dataset:
-            self.delete_items(items)
-        return items
+            self.delete_items(split_items)
+        return split_items
 
 
     def delete_items(self, items: list[ImageTrainItem]):
