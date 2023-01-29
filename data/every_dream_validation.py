@@ -121,12 +121,13 @@ class EveryDreamValidator:
             val_items = train_batch.get_random_split(split_proportion, remove_from_dataset=enforce_split)
             if enforce_split:
                 print(
-                f"  * Removed {len(val_items)} items from from '{train_batch.name}' for validation split")
+                f"  * Removed {len(val_items)} items from from '{train_batch.name}' for validation split, length is now {round(len(train_batch)/train_batch.batch_size)} batches")
             if len(train_batch) == 0:
                 raise ValueError(f"Validation split used up all of the training data. Try a lower split proportion than {split_proportion}")
             val_batch = self._make_val_batch_with_train_batch_settings(
                 val_items,
-                train_batch
+                train_batch,
+                name=name
             )
             return build_torch_dataloader(
                 items=val_batch,
