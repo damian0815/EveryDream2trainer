@@ -47,6 +47,7 @@ class EveryDreamValidator:
             # the overlapping dataloader
             self.train_overlapping_dataloader = self._build_dataloader_from_automatic_split(train_batch,
                                                             split_proportion=stabilize_split_proportion,
+                                                            name='train-stabilizer',
                                                             enforce_split=False) if stabilize_training_loss else None
 
 
@@ -97,7 +98,7 @@ class EveryDreamValidator:
         if validation_split_mode == 'none':
             return None
         elif validation_split_mode == 'automatic':
-            return self._build_dataloader_from_automatic_split(train_batch, split_proportion, enforce_split=True)
+            return self._build_dataloader_from_automatic_split(train_batch, split_proportion, name='val', enforce_split=True)
         elif validation_split_mode == 'custom':
             if val_data_root is None:
                 raise ValueError("val_data_root is required for 'split-custom' validation mode")
@@ -109,6 +110,7 @@ class EveryDreamValidator:
     def _build_dataloader_from_automatic_split(self,
                                                train_batch: EveryDreamBatch,
                                                split_proportion: float,
+                                               name: str,
                                                enforce_split: bool=False) -> DataLoader:
         """
         Build a validation dataloader by copying data from the given `train_batch`. If `enforce_split` is `True`, remove
@@ -139,7 +141,7 @@ class EveryDreamValidator:
             batch_size=reference_train_batch.batch_size
         )
 
-    def _make_val_batch_with_train_batch_settings(self, data_root, reference_train_batch):
+    def _make_val_batch_with_train_batch_settings(self, data_root, reference_train_batch, name='val'):
         val_batch = EveryDreamBatch(
             data=data_root,
             debug_level=1,
@@ -150,7 +152,7 @@ class EveryDreamValidator:
             seed=reference_train_batch.seed,
             log_folder=reference_train_batch.log_folder,
             write_schedule=reference_train_batch.write_schedule,
-            name='val',
+            name=name,
         )
         return val_batch
 
