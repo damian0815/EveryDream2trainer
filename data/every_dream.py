@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import logging
+import math
+
 import torch
 from torch.utils.data import Dataset
 from data.data_loader import DataLoaderMultiAspect as dlma
@@ -87,7 +89,8 @@ class EveryDreamBatch(Dataset):
 
         self.__update_image_train_items(1.0, 0)
         num_images = len(self.image_train_items)
-        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} steps, num_images: {num_images}, batch_size: {self.batch_size}")
+        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
+
 
     def __write_batch_schedule(self, epoch_n):
         with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
@@ -113,20 +116,14 @@ class EveryDreamBatch(Dataset):
             self.__write_batch_schedule(epoch_n + 1)
 
 
+    def extract_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
+        items = self.dataloader.get_split(split_proportion, remove_from_dataset=remove_from_dataset)
+        self.__update_image_train_items()
+        return items
+
+
     def __len__(self):
         return len(self.image_train_items)
-
-    def __delitem__(self, key):
-        old_count = len(self)
-        items_to_delete = self.image_train_items[key]
-        self.dataloader.delete_items(items_to_delete)
-        self.image_train_items = self.dataloader.get_shuffled_image_buckets(1.0) # First epoch always trains on all images
-
-        removed_count = old_count-len(self)
-        if (removed_count % self.batch_size) != 0:
-            raise ValueError(
-                f"cannot remove {removed_count} images from '{self.name}' because it is not a multiple of batch_size ({self.batch_size})")
-        logging.info(f"   * {removed_count} images removed from EveryDreamBatch set '{self.name}', num_images is now: {len(self)}, steps: {len(self) / self.batch_size}")
 
 
     def __getitem__(self, i):

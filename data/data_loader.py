@@ -56,8 +56,16 @@ class DataLoaderMultiAspect():
         (self.rating_overall_sum, self.ratings_summed) = self.__sort_and_precalc_image_ratings()
 
 
+    def get_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
+        item_count = math.ceil(split_proportion * len(self.prepared_train_data) // self.batch_size) * self.batch_size
+        items = random.shuffle(self.prepared_train_data.copy())[:item_count]
+        if remove_from_dataset:
+            self.delete_items(items)
+        return items
+
+
     def delete_items(self, items: list[ImageTrainItem]):
-        old_item_count = len(self.prepared_train_data)
+        #old_item_count = len(self.prepared_train_data)
         for item_to_delete in items:
             try:
                 matching_item = next(i for i in self.prepared_train_data if i.pathname==item_to_delete.pathname)
