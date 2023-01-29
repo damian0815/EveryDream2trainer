@@ -32,12 +32,12 @@ class DataLoaderMultiAspect():
     """
     Data loader for multi-aspect-ratio training and bucketing
 
-    data_root: root folder of training data
+    data: either a str indicating the root path of all your training images, will be recursively searched for images; or a list of ImageTrainItem
     batch_size: number of images per batch
     flip_p: probability of flipping image horizontally (i.e. 0-0.5)
     """
-    def __init__(self, data_root, seed=555, debug_level=0, batch_size=1, flip_p=0.0, resolution=512, log_folder=None, name='train'):
-        self.data_root = data_root
+    def __init__(self, data, seed=555, debug_level=0, batch_size=1, flip_p=0.0, resolution=512, log_folder=None, name='train'):
+        self.data = data
         self.debug_level = debug_level
         self.flip_p = flip_p
         self.log_folder = log_folder
@@ -177,19 +177,21 @@ class DataLoaderMultiAspect():
 
         return rating_overall_sum, ratings_summed
 
-    def __prepare_train_data(self, flip_p=0.0) -> list[ImageTrainItem]:
+    def __prepare_train_data(self, flip_p=0.0):
         """
         Create ImageTrainItem objects with metadata for hydration later
         """
         if not self.has_scanned:
             self.has_scanned = True
             
-            logging.info(" Preloading images...")
-            
-            items = resolver.resolve(self.data_root, self.aspects, flip_p=flip_p, seed=self.seed)
-            image_paths = set(map(lambda item: item.pathname, items))
-
-            print (f" * DLMA: {len(items)} images loaded from {len(image_paths)} files")
+            if type(self.data) is list:
+                items = self.data
+                print (f" * DLMA: {len(items)} images")
+            else:
+                logging.info(" Preloading images...")
+                items = resolver.resolve(self.data, self.aspects, flip_p=flip_p, seed=self.seed)
+                image_paths = set(map(lambda item: item.pathname, items))
+                print (f" * DLMA: {len(items)} images loaded from {len(image_paths)} files")
             
             self.prepared_train_data = items
             random.Random(self.seed).shuffle(self.prepared_train_data)

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import logging
-import math
 
 import torch
 from torch.utils.data import Dataset
@@ -26,7 +25,7 @@ from torchvision import transforms
 
 class EveryDreamBatch(Dataset):
     """
-    data_root: root path of all your training images, will be recursively searched for images
+    data: either a str indicating the root path of all your training images, will be recursively searched for images; or a list of ImageTrainItem
     repeats: how many times to repeat each image in the dataset
     flip_p: probability of flipping the image horizontally
     debug_level: 0=none, 1=print drops due to unfilled batches on aspect ratio buckets, 2=debug info per image, 3=save crops to disk for inspection
@@ -75,23 +74,16 @@ class EveryDreamBatch(Dataset):
         if seed == -1:
             seed = random.randint(0, 99999)
 
-        if type(data) is str:
-            self.data_root = data
-            self.dataloader = dlma(data_root=self.data_root,
-                                   seed=seed,
-                                   debug_level=debug_level,
-                                   batch_size=self.batch_size,
-                                   flip_p=flip_p,
-                                   resolution=resolution,
-                                   log_folder=self.log_folder,
-                                   name=self.name
-                                   )
-            self.__update_image_train_items(1.0, 0)
-        else:
-            self.data_root = None
-            self.image_train_items = data
-            if self.write_schedule:
-                self.__write_batch_schedule(0)
+        self.dataloader = dlma(data=data,
+                               seed=seed,
+                               debug_level=debug_level,
+                               batch_size=self.batch_size,
+                               flip_p=flip_p,
+                               resolution=resolution,
+                               log_folder=self.log_folder,
+                               name=self.name
+                               )
+        self.__update_image_train_items(1.0, 0)
 
         num_images = len(self.image_train_items)
         logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
