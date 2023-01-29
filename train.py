@@ -71,7 +71,7 @@ def get_hf_ckpt_cache_path(ckpt_path):
 def convert_to_hf(ckpt_path):
 
     hf_cache = get_hf_ckpt_cache_path(ckpt_path)
-    from utils.patch_unet import patch_unet
+    from utils.analyze_unet import get_attn_yaml
 
     if os.path.isfile(ckpt_path):        
         if not os.path.exists(hf_cache):
@@ -86,13 +86,13 @@ def convert_to_hf(ckpt_path):
         else:
             logging.info(f"Found cached checkpoint at {hf_cache}")
         
-        is_sd1attn, yaml = patch_unet(hf_cache)
+        is_sd1attn, yaml = get_attn_yaml(hf_cache)
         return hf_cache, is_sd1attn, yaml
     elif os.path.isdir(hf_cache):
-        is_sd1attn, yaml = patch_unet(hf_cache)
+        is_sd1attn, yaml = get_attn_yaml(hf_cache)
         return hf_cache, is_sd1attn, yaml
     else:
-        is_sd1attn, yaml = patch_unet(ckpt_path)
+        is_sd1attn, yaml = get_attn_yaml(ckpt_path)
         return ckpt_path, is_sd1attn, yaml
 
 def setup_local_logger(args):
@@ -488,7 +488,7 @@ def main(args):
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
     except Exception as e:
         traceback.print_exc()
-        logging.ERROR(" * Failed to load checkpoint *")
+        logging.error(" * Failed to load checkpoint *")
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -536,7 +536,7 @@ def main(args):
     betas = (0.9, 0.999)
     epsilon = 1e-8
     if args.amp:
-        epsilon = 2e-8
+        epsilon = 1e-8
     
     weight_decay = 0.01
     if args.useadam8bit:

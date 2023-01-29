@@ -97,17 +97,15 @@ class DataLoaderMultiAspect():
         remaining = epoch_size - len(picked_images)
 
         assert remaining >= 0, "Something went wrong with the multiplier calculation"
-        #print(f"Remaining to fill epoch after whole number adds: {remaining}")
-        #print(f"Remaining in data copy: {len(data_copy)}")
 
-        # add by renaming fractional numbers by random chance
+        # add by remaining fractional numbers by random chance
         while remaining > 0:
             for iti in data_copy:
                 if randomizer.uniform(0.0, 1.0) < iti.multiplier:
                     #print(f"Adding {iti.multiplier}: {iti.pathname}, remaining {remaining}, datalen: {len(data_copy)}")
                     picked_images.append(iti)
                     remaining -= 1
-                    data_copy.remove(iti)
+                    iti.multiplier = 0.0
                 if remaining <= 0:
                     break
         
@@ -193,7 +191,7 @@ class DataLoaderMultiAspect():
                 image_paths = set(map(lambda item: item.pathname, items))
                 print (f" * DLMA: {len(items)} images loaded from {len(image_paths)} files")
             
-            self.prepared_train_data = items
+            self.prepared_train_data = [item for item in items if item.error is None]
             random.Random(self.seed).shuffle(self.prepared_train_data)
             self.__report_errors(items)
 
@@ -213,9 +211,8 @@ class DataLoaderMultiAspect():
             with open(underized_log_path, "w") as undersized_images_file:
                 undersized_images_file.write(f" The following images are smaller than the target size, consider removing or sourcing a larger copy:")
                 for undersized_item in undersized_items:
-                    message = f" *** {undersized_item.pathname} with size: {undersized_item.image_size} is smaller than target size: {undersized_item.target_wh}, consider using larger images"
+                    message = f" *** {undersized_item.pathname} with size: {undersized_item.image_size} is smaller than target size: {undersized_item.target_wh}\n"
                     undersized_images_file.write(message)
-
 
 
     def __pick_random_subset(self, dropout_fraction: float, picker: random.Random) -> list[ImageTrainItem]:
