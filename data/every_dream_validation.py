@@ -54,7 +54,7 @@ class EveryDreamValidator:
                                          [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
         if (epoch % self.every_n_epochs) == 0:
             if self.train_overlapping_dataloader is not None:
-                self._do_validation('stabilize-train-loss', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
+                self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
             if self.val_dataloader is not None:
                 self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable)
 
