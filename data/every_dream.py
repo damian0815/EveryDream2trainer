@@ -37,7 +37,7 @@ class EveryDreamBatch(Dataset):
     name: the name of this dataset (only used for logging)
     """
     def __init__(self,
-                 data_root,
+                 data: str | list[ImageTrainItem],
                  flip_p=0.0,
                  debug_level=0,
                  batch_size=1,
@@ -54,7 +54,6 @@ class EveryDreamBatch(Dataset):
                  rated_dataset_dropout_target=0.5,
                  name='train'
                  ):
-        self.data_root = data_root
         self.batch_size = batch_size
         self.debug_level = debug_level
         self.conditional_dropout = conditional_dropout
@@ -76,29 +75,34 @@ class EveryDreamBatch(Dataset):
         if seed == -1:
             seed = random.randint(0, 99999)
 
-        self.dataloader = dlma(data_root=data_root,
-                                         seed=seed,
-                                         debug_level=debug_level,
-                                         batch_size=self.batch_size,
-                                         flip_p=flip_p,
-                                         resolution=resolution,
-                                         log_folder=self.log_folder,
-                                         name=self.name
-                                        )
+        if type(data) is str:
+            self.data_root = data
+            self.dataloader = dlma(data_root=self.data_root,
+                                   seed=seed,
+                                   debug_level=debug_level,
+                                   batch_size=self.batch_size,
+                                   flip_p=flip_p,
+                                   resolution=resolution,
+                                   log_folder=self.log_folder,
+                                   name=self.name
+                                   )
+            self.__update_image_train_items(1.0, 0)
+        else:
+            self.data_root = None
+            self.image_train_items = data
+            if self.write_schedule:
+                self.__write_batch_schedule(0)
 
-
-        self.__update_image_train_items(1.0, 0)
         num_images = len(self.image_train_items)
         logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
 
 
-    def __write_batch_schedule(self, epoch_n):
-        with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
-            for i in range(len(self.image_train_items)):
-                try:
-                    f.write(f"step:{int(i / self.batch_size):05}, wh:{self.image_train_items[i].target_wh}, r:{self.image_train_items[i].runt_size}, path:{self.image_train_items[i].pathname}\n")
-                except Exception as e:
-                    logging.error(f" * Error writing to batch schedule for file path: {self.image_train_items[i].pathname}")
+    def get_random_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
+        if self.dataloader is None:
+            raise RuntimeError("EveryDreamBatch is already static")
+        items = self.dataloader.get_random_split(split_proportion, remove_from_dataset=remove_from_dataset)
+        self.__update_image_train_items(1.0, 0)
+        return items
 
 
     def shuffle(self, epoch_n: int, max_epochs: int):
@@ -111,15 +115,20 @@ class EveryDreamBatch(Dataset):
 
 
     def __update_image_train_items(self, dropout_fraction: float, epoch_n: int):
+        if self.dataloader is None:
+            raise RuntimeError("Cannot run __update_train_images on a static EveryDreamBatch")
         self.image_train_items = self.dataloader.get_shuffled_image_buckets(dropout_fraction)
         if self.write_schedule:
             self.__write_batch_schedule(epoch_n + 1)
 
 
-    def get_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
-        items = self.dataloader.get_split(split_proportion, remove_from_dataset=remove_from_dataset)
-        self.__update_image_train_items(1.0, 0)
-        return items
+    def __write_batch_schedule(self, epoch_n):
+        with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
+            for i in range(len(self.image_train_items)):
+                try:
+                    f.write(f"step:{int(i / self.batch_size):05}, wh:{self.image_train_items[i].target_wh}, r:{self.image_train_items[i].runt_size}, path:{self.image_train_items[i].pathname}\n")
+                except Exception as e:
+                    logging.error(f" * Error writing to batch schedule for file path: {self.image_train_items[i].pathname}")
 
 
     def __len__(self):
@@ -170,6 +179,7 @@ class EveryDreamBatch(Dataset):
         example["runt_size"] = train_item["runt_size"]
 
         return example
+
 
     def __get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
         example = {}

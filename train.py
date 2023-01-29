@@ -53,8 +53,8 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
-from utils.gpu import GPU
-from utils.isolate_rng import isolate_rng
+if torch.cuda.is_available():
+    from utils.gpu import GPU
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
@@ -307,10 +307,12 @@ def main(args):
     seed = args.seed if args.seed != -1 else random.randint(0, 2**30)
     logging.info(f" Seed: {seed}")
     set_seed(seed)
-    gpu = GPU()
-    device = torch.device(f"cuda:{args.gpuid}")
-
-    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        gpu = GPU()
+        device = torch.device(f"cuda:{args.gpuid}")
+        torch.backends.cudnn.benchmark = True
+    else:
+        device = 'cpu'
 
     log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
 
@@ -558,7 +560,7 @@ def main(args):
     log_optimizer(optimizer, betas, epsilon)
 
     train_batch = EveryDreamBatch(
-        data_root=args.data_root,
+        data=args.data_root,
         flip_p=args.flip_p,
         debug_level=1,
         batch_size=args.batch_size,

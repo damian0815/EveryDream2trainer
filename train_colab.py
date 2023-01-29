@@ -510,7 +510,7 @@ def main(args):
     log_optimizer(optimizer, betas, epsilon)
 
     train_batch = EveryDreamBatch(
-        data_root=args.data_root,
+        data=args.data_root,
         flip_p=args.flip_p,
         debug_level=1,
         batch_size=args.batch_size,

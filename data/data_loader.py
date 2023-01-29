@@ -56,7 +56,7 @@ class DataLoaderMultiAspect():
         (self.rating_overall_sum, self.ratings_summed) = self.__sort_and_precalc_image_ratings()
 
 
-    def get_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
+    def get_random_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
         item_count = math.ceil(split_proportion * len(self.prepared_train_data) // self.batch_size) * self.batch_size
         items_copy = self.prepared_train_data.copy()
         random.shuffle(items_copy)

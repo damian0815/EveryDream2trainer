@@ -1,6 +1,7 @@
 import itertools
 import json
 import math
+import random
 from typing import Callable, Any, Optional
 
 import torch
@@ -113,22 +114,34 @@ class EveryDreamValidator:
         Build a validation dataloader by copying data from the given `train_batch`. If `enforce_split` is `True`, remove
         the copied items from train_batch so that there is no overlap between `train_batch` and the new dataloader.
         """
-        # train_batch has been shuffled on load - bake its order here by converting from iterator to list
-        val_items = train_batch.get_split(split_proportion, remove_from_dataset=enforce_split)
-        if enforce_split:
-            print(
-            f"  * Removed {len(val_items)} items from from '{train_batch.name}' for validation split")
-        if len(train_batch) == 0:
-            raise ValueError(f"Validation split used up all of the training data. Try a lower split proportion than {split_proportion}")
-        return build_torch_dataloader(
-            items=val_items,
-            batch_size=train_batch.batch_size,
-        )
+        with isolate_rng():
+            random.seed(self.seed)
+            val_items = train_batch.get_random_split(split_proportion, remove_from_dataset=enforce_split)
+            if enforce_split:
+                print(
+                f"  * Removed {len(val_items)} items from from '{train_batch.name}' for validation split")
+            if len(train_batch) == 0:
+                raise ValueError(f"Validation split used up all of the training data. Try a lower split proportion than {split_proportion}")
+            val_batch = self._make_val_batch_with_train_batch_settings(
+                val_items,
+                train_batch
+            )
+            return build_torch_dataloader(
+                items=val_batch,
+                batch_size=train_batch.batch_size,
+            )
 
 
     def _build_dataloader_from_custom_split(self, data_root: str, reference_train_batch: EveryDreamBatch) -> DataLoader:
+        val_batch = self._make_val_batch_with_train_batch_settings(data_root, reference_train_batch)
+        return build_torch_dataloader(
+            items=val_batch,
+            batch_size=reference_train_batch.batch_size
+        )
+
+    def _make_val_batch_with_train_batch_settings(self, data_root, reference_train_batch):
         val_batch = EveryDreamBatch(
-            data_root=data_root,
+            data=data_root,
             debug_level=1,
             batch_size=reference_train_batch.batch_size,
             conditional_dropout=0,
@@ -139,10 +152,7 @@ class EveryDreamValidator:
             write_schedule=reference_train_batch.write_schedule,
             name='val',
         )
-        return build_torch_dataloader(
-            items=val_batch,
-            batch_size=reference_train_batch.batch_size
-        )
+        return val_batch
 
 
 
