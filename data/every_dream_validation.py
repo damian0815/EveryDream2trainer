@@ -54,21 +54,22 @@ class EveryDreamValidator:
                                          [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
         if (epoch % self.every_n_epochs) == 0:
             if self.train_overlapping_dataloader is not None:
-                self._do_validation('train-stabilized', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
+                self._do_validation('stabilize-train-loss', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
             if self.val_dataloader is not None:
                 self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable)
 
 
-    def _do_validation(self, tag, global_step, dataloader, get_model_prediction_and_target_callable):
+    def _do_validation(self, tag, global_step, dataloader, get_model_prediction_and_target: Callable[
+                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
         with torch.no_grad(), isolate_rng():
             loss_validation_epoch = []
             steps_pbar = tqdm(range(len(dataloader)), position=1)
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps ({tag}){Style.RESET_ALL}")
 
             for step, batch in enumerate(dataloader):
-                # ok to override seed here because we are in an isolate_rng() 'with' block
+                # ok to override seed here because we are in a `with isolate_rng():` block
                 torch.manual_seed(self.seed + step)
-                model_pred, target = get_model_prediction_and_target_callable(batch["image"], batch["tokens"])
+                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
                 # del timesteps, encoder_hidden_states, noisy_latents
                 # with autocast(enabled=args.amp):
@@ -77,10 +78,9 @@ class EveryDreamValidator:
                 del target, model_pred
 
                 loss_step = loss.detach().item()
-                steps_pbar.set_postfix({f"loss/{tag} step": loss_step}, {"gs": global_step})
-                steps_pbar.update(1)
-
                 loss_validation_epoch.append(loss_step)
+
+                steps_pbar.update(1)
 
             steps_pbar.close()
 
