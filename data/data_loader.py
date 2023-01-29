@@ -64,7 +64,6 @@ class DataLoaderMultiAspect():
                 self.prepared_train_data.remove(matching_item)
             except StopIteration:
                 raise ValueError(f"tried to remove {item_to_delete} but couldn't find it")
-        print(f"DLMA '{self.name}' deleted {old_item_count-len(self.prepared_train_data)} items, now have {len(self.prepared_train_data)} items")
         self.__update_ratings()
 
 

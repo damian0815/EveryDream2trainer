@@ -87,7 +87,7 @@ class EveryDreamBatch(Dataset):
 
         self.__update_image_train_items(1.0, 0)
         num_images = len(self.image_train_items)
-        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f}, num_images: {num_images}, batch_size: {self.batch_size}")
+        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} steps, num_images: {num_images}, batch_size: {self.batch_size}")
 
     def __write_batch_schedule(self, epoch_n):
         with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
@@ -126,7 +126,7 @@ class EveryDreamBatch(Dataset):
         if (removed_count % self.batch_size) != 0:
             raise ValueError(
                 f"cannot remove {removed_count} images from '{self.name}' because it is not a multiple of batch_size ({self.batch_size})")
-        logging.info(f" ** EveryDreamBatch Set '{self.name}': {removed_count} images removed, num_images now: {len(self)}")
+        logging.info(f"   * {removed_count} images removed from EveryDreamBatch set '{self.name}', num_images is now: {len(self)}, steps: {len(self) / self.batch_size}")
 
 
     def __getitem__(self, i):
