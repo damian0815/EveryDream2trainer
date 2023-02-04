@@ -41,7 +41,7 @@ class EveryDreamValidator:
         self.seed = val_config.get('seed', 555)
 
         find_outliers = val_config.get('find_outliers', False)
-        self.prev_losses: Optional[torch.Tensor] = None
+        self.collected_losses: Optional[torch.Tensor] = None
 
         with isolate_rng():
             self.val_dataloader = self._build_validation_dataloader(val_split_mode,
@@ -130,15 +130,16 @@ class EveryDreamValidator:
     def _do_find_outliers(self, global_step, get_model_prediction_and_target_callable):
         losses = self._do_validation('find-outliers', global_step, self.find_outliers_dataloader,
                                      get_model_prediction_and_target_callable, log_loss=False, log_extended_stats=True)
-        if self.prev_losses is None:
-            self.prev_losses = losses
-            return
+        # to column vector
+        losses = losses.unsqueeze(0).t()
 
-        loss_deltas = self.prev_losses - losses
+        if self.collected_losses is None:
+            self.collected_losses = losses
+        else:
+            self.collected_losses = torch.cat([self.collected_losses, losses], dim=1)
 
         loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
-                                            losses.tolist(),
-                                            loss_deltas.tolist()
+                                            self.collected_losses.tolist()
                                             ),
                                  key=lambda i: i[0], reverse=True)
 
@@ -147,9 +148,9 @@ class EveryDreamValidator:
         # we want to prepend new data
         try:
             with open(filename, "w", encoding='utf-8') as f:
-                f.write("path,loss,delta-loss\n")
-                for path, loss, loss_delta in loss_path_pairs_sorted:
-                    f.write(f"{path},{loss},{loss_delta}\n")
+                for path, losses in loss_path_pairs_sorted:
+                    path_escaped_and_quoted = '"' + path.replace('"', '\\"') + '"'
+                    f.write(f"{path_escaped_and_quoted},{','.join([str(x) for x in losses])}\n")
         except Exception as e:
             traceback.print_exc()
             logging.error(f" * Error {e} writing outliers to {filename}")
