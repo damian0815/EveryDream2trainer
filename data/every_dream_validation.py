@@ -59,7 +59,7 @@ class EveryDreamValidator:
             if find_outliers is None:
                 self.find_outliers_dataloader = None
             else:
-                self.find_outliers_batch = self._make_val_batch_with_train_batch_settings(train_batch.image_train_items,
+                self.find_outliers_batch = self._make_val_batch_with_train_batch_settings(train_batch.get_all_image_train_items(),
                                                                                           train_batch,
                                                                                           'find-outliers',
                                                                                           override_batch_size=1)

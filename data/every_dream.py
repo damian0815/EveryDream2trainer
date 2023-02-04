@@ -89,6 +89,13 @@ class EveryDreamBatch(Dataset):
         logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
 
 
+    def get_all_image_train_items(self):
+        """
+        self.image_train_items have all multipliers == 0, so this gets us the ones with good multipliers
+        """
+        return self.dataloader.prepared_train_data
+
+
     def get_random_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
         if self.dataloader is None:
             raise RuntimeError("EveryDreamBatch is already static")
