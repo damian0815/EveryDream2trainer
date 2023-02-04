@@ -80,7 +80,8 @@ class EveryDreamValidator:
 
 
     def _do_validation(self, tag, global_step, dataloader, get_model_prediction_and_target: Callable[
-                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]], extended_logging: bool=False):
+                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]], log_loss: bool=True,
+                       log_extended_stats: bool=False) -> torch.Tensor:
         with torch.no_grad(), isolate_rng():
             losses_list = []
             steps_pbar = tqdm(range(len(dataloader)), position=1)
@@ -105,13 +106,14 @@ class EveryDreamValidator:
             steps_pbar.close()
 
         losses_tensor: torch.Tensor = torch.tensor(losses_list)
-        self.log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
+        if log_loss:
+            self.log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
 
-        if extended_logging:
+        if log_extended_stats:
             self.log_writer.add_scalar(tag=f"{tag}/mean", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
             self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
-            self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
-            self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
+            self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
+            self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
 
 
             mean = torch.mean(losses_tensor)
@@ -123,18 +125,21 @@ class EveryDreamValidator:
                 self.log_writer.add_scalar(tag=f"{tag}/trimmed-min", scalar_value=torch.min(losses_no_outliers).item(), global_step=global_step)
                 self.log_writer.add_scalar(tag=f"{tag}/trimmed-max", scalar_value=torch.max(losses_no_outliers).item(), global_step=global_step)
 
+        return losses_tensor
 
     def _do_find_outliers(self, global_step, get_model_prediction_and_target_callable):
         losses = self._do_validation('find-outliers', global_step, self.find_outliers_dataloader,
-                                     get_model_prediction_and_target_callable, extended_logging=True)
+                                     get_model_prediction_and_target_callable, log_loss=False, log_extended_stats=True)
         if self.prev_losses is None:
             self.prev_losses = losses
             return
 
         loss_deltas = losses - self.prev_losses
-        self.prev_losses += loss_deltas
 
-        loss_path_pairs_sorted = sorted(zip(loss_deltas.tolist(), [i.pathname for i in self.find_outliers_batch.image_train_items]),
+        loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
+                                            losses.tolist(),
+                                            loss_deltas.tolist()
+                                            ),
                                  key=lambda i: i[0], reverse=True)
 
         filename = f"{self.log_folder}/per_item_loss_deltas-gs{global_step:05}.csv"
@@ -142,8 +147,9 @@ class EveryDreamValidator:
         # we want to prepend new data
         try:
             with open(filename, "w", encoding='utf-8') as f:
-                for loss, path in loss_path_pairs_sorted:
-                    f.write(f"{loss},{path}\n")
+                f.write("path,loss,delta-loss")
+                for loss, loss_delta, path in loss_path_pairs_sorted:
+                    f.write(f"{path},{loss},{loss_delta}\n")
         except Exception as e:
             traceback.print_exc()
             logging.error(f" * Error {e} writing outliers to {filename}")

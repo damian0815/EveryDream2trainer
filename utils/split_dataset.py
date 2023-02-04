@@ -15,8 +15,8 @@ def gather_captioned_images(root_dir: str) -> list[tuple[str,Optional[str]]]:
         image_filenames = [f for f in filenames if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS]
         for image_filename in image_filenames:
             caption_filename = os.path.splitext(image_filename)[0] + '.txt'
-            image_path = os.path.join(directory+image_filename)
-            caption_path = os.path.join(directory+caption_filename)
+            image_path = os.path.join(directory, image_filename)
+            caption_path = os.path.join(directory, caption_filename)
             yield (image_path, caption_path if os.path.exists(caption_path) else None)
 
 
@@ -45,7 +45,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, required=False, default=555, help='Random seed for shuffling')
     args = parser.parse_args()
 
-    images = gather_captioned_images(args.source_root)
+    images = list(gather_captioned_images(args.source_root))
     print(f"Found {len(images)} captioned images in {args.source_root}")
     val_split_count = math.ceil(len(images) * args.split_proportion)
     if val_split_count == 0:
