@@ -80,7 +80,7 @@ class EveryDreamValidator:
 
 
     def _do_validation(self, tag, global_step, dataloader, get_model_prediction_and_target: Callable[
-                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
+                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]], extended_logging: bool=False):
         with torch.no_grad(), isolate_rng():
             losses_list = []
             steps_pbar = tqdm(range(len(dataloader)), position=1)
@@ -106,25 +106,27 @@ class EveryDreamValidator:
 
         losses_tensor: torch.Tensor = torch.tensor(losses_list)
         self.log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}/mean", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
+
+        if extended_logging:
+            self.log_writer.add_scalar(tag=f"{tag}/mean", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
+            self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
+            self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
+            self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
 
 
-        mean = torch.mean(losses_tensor)
-        std = torch.std(losses_tensor)
-        outlier_indices = torch.nonzero((losses_tensor > mean-std) & (losses_tensor < mean+std), as_tuple=True)[0]
-        losses_no_outliers = torch.index_select(losses_tensor, dim=0, index=outlier_indices)
-        self.log_writer.add_scalar(tag=f"{tag}-no-outliers/mean", scalar_value=torch.mean(losses_no_outliers).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}-no-outliers/median", scalar_value=torch.median(losses_no_outliers).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}-no-outliers/min", scalar_value=torch.max(losses_no_outliers).item(), global_step=global_step)
-        self.log_writer.add_scalar(tag=f"{tag}-no-outliers/max", scalar_value=torch.min(losses_no_outliers).item(), global_step=global_step)
+            mean = torch.mean(losses_tensor)
+            std = torch.std(losses_tensor)
+            outlier_indices = torch.nonzero((losses_tensor > mean-std*2) & (losses_tensor < mean+std*2), as_tuple=True)[0]
+            losses_no_outliers = torch.index_select(losses_tensor, dim=0, index=outlier_indices)
+            if losses_no_outliers.numel() > 0:
+                self.log_writer.add_scalar(tag=f"{tag}/trimmed-mean", scalar_value=torch.mean(losses_no_outliers).item(), global_step=global_step)
+                self.log_writer.add_scalar(tag=f"{tag}/trimmed-min", scalar_value=torch.min(losses_no_outliers).item(), global_step=global_step)
+                self.log_writer.add_scalar(tag=f"{tag}/trimmed-max", scalar_value=torch.max(losses_no_outliers).item(), global_step=global_step)
 
 
     def _do_find_outliers(self, global_step, get_model_prediction_and_target_callable):
         losses = self._do_validation('find-outliers', global_step, self.find_outliers_dataloader,
-                                     get_model_prediction_and_target_callable)
+                                     get_model_prediction_and_target_callable, extended_logging=True)
         if self.prev_losses is None:
             self.prev_losses = losses
             return
