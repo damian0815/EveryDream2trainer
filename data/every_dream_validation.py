@@ -134,7 +134,7 @@ class EveryDreamValidator:
             self.prev_losses = losses
             return
 
-        loss_deltas = losses - self.prev_losses
+        loss_deltas = self.prev_losses - losses
 
         loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
                                             losses.tolist(),
@@ -147,8 +147,8 @@ class EveryDreamValidator:
         # we want to prepend new data
         try:
             with open(filename, "w", encoding='utf-8') as f:
-                f.write("path,loss,delta-loss")
-                for loss, loss_delta, path in loss_path_pairs_sorted:
+                f.write("path,loss,delta-loss\n")
+                for path, loss, loss_delta in loss_path_pairs_sorted:
                     f.write(f"{path},{loss},{loss_delta}\n")
         except Exception as e:
             traceback.print_exc()
