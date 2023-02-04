@@ -73,7 +73,7 @@ class EveryDreamValidator:
             if self.train_overlapping_dataloader is not None:
                 self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
             if self.val_dataloader is not None:
-                self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable)
+                self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable, log_extended_stats=True)
             if self.find_outliers_dataloader is not None:
                 self._do_find_outliers(global_step, get_model_prediction_and_target_callable)
 
@@ -114,16 +114,6 @@ class EveryDreamValidator:
             self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
             self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
             self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
-
-
-            mean = torch.mean(losses_tensor)
-            std = torch.std(losses_tensor)
-            outlier_indices = torch.nonzero((losses_tensor > mean-std*2) & (losses_tensor < mean+std*2), as_tuple=True)[0]
-            losses_no_outliers = torch.index_select(losses_tensor, dim=0, index=outlier_indices)
-            if losses_no_outliers.numel() > 0:
-                self.log_writer.add_scalar(tag=f"{tag}/trimmed-mean", scalar_value=torch.mean(losses_no_outliers).item(), global_step=global_step)
-                self.log_writer.add_scalar(tag=f"{tag}/trimmed-min", scalar_value=torch.min(losses_no_outliers).item(), global_step=global_step)
-                self.log_writer.add_scalar(tag=f"{tag}/trimmed-max", scalar_value=torch.max(losses_no_outliers).item(), global_step=global_step)
 
         return losses_tensor
 
