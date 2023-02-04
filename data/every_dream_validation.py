@@ -41,6 +41,7 @@ class EveryDreamValidator:
         self.seed = val_config.get('seed', 555)
 
         find_outliers = val_config.get('find_outliers', False)
+        self.find_outliers_every_n_epochs = val_config.get('find_outliers_every_n_epochs', self.every_n_epochs)
         self.collected_losses: Optional[torch.Tensor] = None
 
         with isolate_rng():
@@ -74,6 +75,7 @@ class EveryDreamValidator:
                 self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
             if self.val_dataloader is not None:
                 self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable, log_extended_stats=True)
+        if (epoch % self.find_outliers_every_n_epochs) == 0:
             if self.find_outliers_dataloader is not None:
                 self._do_find_outliers(global_step, get_model_prediction_and_target_callable)
 
