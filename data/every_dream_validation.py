@@ -125,22 +125,27 @@ class EveryDreamValidator:
 
         if self.collected_losses is None:
             self.collected_losses = losses
+            self.collected_global_steps = [global_step]
         else:
             self.collected_losses = torch.cat([self.collected_losses, losses], dim=1)
+            self.collected_global_steps.append(global_step)
 
         loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
                                             self.collected_losses.tolist()
                                             ),
                                  key=lambda i: i[0], reverse=True)
 
-        filename = f"{self.log_folder}/per_item_loss_deltas-gs{global_step:05}.csv"
+        filename = f"{self.log_folder}/per_item_losses.csv"
 
         # we want to prepend new data
         try:
             with open(filename, "w", encoding='utf-8') as f:
+                steps_list_string = {','.join([f'step {s}' for s in self.collected_global_steps])}
+                f.write(f"path,{steps_list_string}")
                 for path, losses in loss_path_pairs_sorted:
                     path_escaped_and_quoted = '"' + path.replace('"', '\\"') + '"'
-                    f.write(f"{path_escaped_and_quoted},{','.join([str(x) for x in losses])}\n")
+                    losses_list_string = {','.join([str(x) for x in losses])}
+                    f.write(f"{path_escaped_and_quoted},{losses_list_string}\n")
         except Exception as e:
             traceback.print_exc()
             logging.error(f" * Error {e} writing outliers to {filename}")
