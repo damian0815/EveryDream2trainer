@@ -40,7 +40,7 @@ class EveryDreamValidator:
         self.every_n_epochs = val_config.get('every_n_epochs', 1)
         self.seed = val_config.get('seed', 555)
 
-        find_outliers = val_config.get('find_outliers', False)
+        do_find_outliers = val_config.get('find_outliers', False)
         self.find_outliers_every_n_epochs = val_config.get('find_outliers_every_n_epochs', self.every_n_epochs)
         self.collected_losses: Optional[torch.Tensor] = None
 
@@ -63,16 +63,15 @@ class EveryDreamValidator:
                                                             name='train-stabilizer',
                                                             enforce_split=False)
 
-            if not find_outliers:
-                self.find_outliers_dataloader = None
+            if do_find_outliers:
+                split_proportion = val_config.get('find_outliers_split_proportion', 1)
+                pinned_image_count = val_config.get('find_outliers_pinned_image_count', 7)
+                self.outlier_finder = OutlierFinder(validator=self,
+                                                    reference_train_batch=train_batch,
+                                                    split_proportion=split_proportion,
+                                                    pinned_image_count=pinned_image_count)
             else:
-                find_outliers_split_proportion = val_config.get('find_outliers_split_proportion', 1)
-                self.find_outliers_dataloader, self.find_outliers_batch = self._build_dataloader_from_automatic_split(
-                    train_batch, split_proportion=find_outliers_split_proportion, name='find-outliers',
-                    enforce_split=False, override_batch_size=1, also_return_batch=True)
-
-                self.find_outliers_count_to_pin = val_config.get('find-outliers-pinned-image-count', 7)
-                self.find_outliers_pinned_batch_ids = None
+                self.outlier_finder = None
 
     def do_validation_if_appropriate(self, epoch: int, global_step: int,
                                      get_model_prediction_and_target_callable: Callable[
@@ -84,10 +83,9 @@ class EveryDreamValidator:
             if self.val_dataloader is not None:
                 self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable,
                                     log_extended_stats=True, log_pinned_batches=self.val_pinned_batch_ids)
-        if (epoch % self.find_outliers_every_n_epochs) == 0:
-            if self.find_outliers_dataloader is not None:
-                self._do_find_outliers(global_step, get_model_prediction_and_target_callable)
-
+        if self.outlier_finder is not None and (epoch % self.find_outliers_every_n_epochs) == 0:
+            self.outlier_finder.do_find_outliers(validator=self, global_step=global_step,
+                                                 get_model_prediction_and_target_callable=get_model_prediction_and_target_callable)
 
 
     def _do_validation(self,
@@ -149,68 +147,6 @@ class EveryDreamValidator:
         return losses_tensor
 
 
-    def _do_find_outliers(self, global_step, get_model_prediction_and_target_callable):
-        losses = self._do_validation('find-outliers', global_step, self.find_outliers_dataloader,
-                                     get_model_prediction_and_target_callable,
-                                     log_loss=False, log_extended_stats=True)
-        # to column vector
-        losses_t = losses.unsqueeze(0).t()
-
-        if self.collected_losses is None:
-            self.collected_losses = losses_t
-            self.collected_global_steps = [global_step]
-        else:
-
-            if len(self.collected_global_steps) == 1:
-                # prepare pinning
-                min_max_pin_count = (self.find_outliers_count_to_pin - 1) // 2
-                if min_max_pin_count == 0:
-                    logging.warning("Not enough data to pin min/max outliers")
-                else:
-                    # collect pinned batch ids
-                    delta_losses = losses_t - self.collected_losses
-                    max_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=True, sorted=True).indices.flip(0)
-                    min_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=False, sorted=True).indices
-                    median_index = torch.median(delta_losses, dim=0).indices.unsqueeze(0)
-                    self.find_outliers_pinned_batch_ids = torch.cat([min_indices, median_index, max_indices]).t().squeeze().tolist()
-                    # make labels
-                    pin_types = ['max'] * min_max_pin_count + ['median'] + ['min'] * min_max_pin_count
-                    self.find_outliers_pinned_batch_labels = [f"{pin_types[i]}-{i:02}-image-#{image_index}"
-                                                       for i,image_index in enumerate(self.find_outliers_pinned_batch_ids)]
-
-                    # one-off log of the images being pinned
-                    newline = '  \n' # tensorboard uses markdown format so needs 2 spaces
-                    pinned_ids_description = newline.join(
-                        [f"{self.find_outliers_pinned_batch_labels[i]}: {self.find_outliers_batch.image_train_items[i].pathname}"
-                         for i in self.find_outliers_pinned_batch_ids]
-                    )
-                    self.log_writer.add_text('find-outliers', pinned_ids_description)
-
-            self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
-            self.collected_global_steps.append(global_step)
-
-        loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
-                                            self.collected_losses.tolist()
-                                            ),
-                                 key=lambda i: i[0], reverse=True)
-
-        filename = f"{self.log_folder}/per_item_losses.csv"
-        try:
-            with open(filename, "w", encoding='utf-8') as f:
-                steps_list_string = ','.join([f"step {s}" for s in self.collected_global_steps])
-                f.write(f"path,{steps_list_string}\n")
-                for path, losses_t in loss_path_pairs_sorted:
-                    path_escaped_and_quoted = '"' + path.replace('"', '\\"') + '"'
-                    losses_list_string = ','.join([str(x) for x in losses_t])
-                    f.write(f"{path_escaped_and_quoted},{losses_list_string}\n")
-        except Exception as e:
-            traceback.print_exc()
-            logging.error(f" * Error {e} writing outliers to {filename}")
-
-        if self.find_outliers_pinned_batch_ids is not None:
-            self._log_individual_batch_losses(losses_tensor=losses, batch_indices=self.find_outliers_pinned_batch_ids,
-                                              tag='find-outliers', global_step=global_step,
-                                              batch_labels=self.find_outliers_pinned_batch_labels)
 
 
 
@@ -295,4 +231,87 @@ class EveryDreamValidator:
             self.log_writer.add_scalar(tag=f"{tag}/{batch_labels[i]}", scalar_value=losses_tensor[batch_idx].item(), global_step=global_step)
 
 
+class OutlierFinder:
+    def __init__(self,
+                 validator: EveryDreamValidator,
+                 reference_train_batch: EveryDreamBatch,
+                 split_proportion: float,
+                 pinned_image_count: int):
 
+        # we need a dataloader and dataset with batch_size=1
+        self.dataloader, self.batched_dataset = validator._build_dataloader_from_automatic_split(
+            reference_train_batch, split_proportion=split_proportion, name='find-outliers',
+            enforce_split=False, override_batch_size=1, also_return_batch=True)
+
+        self.logging_tag = 'outliers'
+
+        self.pinned_images_count = pinned_image_count
+        self.pinned_image_indices = None
+        self.pinned_image_labels = None
+        self.collected_losses = None
+        self.collected_global_steps = None
+
+    def do_find_outliers(self,
+                         validator: EveryDreamValidator,
+                         global_step: int,
+                         get_model_prediction_and_target_callable):
+        losses = validator._do_validation(self.logging_tag, global_step, self.dataloader,
+                                          get_model_prediction_and_target_callable,
+                                          log_loss=False, log_extended_stats=True)
+        # to column vector
+        losses_t = losses.unsqueeze(0).t()
+
+        if self.collected_losses is None:
+            self.collected_losses = losses_t
+            self.collected_global_steps = [global_step]
+        else:
+            if len(self.collected_global_steps) == 1:
+                # prepare pinning
+                min_max_pin_count = (self.pinned_images_count - 1) // 2
+                if min_max_pin_count == 0:
+                    logging.warning("Not enough data to pin min/max outliers")
+                else:
+                    # collect pinned batch ids
+                    delta_losses = losses_t - self.collected_losses
+                    max_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=True, sorted=True).indices.flip(0)
+                    min_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=False, sorted=True).indices
+                    median_index = torch.median(delta_losses, dim=0).indices.unsqueeze(0)
+                    self.pinned_image_indices = torch.cat([min_indices, median_index, max_indices]).t().squeeze().tolist()
+                    # make labels
+                    pin_types = ['max'] * min_max_pin_count + ['median'] + ['min'] * min_max_pin_count
+                    self.pinned_image_labels = [f"{pin_types[i]}-{i:02}-image-#{image_index}"
+                                                for i,image_index in enumerate(self.pinned_image_indices)]
+
+                    # one-off log of the images being pinned
+                    newline = '  \n' # tensorboard uses markdown format so needs 2 spaces
+                    pinned_ids_description = newline.join(
+                        [f"{self.pinned_image_labels[i]}: {self.batched_dataset.image_train_items[i].pathname}"
+                         for i in self.pinned_image_indices]
+                    )
+                    validator.log_writer.add_text(self.logging_tag, pinned_ids_description)
+
+            self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
+            self.collected_global_steps.append(global_step)
+
+        loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.batched_dataset.image_train_items],
+                                            self.collected_losses.tolist()
+                                            ),
+                                 key=lambda i: i[0], reverse=True)
+
+        filename = f"{validator.log_folder}/per_item_losses.csv"
+        try:
+            with open(filename, "w", encoding='utf-8') as f:
+                steps_list_string = ','.join([f"step {s}" for s in self.collected_global_steps])
+                f.write(f"path,{steps_list_string}\n")
+                for path, losses_t in loss_path_pairs_sorted:
+                    path_escaped_and_quoted = '"' + path.replace('"', '\\"') + '"'
+                    losses_list_string = ','.join([str(x) for x in losses_t])
+                    f.write(f"{path_escaped_and_quoted},{losses_list_string}\n")
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(f" * Error {e} writing outliers to {filename}")
+
+        if self.pinned_image_indices is not None:
+            validator._log_individual_batch_losses(losses_tensor=losses, batch_indices=self.pinned_image_indices,
+                                                   tag=self.logging_tag, global_step=global_step,
+                                                   batch_labels=self.pinned_image_labels)
