@@ -169,7 +169,7 @@ class EveryDreamValidator:
                 else:
                     # collect pinned batch ids
                     delta_losses = losses_t - self.collected_losses
-                    max_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=True, sorted=True).indices
+                    max_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=True, sorted=True).indices.flip(0)
                     min_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=False, sorted=True).indices
                     median_index = torch.median(delta_losses, dim=0).indices.unsqueeze(0)
                     self.find_outliers_pinned_batch_ids = torch.cat([min_indices, median_index, max_indices]).t().squeeze().tolist()
