@@ -167,18 +167,23 @@ class EveryDreamValidator:
                 if min_max_pin_count == 0:
                     logging.warning("Not enough data to pin min/max outliers")
                 else:
+                    # collect pinned batch ids
                     delta_losses = losses_t - self.collected_losses
                     max_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=True, sorted=True).indices
                     min_indices = torch.topk(delta_losses, k=min_max_pin_count, dim=0, largest=False, sorted=True).indices
                     median_index = torch.median(delta_losses, dim=0).indices.unsqueeze(0)
                     self.find_outliers_pinned_batch_ids = torch.cat([min_indices, median_index, max_indices]).t().squeeze().tolist()
-                    self.find_outliers_pinned_batch_labels = [f"ordered-{i:05}-image-#{image_index}"
+                    # make labels
+                    pin_types = ['max'] * min_max_pin_count + ['median'] + ['min'] * min_max_pin_count
+                    self.find_outliers_pinned_batch_labels = [f"{pin_types[i]}-{i:02}-image-#{image_index}"
                                                        for i,image_index in enumerate(self.find_outliers_pinned_batch_ids)]
 
                     # one-off log of the images being pinned
-                    pinned_ids_description = '\n'.join(
-                        [f"image-#{i}: {self.find_outliers_batch.image_train_items[i].pathname}" for i in
-                         self.find_outliers_pinned_batch_ids])
+                    newline = '  \n' # tensorboard uses markdown format so needs 2 spaces
+                    pinned_ids_description = newline.join(
+                        [f"{self.find_outliers_pinned_batch_labels[i]}: {self.find_outliers_batch.image_train_items[i].pathname}"
+                         for i in self.find_outliers_pinned_batch_ids]
+                    )
                     self.log_writer.add_text('find-outliers', pinned_ids_description)
 
             self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
