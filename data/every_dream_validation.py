@@ -72,7 +72,7 @@ class EveryDreamValidator:
                     enforce_split=False, override_batch_size=1, also_return_batch=True)
 
                 self.find_outliers_count_to_pin = val_config.get('find-outliers-pinned-image-count', 7)
-
+                self.find_outliers_pinned_batch_ids = None
 
     def do_validation_if_appropriate(self, epoch: int, global_step: int,
                                      get_model_prediction_and_target_callable: Callable[
