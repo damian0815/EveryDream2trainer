@@ -279,7 +279,7 @@ class OutlierFinder:
                     self.pinned_image_indices = torch.cat([min_indices, median_index, max_indices]).t().squeeze().tolist()
                     # make labels
                     pin_types = ['max'] * min_max_pin_count + ['median'] + ['min'] * min_max_pin_count
-                    self.pinned_image_labels = [f"{pin_types[i]}-{i:02}-image-#{image_index}"
+                    self.pinned_image_labels = [f"pin{i:02}-{pin_types[i]}-i#{image_index}"
                                                 for i,image_index in enumerate(self.pinned_image_indices)]
 
                     # one-off log of the images being pinned
@@ -289,6 +289,11 @@ class OutlierFinder:
                          for label, image_index in zip(self.pinned_image_labels, self.pinned_image_indices)]
                     )
                     validator.log_writer.add_text(self.logging_tag, pinned_ids_description)
+
+                    # log the initial losses that we couldn't log before because the pinned indices weren't yet known
+                    skipped_losses = self.collected_losses
+                    self._log_individual_item_losses(losses_tensor=skipped_losses, validator=validator,
+                                                     global_step=self.collected_global_steps[0])
 
             self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
             self.collected_global_steps.append(global_step)
@@ -312,6 +317,10 @@ class OutlierFinder:
             logging.error(f" * Error {e} writing outliers to {filename}")
 
         if self.pinned_image_indices is not None:
-            validator._log_individual_batch_losses(losses_tensor=losses, batch_indices=self.pinned_image_indices,
-                                                   tag=self.logging_tag, global_step=global_step,
-                                                   batch_labels=self.pinned_image_labels)
+            self._log_individual_item_losses(losses_tensor=losses, validator=validator, global_step=global_step)
+
+    def _log_individual_item_losses(self, losses_tensor: torch.Tensor, validator: EveryDreamValidator, global_step: int):
+        validator._log_individual_batch_losses(losses_tensor=losses_tensor,
+                                               batch_indices=self.pinned_image_indices,
+                                               tag=self.logging_tag, global_step=global_step,
+                                               batch_labels=self.pinned_image_labels)
