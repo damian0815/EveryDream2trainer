@@ -233,7 +233,7 @@ class EveryDreamValidator:
             )
             dataloader = build_torch_dataloader(
                 items=val_batch,
-                batch_size=train_batch.batch_size,
+                batch_size=override_batch_size or train_batch.batch_size,
             )
             if also_return_batch:
                 return dataloader, val_batch
