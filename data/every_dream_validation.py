@@ -184,18 +184,12 @@ class EveryDreamValidator:
             self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
             self.collected_global_steps.append(global_step)
 
-        self._log_individual_batch_losses(losses_tensor=losses, batch_indices=self.find_outliers_pinned_batch_ids,
-                                          tag='find-outliers', global_step=global_step,
-                                          batch_labels=self.find_outliers_pinned_batch_labels)
-
         loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
                                             self.collected_losses.tolist()
                                             ),
                                  key=lambda i: i[0], reverse=True)
 
         filename = f"{self.log_folder}/per_item_losses.csv"
-
-        # we want to prepend new data
         try:
             with open(filename, "w", encoding='utf-8') as f:
                 steps_list_string = ','.join([f"step {s}" for s in self.collected_global_steps])
@@ -207,6 +201,11 @@ class EveryDreamValidator:
         except Exception as e:
             traceback.print_exc()
             logging.error(f" * Error {e} writing outliers to {filename}")
+
+        if self.find_outliers_pinned_batch_ids is not None:
+            self._log_individual_batch_losses(losses_tensor=losses, batch_indices=self.find_outliers_pinned_batch_ids,
+                                              tag='find-outliers', global_step=global_step,
+                                              batch_labels=self.find_outliers_pinned_batch_labels)
 
 
 
