@@ -49,10 +49,11 @@ class EveryDreamValidator:
                                                                     split_proportion=val_split_proportion,
                                                                     val_data_root=self.val_data_root,
                                                                     train_batch=train_batch)
-            # pin 3 random batches
-            all_val_batch_ids = list(range(len(self.val_dataloader)))
-            random.shuffle(all_val_batch_ids)
-            self.val_pinned_batch_ids = all_val_batch_ids[:3]
+            if self.val_dataloader is not None:
+                # pin 3 random batches
+                all_val_batch_ids = list(range(len(self.val_dataloader)))
+                random.shuffle(all_val_batch_ids)
+                self.val_pinned_batch_ids = all_val_batch_ids[:3]
 
             # order is important - if we're removing images from train, this needs to happen before making
             # the overlapping dataloader
@@ -62,15 +63,17 @@ class EveryDreamValidator:
                                                             name='train-stabilizer',
                                                             enforce_split=False)
 
-            if find_outliers is None:
+            if not find_outliers:
                 self.find_outliers_dataloader = None
             else:
-                self.find_outliers_batch = self._make_val_batch_with_train_batch_settings(train_batch.get_all_image_train_items(),
-                                                                                          train_batch,
-                                                                                          'find-outliers',
-                                                                                          override_batch_size=1)
-                self.find_outliers_dataloader = build_torch_dataloader(self.find_outliers_batch, batch_size=1)
+                find_outliers_split_proportion = val_config.get('find_outliers_split_proportion', 1)
+                self.find_outliers_dataloader, self.find_outliers_batch = self._build_dataloader_from_automatic_split(
+                    train_batch, split_proportion=find_outliers_split_proportion, name='find-outliers',
+                    enforce_split=False, override_batch_size=1, also_return_batch=True)
 
+                all_find_outliers_batch_ids = list(range(len(self.find_outliers_dataloader)))
+                random.shuffle(all_find_outliers_batch_ids)
+                self.find_outliers_pinned_batch_ids = all_find_outliers_batch_ids[:3*train_batch.batch_size]
 
 
     def do_validation_if_appropriate(self, epoch: int, global_step: int,
@@ -150,7 +153,9 @@ class EveryDreamValidator:
 
     def _do_find_outliers(self, global_step, get_model_prediction_and_target_callable):
         losses = self._do_validation('find-outliers', global_step, self.find_outliers_dataloader,
-                                     get_model_prediction_and_target_callable, log_loss=False, log_extended_stats=True)
+                                     get_model_prediction_and_target_callable,
+                                     log_loss=False, log_extended_stats=True,
+                                     log_pinned_batches=self.find_outliers_pinned_batch_ids)
         # to column vector
         losses = losses.unsqueeze(0).t()
 
@@ -205,8 +210,9 @@ class EveryDreamValidator:
                                                split_proportion: float,
                                                name: str,
                                                enforce_split: bool=False,
-                                               override_batch_size: Optional[int]=None
-                                               ) -> DataLoader:
+                                               override_batch_size: Optional[int]=None,
+                                               also_return_batch: bool=False
+                                               ) -> DataLoader | tuple[DataLoader, EveryDreamBatch]:
         """
         Build a validation dataloader by copying data from the given `train_batch`. If `enforce_split` is `True`, remove
         the copied items from train_batch so that there is no overlap between `train_batch` and the new dataloader.
@@ -225,10 +231,14 @@ class EveryDreamValidator:
                 name=name,
                 override_batch_size=override_batch_size
             )
-            return build_torch_dataloader(
+            dataloader = build_torch_dataloader(
                 items=val_batch,
                 batch_size=train_batch.batch_size,
             )
+            if also_return_batch:
+                return dataloader, val_batch
+            else:
+                return dataloader
 
 
     def _build_dataloader_from_custom_split(self, data_root: str, reference_train_batch: EveryDreamBatch) -> DataLoader:
