@@ -142,11 +142,11 @@ class EveryDreamValidator:
         # we want to prepend new data
         try:
             with open(filename, "w", encoding='utf-8') as f:
-                steps_list_string = {','.join([f'step {s}' for s in self.collected_global_steps])}
-                f.write(f"path,{steps_list_string}")
+                steps_list_string = ','.join([f"step {s}" for s in self.collected_global_steps])
+                f.write(f"path,{steps_list_string}\n")
                 for path, losses in loss_path_pairs_sorted:
                     path_escaped_and_quoted = '"' + path.replace('"', '\\"') + '"'
-                    losses_list_string = {','.join([str(x) for x in losses])}
+                    losses_list_string = ','.join([str(x) for x in losses])
                     f.write(f"{path_escaped_and_quoted},{losses_list_string}\n")
         except Exception as e:
             traceback.print_exc()
