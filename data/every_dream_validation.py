@@ -49,6 +49,11 @@ class EveryDreamValidator:
                                                                     split_proportion=val_split_proportion,
                                                                     val_data_root=self.val_data_root,
                                                                     train_batch=train_batch)
+            # pin 3 random batches
+            all_val_batch_ids = list(range(len(self.val_dataloader)))
+            random.shuffle(all_val_batch_ids)
+            self.val_pinned_batch_ids = all_val_batch_ids[:3]
+
             # order is important - if we're removing images from train, this needs to happen before making
             # the overlapping dataloader
             self.train_overlapping_dataloader = None if not stabilize_training_loss else \
@@ -67,23 +72,43 @@ class EveryDreamValidator:
                 self.find_outliers_dataloader = build_torch_dataloader(self.find_outliers_batch, batch_size=1)
 
 
+
     def do_validation_if_appropriate(self, epoch: int, global_step: int,
                                      get_model_prediction_and_target_callable: Callable[
                                          [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
         if (epoch % self.every_n_epochs) == 0:
             if self.train_overlapping_dataloader is not None:
-                self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader, get_model_prediction_and_target_callable)
+                self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader,
+                                    get_model_prediction_and_target_callable)
             if self.val_dataloader is not None:
-                self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable, log_extended_stats=True)
+                self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable,
+                                    log_extended_stats=True, log_pinned_batches=self.val_pinned_batch_ids)
         if (epoch % self.find_outliers_every_n_epochs) == 0:
             if self.find_outliers_dataloader is not None:
                 self._do_find_outliers(global_step, get_model_prediction_and_target_callable)
 
 
 
-    def _do_validation(self, tag, global_step, dataloader, get_model_prediction_and_target: Callable[
-                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]], log_loss: bool=True,
-                       log_extended_stats: bool=False) -> torch.Tensor:
+    def _do_validation(self,
+                       tag:str,
+                       global_step:int,
+                       dataloader:torch.utils.data.DataLoader,
+                       get_model_prediction_and_target: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+                       log_loss: bool=True,
+                       log_extended_stats: bool=False,
+                       log_pinned_batches: Optional[list[int]]=None) -> torch.Tensor:
+        """
+        Do a validation pass using the given dataloader. RNG is isolated and reset to self.seed.
+
+        tag: Used to dilineate log outputs (see e.g. `log_loss`).
+        global_step: Current step.
+        dataloader: Source for validation data (images and captions).
+        get_model_prediction_and_target : Callable that takes image and tokens and returns predicted and target
+                                          (i.e. actual) VAE latents.
+        log_loss: if True, log the mean of all losses in this batch to `loss/{tag}`.
+        log_extended_stats: if True, log mean, median, min, and max losses to `{tag}/mean` etc.
+        log_pinned_batches: if not None, log the loss of each of the given batch indices to `{tag}/batch-#{idx}`.
+        """
         with torch.no_grad(), isolate_rng():
             losses_list = []
             steps_pbar = tqdm(range(len(dataloader)), position=1)
@@ -117,7 +142,11 @@ class EveryDreamValidator:
             self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
             self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
 
+        for batch_idx in log_pinned_batches:
+            self.log_writer.add_scalar(tag=f"{tag}/batch-#{batch_idx}", scalar_value=losses_tensor[batch_idx].item(), global_step=global_step)
+
         return losses_tensor
+
 
     def _do_find_outliers(self, global_step, get_model_prediction_and_target_callable):
         losses = self._do_validation('find-outliers', global_step, self.find_outliers_dataloader,
