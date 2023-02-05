@@ -142,7 +142,7 @@ class EveryDreamValidator:
             self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
             self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
 
-        for batch_idx in log_pinned_batches:
+        for batch_idx in (log_pinned_batches or []):
             self.log_writer.add_scalar(tag=f"{tag}/batch-#{batch_idx}", scalar_value=losses_tensor[batch_idx].item(), global_step=global_step)
 
         return losses_tensor
