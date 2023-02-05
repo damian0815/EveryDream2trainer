@@ -144,7 +144,7 @@ class EveryDreamValidator:
             self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
 
         if log_pinned_batches is not None:
-            self._log_batches(log_pinned_batches, losses_tensor, tag=tag, global_step=global_step)
+            self._log_individual_batch_losses(log_pinned_batches, losses_tensor, tag=tag, global_step=global_step)
 
         return losses_tensor
 
@@ -184,9 +184,9 @@ class EveryDreamValidator:
             self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
             self.collected_global_steps.append(global_step)
 
-        self._log_batches(losses_tensor=losses, batches=self.find_outliers_pinned_batch_ids,
-                          tag='find-outliers', global_step=global_step,
-                          batch_labels=self.find_outliers_pinned_batch_labels)
+        self._log_individual_batch_losses(losses_tensor=losses, batch_indices=self.find_outliers_pinned_batch_ids,
+                                          tag='find-outliers', global_step=global_step,
+                                          batch_labels=self.find_outliers_pinned_batch_labels)
 
         loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.find_outliers_batch.image_train_items],
                                             self.collected_losses.tolist()
@@ -285,10 +285,10 @@ class EveryDreamValidator:
             name=name,
         )
 
-    def _log_batches(self, batches: list[int], losses_tensor:torch.Tensor, tag:str, global_step: int, batch_labels: list[str]=None):
-        batch_labels = batch_labels or [f"batch-#{batch_idx}" for batch_idx in batches]
-        for batch_idx in batches:
-            self.log_writer.add_scalar(tag=f"{tag}/{batch_labels[batch_idx]}", scalar_value=losses_tensor[batch_idx].item(), global_step=global_step)
+    def _log_individual_batch_losses(self, batch_indices: list[int], losses_tensor:torch.Tensor, tag:str, global_step: int, batch_labels: list[str]=None):
+        batch_labels = batch_labels or [f"batch-#{batch_idx}" for batch_idx in batch_indices]
+        for i,batch_idx in enumerate(batch_indices):
+            self.log_writer.add_scalar(tag=f"{tag}/{batch_labels[i]}", scalar_value=losses_tensor[batch_idx].item(), global_step=global_step)
 
 
 
