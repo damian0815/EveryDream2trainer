@@ -285,8 +285,8 @@ class OutlierFinder:
                     # one-off log of the images being pinned
                     newline = '  \n' # tensorboard uses markdown format so needs 2 spaces
                     pinned_ids_description = newline.join(
-                        [f"{self.pinned_image_labels[i]}: {self.batched_dataset.image_train_items[i].pathname}"
-                         for i in self.pinned_image_indices]
+                        [f"{label}: {self.batched_dataset.image_train_items[image_index].pathname}"
+                         for label, image_index in zip(self.pinned_image_labels, self.pinned_image_indices)]
                     )
                     validator.log_writer.add_text(self.logging_tag, pinned_ids_description)
 
