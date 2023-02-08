@@ -1,8 +1,10 @@
 import json
 import logging
+import math
 import random
 import traceback
-from typing import Callable, Any, Optional
+from typing import Callable, Any, Optional, Generator
+from argparse import Namespace
 
 import torch
 from colorama import Fore, Style
@@ -12,66 +14,91 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from data.every_dream import build_torch_dataloader, EveryDreamBatch
+from data.data_loader import DataLoaderMultiAspect
+from data import resolver
+from data import aspects
+from data.image_train_item import ImageTrainItem
 from utils.isolate_rng import isolate_rng
 
+
+def get_random_split(items: list[ImageTrainItem], split_proportion: float, batch_size: int) \
+        -> tuple[list[ImageTrainItem], list[ImageTrainItem]]:
+    split_item_count = math.ceil(split_proportion * len(items) // batch_size) * batch_size
+    # sort first, then shuffle, to ensure determinate outcome for the current random state
+    items_copy = list(sorted(items, key=lambda i: i.pathname))
+    random.shuffle(items_copy)
+    split_items = list(items_copy[:split_item_count])
+    remaining_items = list(items_copy[split_item_count:])
+    return split_items, remaining_items
+
+def disable_multiplier_and_flip(items: list[ImageTrainItem]) -> Generator[ImageTrainItem, None, None]:
+    for i in items:
+        yield ImageTrainItem(image=i.image, caption=i.caption, aspects=i.aspects, pathname=i.pathname, flip_p=0, multiplier=1)
 
 class EveryDreamValidator:
     def __init__(self,
                  val_config_path: Optional[str],
-                 train_batch: EveryDreamBatch,
+                 default_batch_size: int,
+                 resolution: int,
                  log_writer: SummaryWriter,
                  log_folder: str):
+        self.val_dataloader = None
+        self.train_overlapping_dataloader = None
+
         self.log_writer = log_writer
         self.log_folder = log_folder
+        self.resolution = resolution
 
-        val_config = {}
+        self.config = {
+            'batch_size': default_batch_size,
+            'every_n_epochs': 1,
+            'seed': 555,
+
+            'validate_training': True,
+            'val_split_mode': 'automatic',
+            'val_split_proportion': 0.15,
+
+            'stabilize_training_loss': False,
+            'stabilize_split_proportion': 0.15,
+
+            'find_outliers': False,
+            'find_outliers_every_n_epochs': 5,
+            'find_outliers_split_proportion': 1,
+            'find_outliers_pinned_image_count': 7
+        }
+
         if val_config_path is not None:
             with open(val_config_path, 'rt') as f:
-                val_config = json.load(f)
+                self.config.update(json.load(f))
 
-        do_validation = val_config.get('validate_training', False)
-        val_split_mode = val_config.get('val_split_mode', 'automatic') if do_validation else 'none'
-        self.val_data_root = val_config.get('val_data_root', None)
-        val_split_proportion = val_config.get('val_split_proportion', 0.15)
+    @property
+    def batch_size(self):
+        return self.config['batch_size']
 
-        stabilize_training_loss = val_config.get('stabilize_training_loss', False)
-        stabilize_split_proportion = val_config.get('stabilize_split_proportion', 0.15)
+    @property
+    def every_n_epochs(self):
+        return self.config['every_n_epochs']
 
-        self.every_n_epochs = val_config.get('every_n_epochs', 1)
-        self.seed = val_config.get('seed', 555)
+    @property
+    def seed(self):
+        return self.config['seed']
 
-        do_find_outliers = val_config.get('find_outliers', False)
-        self.find_outliers_every_n_epochs = val_config.get('find_outliers_every_n_epochs', self.every_n_epochs)
-        self.collected_losses: Optional[torch.Tensor] = None
-
+    def prepare_validation_splits(self, train_items: list[ImageTrainItem], tokenizer: Any) -> list[ImageTrainItem]:
+        """
+        Build the validation splits as requested by the config passed at init.
+        This may steal some items from `train_items`.
+        If this happens, the returned `list` contains the remaining items after the required items have been stolen.
+        Otherwise, the returned `list` is identical to the passed-in `train_items`.
+        """
         with isolate_rng():
-            self.val_dataloader = self._build_validation_dataloader(val_split_mode,
-                                                                    split_proportion=val_split_proportion,
-                                                                    val_data_root=self.val_data_root,
-                                                                    train_batch=train_batch)
-            if self.val_dataloader is not None:
-                # pin 3 random batches
-                all_val_batch_ids = list(range(len(self.val_dataloader)))
-                random.shuffle(all_val_batch_ids)
-                self.val_pinned_batch_ids = all_val_batch_ids[:3]
-
+            self.val_dataloader, remaining_train_items = self._build_val_dataloader_if_required(train_items, tokenizer)
             # order is important - if we're removing images from train, this needs to happen before making
             # the overlapping dataloader
-            self.train_overlapping_dataloader = None if not stabilize_training_loss else \
-                self._build_dataloader_from_automatic_split(train_batch,
-                                                            split_proportion=stabilize_split_proportion,
-                                                            name='train-stabilizer',
-                                                            enforce_split=False)
+            self.train_overlapping_dataloader = self._build_train_stabilizer_dataloader_if_required(
+                remaining_train_items, tokenizer)
 
-            if do_find_outliers:
-                split_proportion = val_config.get('find_outliers_split_proportion', 1)
-                pinned_image_count = val_config.get('find_outliers_pinned_image_count', 7)
-                self.outlier_finder = OutlierFinder(validator=self,
-                                                    reference_train_batch=train_batch,
-                                                    split_proportion=split_proportion,
-                                                    pinned_image_count=pinned_image_count)
-            else:
-                self.outlier_finder = None
+            self.outlier_finder = self._build_outlier_finder_if_required(remaining_train_items, tokenizer)
+            return remaining_train_items
 
     def do_validation_if_appropriate(self, epoch: int, global_step: int,
                                      get_model_prediction_and_target_callable: Callable[
@@ -82,8 +109,8 @@ class EveryDreamValidator:
                                     get_model_prediction_and_target_callable)
             if self.val_dataloader is not None:
                 self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable,
-                                    log_extended_stats=True, log_pinned_batches=self.val_pinned_batch_ids)
-        if self.outlier_finder is not None and (epoch % self.find_outliers_every_n_epochs) == 0:
+                                    log_extended_stats=True)
+        if self.outlier_finder is not None and (epoch % self.config['find_outliers_every_n_epochs']) == 0:
             self.outlier_finder.do_find_outliers(validator=self, global_step=global_step,
                                                  get_model_prediction_and_target_callable=get_model_prediction_and_target_callable)
 
@@ -118,14 +145,14 @@ class EveryDreamValidator:
                 torch.manual_seed(self.seed + step)
                 model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
-                # del timesteps, encoder_hidden_states, noisy_latents
-                # with autocast(enabled=args.amp):
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
                 del target, model_pred
 
                 loss_step = loss.detach().item()
+                del loss
+
                 losses_list.append(loss_step)
+                
 
                 steps_pbar.update(1)
 
@@ -134,7 +161,7 @@ class EveryDreamValidator:
         losses_tensor: torch.Tensor = torch.tensor(losses_list)
         if log_loss:
             self.log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
-
+        
         if log_extended_stats:
             self.log_writer.add_scalar(tag=f"{tag}/mean", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
             self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
@@ -143,105 +170,96 @@ class EveryDreamValidator:
 
         if log_pinned_batches is not None:
             self._log_individual_batch_losses(log_pinned_batches, losses_tensor, tag=tag, global_step=global_step)
-
+        
         return losses_tensor
 
-
-
-
-
-    def _build_validation_dataloader(self,
-                                     validation_split_mode: str,
-                                     split_proportion: float,
-                                     val_data_root: Optional[str],
-                                     train_batch: EveryDreamBatch) -> Optional[DataLoader]:
-        if validation_split_mode == 'none':
-            return None
-        elif validation_split_mode == 'automatic':
-            return self._build_dataloader_from_automatic_split(train_batch, split_proportion, name='val', enforce_split=True)
-        elif validation_split_mode == 'manual':
-            if val_data_root is None:
-                raise ValueError("val_data_root is required for 'manual' validation split mode")
-            return self._build_dataloader_from_custom_split(self.val_data_root, reference_train_batch=train_batch)
+    def _build_val_dataloader_if_required(self, image_train_items: list[ImageTrainItem], tokenizer)\
+            -> tuple[Optional[torch.utils.data.DataLoader], list[ImageTrainItem]]:
+        val_split_mode = self.config['val_split_mode'] if self.config['validate_training'] else None
+        val_split_proportion = self.config['val_split_proportion']
+        remaining_train_items = image_train_items
+        if val_split_mode is None or val_split_mode == 'none':
+            return None, image_train_items
+        elif val_split_mode == 'automatic':
+            val_items, remaining_train_items = get_random_split(image_train_items, val_split_proportion, batch_size=self.batch_size)
+            val_items = list(disable_multiplier_and_flip(val_items))
+            logging.info(f" * Removed {len(val_items)} images from the training set to use for validation")
+        elif val_split_mode == 'manual':
+            args = Namespace(
+                aspects=aspects.get_aspect_buckets(self.resolution),
+                flip_p=0.0,
+                seed=self.seed,
+            )
+            val_data_root = self.config['val_data_root']
+            val_items = resolver.resolve_root(val_data_root, args)
+            logging.info(f" * Loaded {len(val_items)} validation images from {val_data_root}")
         else:
-            raise ValueError(f"unhandled validation split mode '{validation_split_mode}'")
+            raise ValueError(f"Unrecognized validation split mode '{val_split_mode}'")
+        val_ed_batch = self._build_ed_batch(val_items, batch_size=self.batch_size, tokenizer=tokenizer, name='val')
+        val_dataloader = build_torch_dataloader(val_ed_batch, batch_size=self.batch_size)
+        return val_dataloader, remaining_train_items
 
+    def _build_train_stabilizer_dataloader_if_required(self, image_train_items: list[ImageTrainItem], tokenizer) \
+            -> Optional[torch.utils.data.DataLoader]:
+        stabilize_training_loss = self.config['stabilize_training_loss']
+        if not stabilize_training_loss:
+            return None
 
-    def _build_dataloader_from_automatic_split(self,
-                                               train_batch: EveryDreamBatch,
-                                               split_proportion: float,
-                                               name: str,
-                                               enforce_split: bool=False,
-                                               override_batch_size: Optional[int]=None,
-                                               also_return_batch: bool=False
-                                               ) -> DataLoader | tuple[DataLoader, EveryDreamBatch]:
-        """
-        Build a validation dataloader by copying data from the given `train_batch`. If `enforce_split` is `True`, remove
-        the copied items from train_batch so that there is no overlap between `train_batch` and the new dataloader.
-        """
-        with isolate_rng():
-            random.seed(self.seed)
-            val_items = train_batch.get_random_split(split_proportion, remove_from_dataset=enforce_split)
-            if enforce_split:
-                print(
-                f"  * Removed {len(val_items)} items for validation split from '{train_batch.name}' - {round(len(train_batch)/train_batch.batch_size)} batches are left")
-            if len(train_batch) == 0:
-                raise ValueError(f"Validation split used up all of the training data. Try a lower split proportion than {split_proportion}")
-            val_batch = self._make_val_batch_with_train_batch_settings(
-                val_items,
-                train_batch,
-                name=name,
-                override_batch_size=override_batch_size
-            )
-            dataloader = build_torch_dataloader(
-                items=val_batch,
-                batch_size=override_batch_size or train_batch.batch_size,
-            )
-            if also_return_batch:
-                return dataloader, val_batch
-            else:
-                return dataloader
+        stabilize_split_proportion = self.config['stabilize_split_proportion']
+        stabilize_items, _ = get_random_split(image_train_items, stabilize_split_proportion, batch_size=self.batch_size)
+        stabilize_items = list(disable_multiplier_and_flip(stabilize_items))
+        stabilize_ed_batch = self._build_ed_batch(stabilize_items, batch_size=self.batch_size, tokenizer=tokenizer,
+                                                  name='stabilize-train')
+        stabilize_dataloader = build_torch_dataloader(stabilize_ed_batch, batch_size=self.batch_size)
+        return stabilize_dataloader
 
+    def _build_outlier_finder_if_required(self, image_train_items: list[ImageTrainItem], tokenizer) \
+            -> Optional['OutlierFinder']:
+        do_find_outliers = self.config['find_outliers']
+        if not do_find_outliers:
+            return None
+        split_proportion = self.config['find_outliers_split_proportion']
+        pinned_image_count = self.config['find_outliers_pinned_image_count']
+        find_outliers_items, _ = get_random_split(image_train_items, split_proportion, batch_size=1)
+        outlier_finder = OutlierFinder(validator=self,
+                                       items=list(disable_multiplier_and_flip(find_outliers_items)),
+                                       tokenizer=tokenizer,
+                                       pinned_image_count=pinned_image_count)
+        return outlier_finder
 
-    def _build_dataloader_from_custom_split(self, data_root: str, reference_train_batch: EveryDreamBatch) -> DataLoader:
-        val_batch = self._make_val_batch_with_train_batch_settings(data_root, reference_train_batch)
-        return build_torch_dataloader(
-            items=val_batch,
-            batch_size=reference_train_batch.batch_size
+    def _build_ed_batch(self, items: list[ImageTrainItem], batch_size: int, tokenizer, name='val'):
+        batch_size = self.batch_size
+        seed = self.seed
+        data_loader = DataLoaderMultiAspect(
+            items,
+            batch_size=batch_size,
+            seed=seed,
         )
-
-    def _make_val_batch_with_train_batch_settings(self, data_root, reference_train_batch, name='val',
-                                                  override_batch_size: Optional[int]=None) -> EveryDreamBatch:
-        return EveryDreamBatch(
-            data=data_root,
+        ed_batch = EveryDreamBatch(
+            data_loader=data_loader,
             debug_level=1,
-            batch_size=override_batch_size or reference_train_batch.batch_size,
             conditional_dropout=0,
-            resolution=reference_train_batch.resolution,
-            tokenizer=reference_train_batch.tokenizer,
-            seed=reference_train_batch.seed,
-            log_folder=reference_train_batch.log_folder,
-            write_schedule=reference_train_batch.write_schedule,
+            tokenizer=tokenizer,
+            seed=seed,
             name=name,
         )
+        return ed_batch
 
     def _log_individual_batch_losses(self, batch_indices: list[int], losses_tensor:torch.Tensor, tag:str, global_step: int, batch_labels: list[str]=None):
         batch_labels = batch_labels or [f"batch-#{batch_idx}" for batch_idx in batch_indices]
         for i,batch_idx in enumerate(batch_indices):
             self.log_writer.add_scalar(tag=f"{tag}/{batch_labels[i]}", scalar_value=losses_tensor[batch_idx].item(), global_step=global_step)
 
-
 class OutlierFinder:
     def __init__(self,
                  validator: EveryDreamValidator,
-                 reference_train_batch: EveryDreamBatch,
-                 split_proportion: float,
+                 items: list[ImageTrainItem],
+                 tokenizer,
                  pinned_image_count: int):
 
         # we need a dataloader and dataset with batch_size=1
-        self.dataloader, self.batched_dataset = validator._build_dataloader_from_automatic_split(
-            reference_train_batch, split_proportion=split_proportion, name='find-outliers',
-            enforce_split=False, override_batch_size=1, also_return_batch=True)
+        self.ed_batch = validator._build_ed_batch(items, batch_size=1, tokenizer=tokenizer, name='outlier-finder')
+        self.dataloader = build_torch_dataloader(self.ed_batch, batch_size=1)
 
         self.logging_tag = 'outliers'
 
@@ -285,7 +303,7 @@ class OutlierFinder:
                     # one-off log of the images being pinned
                     newline = '  \n' # tensorboard uses markdown format so needs 2 spaces
                     pinned_ids_description = newline.join(
-                        [f"{label}: {self.batched_dataset.image_train_items[image_index].pathname}"
+                        [f"{label}: {self.ed_batch.image_train_items[image_index].pathname}"
                          for label, image_index in zip(self.pinned_image_labels, self.pinned_image_indices)]
                     )
                     validator.log_writer.add_text(self.logging_tag, pinned_ids_description)
@@ -298,7 +316,7 @@ class OutlierFinder:
             self.collected_losses = torch.cat([self.collected_losses, losses_t], dim=1)
             self.collected_global_steps.append(global_step)
 
-        loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.batched_dataset.image_train_items],
+        loss_path_pairs_sorted = sorted(zip([i.pathname for i in self.ed_batch.image_train_items],
                                             self.collected_losses.tolist()
                                             ),
                                  key=lambda i: i[0], reverse=True)

@@ -14,125 +14,69 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import logging
-
 import torch
 from torch.utils.data import Dataset
-from data.data_loader import DataLoaderMultiAspect as dlma
+from data.data_loader import DataLoaderMultiAspect
 from data.image_train_item import ImageTrainItem
 import random
 from torchvision import transforms
-
+from transformers import CLIPTokenizer
+import torch.nn.functional as F
 
 class EveryDreamBatch(Dataset):
     """
-    data: either a str indicating the root path of all your training images, will be recursively searched for images; or a list of ImageTrainItem
-    repeats: how many times to repeat each image in the dataset
-    flip_p: probability of flipping the image horizontally
+    data_loader: `DataLoaderMultiAspect` object
     debug_level: 0=none, 1=print drops due to unfilled batches on aspect ratio buckets, 2=debug info per image, 3=save crops to disk for inspection
-    batch_size: how many images to return in a batch
     conditional_dropout: probability of dropping the caption for a given image
-    resolution: max resolution (relative to square)
-    jitter: number of pixels to jitter the crop by, only for non-square images
-    name: the name of this dataset (only used for logging)
+    crop_jitter: number of pixels to jitter the crop by, only for non-square images
+    seed: random seed
     """
     def __init__(self,
-                 data: str | list[ImageTrainItem],
-                 flip_p=0.0,
+                 data_loader: DataLoaderMultiAspect,
                  debug_level=0,
-                 batch_size=1,
                  conditional_dropout=0.02,
-                 resolution=512,
                  crop_jitter=20,
                  seed=555,
                  tokenizer=None,
-                 log_folder=None,
                  retain_contrast=False,
-                 write_schedule=False,
                  shuffle_tags=False,
                  rated_dataset=False,
                  rated_dataset_dropout_target=0.5,
                  name='train'
                  ):
-        self.batch_size = batch_size
+        self.data_loader = data_loader
+        self.batch_size = data_loader.batch_size
         self.debug_level = debug_level
         self.conditional_dropout = conditional_dropout
         self.crop_jitter = crop_jitter
-        self.resolution = resolution
         self.unloaded_to_idx = 0
         self.tokenizer = tokenizer
-        self.log_folder = log_folder
-        #print(f"tokenizer: {tokenizer}")
         self.max_token_length = self.tokenizer.model_max_length
         self.retain_contrast = retain_contrast
-        self.write_schedule = write_schedule
         self.shuffle_tags = shuffle_tags
         self.seed = seed
         self.rated_dataset = rated_dataset
         self.rated_dataset_dropout_target = rated_dataset_dropout_target
+        # First epoch always trains on all images
+        self.image_train_items  = []
+        self.__update_image_train_items(1.0)
         self.name = name
-
-        if seed == -1:
-            seed = random.randint(0, 99999)
-
-        self.dataloader = dlma(data=data,
-                               seed=seed,
-                               debug_level=debug_level,
-                               batch_size=self.batch_size,
-                               flip_p=flip_p,
-                               resolution=resolution,
-                               log_folder=self.log_folder,
-                               name=self.name
-                               )
-        self.__update_image_train_items(1.0, 0)
-
+            
         num_images = len(self.image_train_items)
-        logging.info(f" ** EveryDreamBatch Set '{self.name}': {num_images / batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
-
-
-    def get_all_image_train_items(self):
-        """
-        self.image_train_items have all multipliers == 0, so this gets us the ones with good multipliers
-        """
-        return self.dataloader.prepared_train_data
-
-
-    def get_random_split(self, split_proportion: float, remove_from_dataset: bool=False) -> list[ImageTrainItem]:
-        if self.dataloader is None:
-            raise RuntimeError("EveryDreamBatch is already static")
-        items = self.dataloader.get_random_split(split_proportion, remove_from_dataset=remove_from_dataset)
-        self.__update_image_train_items(1.0, 0)
-        return items
-
+        logging.info(f" ** Dataset '{name}': {num_images / self.batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
 
     def shuffle(self, epoch_n: int, max_epochs: int):
         self.seed += 1
+        
         if self.rated_dataset:
             dropout_fraction = (max_epochs - (epoch_n * self.rated_dataset_dropout_target)) / max_epochs
         else:
             dropout_fraction = 1.0
-        self.__update_image_train_items(dropout_fraction, epoch_n)
-
-
-    def __update_image_train_items(self, dropout_fraction: float, epoch_n: int):
-        if self.dataloader is None:
-            raise RuntimeError("Cannot run __update_train_images on a static EveryDreamBatch")
-        self.image_train_items = self.dataloader.get_shuffled_image_buckets(dropout_fraction)
-        if self.write_schedule:
-            self.__write_batch_schedule(epoch_n + 1)
-
-
-    def __write_batch_schedule(self, epoch_n):
-        with open(f"{self.log_folder}/ep{epoch_n}_batch_schedule_{self.name}.txt", "w", encoding='utf-8') as f:
-            for i in range(len(self.image_train_items)):
-                try:
-                    f.write(f"step:{int(i / self.batch_size):05}, wh:{self.image_train_items[i].target_wh}, r:{self.image_train_items[i].runt_size}, path:{self.image_train_items[i].pathname}\n")
-                except Exception as e:
-                    logging.error(f" * Error writing to batch schedule for file path: {self.image_train_items[i].pathname}")
-
+            
+        self.__update_image_train_items(dropout_fraction)
 
     def __len__(self):
         return len(self.image_train_items)
-
 
     def __getitem__(self, i):
         example = {}
@@ -179,7 +123,6 @@ class EveryDreamBatch(Dataset):
 
         return example
 
-
     def __get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
         example = {}
         save = debug_level > 2
@@ -191,13 +134,15 @@ class EveryDreamBatch(Dataset):
         example["runt_size"] = image_train_tmp.runt_size
         return example
 
-
-def build_torch_dataloader(items, batch_size) -> torch.utils.data.DataLoader:
+    def __update_image_train_items(self, dropout_fraction: float):
+        self.image_train_items = self.data_loader.get_shuffled_image_buckets(dropout_fraction)
+        
+def build_torch_dataloader(dataset, batch_size) -> torch.utils.data.DataLoader:
     dataloader = torch.utils.data.DataLoader(
-        items,
+        dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
         collate_fn=collate_fn
     )
     return dataloader
@@ -223,5 +168,3 @@ def collate_fn(batch):
     }
     del batch
     return ret
-
-

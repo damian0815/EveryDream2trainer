@@ -15,11 +15,13 @@ limitations under the License.
 """
 
 import os
+import pprint
 import sys
 import math
 import signal
 import argparse
 import logging
+import threading
 import time
 import gc
 import random
@@ -48,13 +50,17 @@ from accelerate.utils import set_seed
 
 import wandb
 from torch.utils.tensorboard import SummaryWriter
+from data.data_loader import DataLoaderMultiAspect
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
+from data.image_train_item import ImageTrainItem
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 if torch.cuda.is_available():
     from utils.gpu import GPU
+import data.aspects as aspects
+import data.resolver as resolver
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
@@ -154,20 +160,21 @@ def append_epoch_log(global_step: int, epoch_pbar, gpu, log_writer, **logs):
     """
     updates the vram usage for the epoch
     """
-    gpu_used_mem, gpu_total_mem = gpu.get_gpu_memory()
-    log_writer.add_scalar("performance/vram", gpu_used_mem, global_step)
-    epoch_mem_color = Style.RESET_ALL
-    if gpu_used_mem > 0.93 * gpu_total_mem:
-        epoch_mem_color = Fore.LIGHTRED_EX
-    elif gpu_used_mem > 0.85 * gpu_total_mem:
-        epoch_mem_color = Fore.LIGHTYELLOW_EX
-    elif gpu_used_mem > 0.7 * gpu_total_mem:
-        epoch_mem_color = Fore.LIGHTGREEN_EX
-    elif gpu_used_mem < 0.5 * gpu_total_mem:
-        epoch_mem_color = Fore.LIGHTBLUE_EX
+    if gpu is not None:
+        gpu_used_mem, gpu_total_mem = gpu.get_gpu_memory()
+        log_writer.add_scalar("performance/vram", gpu_used_mem, global_step)
+        epoch_mem_color = Style.RESET_ALL
+        if gpu_used_mem > 0.93 * gpu_total_mem:
+            epoch_mem_color = Fore.LIGHTRED_EX
+        elif gpu_used_mem > 0.85 * gpu_total_mem:
+            epoch_mem_color = Fore.LIGHTYELLOW_EX
+        elif gpu_used_mem > 0.7 * gpu_total_mem:
+            epoch_mem_color = Fore.LIGHTGREEN_EX
+        elif gpu_used_mem < 0.5 * gpu_total_mem:
+            epoch_mem_color = Fore.LIGHTBLUE_EX
 
-    if logs is not None:
-        epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{global_step}")
+        if logs is not None:
+            epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{global_step}")
 
 
 def set_args_12gb(args):
@@ -267,29 +274,81 @@ def setup_args(args):
 
         logging.info(logging.info(f"{Fore.CYAN} * Activating rated images learning with a target rate of {args.rated_dataset_target_dropout_percent}% {Style.RESET_ALL}"))
 
+    args.aspects = aspects.get_aspect_buckets(args.resolution)    
+
     return args
 
 def update_grad_scaler(scaler: GradScaler, global_step, epoch, step):
-    if global_step == 250 or (epoch >= 4 and step == 1):
+    if global_step == 250 or (epoch == 4 and step == 1):
         factor = 1.8
         scaler.set_growth_factor(factor)
         scaler.set_backoff_factor(1/factor)
         scaler.set_growth_interval(50)
-    if global_step == 500 or (epoch >= 8 and step == 1):
+    if global_step == 500 or (epoch == 8 and step == 1):
         factor = 1.6
         scaler.set_growth_factor(factor)
         scaler.set_backoff_factor(1/factor)
         scaler.set_growth_interval(50)
-    if global_step == 1000 or (epoch >= 10 and step == 1):
+    if global_step == 1000 or (epoch == 10 and step == 1):
         factor = 1.3
         scaler.set_growth_factor(factor)
         scaler.set_backoff_factor(1/factor)
         scaler.set_growth_interval(100)
-    if global_step == 3000 or (epoch >= 20 and step == 1):
+    if global_step == 3000 or (epoch == 20 and step == 1):
         factor = 1.15
         scaler.set_growth_factor(factor)
         scaler.set_backoff_factor(1/factor)
         scaler.set_growth_interval(100)
+        
+def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem]) -> None:
+    for item in items:
+        if item.error is not None:
+            logging.error(f"{Fore.LIGHTRED_EX} *** Error opening {Fore.LIGHTYELLOW_EX}{item.pathname}{Fore.LIGHTRED_EX} to get metadata. File may be corrupt and will be skipped.{Style.RESET_ALL}")
+            logging.error(f" *** exception: {item.error}")
+    
+    undersized_items = [item for item in items if item.is_undersized]
+
+    if len(undersized_items) > 0:
+        underized_log_path = os.path.join(log_folder, "undersized_images.txt")
+        logging.warning(f"{Fore.LIGHTRED_EX} ** Some images are smaller than the target size, consider using larger images{Style.RESET_ALL}")
+        logging.warning(f"{Fore.LIGHTRED_EX} ** Check {underized_log_path} for more information.{Style.RESET_ALL}")
+        with open(underized_log_path, "w") as undersized_images_file:
+            undersized_images_file.write(f" The following images are smaller than the target size, consider removing or sourcing a larger copy:")
+            for undersized_item in undersized_items:
+                message = f" *** {undersized_item.pathname} with size: {undersized_item.image_size} is smaller than target size: {undersized_item.target_wh}\n"
+                undersized_images_file.write(message)
+                
+def resolve_image_train_items(args: argparse.Namespace, log_folder: str) -> list[ImageTrainItem]:
+    logging.info(f"* DLMA resolution {args.resolution}, buckets: {args.aspects}")
+    logging.info(" Preloading images...")
+    
+    resolved_items = resolver.resolve(args.data_root, args)
+    report_image_train_item_problems(log_folder, resolved_items)
+    image_paths = set(map(lambda item: item.pathname, resolved_items))
+    
+    # Remove erroneous items
+    image_train_items = [item for item in resolved_items if item.error is None]
+    print (f" * Found {len(image_paths)} files in '{args.data_root}'")
+    
+    return image_train_items
+                
+def write_batch_schedule(args: argparse.Namespace, log_folder: str, train_batch: EveryDreamBatch, epoch: int):
+    if args.write_schedule:
+        with open(f"{log_folder}/ep{epoch}_batch_schedule.txt", "w", encoding='utf-8') as f:
+            for i in range(len(train_batch.image_train_items)):
+                try:
+                    item = train_batch.image_train_items[i]
+                    f.write(f"step:{int(i / train_batch.batch_size):05}, wh:{item.target_wh}, r:{item.runt_size}, path:{item.pathname}\n")
+                except Exception as e:
+                    logging.error(f" * Error writing to batch schedule for file path: {item.pathname}")
+
+
+def read_sample_prompts(sample_prompts_file_path: str):
+    sample_prompts = []
+    with open(sample_prompts_file_path, "r") as f:
+        for line in f:
+            sample_prompts.append(line.strip())
+    return sample_prompts
 
 
 def main(args):
@@ -308,11 +367,13 @@ def main(args):
     logging.info(f" Seed: {seed}")
     set_seed(seed)
     if torch.cuda.is_available():
-        gpu = GPU()
         device = torch.device(f"cuda:{args.gpuid}")
+        gpu = GPU(device)
         torch.backends.cudnn.benchmark = True
     else:
+        logging.warning("*** Running on CPU. This is for testing loading/config parsing code only.")
         device = 'cpu'
+        gpu = None
 
     log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
 
@@ -489,6 +550,7 @@ def main(args):
     except Exception as e:
         traceback.print_exc()
         logging.error(" * Failed to load checkpoint *")
+        raise
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -556,31 +618,39 @@ def main(args):
             amsgrad=False,
         )
 
-
     log_optimizer(optimizer, betas, epsilon)
 
-    train_batch = EveryDreamBatch(
-        data=args.data_root,
-        flip_p=args.flip_p,
-        debug_level=1,
+
+    image_train_items = resolve_image_train_items(args, log_folder)
+
+    validator = None
+    if args.validation_config is not None:
+        validator = EveryDreamValidator(args.validation_config,
+                                        default_batch_size=args.batch_size,
+                                        resolution=args.resolution,
+                                        log_writer=log_writer,
+                                        log_folder=log_folder
+                                        )
+        # the validation dataset may need to steal some items from image_train_items
+        image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=tokenizer)
+
+    data_loader = DataLoaderMultiAspect(
+        image_train_items=image_train_items,
+        seed=seed,
         batch_size=args.batch_size,
+    )
+
+    train_batch = EveryDreamBatch(
+        data_loader=data_loader,
+        debug_level=1,
         conditional_dropout=args.cond_dropout,
-        resolution=args.resolution,
         tokenizer=tokenizer,
         seed = seed,
-        log_folder=log_folder,
-        write_schedule=args.write_schedule,
         shuffle_tags=args.shuffle_tags,
         rated_dataset=args.rated_dataset,
-        rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
-        name='train'
+        rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0))
     )
-    validator = EveryDreamValidator(args.validation_config,
-                                    train_batch=train_batch,
-                                    log_writer=log_writer,
-                                    log_folder=log_folder)
-
-
+    
     torch.cuda.benchmark = False
 
     epoch_len = math.ceil(len(train_batch) / args.batch_size)
@@ -597,15 +667,8 @@ def main(args):
         num_training_steps=args.lr_decay_steps,
     )
 
-    sample_prompts = []
-    with open(args.sample_prompts, "r") as f:
-        for line in f:
-            sample_prompts.append(line.strip())
-
-
     if args.wandb is not None and args.wandb:
         wandb.init(project=args.project_name, sync_tensorboard=True, )
-  
 
 
     def log_args(log_writer, args):
@@ -633,27 +696,33 @@ def main(args):
         """
         handles sigterm
         """
-        global interrupted
-        if not interrupted:
-            interrupted=True            
-            global global_step
-            #TODO: save model on ctrl-c
-            interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step}")
-            print()
-            logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
-            logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
-            logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
-            time.sleep(2) # give opportunity to ctrl-C again to cancel save
-            __save_model(interrupted_checkpoint_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
-        exit(_SIGTERM_EXIT_CODE)
+        is_main_thread = (torch.utils.data.get_worker_info() == None)
+        if is_main_thread:
+            global interrupted
+            if not interrupted:
+                interrupted=True
+                global global_step
+                #TODO: save model on ctrl-c
+                interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step}")
+                print()
+                logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
+                logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
+                logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
+                time.sleep(2) # give opportunity to ctrl-C again to cancel save
+                __save_model(interrupted_checkpoint_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
+            exit(_SIGTERM_EXIT_CODE)
+        else:
+            # non-main threads (i.e. dataloader workers) should exit cleanly
+            exit(0)
 
     signal.signal(signal.SIGINT, sigterm_handler)
     
     if not os.path.exists(f"{log_folder}/samples/"):
         os.makedirs(f"{log_folder}/samples/")
 
-    gpu_used_mem, gpu_total_mem = gpu.get_gpu_memory()
-    logging.info(f" Pretraining GPU Memory: {gpu_used_mem} / {gpu_total_mem} MB")
+    if gpu is not None:
+        gpu_used_mem, gpu_total_mem = gpu.get_gpu_memory()
+        logging.info(f" Pretraining GPU Memory: {gpu_used_mem} / {gpu_total_mem} MB")
     logging.info(f" saving ckpts every {args.ckpt_every_n_minutes} minutes")
     logging.info(f" saving ckpts every {args.save_every_n_epochs } epochs")
 
@@ -757,10 +826,8 @@ def main(args):
         # # discard the grads, just want to pin memory
         # optimizer.zero_grad(set_to_none=True)
 
-
-
-
-
+        write_batch_schedule(args, log_folder, train_batch, 0)
+        
         for epoch in range(args.max_epochs):
             loss_epoch = []
             epoch_start_time = time.time()
@@ -839,6 +906,7 @@ def main(args):
                     pipe = pipe.to(device)
 
                     with torch.no_grad():
+                        sample_prompts = read_sample_prompts(args.sample_prompts)
                         if sample_prompts is not None and len(sample_prompts) > 0 and len(sample_prompts[0]) > 1:
                             __generate_test_samples(pipe=pipe, prompts=sample_prompts, log_writer=log_writer, log_folder=log_folder, gs=global_step, resolution=args.resolution)
                         else:
@@ -877,15 +945,15 @@ def main(args):
             epoch_pbar.update(1)
             if epoch < args.max_epochs - 1:
                 train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
+                write_batch_schedule(args, log_folder, train_batch, epoch + 1)
 
             loss_local = sum(loss_epoch) / len(loss_epoch)
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
 
-            # validate
-            validator.do_validation_if_appropriate(epoch, global_step, get_model_prediction_and_target)
+            if validator:
+                validator.do_validation_if_appropriate(epoch, global_step, get_model_prediction_and_target)
 
             gc.collect()
-
             # end of epoch
 
         # end of training
@@ -909,33 +977,6 @@ def main(args):
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
 
 
-def update_old_args(t_args):
-    """
-    Update old args to new args to deal with json config loading and missing args for compatibility
-    """
-    if not hasattr(t_args, "shuffle_tags"):
-        print(f" Config json is missing 'shuffle_tags' flag")
-        t_args.__dict__["shuffle_tags"] = False
-    if not hasattr(t_args, "save_full_precision"):
-        print(f" Config json is missing 'save_full_precision' flag")
-        t_args.__dict__["save_full_precision"] = False
-    if not hasattr(t_args, "notebook"):
-        print(f" Config json is missing 'notebook' flag")
-        t_args.__dict__["notebook"] = False
-    if not hasattr(t_args, "disable_unet_training"):
-        print(f" Config json is missing 'disable_unet_training' flag")
-        t_args.__dict__["disable_unet_training"] = False
-    if not hasattr(t_args, "rated_dataset"):
-        print(f" Config json is missing 'rated_dataset' flag")
-        t_args.__dict__["rated_dataset"] = False
-    if not hasattr(t_args, "rated_dataset_target_dropout_percent"):
-        print(f" Config json is missing 'rated_dataset_target_dropout_percent' flag")
-        t_args.__dict__["rated_dataset_target_dropout_percent"] = 50
-    if not hasattr(t_args, "validation_config"):
-        print(f" Config json is missing 'validation_config' flag")
-        t_args.__dict__["validation_config"] = None
-
-
 if __name__ == "__main__":
     supported_resolutions = [256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1088, 1152]
     supported_precisions = ['fp16', 'fp32']
@@ -947,11 +988,11 @@ if __name__ == "__main__":
         print(f"Loading training config from {args.config}.")
         with open(args.config, 'rt') as f:
             args.__dict__.update(json.load(f))
-            update_old_args(args) # update args to support older configs
             if len(argv) > 0:
                 print(f"Config .json loaded but there are additional CLI arguments -- these will override values in {args.config}.")
     else:
         print("No config file specified, using command line args")
+
     argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
     argparser.add_argument("--amp", action="store_true", default=False, help="Enables automatic mixed precision compute, recommended on")
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
@@ -960,7 +1001,6 @@ if __name__ == "__main__":
     argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
     argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
-    argparser.add_argument("--validation_config", type=str, default=None, help="(optional) path to the validation config file (.json)")
     argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
     argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
     argparser.add_argument("--disable_xformers", action="store_true", default=False, help="disable xformers, may reduce performance (def: False)")
@@ -992,11 +1032,13 @@ if __name__ == "__main__":
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
     argparser.add_argument("--useadam8bit", action="store_true", default=False, help="Use AdamW 8-Bit optimizer, recommended!")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
+    argparser.add_argument("--validation_config", default=None, help="Path to a JSON configuration file for the validator.  Default is no validation.")
     argparser.add_argument("--write_schedule", action="store_true", default=False, help="write schedule of images and their batches to file (def: False)")
     argparser.add_argument("--rated_dataset", action="store_true", default=False, help="enable rated image set training, to less often train on lower rated images through the epochs")
     argparser.add_argument("--rated_dataset_target_dropout_percent", type=int, default=50, help="how many images (in percent) should be included in the last epoch (Default 50)")
 
+    # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)
-    print(f" args: \n{args.__dict__}")
-
+    print(f" Args:")
+    pprint.pprint(vars(args))
     main(args)

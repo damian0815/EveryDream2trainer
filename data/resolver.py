@@ -4,18 +4,21 @@ import os
 import random
 import typing
 import zipfile
+import argparse
 
-import PIL.Image as Image
 import tqdm
 from colorama import Fore, Style
 
 from data.image_train_item import ImageCaption, ImageTrainItem
 
 class DataResolver:
-    def __init__(self, aspects: list[typing.Tuple[int, int]], flip_p=0.0, seed=555):
-        self.seed = seed
-        self.aspects = aspects
-        self.flip_p = flip_p
+    def __init__(self, args: argparse.Namespace):
+        """
+        :param args: EveryDream configuration, an `argparse.Namespace` object.
+        """
+        self.aspects = args.aspects
+        self.flip_p = args.flip_p
+        self.seed = args.seed
         
     def image_train_items(self, data_root: str) -> list[ImageTrainItem]:
         """
@@ -125,7 +128,7 @@ class DirectoryResolver(DataResolver):
                         with open(multiply_txt_path, 'r') as f:
                             val = float(f.read().strip())
                             multipliers[current_dir] = val
-                            logging.info(f" * DLMA multiply.txt in {current_dir} set to {val}")
+                            logging.info(f" - multiply.txt in '{current_dir}' set to {val}")
                     except Exception as e:
                         logging.warning(f" * {Fore.LIGHTYELLOW_EX}Error trying to read multiply.txt for {current_dir}: {Style.RESET_ALL}{e}")
                         multipliers[current_dir] = 1.0
@@ -134,16 +137,8 @@ class DirectoryResolver(DataResolver):
             
             caption = ImageCaption.resolve(pathname)
             item = self.image_train_item(pathname, caption, multiplier=multipliers[current_dir])
-            
-            cur_file_multiplier = multipliers[current_dir]
+            items.append(item)
 
-            while cur_file_multiplier >= 1.0:
-                items.append(item)
-                cur_file_multiplier -= 1
-            
-            if cur_file_multiplier > 0:
-                if randomizer.random() < cur_file_multiplier:
-                    items.append(item) 
         return items
         
     @staticmethod
@@ -173,8 +168,11 @@ class DirectoryResolver(DataResolver):
             if os.path.isdir(current):
                 yield from DirectoryResolver.recurse_data_root(current)
         
-
-def strategy(data_root: str):
+def strategy(data_root: str) -> typing.Type[DataResolver]:
+    """
+    Determine the strategy to use for resolving the data.
+    :param data_root: The root directory or JSON file to resolve.
+    """
     if os.path.isfile(data_root) and data_root.endswith('.json'):
         return JSONResolver
     
@@ -183,41 +181,37 @@ def strategy(data_root: str):
         
     raise ValueError(f"data_root '{data_root}' is not a valid directory or JSON file.")
                     
-
-def resolve_root(path: str, aspects: list[float], flip_p: float = 0.0, seed=555) -> list[ImageTrainItem]:
+def resolve_root(path: str, args: argparse.Namespace) -> list[ImageTrainItem]:
     """
-    :param data_root: Directory or JSON file.
-    :param aspects: The list of aspect ratios to use
-    :param flip_p: The probability of flipping the image
+    Resolve the training data from the root path.
+    :param path: The root path to resolve.
+    :param args: EveryDream configuration, an `argparse.Namespace` object.
     """
-    if os.path.isfile(path) and path.endswith('.json'):
-        return JSONResolver(aspects, flip_p, seed).image_train_items(path)
-    
-    if os.path.isdir(path):
-        return DirectoryResolver(aspects, flip_p, seed).image_train_items(path)
-        
-    raise ValueError(f"data_root '{path}' is not a valid directory or JSON file.")
+    resolver = strategy(path)
+    return resolver(args).image_train_items(path)
 
-def resolve(value: typing.Union[dict, str], aspects: list[float], flip_p: float=0.0, seed=555) -> list[ImageTrainItem]:
+def resolve(value: typing.Union[dict, str], args: argparse.Namespace) -> list[ImageTrainItem]:
     """
     Resolve the training data from the value.
-    :param value: The value to resolve, either a dict or a string.
-    :param aspects: The list of aspect ratios to use
-    :param flip_p: The probability of flipping the image
+    :param value: The value to resolve, either a dict, an array, or a string.
+    :param args: EveryDream configuration, an `argparse.Namespace` object.
     """
     if isinstance(value, str):
-        return resolve_root(value, aspects, flip_p)
+        return resolve_root(value, args)
     
     if isinstance(value, dict):
         resolver = value.get('resolver', None)
         match resolver:
             case 'directory' | 'json':
                 path = value.get('path', None)
-                return resolve_root(path, aspects, flip_p, seed)
+                return resolve_root(path, args)
             case 'multi':
-                items = []
-                for resolver in value.get('resolvers', []):
-                    items += resolve(resolver, aspects, flip_p, seed)
-                return items
+                return resolve(value.get('resolvers', []), args)
             case _:
                 raise ValueError(f"Cannot resolve training data for resolver value '{resolver}'")
+
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            items += resolve(item, args)
+        return items 

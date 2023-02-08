@@ -1,5 +1,3 @@
-
-
 # copy/pasted from pytorch lightning
 # https://github.com/Lightning-AI/lightning/blob/0d52f4577310b5a1624bed4d23d49e37fb05af9e/src/lightning_fabric/utilities/seed.py
 # and
@@ -73,4 +71,3 @@ def isolate_rng(include_cuda: bool = True) -> Generator[None, None, None]:
     states = _collect_rng_states(include_cuda)
     yield
     _set_rng_states(states)
-
