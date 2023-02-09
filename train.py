@@ -548,7 +548,7 @@ def main(args):
         if args.override_beta_schedule is not None:
             noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", beta_schedule=args.override_beta_schedule)
         else:
-            DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
+            noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
     except Exception as e:
         traceback.print_exc()
@@ -736,7 +736,7 @@ def main(args):
     logging.info(f" unet device: {unet.device}, precision: {unet.dtype}, training: {unet.training}")
     logging.info(f" text_encoder device: {text_encoder.device}, precision: {text_encoder.dtype}, training: {text_encoder.training}")
     logging.info(f" vae device: {vae.device}, precision: {vae.dtype}, training: {vae.training}")
-    logging.info(f" scheduler: {noise_scheduler.__class__}")
+    logging.info(f" scheduler: {noise_scheduler.__class__.__name__}, beta schedule: {noise_scheduler.beta_schedule}")
 
     logging.info(f" {Fore.GREEN}Project name: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.project_name}{Style.RESET_ALL}")
     logging.info(f" {Fore.GREEN}grad_accum: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.grad_accum}{Style.RESET_ALL}"), 
