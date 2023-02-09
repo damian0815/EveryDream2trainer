@@ -132,6 +132,7 @@ class DataLoaderMultiAspect():
 
         return items
 
+
     def __pick_random_subset(self, dropout_fraction: float, picker: random.Random) -> list[ImageTrainItem]:
         """
         Picks a random subset of all images

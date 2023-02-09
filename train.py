@@ -524,6 +524,7 @@ def main(args):
                                         default_batch_size=args.batch_size,
                                         resolution=args.resolution,
                                         log_writer=log_writer,
+                                        log_folder=log_folder
                                         )
         # the validation dataset may need to steal some items from image_train_items
         image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=tokenizer)
