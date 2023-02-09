@@ -545,7 +545,10 @@ def main(args):
         vae = AutoencoderKL.from_pretrained(model_root_folder, subfolder="vae")
         unet = UNet2DConditionModel.from_pretrained(model_root_folder, subfolder="unet")
         sample_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
-        noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
+        if args.override_beta_schedule is not None:
+            noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", beta_schedule=args.override_beta_schedule)
+        else:
+            DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
     except Exception as e:
         traceback.print_exc()
@@ -1017,6 +1020,7 @@ if __name__ == "__main__":
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
     argparser.add_argument("--notebook", action="store_true", default=False, help="disable keypresses and uses tqdm.notebook for jupyter notebook (def: False)")
+    argparser.add_argument("--override_beta_schedule", default=None, help="override for the beta_schedule parameter of the noise scheduler, or None to use the model's default")
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
     argparser.add_argument("--resolution", type=int, default=512, help="resolution to train", choices=supported_resolutions)
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
