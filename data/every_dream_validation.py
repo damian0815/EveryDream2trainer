@@ -228,7 +228,6 @@ class EveryDreamValidator:
         return outlier_finder
 
     def _build_ed_batch(self, items: list[ImageTrainItem], batch_size: int, tokenizer, name='val'):
-        batch_size = self.batch_size
         seed = self.seed
         data_loader = DataLoaderMultiAspect(
             items,
