@@ -738,7 +738,10 @@ def main(args):
 
 
         write_batch_schedule(args, log_folder, train_batch, 0)
-        
+
+        if validator:
+            validator.do_validation_if_appropriate(0, global_step, get_model_prediction_and_target)
+
         for epoch in range(args.max_epochs):
             loss_epoch = []
             epoch_start_time = time.time()

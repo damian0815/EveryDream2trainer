@@ -296,7 +296,7 @@ class OutlierFinder:
                     self.pinned_image_indices = torch.cat([min_indices, median_index, max_indices]).t().squeeze().tolist()
                     # make labels
                     pin_types = ['max'] * min_max_pin_count + ['median'] + ['min'] * min_max_pin_count
-                    self.pinned_image_labels = [f"pin{i:02}-{pin_types[i]}-i#{image_index}"
+                    self.pinned_image_labels = [f"pin{i:02}-{pin_types[i]}"
                                                 for i,image_index in enumerate(self.pinned_image_indices)]
 
                     # one-off log of the images being pinned
