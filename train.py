@@ -482,7 +482,7 @@ def main(args):
         logging.info(f"Generating samples gs:{gs}, for {prompts}")
         pipe.set_progress_bar_config(disable=True)
 
-        seed = args.seed if args.seed != -1 else random.randint(0, 2**30)
+        seed = args.sample_seed if args.sample_seed != -1 else random.randint(0, 2 ** 30)
         gen = torch.Generator(device=device).manual_seed(seed)
 
         i = 0
@@ -1021,6 +1021,7 @@ if __name__ == "__main__":
     argparser.add_argument("--resolution", type=int, default=512, help="resolution to train", choices=supported_resolutions)
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
     argparser.add_argument("--sample_prompts", type=str, default="sample_prompts.txt", help="File with prompts to generate test samples from (def: sample_prompts.txt)")
+    argparser.add_argument("--sample_seed", type=int, default=555, help="Seed for the image sample generations, or -1 to choose a random seed every generation (def: 555)")
     argparser.add_argument("--sample_steps", type=int, default=250, help="Number of steps between samples (def: 250)")
     argparser.add_argument("--save_ckpt_dir", type=str, default=None, help="folder to save checkpoints to (def: root training folder)")
     argparser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every n epochs, def: 0 (disabled)")
