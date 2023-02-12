@@ -7,22 +7,25 @@ from typing import Optional
 
 from tqdm.auto import tqdm
 
+from data import resolver
+
 IMAGE_EXTENSIONS =  ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif']
-CAPTION_EXTENSIONS = ['.txt', '.caption', '.yaml', '.yml']
+CAPTION_EXTENSIONS = [".yaml", ".yml", ".txt", ".caption"]
+
 
 def gather_captioned_images(root_dir: str) -> list[tuple[str,Optional[str]]]:
     for directory, _, filenames in os.walk(root_dir):
         image_filenames = [f for f in filenames if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS]
         for image_filename in image_filenames:
-            image_path = os.path.join(directory, image_filename)
-            image_path_without_extension = os.path.splitext(image_path)[0]
+            image_basename = os.path.splitext(image_filename)[0]
             caption_path = None
-            for caption_extension in CAPTION_EXTENSIONS:
-                possible_caption_path = image_path_without_extension + caption_extension
-                if os.path.exists(possible_caption_path):
-                    caption_path = possible_caption_path
+            for caption_filename in [image_basename + c for c in CAPTION_EXTENSIONS]:
+                caption_path = os.path.join(directory, caption_filename)
+                if os.path.exists(caption_path):
                     break
-            yield image_path, caption_path
+            # caption_path may still be None but that's ok
+            image_path = os.path.join(directory, image_filename)
+            yield (image_path, caption_path)
 
 
 def copy_captioned_image(image_caption_pair: tuple[str, Optional[str]], source_root: str, target_root: str):

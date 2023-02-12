@@ -40,8 +40,8 @@ class EveryDreamValidator:
                  val_config_path: Optional[str],
                  default_batch_size: int,
                  resolution: int,
-                 log_writer: SummaryWriter,
-                 log_folder: str):
+                 log_writer: SummaryWriter=None,
+                 log_folder: str=None):
         self.val_dataloader = None
         self.train_overlapping_dataloader = None
 
@@ -159,17 +159,18 @@ class EveryDreamValidator:
             steps_pbar.close()
 
         losses_tensor: torch.Tensor = torch.tensor(losses_list)
-        if log_loss:
-            self.log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
-        
-        if log_extended_stats:
-            self.log_writer.add_scalar(tag=f"{tag}/mean", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
-            self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
-            self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
-            self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
+        if self.log_writer is not None:
+            if log_loss:
+                self.log_writer.add_scalar(tag=f"loss/{tag}", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
 
-        if log_pinned_batches is not None:
-            self._log_individual_batch_losses(log_pinned_batches, losses_tensor, tag=tag, global_step=global_step)
+            if log_extended_stats:
+                self.log_writer.add_scalar(tag=f"{tag}/mean", scalar_value=torch.mean(losses_tensor).item(), global_step=global_step)
+                self.log_writer.add_scalar(tag=f"{tag}/median", scalar_value=torch.median(losses_tensor).item(), global_step=global_step)
+                self.log_writer.add_scalar(tag=f"{tag}/min", scalar_value=torch.min(losses_tensor).item(), global_step=global_step)
+                self.log_writer.add_scalar(tag=f"{tag}/max", scalar_value=torch.max(losses_tensor).item(), global_step=global_step)
+
+            if log_pinned_batches is not None:
+                self._log_individual_batch_losses(log_pinned_batches, losses_tensor, tag=tag, global_step=global_step)
         
         return losses_tensor
 
