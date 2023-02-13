@@ -746,8 +746,10 @@ def main(args):
     try:
         write_batch_schedule(args, log_folder, train_batch, epoch = 0)
         
+        prev_loss_epoch = None
         for epoch in range(args.max_epochs):
             loss_epoch = []
+            identifiers = []
             epoch_start_time = time.time()
             images_per_sec_log_step = []
 
@@ -846,6 +848,21 @@ def main(args):
                 update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
                 # end of step
 
+            # apply loss deltas to item multipliers
+            do_shuffle_items = False
+            if prev_loss_epoch is None:
+                prev_loss_epoch = loss_epoch
+            else:
+                loss_change_proportions = [l / prev_loss_epoch[i] for i,l in enumerate(loss_epoch)]
+                with data_loader.renormalize_multipliers():
+                    print(f"scaling items: {loss_change_proportions}")
+                    for i, loss_change_proportions in enumerate(loss_change_proportions):
+                        for identifier in identifiers[i]:
+                            # if loss increases, so does multiplier
+                            # and vice versa
+                            data_loader.scale_multiplier(identifier, loss_change_proportions)
+                do_shuffle_items = True
+
             steps_pbar.close()
 
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
@@ -853,7 +870,7 @@ def main(args):
             log_writer.add_scalar("performance/minutes per epoch", elapsed_epoch_time, global_step)
 
             epoch_pbar.update(1)
-            if epoch < args.max_epochs - 1:
+            if do_shuffle_items and epoch < args.max_epochs - 1:
                 train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
                 write_batch_schedule(args, log_folder, train_batch, epoch + 1)
 

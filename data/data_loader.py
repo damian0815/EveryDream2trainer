@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import bisect
+import contextlib
 import logging
-import os.path
-from collections import defaultdict
 import math
 import copy
 
@@ -175,3 +174,17 @@ class DataLoaderMultiAspect():
         for item in self.prepared_train_data:
             self.rating_overall_sum += item.caption.rating()
             self.ratings_summed.append(self.rating_overall_sum)
+
+    @contextlib.contextmanager
+    def renormalize_multipliers(self):
+        multiplier_sum = sum([i.multiplier for i in self.prepared_train_data])
+        yield
+        new_multiplier_sum = sum([i.multiplier for i in self.prepared_train_data])
+        normalization_scale = multiplier_sum / new_multiplier_sum
+        print(f"sum of all multipliers was {multiplier_sum}, now {new_multiplier_sum} -> scaling by {normalization_scale}")
+        for i in self.prepared_train_data:
+            i.multiplier *= normalization_scale
+
+    def scale_multiplier(self, identifier, scale):
+        item = next(i for i in self.prepared_train_data if i.identifier == identifier)
+        item.multiplier *= scale

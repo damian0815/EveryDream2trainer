@@ -282,6 +282,10 @@ class ImageTrainItem:
         self.error = None
         self.__compute_target_width_height()
 
+    @property
+    def identifier(self):
+        return self.pathname
+
     def hydrate(self, crop=False, crop_jitter=20):
         """
         crop: hard center crop to 512x512

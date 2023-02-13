@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import contextlib
 import logging
 import torch
 from torch.utils.data import Dataset
@@ -111,6 +112,8 @@ class EveryDreamBatch(Dataset):
 
         example["runt_size"] = train_item["runt_size"]
 
+        example["identifier"] = train_item["identifier"]
+
         return example
 
     def __get_image_for_trainer(self, image_train_item: ImageTrainItem):
@@ -122,7 +125,7 @@ class EveryDreamBatch(Dataset):
         image_train_tmp.image = None # hack for now to avoid memory leak
         example["caption"] = image_train_tmp.caption
         example["runt_size"] = image_train_tmp.runt_size
-       
+        example["identifier"] = image_train_item.pathname # assuming pathnames are unique
         return example
 
     def __update_image_train_items(self, dropout_fraction: float):
