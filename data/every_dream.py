@@ -149,6 +149,7 @@ def collate_fn(batch):
     images = [example["image"] for example in batch]
     captions = [example["caption"] for example in batch]
     tokens = [example["tokens"] for example in batch]
+    identifiers = [example["identifier"] for example in batch]
     runt_size = batch[0]["runt_size"]
 
     images = torch.stack(images)
@@ -159,6 +160,7 @@ def collate_fn(batch):
         "image": images,
         "captions": captions,
         "runt_size": runt_size,
+        "identifier": identifiers,
     }
     del batch
     return ret
