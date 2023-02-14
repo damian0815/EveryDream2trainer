@@ -39,7 +39,8 @@ class DataLoaderMultiAspect():
         self.prepared_train_data = image_train_items
         random.Random(self.seed).shuffle(self.prepared_train_data)
         self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
-        self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
+        self.original_multipliers = {i.identifier: i.multiplier for i in self.prepared_train_data}
+        self.expected_epoch_size = math.floor(sum(self.original_multipliers.values()))
         if self.expected_epoch_size != len(self.prepared_train_data):
             logging.info(f" * DLMA initialized with {len(image_train_items)} source images. After applying multipliers, each epoch will train on at least {self.expected_epoch_size} images.")
         else:
@@ -176,7 +177,12 @@ class DataLoaderMultiAspect():
             self.ratings_summed.append(self.rating_overall_sum)
 
     @contextlib.contextmanager
-    def renormalize_multipliers(self):
+    def renormalize_multipliers(self, self_reset_alpha=0.8):
+        # restore
+        for i in self.prepared_train_data:
+            original_multiplier = self.original_multipliers[i.identifier]
+            i.multiplier = i.multiplier * self_reset_alpha + (original_multiplier * (1.0 - self_reset_alpha))
+
         multiplier_sum = sum([i.multiplier for i in self.prepared_train_data])
         yield
         new_multiplier_sum = sum([i.multiplier for i in self.prepared_train_data])

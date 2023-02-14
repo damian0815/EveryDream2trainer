@@ -748,6 +748,7 @@ def main(args):
         
         prev_loss_epoch = None
         for epoch in range(args.max_epochs):
+            torch.manual_seed(seed + (epoch // 2))
             loss_epoch = []
             identifiers = []
             epoch_start_time = time.time()
