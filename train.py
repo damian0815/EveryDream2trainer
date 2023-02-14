@@ -864,6 +864,7 @@ def main(args):
                             # and vice versa
                             data_loader.scale_multiplier(identifier, loss_change_proportions)
                 do_shuffle_items = True
+                prev_loss_epoch = None
 
             steps_pbar.close()
 
