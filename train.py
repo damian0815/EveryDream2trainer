@@ -858,11 +858,12 @@ def main(args):
                 loss_change_proportions = [l / prev_loss_epoch[i] for i,l in enumerate(loss_epoch)]
                 with data_loader.renormalize_multipliers():
                     print(f"scaling items {identifiers}: {loss_change_proportions}")
-                    for i, loss_change_proportions in enumerate(loss_change_proportions):
+                    for i, loss_change_proportion in enumerate(loss_change_proportions):
+                        lr_adjusted_change_proportion = math.pow(10, math.log10(loss_change_proportion) * -math.log10(args.lr))
                         for identifier in identifiers[i]:
                             # if loss increases, so does multiplier
                             # and vice versa
-                            data_loader.scale_multiplier(identifier, loss_change_proportions)
+                            data_loader.scale_multiplier(identifier, lr_adjusted_change_proportion)
                 do_shuffle_items = True
                 prev_loss_epoch = None
 
