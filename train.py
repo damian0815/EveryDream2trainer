@@ -797,6 +797,7 @@ def main(args):
 
                 loss_log_step.append(loss_step)
                 loss_epoch.append(loss_step)
+                identifiers.append(batch["identifier"])
 
                 if (global_step + 1) % args.log_step == 0:
                     curr_lr = lr_scheduler.get_last_lr()[0]
@@ -855,7 +856,7 @@ def main(args):
             else:
                 loss_change_proportions = [l / prev_loss_epoch[i] for i,l in enumerate(loss_epoch)]
                 with data_loader.renormalize_multipliers():
-                    print(f"scaling items: {loss_change_proportions}")
+                    print(f"scaling items {identifiers}: {loss_change_proportions}")
                     for i, loss_change_proportions in enumerate(loss_change_proportions):
                         for identifier in identifiers[i]:
                             # if loss increases, so does multiplier
