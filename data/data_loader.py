@@ -181,7 +181,8 @@ class DataLoaderMultiAspect():
         # restore
         for i in self.prepared_train_data:
             original_multiplier = self.original_multipliers[i.identifier]
-            i.multiplier = i.multiplier * self_reset_alpha + (original_multiplier * (1.0 - self_reset_alpha))
+            i.multiplier = math.exp(math.log(i.multiplier) * self_reset_alpha +
+                                    math.log(original_multiplier) * (1-self_reset_alpha))
 
         multiplier_sum = sum([i.multiplier for i in self.prepared_train_data])
         yield
@@ -193,4 +194,6 @@ class DataLoaderMultiAspect():
 
     def scale_multiplier(self, identifier, scale):
         item = next(i for i in self.prepared_train_data if i.identifier == identifier)
-        item.multiplier *= scale
+        max_multiplier = 8
+        min_multiplier = 1/max_multiplier
+        item.multiplier = max(min_multiplier, min(max_multiplier, item.multiplier*scale))
