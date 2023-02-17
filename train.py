@@ -813,7 +813,7 @@ def main(args):
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator:
-        validator.setup_intermediate_validation_steps(steps_per_epoch=len(train_batch))
+        validator.setup_intermediate_validation_steps(steps_per_epoch=len(train_dataloader))
 
     try:
         # # dummy batch to pin memory to avoid fragmentation in torch, uses square aspect which is maximum bytes size per aspects.py
