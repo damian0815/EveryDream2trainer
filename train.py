@@ -813,8 +813,9 @@ def main(args):
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator:
-        validator.do_validation_if_appropriate(epoch=0, global_step=0,
-                                               get_model_prediction_and_target_callable=get_model_prediction_and_target)
+        validator.setup_intermediate_validation_steps(steps_per_epoch=len(train_batch))
+        validator.do_validation_if_appropriate(epoch=0, global_step=0, epoch_step=0,
+                                               model_prediction_callback=get_model_prediction_and_target)
 
     try:
         # # dummy batch to pin memory to avoid fragmentation in torch, uses square aspect which is maximum bytes size per aspects.py
@@ -934,6 +935,13 @@ def main(args):
                     __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
 
                 del batch
+
+                # do intermediate validation steps, if requested
+                if validator:
+                    validator.do_validation_if_appropriate(epoch, global_step=global_step,
+                                                           epoch_step=step,
+                                                           model_prediction_callback=get_model_prediction_and_target)
+
                 global_step += 1
                 update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
                 # end of step
@@ -953,7 +961,10 @@ def main(args):
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
 
             if validator:
-                validator.do_validation_if_appropriate(epoch+1, global_step, get_model_prediction_and_target)
+                validator.do_validation_if_appropriate(epoch+1,
+                                                       global_step=global_step,
+                                                       epoch_step=len(train_batch),
+                                                       model_prediction_callback=get_model_prediction_and_target)
             
             gc.collect()
             # end of epoch

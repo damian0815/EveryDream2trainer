@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 import math
@@ -50,6 +49,7 @@ class EveryDreamValidator:
         self.config = {
             'batch_size': default_batch_size,
             'every_n_epochs': 1,
+            'intermediate_validations_per_epoch': 0,
             'seed': 555,
 
             'validate_training': True,
@@ -59,6 +59,7 @@ class EveryDreamValidator:
             'stabilize_training_loss': False,
             'stabilize_split_proportion': 0.15
         }
+        self.intermediate_steps_to_log = []
         if val_config_path is not None:
             with open(val_config_path, 'rt') as f:
                 self.config.update(json.load(f))
@@ -68,7 +69,7 @@ class EveryDreamValidator:
         return self.config['batch_size']
 
     @property
-    def every_n_epochs(self):
+    def every_n_epochs(self) -> int:
         return self.config['every_n_epochs']
 
     @property
@@ -90,15 +91,23 @@ class EveryDreamValidator:
                 remaining_train_items, tokenizer)
             return remaining_train_items
 
-    def do_validation_if_appropriate(self, epoch: int, global_step: int,
-                                     get_model_prediction_and_target_callable: Callable[
+    def setup_intermediate_validation_steps(self, steps_per_epoch: int):
+        intermediate_validations_per_epoch = self.config['intermediate_validations_per_epoch']
+        if intermediate_validations_per_epoch == 0:
+            self.intermediate_steps_to_log = []
+        else:
+            slice_size = steps_per_epoch // intermediate_validations_per_epoch
+            self.intermediate_steps_to_log = [(i+1) * slice_size for i in range(intermediate_validations_per_epoch)]
+
+    def do_validation_if_appropriate(self, epoch: int, global_step: int, epoch_step: int,
+                                     model_prediction_callback: Callable[
                                          [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
-        if (epoch % self.every_n_epochs) == 0:
+        if ((epoch % self.every_n_epochs) == 0 or epoch_step in self.intermediate_steps_to_log):
             if self.train_overlapping_dataloader is not None:
                 self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader,
-                                    get_model_prediction_and_target_callable)
+                                    model_prediction_callback)
             if self.val_dataloader is not None:
-                self._do_validation('val', global_step, self.val_dataloader, get_model_prediction_and_target_callable)
+                self._do_validation('val', global_step, self.val_dataloader, model_prediction_callback)
 
     def _do_validation(self, tag, global_step, dataloader, get_model_prediction_and_target: Callable[
         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
