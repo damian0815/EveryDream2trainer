@@ -96,8 +96,9 @@ class EveryDreamValidator:
         if intermediate_validations_per_epoch == 0:
             self.epoch_steps_to_validate = [0]
         else:
-            slice_size = steps_per_epoch // intermediate_validations_per_epoch
+            slice_size = steps_per_epoch // (intermediate_validations_per_epoch + 1)
             self.epoch_steps_to_validate = [i * slice_size for i in range(intermediate_validations_per_epoch + 1)]
+        print(f"for {intermediate_validations_per_epoch} validations per epoch, will validate at epoch steps {self.epoch_steps_to_validate}")
 
     def do_validation_if_appropriate(self, epoch_step: int, global_step: int,
                                      model_prediction_callback: Callable[
