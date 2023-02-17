@@ -59,7 +59,7 @@ class EveryDreamValidator:
             'stabilize_training_loss': False,
             'stabilize_split_proportion': 0.15
         }
-        self.intermediate_steps_to_log = []
+        self.epoch_steps_to_validate = [0]
         if val_config_path is not None:
             with open(val_config_path, 'rt') as f:
                 self.config.update(json.load(f))
@@ -94,15 +94,15 @@ class EveryDreamValidator:
     def setup_intermediate_validation_steps(self, steps_per_epoch: int):
         intermediate_validations_per_epoch = self.config['intermediate_validations_per_epoch']
         if intermediate_validations_per_epoch == 0:
-            self.intermediate_steps_to_log = []
+            self.epoch_steps_to_validate = [0]
         else:
             slice_size = steps_per_epoch // intermediate_validations_per_epoch
-            self.intermediate_steps_to_log = [(i+1) * slice_size for i in range(intermediate_validations_per_epoch)]
+            self.epoch_steps_to_validate = [i * slice_size for i in range(intermediate_validations_per_epoch + 1)]
 
-    def do_validation_if_appropriate(self, epoch: int, global_step: int, epoch_step: int,
+    def do_validation_if_appropriate(self, epoch_step: int, global_step: int,
                                      model_prediction_callback: Callable[
                                          [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
-        if ((epoch % self.every_n_epochs) == 0 or epoch_step in self.intermediate_steps_to_log):
+        if epoch_step in self.epoch_steps_to_validate:
             if self.train_overlapping_dataloader is not None:
                 self._do_validation('stabilize-train', global_step, self.train_overlapping_dataloader,
                                     model_prediction_callback)
