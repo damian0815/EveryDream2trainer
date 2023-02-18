@@ -846,6 +846,12 @@ def main(args):
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
 
             for step, batch in enumerate(train_dataloader):
+                # do intermediate validation steps, if requested
+                if validator:
+                    validator.do_validation_if_appropriate(global_step=global_step,
+                                                           epoch_step=step,
+                                                           model_prediction_callback=get_model_prediction_and_target)
+
                 step_start_time = time.time()
 
                 model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
@@ -933,12 +939,6 @@ def main(args):
                     __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
 
                 del batch
-
-                # do intermediate validation steps, if requested
-                if validator:
-                    validator.do_validation_if_appropriate(global_step=global_step,
-                                                           epoch_step=step,
-                                                           model_prediction_callback=get_model_prediction_and_target)
 
                 global_step += 1
                 update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
