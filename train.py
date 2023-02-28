@@ -125,12 +125,12 @@ def setup_local_logger(args):
 
     return datetimestamp
 
-def log_optimizer(optimizer: torch.optim.Optimizer, betas, epsilon):
+def log_optimizer(optimizer: torch.optim.Optimizer, betas, epsilon, weight_decay, lr):
     """
     logs the optimizer settings
     """
     logging.info(f"{Fore.CYAN} * Optimizer: {optimizer.__class__.__name__} *{Style.RESET_ALL}")
-    logging.info(f"    betas: {betas}, epsilon: {epsilon} *{Style.RESET_ALL}")
+    logging.info(f"{Fore.CYAN}    lr: {lr}, betas: {betas}, epsilon: {epsilon}, weight_decay: {weight_decay} *{Style.RESET_ALL}")
 
 def save_optimizer(optimizer: torch.optim.Optimizer, path: str):
     """
@@ -173,7 +173,6 @@ def append_epoch_log(global_step: int, epoch_pbar, gpu, log_writer, **logs):
         if logs is not None:
             epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{global_step}")
 
-
 def set_args_12gb(args):
     logging.info(" Setting args to 12GB mode")
     if not args.gradient_checkpointing:   
@@ -182,15 +181,10 @@ def set_args_12gb(args):
     if args.batch_size != 1:
         logging.info("  - Overiding batch size to 1")
         args.batch_size = 1
-    # if args.grad_accum != 1:
-    #     logging.info("   Overiding grad accum to 1")
         args.grad_accum = 1
     if args.resolution > 512:
         logging.info("  - Overiding resolution to 512")
         args.resolution = 512
-    if not args.useadam8bit:
-        logging.info("  - Overiding adam8bit to True")
-        args.useadam8bit = True
 
 def find_last_checkpoint(logdir):
     """
@@ -235,6 +229,9 @@ def setup_args(args):
         args.shuffle_tags = False
 
     args.clip_skip = max(min(4, args.clip_skip), 0)
+
+    if args.useadam8bit:
+        logging.warning(f"{Fore.LIGHTYELLOW_EX} Useadam8bit arg is deprecated, use optimizer.json instead, which defaults to useadam8bit anyway{Style.RESET_ALL}")
 
     if args.ckpt_every_n_minutes is None and args.save_every_n_epochs is None:
         logging.info(f"{Fore.LIGHTCYAN_EX} No checkpoint saving specified, defaulting to every 20 minutes.{Style.RESET_ALL}")
@@ -347,11 +344,17 @@ def read_sample_prompts(sample_prompts_file_path: str):
             sample_prompts.append(line.strip())
     return sample_prompts
 
+def log_args(log_writer, args):
+    arglog = "args:\n"
+    for arg, value in sorted(vars(args).items()):
+        arglog += f"{arg}={value}, "
+    log_writer.add_text("config", arglog)
+
 
 def main(args):
     """
     Main entry point
-    """
+    """   
     log_time = setup_local_logger(args)
     args = setup_args(args)
 
@@ -427,21 +430,24 @@ def main(args):
         hf_cache_path = get_hf_ckpt_cache_path(args.resume_ckpt)
         if os.path.exists(hf_cache_path) or os.path.exists(args.resume_ckpt):
             model_root_folder, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
+            text_encoder = CLIPTextModel.from_pretrained(model_root_folder, subfolder="text_encoder")
+            vae = AutoencoderKL.from_pretrained(model_root_folder, subfolder="vae")
+            unet = UNet2DConditionModel.from_pretrained(model_root_folder, subfolder="unet")
         else:
             # try to download from HF using resume_ckpt as a repo id
-            print(f"local file/folder not found for {args.resume_ckpt}, will try to download from huggingface.co")
-            hf_repo_subfolder = args.hf_repo_subfolder if hasattr(args, 'hf_repo_subfolder') else None
-            model_root_folder, is_sd1attn, yaml = try_download_model_from_hf(repo_id=args.resume_ckpt,
-                                                                             subfolder=hf_repo_subfolder)
-            if model_root_folder is None:
+            downloaded = try_download_model_from_hf(repo_id=args.resume_ckpt)
+            if downloaded is None:
                 raise ValueError(f"No local file/folder for {args.resume_ckpt}, and no matching huggingface.co repo could be downloaded")
+            pipe, model_root_folder, is_sd1attn, yaml = downloaded
+            text_encoder = pipe.text_encoder
+            vae = pipe.vae
+            unet = pipe.unet
+            del pipe
 
-        text_encoder = CLIPTextModel.from_pretrained(model_root_folder, subfolder="text_encoder")
-        vae = AutoencoderKL.from_pretrained(model_root_folder, subfolder="vae")
-        unet = UNet2DConditionModel.from_pretrained(model_root_folder, subfolder="unet")
         reference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
         noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
+
     except Exception as e:
         traceback.print_exc()
         logging.error(" * Failed to load checkpoint *")
@@ -450,7 +456,7 @@ def main(args):
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         text_encoder.gradient_checkpointing_enable()
-    
+
     if not args.disable_xformers:
         if (args.amp and is_sd1attn) or (not is_sd1attn):
             try:
@@ -463,10 +469,6 @@ def main(args):
     else:
         logging.info("xformers disabled, using attention slicing instead")
         unet.set_attention_slice("auto")
-
-    default_lr = 2e-6
-    curr_lr = args.lr if args.lr is not None else default_lr
-
 
     vae = vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
     unet = unet.to(device, dtype=torch.float32)
@@ -485,36 +487,72 @@ def main(args):
         logging.info(f"{Fore.CYAN} * Training Text and Unet *{Style.RESET_ALL}")
         params_to_train = itertools.chain(unet.parameters(), text_encoder.parameters())
 
+    optimizer_config = None
+    optimizer_config_path  = args.optimizer_config if args.optimizer_config else "optimizer.json"
+    if os.path.exists(os.path.join(os.curdir, optimizer_config_path)):
+        with open(os.path.join(os.curdir, optimizer_config_path), "r") as f:
+            optimizer_config = json.load(f)
+
+    if args.wandb is not None and args.wandb:
+        wandb.init(project=args.project_name, 
+                   sync_tensorboard=True, 
+                   dir=args.logdir, 
+                   config={"main":args, "optimizer":optimizer_config}, 
+                   name=args.run_name,
+                   )
+
     log_writer = SummaryWriter(log_dir=log_folder,
-                                   flush_secs=5,
-                                   comment="EveryDream2FineTunes",
-                                  )
+                               flush_secs=10,
+                               comment=args.run_name if args.run_name is not None else "EveryDream2FineTunes",
+                              )
 
-    betas = (0.9, 0.999)
+    betas = [0.9, 0.999]
     epsilon = 1e-8
-    if args.amp:
-        epsilon = 1e-8
-    
     weight_decay = 0.01
-    if args.useadam8bit:
-        import bitsandbytes as bnb
-        opt_class = bnb.optim.AdamW8bit
-        logging.info(f"{Fore.CYAN} * Using AdamW 8-bit Optimizer *{Style.RESET_ALL}")
-    else:
-        opt_class = torch.optim.AdamW
-        logging.info(f"{Fore.CYAN} * Using AdamW standard Optimizer *{Style.RESET_ALL}")
+    opt_class = None
+    optimizer = None
 
-    optimizer = opt_class(
+    default_lr = 1e-6
+    curr_lr = args.lr
+
+    if optimizer_config is not None:
+        betas = optimizer_config["betas"]
+        epsilon = optimizer_config["epsilon"]
+        weight_decay = optimizer_config["weight_decay"]
+        optimizer_name = optimizer_config["optimizer"]
+        curr_lr = optimizer_config.get("lr", curr_lr)
+        logging.info(f" * Loaded optimizer args from {optimizer_config_path} *")
+
+    if curr_lr is None:
+        curr_lr = default_lr
+
+    if optimizer_name:
+        if optimizer_name == "lion":
+            from lion_pytorch import Lion
+            opt_class = Lion
+            optimizer = opt_class(
+                itertools.chain(params_to_train),
+                lr=curr_lr,
+                betas=(betas[0], betas[1]),
+                weight_decay=weight_decay,
+            )
+        elif optimizer_name in ["adamw"]:            
+            opt_class = torch.optim.AdamW
+        else:
+            import bitsandbytes as bnb
+            opt_class = bnb.optim.AdamW8bit
+
+    if not optimizer:
+        optimizer = opt_class(
             itertools.chain(params_to_train),
             lr=curr_lr,
-            betas=betas,
+            betas=(betas[0], betas[1]),
             eps=epsilon,
             weight_decay=weight_decay,
             amsgrad=False,
         )
 
-    log_optimizer(optimizer, betas, epsilon)
-
+    log_optimizer(optimizer, betas, epsilon, weight_decay, curr_lr)
 
     image_train_items = resolve_image_train_items(args, log_folder)
 
@@ -561,16 +599,6 @@ def main(args):
         num_warmup_steps=lr_warmup_steps,
         num_training_steps=args.lr_decay_steps,
     )
-
-    if args.wandb is not None and args.wandb:
-        wandb.init(project=args.project_name, sync_tensorboard=True, dir=args.logdir, config=args)
-
-
-    def log_args(log_writer, args):
-        arglog = "args:\n"
-        for arg, value in sorted(vars(args).items()):
-            arglog += f"{arg}={value}, "
-        log_writer.add_text("config", arglog)
     
     log_args(log_writer, args)
 
@@ -688,7 +716,6 @@ def main(args):
 
             cuda_caption = tokens.to(text_encoder.device)
 
-        # with autocast(enabled=args.amp):
         encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
 
         if args.clip_skip > 0:
@@ -718,30 +745,8 @@ def main(args):
                                                get_model_prediction_and_target_callable=get_model_prediction_and_target)
 
     try:
-        # # dummy batch to pin memory to avoid fragmentation in torch, uses square aspect which is maximum bytes size per aspects.py
-        # pixel_values = torch.randn_like(torch.zeros([args.batch_size, 3, args.resolution, args.resolution]))
-        # pixel_values = pixel_values.to(unet.device)
-        # with autocast(enabled=args.amp):
-        #     latents = vae.encode(pixel_values, return_dict=False)
-        # latents = latents[0].sample() * 0.18215
-        # noise = torch.randn_like(latents)
-        # bsz = latents.shape[0]
-        # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-        # timesteps = timesteps.long()
-        # noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        # cuda_caption = torch.linspace(100,177, steps=77, dtype=int).to(text_encoder.device)
-        # encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True).last_hidden_state
-        # with autocast(enabled=args.amp):
-        #     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        # # discard the grads, just want to pin memory
-        # optimizer.zero_grad(set_to_none=True)
-
-
-        write_batch_schedule(args, log_folder, train_batch, 0)
-
-        if validator:
-            validator.do_validation_if_appropriate(0, global_step, get_model_prediction_and_target)
-
+        write_batch_schedule(args, log_folder, train_batch, epoch = 0)
+        
         for epoch in range(args.max_epochs):
             loss_epoch = []
             epoch_start_time = time.time()
@@ -914,7 +919,6 @@ if __name__ == "__main__":
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1)")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
-    argparser.add_argument("--hf_repo_subfolder", type=str, default=None, help="Subfolder inside the huggingface repo to download, if the model is not in the root of the repo.")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--lowvram", action="store_true", default=False, help="automatically overrides various args to support 12GB gpu")
@@ -924,9 +928,11 @@ if __name__ == "__main__":
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
     argparser.add_argument("--notebook", action="store_true", default=False, help="disable keypresses and uses tqdm.notebook for jupyter notebook (def: False)")
+    argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
     argparser.add_argument("--resolution", type=int, default=512, help="resolution to train", choices=supported_resolutions)
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
+    argparser.add_argument("--run_name", type=str, required=False, default=None, help="Run name for wandb (child of project name), and comment for tensorboard, (def: None)")
     argparser.add_argument("--sample_prompts", type=str, default="sample_prompts.txt", help="Text file with prompts to generate test samples from, or JSON file with sample generator settings (default: sample_prompts.txt)")
     argparser.add_argument("--sample_steps", type=int, default=250, help="Number of steps between samples (def: 250)")
     argparser.add_argument("--save_ckpt_dir", type=str, default=None, help="folder to save checkpoints to (def: root training folder)")
@@ -937,7 +943,7 @@ if __name__ == "__main__":
     argparser.add_argument("--scale_lr", action="store_true", default=False, help="automatically scale up learning rate based on batch size and grad accumulation (def: False)")
     argparser.add_argument("--seed", type=int, default=555, help="seed used for samples and shuffling, use -1 for random")
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
-    argparser.add_argument("--useadam8bit", action="store_true", default=False, help="Use AdamW 8-Bit optimizer, recommended!")
+    argparser.add_argument("--useadam8bit", action="store_true", default=False, help="deprecated, use --optimizer_config and optimizer.json instead")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
     argparser.add_argument("--validation_config", default=None, help="Path to a JSON configuration file for the validator.  Default is no validation.")
     argparser.add_argument("--write_schedule", action="store_true", default=False, help="write schedule of images and their batches to file (def: False)")

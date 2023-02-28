@@ -6,6 +6,8 @@ Please join us on Discord! https://discord.gg/uheqxU6sXN
 
 If you find this tool useful, please consider subscribing to the project on [Patreon](https://www.patreon.com/everydream) or a one-time donation at [Ko-fi](https://ko-fi.com/everydream).
 
+If you're coming from Dreambooth, please [read this](doc/NOTDREAMBOOTH.md) for an explanation of why EveryDream is not Dreambooth.
+
 ## Video tutorials
 
 ### [Basic setup and getting started](https://www.youtube.com/watch?v=OgpJK8SUW3c) 
@@ -35,6 +37,8 @@ Make sure to check out the [tools repo](https://github.com/victorchall/EveryDrea
 
 [Advanced Tweaking](doc/ATWEAKING.md) - More stuff to tweak once you are comfortable
 
+[Advanced Optimizer Tweaking](/doc/OPTIMIZER.md) - Even more stuff to tweak if you are *very adventurous*
+
 [Chaining training sessions](doc/CHAINING.md) - Modify training parameters by chaining training sessions together end to end
 
 [Shuffling Tags](doc/SHUFFLING_TAGS.md)
@@ -50,3 +54,5 @@ Make sure to check out the [tools repo](https://github.com/victorchall/EveryDrea
 [Free tier Google Colab notebook](https://colab.research.google.com/github/victorchall/EveryDream2trainer/blob/main/Train_Colab.ipynb)
 
 [RunPod / Vast](/doc/CLOUD_SETUP.md)
+
+[Docker image link](https://github.com/victorchall/EveryDream2trainer/pkgs/container/everydream2trainer)
