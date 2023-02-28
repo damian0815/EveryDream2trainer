@@ -53,7 +53,7 @@ from torch.utils.tensorboard import SummaryWriter
 from data.data_loader import DataLoaderMultiAspect
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
-from data.every_dream_validation import EveryDreamValidator
+from data.every_dream_validation import EveryDreamValidator, AutoMultiplierUpdater
 from data.image_train_item import ImageTrainItem
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
@@ -572,6 +572,10 @@ def main(args):
         batch_size=args.batch_size,
     )
 
+    auto_multiplier_updater = None
+    if args.auto_multiplier_beta is not None:
+        auto_multiplier_updater = AutoMultiplierUpdater(data_loader=data_loader, beta=args.auto_multiplier_beta)
+
     train_batch = EveryDreamBatch(
         data_loader=data_loader,
         debug_level=1,
@@ -746,11 +750,9 @@ def main(args):
     try:
         write_batch_schedule(args, log_folder, train_batch, epoch = 0)
         
-        prev_loss_epoch = None
         for epoch in range(args.max_epochs):
             torch.manual_seed(seed + (epoch // 2))
             loss_epoch = []
-            identifiers = []
             epoch_start_time = time.time()
             images_per_sec_log_step = []
 
@@ -798,7 +800,6 @@ def main(args):
 
                 loss_log_step.append(loss_step)
                 loss_epoch.append(loss_step)
-                identifiers.append(batch["identifier"])
 
                 if (global_step + 1) % args.log_step == 0:
                     curr_lr = lr_scheduler.get_last_lr()[0]
@@ -850,22 +851,10 @@ def main(args):
                 update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
                 # end of step
 
-            # apply loss deltas to item multipliers
-            do_shuffle_items = False
-            if prev_loss_epoch is None:
-                prev_loss_epoch = loss_epoch
+            if auto_multiplier_updater is not None:
+                do_shuffle_items = auto_multiplier_updater.update_multipliers()
             else:
-                loss_change_proportions = [l / prev_loss_epoch[i] for i,l in enumerate(loss_epoch)]
-                with data_loader.renormalize_multipliers():
-                    #print(f"scaling items {identifiers}: {loss_change_proportions}")
-                    for i, loss_change_proportion in enumerate(loss_change_proportions):
-                        lr_adjusted_change_proportion = math.pow(10, math.log10(loss_change_proportion) * -math.log10(args.lr))
-                        for identifier in identifiers[i]:
-                            # if loss increases, so does multiplier
-                            # and vice versa
-                            data_loader.scale_multiplier(identifier, lr_adjusted_change_proportion)
                 do_shuffle_items = True
-                prev_loss_epoch = None
 
             steps_pbar.close()
 
@@ -874,8 +863,9 @@ def main(args):
             log_writer.add_scalar("performance/minutes per epoch", elapsed_epoch_time, global_step)
 
             epoch_pbar.update(1)
-            if do_shuffle_items and epoch < args.max_epochs - 1:
-                train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
+            if epoch < args.max_epochs - 1:
+                if do_shuffle_items:
+                    train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
                 write_batch_schedule(args, log_folder, train_batch, epoch + 1)
 
             loss_local = sum(loss_epoch) / len(loss_epoch)
@@ -926,6 +916,7 @@ if __name__ == "__main__":
 
     argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
     argparser.add_argument("--amp", action="store_true", default=False, help="Enables automatic mixed precision compute, recommended on")
+    argparser.add_argument("--auto_multiplier_beta", type=float, default=None, help="(Optional) Feedback beta for the auto-multiplier system, omit to disable")
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
     argparser.add_argument("--ckpt_every_n_minutes", type=int, default=None, help="Save checkpoint every n minutes, def: 20")
     argparser.add_argument("--clip_grad_norm", type=float, default=None, help="Clip gradient norm (def: disabled) (ex: 1.5), useful if loss=nan?")

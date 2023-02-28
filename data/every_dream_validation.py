@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 import math
@@ -108,9 +107,10 @@ class EveryDreamValidator:
             steps_pbar = tqdm(range(len(dataloader)), position=1)
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({tag}){Style.RESET_ALL}")
 
+            # ok to override seed here because we are in a `with isolate_rng():` block
+            torch.manual_seed(self.seed)
+
             for step, batch in enumerate(dataloader):
-                # ok to override seed here because we are in a `with isolate_rng():` block
-                torch.manual_seed(self.seed + step)
                 model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -149,7 +149,7 @@ class EveryDreamValidator:
             logging.info(f" * Loaded {len(val_items)} validation images from {val_data_root}")
         else:
             raise ValueError(f"Unrecognized validation split mode '{val_split_mode}'")
-        val_ed_batch = self._build_ed_batch(val_items, batch_size=self.batch_size, tokenizer=tokenizer, name='val')
+        val_ed_batch = self._build_ed_batch(val_items, tokenizer=tokenizer, name='val')
         val_dataloader = build_torch_dataloader(val_ed_batch, batch_size=self.batch_size)
         return val_dataloader, remaining_train_items
 
@@ -162,12 +162,11 @@ class EveryDreamValidator:
         stabilize_split_proportion = self.config['stabilize_split_proportion']
         stabilize_items, _ = get_random_split(image_train_items, stabilize_split_proportion, batch_size=self.batch_size)
         stabilize_items = list(disable_multiplier_and_flip(stabilize_items))
-        stabilize_ed_batch = self._build_ed_batch(stabilize_items, batch_size=self.batch_size, tokenizer=tokenizer,
-                                                  name='stabilize-train')
+        stabilize_ed_batch = self._build_ed_batch(stabilize_items, tokenizer=tokenizer, name='stabilize-train')
         stabilize_dataloader = build_torch_dataloader(stabilize_ed_batch, batch_size=self.batch_size)
         return stabilize_dataloader
 
-    def _build_ed_batch(self, items: list[ImageTrainItem], batch_size: int, tokenizer, name='val'):
+    def _build_ed_batch(self, items: list[ImageTrainItem], tokenizer, name='val'):
         batch_size = self.batch_size
         seed = self.seed
         data_loader = DataLoaderMultiAspect(
@@ -184,3 +183,29 @@ class EveryDreamValidator:
             name=name,
         )
         return ed_batch
+
+class AutoMultiplierUpdater:
+
+    def __init__(self, data_loader: DataLoaderMultiAspect, beta: float):
+        self.data_loader = data_loader
+        self.beta = beta
+        self.identifiers = batch["identifier"])
+
+
+    def update_multipliers(self, batches, loss_epoch):
+        # apply loss deltas to item multipliers
+        if self.prev_loss_epoch is None:
+            self.prev_loss_epoch = loss_epoch
+            return False
+        else:
+            loss_change_proportions = [l/self.prev_loss_epoch[i] for i, l in enumerate(loss_epoch)]
+            with self.data_loader.renormalize_multipliers():
+                # print(f"scaling items {identifiers}: {loss_change_proportions}")
+                for i, loss_change_proportion in enumerate(loss_change_proportions):
+                    adjusted_change_proportion = math.pow(10, math.log10(loss_change_proportion) * self.beta)
+                    for identifier in self.identifiers[i]:
+                        # if loss increases, so does multiplier
+                        # and vice versa
+                        self.data_loader.scale_multiplier(identifier, adjusted_change_proportion)
+            self.prev_loss_epoch = None
+            return True
