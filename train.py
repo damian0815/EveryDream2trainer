@@ -574,7 +574,7 @@ def main(args):
 
     auto_multiplier_updater = None
     if args.auto_multiplier_beta is not None:
-        auto_multiplier_updater = AutoMultiplierUpdater(data_loader=data_loader, beta=args.auto_multiplier_beta)
+        auto_multiplier_updater = AutoMultiplierUpdater(beta=args.auto_multiplier_beta, dlma=data_loader)
 
     train_batch = EveryDreamBatch(
         data_loader=data_loader,
@@ -765,7 +765,7 @@ def main(args):
 
                 model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
 
-                #del timesteps, encoder_hidden_states, noisy_latents
+                #del timesteps, encoder_hidden  _states, noisy_latents
                 #with autocast(enabled=args.amp):
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -852,7 +852,7 @@ def main(args):
                 # end of step
 
             if auto_multiplier_updater is not None:
-                do_shuffle_items = auto_multiplier_updater.update_multipliers()
+                do_shuffle_items = auto_multiplier_updater.update_multipliers(loss_epoch=loss_epoch, torch_dataloader=train_dataloader)
             else:
                 do_shuffle_items = True
 
@@ -890,7 +890,8 @@ def main(args):
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
         save_path = os.path.join(f"{log_folder}/ckpts/errored-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
+        # DO NOT GIT COMMIT THIS
+        #__save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")

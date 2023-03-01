@@ -186,26 +186,40 @@ class EveryDreamValidator:
 
 class AutoMultiplierUpdater:
 
-    def __init__(self, data_loader: DataLoaderMultiAspect, beta: float):
-        self.data_loader = data_loader
+    def __init__(self, beta: float, dlma: DataLoaderMultiAspect):
         self.beta = beta
-        self.identifiers = batch["identifier"])
+        self.prev_loss_epoch = None
+        self.batched_identifiers = None
+        self.dlma = dlma
 
 
-    def update_multipliers(self, batches, loss_epoch):
+    def update_multipliers(self, loss_epoch, torch_dataloader: torch.utils.data.DataLoader):
         # apply loss deltas to item multipliers
+        batched_identifiers = [b["identifier"] for _, b in enumerate(torch_dataloader)]
         if self.prev_loss_epoch is None:
             self.prev_loss_epoch = loss_epoch
+            self.batched_identifiers = batched_identifiers
+            print("identifiers: ", self.batched_identifiers)
             return False
         else:
             loss_change_proportions = [l/self.prev_loss_epoch[i] for i, l in enumerate(loss_epoch)]
-            with self.data_loader.renormalize_multipliers():
-                # print(f"scaling items {identifiers}: {loss_change_proportions}")
-                for i, loss_change_proportion in enumerate(loss_change_proportions):
-                    adjusted_change_proportion = math.pow(10, math.log10(loss_change_proportion) * self.beta)
-                    for identifier in self.identifiers[i]:
-                        # if loss increases, so does multiplier
-                        # and vice versa
-                        self.data_loader.scale_multiplier(identifier, adjusted_change_proportion)
+            if self.batched_identifiers != batched_identifiers:
+                logging.error("Batch order has changed, cannot update multipliers")
+            else:
+                with self.dlma.renormalize_multipliers():
+                    print(f"scaling items {self.batched_identifiers}: {loss_change_proportions}")
+                    for i, loss_change_proportion in enumerate(loss_change_proportions):
+                        # negative beta = negative feedback, positive beta = positive feedback
+                        adjusted_change_proportion = (
+                            pow(loss_change_proportion, self.beta)
+                            if self.beta > 0
+                            else pow(1/loss_change_proportion, -self.beta)
+                        )
+                        for identifier in self.batched_identifiers[i]:
+                            print(f"adjusting {identifier} by {adjusted_change_proportion} ({loss_change_proportion} adjusted by beta {self.beta})")
+                            # if loss increases, so does multiplier
+                            # and vice versa
+                            self.dlma.scale_multiplier(identifier, adjusted_change_proportion)
             self.prev_loss_epoch = None
+            self.batched_identifiers = None
             return True

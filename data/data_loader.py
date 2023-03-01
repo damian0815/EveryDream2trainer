@@ -58,8 +58,7 @@ class DataLoaderMultiAspect():
         picked_images = []
         data_copy = copy.deepcopy(self.prepared_train_data) # deep copy to avoid modifying original multiplier property
         for iti in data_copy:
-            if iti.multiplier > 1:
-                print(f"multiplier >1 : {iti.multiplier} {iti.pathname}")
+            print(f"multiplier: {iti.multiplier} {iti.pathname}")
             while iti.multiplier >= 1:
                 picked_images.append(iti)
                 iti.multiplier -= 1
