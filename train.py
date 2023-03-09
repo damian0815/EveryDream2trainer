@@ -516,9 +516,6 @@ def main(args):
         epsilon = optimizer_config["epsilon"]
         weight_decay = optimizer_config["weight_decay"]
         optimizer_name = optimizer_config["optimizer"]
-        optimizer_min_timestep = optimizer_config.get("min_timestep", optimizer_min_timestep)
-        optimizer_max_timestep = optimizer_config.get("max_timestep", optimizer_max_timestep)
-        optimizer_timestep_schedule = optimizer_config.get("timestep_schedule", optimizer_timestep_schedule)
         curr_lr = optimizer_config.get("lr", curr_lr)
         if args.lr is not None:
             curr_lr = args.lr
@@ -527,6 +524,14 @@ def main(args):
         text_encoder_lr_scale = optimizer_config.get("text_encoder_lr_scale", text_encoder_lr_scale)
         if text_encoder_lr_scale != 1.0:
             logging.info(f" * Using text encoder LR scale {text_encoder_lr_scale}")
+
+        optimizer_min_timestep = optimizer_config.get("min_timestep", optimizer_min_timestep)
+        optimizer_max_timestep = optimizer_config.get("max_timestep", optimizer_max_timestep)
+        optimizer_timestep_schedule = optimizer_config.get("timestep_schedule", optimizer_timestep_schedule)
+        if (optimizer_min_timestep != 0
+                or optimizer_max_timestep != noise_scheduler.config.num_train_timesteps
+                or optimizer_timestep_schedule != "linear"):
+            logging.info(f" * Overriding default timestep training with min timestep {optimizer_min_timestep}, max {optimizer_max_timestep}, schedule {optimizer_timestep_schedule}")
 
         logging.info(f" * Loaded optimizer args from {optimizer_config_path} *")
 
