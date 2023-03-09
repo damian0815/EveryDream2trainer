@@ -354,7 +354,7 @@ def log_args(log_writer, args):
 def main(args):
     """
     Main entry point
-    """   
+    """
     log_time = setup_local_logger(args)
     args = setup_args(args)
 
@@ -507,12 +507,18 @@ def main(args):
     default_lr = 1e-6
     curr_lr = args.lr
     text_encoder_lr_scale = 1.0
+    optimizer_min_timestep = 0
+    optimizer_max_timestep = noise_scheduler.config.num_train_timesteps
+    optimizer_timestep_schedule = "linear"
 
     if optimizer_config is not None:
         betas = optimizer_config["betas"]
         epsilon = optimizer_config["epsilon"]
         weight_decay = optimizer_config["weight_decay"]
         optimizer_name = optimizer_config["optimizer"]
+        optimizer_min_timestep = optimizer_config.get("min_timestep", optimizer_min_timestep)
+        optimizer_max_timestep = optimizer_config.get("max_timestep", optimizer_max_timestep)
+        optimizer_timestep_schedule = optimizer_config.get("timestep_schedule", optimizer_timestep_schedule)
         curr_lr = optimizer_config.get("lr", curr_lr)
         if args.lr is not None:
             curr_lr = args.lr
@@ -729,7 +735,17 @@ def main(args):
             
             bsz = latents.shape[0]
 
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            if optimizer_timestep_schedule == "sqrt":
+                # high timestep = noisy image, low timestep = clear image
+                timesteps_01 = torch.rand((bsz,), device=latents.device)
+                timesteps_01_sqrted = torch.sqrt(timesteps_01)
+                range = optimizer_max_timestep - optimizer_min_timestep
+                timesteps = optimizer_min_timestep + torch.floor(timesteps_01_sqrted * range)
+            elif optimizer_timestep_schedule == "linear":
+                timesteps = torch.randint(optimizer_min_timestep, optimizer_max_timestep, (bsz,), device=latents.device)
+            else:
+                raise ValueError(f"Unrecognized optimizer timestep_schedule '{optimizer_timestep_schedule}'")
+
             timesteps = timesteps.long()
 
             cuda_caption = tokens.to(text_encoder.device)
