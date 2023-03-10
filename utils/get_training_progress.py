@@ -8,6 +8,11 @@ from diffusers import StableDiffusionPipeline
 from diffusers.utils import is_xformers_available
 from tqdm.auto import tqdm
 
+# make imports from data and train.py work
+import sys
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.dirname(SCRIPT_DIR))
+
 from data import resolver, aspects
 from data.data_loader import DataLoaderMultiAspect
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
