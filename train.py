@@ -28,6 +28,7 @@ import random
 import traceback
 import shutil
 import importlib
+from typing import Optional
 
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
@@ -349,6 +350,78 @@ def log_args(log_writer, args):
     for arg, value in sorted(vars(args).items()):
         arglog += f"{arg}={value}, "
     log_writer.add_text("config", arglog)
+
+
+class ModelPredictionAndTargetComputer:
+    def __init__(self, vae, text_encoder, unet, noise_scheduler, amp: bool, clip_skip: int):
+        self.vae = vae
+        self.text_encoder = text_encoder
+        self.unet = unet
+        self.noise_scheduler = noise_scheduler
+        self.amp = amp
+        self.clip_skip = clip_skip
+
+    def __call__(self, image, tokens,
+                 zero_frequency_noise_ratio=0.0,
+                 timestep: Optional[float] = None):
+        """
+        Compute model predicted VAE latents/velocities for the given image and tokens, and target (ground truth) VAE
+        latents/velocities for the given image, and return both.
+
+        `zero_frequency_noise`: If >0, mix "zero frequency" noise in with the model prediction input.
+        `timestep_01`: If set, return prediction and target for this timestep, expressed as a float 0..1 (where 0 is
+            the denoised image and 1 is pure noise). If None, pick a timestep at random from the scheduler's
+            num_train_timesteps.
+
+        """
+        with torch.no_grad():
+            with autocast(enabled=self.amp):
+                pixel_values = image.to(memory_format=torch.contiguous_format).to(self.unet.device)
+                latents = self.vae.encode(pixel_values, return_dict=False)
+            del pixel_values
+            latents = latents[0].sample() * 0.18215
+
+            if zero_frequency_noise_ratio > 0.0:
+                # see https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1,
+                                                                                1, device=latents.device)
+                noise = torch.randn_like(latents) + zero_frequency_noise
+            else:
+                noise = torch.randn_like(latents)
+
+            bsz = latents.shape[0]
+
+            if timestep is not None:
+                timesteps = torch.tensor([timestep * self.noise_scheduler.config.num_train_timesteps] * bsz,
+                                         device=latents.device)
+            else:
+                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
+
+            cuda_caption = tokens.to(self.text_encoder.device)
+
+        encoder_hidden_states = self.text_encoder(cuda_caption, output_hidden_states=True)
+
+        if self.clip_skip > 0:
+            encoder_hidden_states = self.text_encoder.text_model.final_layer_norm(
+                encoder_hidden_states.hidden_states[-self.clip_skip])
+        else:
+            encoder_hidden_states = encoder_hidden_states.last_hidden_state
+
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+        del noise, latents, cuda_caption
+
+        with autocast(enabled=self.amp):
+            model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        return model_pred, target
 
 
 def main(args):
@@ -712,50 +785,14 @@ def main(args):
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
     # actual prediction function - shared between train and validate
-    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0):
-        with torch.no_grad():
-            with autocast(enabled=args.amp):
-                pixel_values = image.to(memory_format=torch.contiguous_format).to(unet.device)
-                latents = vae.encode(pixel_values, return_dict=False)
-            del pixel_values
-            latents = latents[0].sample() * 0.18215
-
-            if zero_frequency_noise_ratio > 0.0:            
-                # see https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
-                noise = torch.randn_like(latents) + zero_frequency_noise           
-            else:
-                noise = torch.randn_like(latents)
-            
-            bsz = latents.shape[0]
-
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-            timesteps = timesteps.long()
-
-            cuda_caption = tokens.to(text_encoder.device)
-
-        encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
-
-        if args.clip_skip > 0:
-            encoder_hidden_states = text_encoder.text_model.final_layer_norm(
-                encoder_hidden_states.hidden_states[-args.clip_skip])
-        else:
-            encoder_hidden_states = encoder_hidden_states.last_hidden_state
-
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-        if noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
-        else:
-            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-        del noise, latents, cuda_caption
-
-        with autocast(enabled=args.amp):
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-        return model_pred, target
+    model_prediction_and_target_computer = ModelPredictionAndTargetComputer(
+        vae=vae,
+        text_encoder=text_encoder,
+        unet=unet,
+        noise_scheduler=noise_scheduler,
+        amp=args.amp,
+        clip_skip=args.clip_skip
+    )
 
     def generate_samples(global_step: int, batch):
         with isolate_rng():
@@ -781,7 +818,7 @@ def main(args):
     # Pre-train validation to establish a starting point on the loss graph
     if validator:
         validator.do_validation_if_appropriate(epoch=0, global_step=0,
-                                               get_model_prediction_and_target_callable=get_model_prediction_and_target)
+                                               get_model_prediction_and_target_callable=model_prediction_and_target_computer)
 
     # the sample generator might be configured to generate samples before step 0
     if sample_generator.generate_pretrain_samples:
@@ -803,7 +840,8 @@ def main(args):
             for step, batch in enumerate(train_dataloader):
                 step_start_time = time.time()
 
-                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
+                model_pred, target = model_prediction_and_target_computer(
+                    batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -896,7 +934,7 @@ def main(args):
             log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_local, global_step=global_step)
 
             if validator:
-                validator.do_validation_if_appropriate(epoch+1, global_step, get_model_prediction_and_target)
+                validator.do_validation_if_appropriate(epoch+1, global_step, model_prediction_and_target_computer)
             
             gc.collect()
             # end of epoch
