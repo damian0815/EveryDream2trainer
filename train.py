@@ -740,12 +740,15 @@ def main(args):
             
             bsz = latents.shape[0]
 
-            if optimizer_timestep_schedule == "sqrt":
+            if optimizer_timestep_schedule == "sqrt" or optimizer_timestep_schedule == "sq":
                 # high timestep = noisy image, low timestep = clear image
                 timesteps_01 = torch.rand((bsz,), device=latents.device)
-                timesteps_01_sqrted = torch.sqrt(timesteps_01)
-                range = optimizer_max_timestep - optimizer_min_timestep
-                timesteps = optimizer_min_timestep + torch.floor(timesteps_01_sqrted * range)
+                if optimizer_timestep_schedule == "sqrt":
+                    timesteps_01 = torch.sqrt(timesteps_01)
+                else:
+                    timesteps_01 = torch.pow(timesteps_01, 2)
+                range = (optimizer_max_timestep-0.00001) - optimizer_min_timestep
+                timesteps = optimizer_min_timestep + torch.floor(timesteps_01 * range)
             elif optimizer_timestep_schedule == "linear":
                 timesteps = torch.randint(optimizer_min_timestep, optimizer_max_timestep, (bsz,), device=latents.device)
             else:
