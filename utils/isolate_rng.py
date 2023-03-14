@@ -1,4 +1,4 @@
-# copy/pasted from pytorch lightning
+# adapted from pytorch lightning
 # https://github.com/Lightning-AI/lightning/blob/0d52f4577310b5a1624bed4d23d49e37fb05af9e/src/lightning_fabric/utilities/seed.py
 # and
 # https://github.com/Lightning-AI/lightning/blob/98f7696d1681974d34fad59c03b4b58d9524ed13/src/pytorch_lightning/utilities/seed.py
@@ -26,7 +26,7 @@ from random import getstate as python_get_rng_state
 from random import setstate as python_set_rng_state
 
 
-def _collect_rng_states(include_cuda: bool = True) -> Dict[str, Any]:
+def collect_rng_states(include_cuda: bool = True) -> Dict[str, Any]:
     """Collect the global random state of :mod:`torch`, :mod:`torch.cuda`, :mod:`numpy` and Python."""
     states = {
         "torch": torch.get_rng_state(),
@@ -38,7 +38,7 @@ def _collect_rng_states(include_cuda: bool = True) -> Dict[str, Any]:
     return states
 
 
-def _set_rng_states(rng_state_dict: Dict[str, Any]) -> None:
+def set_rng_states(rng_state_dict: Dict[str, Any]) -> None:
     """Set the global random state of :mod:`torch`, :mod:`torch.cuda`, :mod:`numpy` and Python in the current
     process."""
     torch.set_rng_state(rng_state_dict["torch"])
@@ -68,6 +68,6 @@ def isolate_rng(include_cuda: bool = True) -> Generator[None, None, None]:
         >>> torch.rand(1)
         tensor([0.7576])
     """
-    states = _collect_rng_states(include_cuda)
+    states = collect_rng_states(include_cuda)
     yield
-    _set_rng_states(states)
+    set_rng_states(states)

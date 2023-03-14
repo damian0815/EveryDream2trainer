@@ -41,6 +41,7 @@ import json
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel, DDIMScheduler, DDPMScheduler, \
     DPMSolverMultistepScheduler
+from diffusers.training_utils import EMAModel
 #from diffusers.models import AttentionBlock
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
@@ -57,7 +58,7 @@ from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
-from utils.isolate_rng import isolate_rng
+from utils.isolate_rng import isolate_rng, collect_rng_states, set_rng_states
 
 if torch.cuda.is_available():
     from utils.gpu import GPU
@@ -143,6 +144,23 @@ def load_optimizer(optimizer, path: str):
     Loads the optimizer state
     """
     optimizer.load_state_dict(torch.load(path))
+
+
+def save_random_state(path: str):
+    """
+    Saves the python, torch, numpy, and CUDA random states to the given path
+    """
+    random_states = collect_rng_states(include_cuda=True)
+    with open(path, "wt") as f:
+        json.dump(random_states, f)
+
+def load_random_state(path: str):
+    """
+    Load python, torch, numpy, and CUDA random states from the given path
+    """
+    with open(path, "rt") as f:
+        random_states = json.load(f)
+        set_rng_states(random_states)
 
 def get_gpu_memory(nvsmi):
     """
@@ -389,7 +407,7 @@ def main(args):
         os.makedirs(log_folder)
 
     @torch.no_grad()
-    def __save_model(save_path, unet, text_encoder, tokenizer, scheduler, vae, save_ckpt_dir, yaml_name, save_full_precision=False):
+    def __save_model(save_path, unet, text_encoder, tokenizer, scheduler, vae, optimizer, save_ckpt_dir, yaml_name, save_full_precision=False):
         """
         Save the model to disk
         """
@@ -427,10 +445,13 @@ def main(args):
             logging.info(f" * Saving yaml to {yaml_save_path}")
             shutil.copyfile(yaml_name, yaml_save_path)
 
-        # optimizer_path = os.path.join(save_path, "optimizer.pt")
-        # if self.save_optimizer_flag:
-        #     logging.info(f" Saving optimizer state to {save_path}")
-        #     self.save_optimizer(self.ctx.optimizer, optimizer_path)
+        if args.save_optimizer:
+            optimizer_path = os.path.join(save_path, "optimizer_state.pt")
+            logging.info(f" Saving optimizer state to {optimizer_path}")
+            save_optimizer(optimizer, optimizer_path)
+            random_state_path = os.path.join(save_path, "random_state.json")
+            logging.info(f" Saving random state to {random_state_path}")
+            save_random_state(random_state_path)
 
     try:
 
@@ -875,12 +896,12 @@ def main(args):
                     last_epoch_saved_time = time.time()
                     logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
                     save_path = os.path.join(f"{log_folder}/ckpts/{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
+                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
 
                 if epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 0 and epoch < args.max_epochs - 1 and epoch >= args.save_ckpts_from_n_epochs:
                     logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
                     save_path = os.path.join(f"{log_folder}/ckpts/{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
+                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
 
                 del batch
                 global_step += 1
@@ -910,7 +931,7 @@ def main(args):
         # end of training
 
         save_path = os.path.join(f"{log_folder}/ckpts/last-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
+        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -920,7 +941,7 @@ def main(args):
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
         save_path = os.path.join(f"{log_folder}/ckpts/errored-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, yaml, args.save_full_precision)
+        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
