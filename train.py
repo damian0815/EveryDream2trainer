@@ -28,6 +28,7 @@ import random
 import traceback
 import shutil
 import importlib
+from typing import Optional
 
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
@@ -45,6 +46,7 @@ from diffusers.training_utils import EMAModel
 #from diffusers.models import AttentionBlock
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
+from torch.optim import Optimizer
 from transformers import CLIPTextModel, CLIPTokenizer
 #from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -145,22 +147,47 @@ def load_optimizer(optimizer, path: str):
     """
     optimizer.load_state_dict(torch.load(path))
 
-
-def save_random_state(path: str):
+def save_resume_state(path: str, epoch, global_step,
+                      train_dataloader: DataLoaderMultiAspect,
+                      validator: EveryDreamValidator):
     """
     Saves the python, torch, numpy, and CUDA random states to the given path
     """
     random_states = collect_rng_states(include_cuda=True)
+    resume_state = {
+        "version": 1,
+        "epoch": epoch,
+        "global_step": global_step,
+        "random_states": random_states,
+        "train_dataloader_state": train_dataloader.state_dict(),
+        "validator_state": validator.state_dict() if validator is not None else None,
+    }
     with open(path, "wt") as f:
-        json.dump(random_states, f)
+        json.dump(resume_state, f)
 
-def load_random_state(path: str):
+def load_resume_state(path: str,
+                      target_train_dataloader: DataLoaderMultiAspect,
+                      target_validator: Optional[EveryDreamValidator]
+                      ) -> tuple[int, int]:
     """
-    Load python, torch, numpy, and CUDA random states from the given path
+    Load resume states from the given json onto the passed-in
     """
     with open(path, "rt") as f:
-        random_states = json.load(f)
-        set_rng_states(random_states)
+        resume_state = json.load(f)
+        last_known_version = 1
+        if resume_state["version"] > last_known_version:
+            raise ValueError(f"resume state json {path} is version {resume_state['version']} which is newer than "
+                             f"the last supported version ({last_known_version})")
+        set_rng_states(resume_state["random_states"])
+        if target_validator is not None:
+            target_validator.load_state_dict(resume_state["validator_state"])
+        elif resume_state["validator_state"] is not None:
+            logging.warning(f"validator_state found in {path} but not validator was passed to load_resume_state")
+        target_train_dataloader.load_state_dict(resume_state["train_dataloader_state"])
+        epoch = resume_state["epoch"]
+        global_step = resume_state["global_step"]
+        return epoch, global_step
+
 
 def get_gpu_memory(nvsmi):
     """

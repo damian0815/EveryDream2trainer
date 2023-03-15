@@ -38,7 +38,6 @@ class DataLoaderMultiAspect():
         self.seed = seed
         self.batch_size = batch_size
         self.prepared_train_data = image_train_items
-        random.Random(self.seed).shuffle(self.prepared_train_data)
         self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
         self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
         if self.expected_epoch_size != len(self.prepared_train_data):
@@ -175,3 +174,24 @@ class DataLoaderMultiAspect():
         for item in self.prepared_train_data:
             self.rating_overall_sum += item.caption.rating()
             self.ratings_summed.append(self.rating_overall_sum)
+
+    def state_dict(self) -> dict:
+        return {
+            "image_train_item_paths_ordered": [p.pathname for p in self.prepared_train_data],
+            "seed": self.seed,
+        }
+
+    def load_state_dict(self, d: dict):
+        image_train_item_paths_ordered = d["image_train_item_paths_ordered"]
+        remaining_items = self.prepared_train_data.copy()
+        ordered_items = []
+        for p in image_train_item_paths_ordered:
+            index = next((index for index, item in enumerate(remaining_items) if item.pathname == p), None)
+            if index is None:
+                raise ValueError(f"cannot load state dict: {p} was listed in state dict but is not on self")
+            ordered_items.append(remaining_items.pop(index))
+        if len(remaining_items) > 0:
+            raise ValueError(f"there are loaded images that have no corresponding order entry: {remaining_items}")
+
+        self.prepared_train_data = ordered_items
+        self.seed = d["seed"]
