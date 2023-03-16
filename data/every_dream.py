@@ -107,15 +107,22 @@ class EveryDreamBatch(Dataset):
         if random.random() > (train_item.get("cond_dropout", self.conditional_dropout)):
             example["tokens"] = self.tokenizer(example["caption"],
                                                 truncation=True,
-                                                padding="max_length",
+                                                padding="do_not_pad",
                                                 max_length=self.tokenizer.model_max_length,
                                               ).input_ids
+            pad
+            mask
+            example["attention_mask"] = mask
         else:
             example["tokens"] = self.tokenizer(" ",
                                                 truncation=True,
-                                                padding="max_length",
+                                                padding="do_not_pad",
                                                 max_length=self.tokenizer.model_max_length,
                                               ).input_ids
+            pad
+            mask
+            example["attention_mask"] = mask
+
 
         example["tokens"] = torch.tensor(example["tokens"])
 
