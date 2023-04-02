@@ -7,23 +7,25 @@ from functools import total_ordering
 from attrs import define, field, Factory
 from data.image_train_item import ImageCaption, ImageTrainItem
 from utils.fs_helpers import *
-from typing import TypeVar, Iterable
+from typing import Iterable
 
+from tqdm import tqdm
+
+DEFAULT_MAX_CAPTION_LENGTH = 2048
 
 def overlay(overlay, base):
     return overlay if overlay is not None else base
 
 def safe_set(val):
     if isinstance(val, str):
-        return {val} if val else {}
+        return dict.fromkeys([val]) if val else dict()
 
     if isinstance(val, Iterable):
-        return {i for i in val if i is not None}
+        return dict.fromkeys((i for i in val if i is not None))
     
-    return val or {}
+    return val or dict() 
 
 @define(frozen=True)
-@total_ordering
 class Tag:
     value: str
     weight: float = field(default=1.0, converter=lambda x: x if x is not None else 1.0)
@@ -41,16 +43,13 @@ class Tag:
 
         return None
 
-    def __lt__(self, other):
-        return self.weight < other.weight and self.value < other.value
-    
 @define
 class ImageConfig:
     # Captions
-    main_prompts: set[str] = field(factory=set, converter=safe_set)
+    main_prompts: dict[str, None] = field(factory=dict, converter=safe_set)
     rating: float = None
     max_caption_length: int = None
-    tags: set[Tag] = field(factory=set, converter=safe_set)
+    tags: dict[Tag, None] = field(factory=dict, converter=safe_set)
     
     # Options
     multiply: float = None
@@ -62,10 +61,10 @@ class ImageConfig:
             return self
 
         return ImageConfig(
-            main_prompts=self.main_prompts.union(other.main_prompts),
+            main_prompts=other.main_prompts | self.main_prompts,
             rating=overlay(other.rating, self.rating),
             max_caption_length=overlay(other.max_caption_length, self.max_caption_length),
-            tags=self.tags.union(other.tags),
+            tags= other.tags | self.tags,
             multiply=overlay(other.multiply, self.multiply),
             cond_dropout=overlay(other.cond_dropout, self.cond_dropout),
             flip_p=overlay(other.flip_p, self.flip_p),
@@ -142,35 +141,34 @@ class ImageConfig:
 class Dataset:
     image_configs: dict[str, ImageConfig]
 
-    def __global_cfg(files):
+    def __global_cfg(fileset):
         cfgs = []
-        for file in files:
-            match os.path.basename(file):
-                case 'global.yaml' | 'global.yml':
-                    cfgs.append(ImageConfig.from_file(file))
+        
+        for cfgfile in ['global.yaml', 'global.yml']:
+            if cfgfile in fileset:
+                cfgs.append(ImageConfig.from_file(fileset[cfgfile]))
         return ImageConfig.fold(cfgs)
 
-    def __local_cfg(files):
+    def __local_cfg(fileset):
         cfgs = []
-        for file in files:
-            match os.path.basename(file):
-                case 'multiply.txt':
-                    cfgs.append(ImageConfig(multiply=read_float(file)))
-                case 'cond_dropout.txt':
-                    cfgs.append(ImageConfig(cond_dropout=read_float(file)))
-                case 'flip_p.txt':
-                    cfgs.append(ImageConfig(flip_p=read_float(file)))
-                case 'local.yaml' | 'local.yml':
-                    cfgs.append(ImageConfig.from_file(file))
+        if 'multiply.txt' in fileset:
+            cfgs.append(ImageConfig(multiply=read_float(fileset['multiply.txt'])))
+        if 'cond_dropout.txt' in fileset:
+            cfgs.append(ImageConfig(cond_dropout=read_float(fileset['cond_dropout.txt'])))
+        if 'flip_p.txt' in fileset:
+            cfgs.append(ImageConfig(flip_p=read_float(fileset['flip_p.txt'])))
+        if 'local.yaml' in fileset:
+            cfgs.append(ImageConfig.from_file(fileset['local.yaml']))
+        if 'local.yml' in fileset:
+            cfgs.append(ImageConfig.from_file(fileset['local.yml']))
         return ImageConfig.fold(cfgs)
 
-    def __sidecar_cfg(imagepath, files):
+    def __sidecar_cfg(imagepath, fileset):
         cfgs = []
-        for file in files:
-            if same_barename(imagepath, file):
-                match ext(file):
-                    case '.txt' | '.caption' | '.yml' | '.yaml':
-                        cfgs.append(ImageConfig.from_file(file))
+        for cfgext in ['.txt', '.caption', '.yml', '.yaml']:
+            cfgfile = barename(imagepath) + cfgext
+            if cfgfile in fileset:
+                cfgs.append(ImageConfig.from_file(fileset[cfgfile]))
         return ImageConfig.fold(cfgs)
 
     # Use file name for caption only as a last resort
@@ -187,10 +185,11 @@ class Dataset:
         # and accumulates image configs as it traverses dataset
         image_configs = {}
         def process_dir(files, parent_globals):
-            global_cfg = parent_globals.merge(Dataset.__global_cfg(files))
-            local_cfg = Dataset.__local_cfg(files)
+            fileset = {os.path.basename(f): f for f in files}
+            global_cfg = parent_globals.merge(Dataset.__global_cfg(fileset))
+            local_cfg = Dataset.__local_cfg(fileset)
             for img in filter(is_image, files):
-                img_cfg = Dataset.__sidecar_cfg(img, files)
+                img_cfg = Dataset.__sidecar_cfg(img, fileset)
                 resolved_cfg = ImageConfig.fold([global_cfg, local_cfg, img_cfg])
                 image_configs[img] = Dataset.__ensure_caption(resolved_cfg, img)
             return global_cfg
@@ -216,34 +215,38 @@ class Dataset:
     
     def image_train_items(self, aspects):
         items = []
-        for image in self.image_configs:
+        for image in tqdm(self.image_configs, desc="preloading", dynamic_ncols=True):
             config = self.image_configs[image]
             if len(config.main_prompts) > 1:
                 logging.warning(f" *** Found multiple multiple main_prompts for image {image}, but only one will be applied: {config.main_prompts}")
 
             tags = []
             tag_weights = []
-            for tag in sorted(config.tags):
+            for tag in sorted(config.tags, key=lambda x: x.weight or 1.0, reverse=True):
                 tags.append(tag.value)
                 tag_weights.append(tag.weight)
             use_weights = len(set(tag_weights)) > 1 
-            
-            caption = ImageCaption(
-                main_prompt=next(iter(sorted(config.main_prompts))),
-                rating=config.rating or 1.0,
-                tags=tags,
-                tag_weights=tag_weights,
-                max_target_length=config.max_caption_length,
-                use_weights=use_weights)
 
-            item = ImageTrainItem(
-                image=None,
-                caption=caption,
-                aspects=aspects,
-                pathname=os.path.abspath(image),
-                flip_p=config.flip_p or 0.0,
-                multiplier=config.multiply or 1.0,
-                cond_dropout=config.cond_dropout
-            )
-            items.append(item)
-        return list(sorted(items, key=lambda ti: ti.pathname))
+            try:            
+                caption = ImageCaption(
+                    main_prompt=next(iter(config.main_prompts)),
+                    rating=config.rating or 1.0,
+                    tags=tags,
+                    tag_weights=tag_weights,
+                    max_target_length=config.max_caption_length or DEFAULT_MAX_CAPTION_LENGTH,
+                    use_weights=use_weights)
+
+                item = ImageTrainItem(
+                    image=None,
+                    caption=caption,
+                    aspects=aspects,
+                    pathname=os.path.abspath(image),
+                    flip_p=config.flip_p or 0.0,
+                    multiplier=config.multiply or 1.0,
+                    cond_dropout=config.cond_dropout
+                )
+                items.append(item)
+            except Exception as e:
+                logging.error(f" *** Error preloading image or caption for: {image}, error: {e}")
+                raise e
+        return items

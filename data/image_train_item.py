@@ -23,12 +23,12 @@ import yaml
 
 import PIL
 import PIL.Image as Image
+import PIL.ImageOps as ImageOps
 import numpy as np
 from torchvision import transforms
 
 _RANDOM_TRIM = 0.04
 
-DEFAULT_MAX_CAPTION_LENGTH = 2048
 
 OptionalImageCaption = typing.Optional['ImageCaption']
 
@@ -36,7 +36,6 @@ class ImageCaption:
     """
     Represents the various parts of an image caption
     """
-
     def __init__(self, main_prompt: str, rating: float, tags: list[str], tag_weights: list[float], max_target_length: int, use_weights: bool):
         """
         :param main_prompt: The part of the caption which should always be included
@@ -49,7 +48,7 @@ class ImageCaption:
         self.__rating = rating
         self.__tags = tags
         self.__tag_weights = tag_weights
-        self.__max_target_length = max_target_length
+        self.__max_target_length = max_target_length or 2048
         self.__use_weights = use_weights
         if use_weights and len(tags) > len(tag_weights):
             self.__tag_weights.extend([1.0] * (len(tags) - len(tag_weights)))
@@ -67,7 +66,13 @@ class ImageCaption:
         :return: generated caption string
         """
         if self.__tags:
-            max_target_tag_length = self.__max_target_length - len(self.__main_prompt)
+            try:
+                max_target_tag_length = self.__max_target_length - len(self.__main_prompt or 0)
+            except Exception as e:
+                print()
+                logging.error(f"Error determining length for: {e} on {self.__main_prompt}")
+                print()
+                max_target_tag_length = 2048
 
             if self.__use_weights:
                 tags_caption = self.__get_weighted_shuffled_tags(seed, self.__tags, self.__tag_weights, max_target_tag_length)
@@ -113,7 +118,6 @@ class ImageCaption:
         random.Random(seed).shuffle(tags)
         return ", ".join(tags)
 
-
 class ImageTrainItem:
     """
     image: PIL.Image
@@ -145,6 +149,14 @@ class ImageTrainItem:
         self.error = None
         self.__compute_target_width_height()
 
+    def load_image(self):
+        image = PIL.Image.open(self.pathname).convert('RGB')
+        try:
+            image = ImageOps.exif_transpose(image)
+        except SyntaxError as e:
+            pass
+        return image
+
     def hydrate(self, crop=False, save=False, crop_jitter=20):
         """
         crop: hard center crop to 512x512
@@ -154,7 +166,7 @@ class ImageTrainItem:
         # print(self.pathname, self.image)
         try:
             # if not hasattr(self, 'image'):
-            self.image = PIL.Image.open(self.pathname).convert('RGB')
+            self.image = self.load_image()
 
             width, height = self.image.size
             if crop:
@@ -224,7 +236,7 @@ class ImageTrainItem:
     def __compute_target_width_height(self):
         self.target_wh = None
         try:
-            with Image.open(self.pathname) as image:
+            with self.load_image() as image:
                 width, height = image.size
                 image_aspect = width / height
                 target_wh = min(self.aspects, key=lambda aspects:abs(aspects[0]/aspects[1] - image_aspect))
