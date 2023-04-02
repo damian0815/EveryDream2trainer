@@ -140,24 +140,26 @@ def log_optimizer(optimizer: torch.optim.Optimizer, betas, epsilon, weight_decay
     logging.info(f"{Fore.CYAN} * Optimizer: {optimizer.__class__.__name__} *{Style.RESET_ALL}")
     logging.info(f"{Fore.CYAN}    unet lr: {unet_lr}, text encoder lr: {text_encoder_lr}, betas: {betas}, epsilon: {epsilon}, weight_decay: {weight_decay} *{Style.RESET_ALL}")
 
-def save_optimizer(optimizer: torch.optim.Optimizer, path: str):
-    """
-    Saves the optimizer state
-    """
-    torch.save(optimizer.state_dict(), path)
 
-def load_optimizer(optimizer: torch.optim.Optimizer, path: str):
-    """
-    Loads the optimizer state
-    """
-    optimizer.load_state_dict(torch.load(path))
 
-def save_resume_state(path: str, epoch, global_step,
+def save_resume_states(parent_folder: str, epoch, global_step,
                       train_dataloader: DataLoaderMultiAspect,
-                      validator: EveryDreamValidator):
+                      train_ed_batch: EveryDreamBatch,
+                      optimizer: Optimizer,
+                      lr_scheduler
+                      ):
     """
     Saves the python, torch, numpy, and CUDA random states to the given path
     """
+    ed_resume_states_path = os.path.join(parent_folder, "ed_resume_states.json")
+    optimizer_resume_state_path = os.path.join(parent_folder, "optimizer_resume_state.pt")
+    lr_scheduler_resume_state_path = os.path.join(parent_folder, "lr_scheduler_resume_state.pt")
+
+    os.makedirs(parent_folder, exist_ok=True)
+
+    torch.save(optimizer.state_dict(), optimizer_resume_state_path)
+    torch.save(lr_scheduler.state_dict(), lr_scheduler_resume_state_path)
+
     random_states = collect_rng_states(include_cuda=True)
     resume_state = {
         "version": 1,
@@ -165,32 +167,48 @@ def save_resume_state(path: str, epoch, global_step,
         "global_step": global_step,
         "random_states": random_states,
         "train_dataloader_state": train_dataloader.state_dict(),
-        "validator_state": validator.state_dict() if validator is not None else None,
+        "train_ed_batch_state": train_ed_batch.state_dict()
     }
-    with open(path, "wt") as f:
+    with open(ed_resume_states_path, "wt") as f:
         json.dump(resume_state, f)
 
-def load_resume_state(path: str,
-                      target_train_dataloader: DataLoaderMultiAspect,
-                      target_validator: Optional[EveryDreamValidator]
-                      ) -> tuple[int, int]:
+
+def load_resume_states(parent_folder: str,
+                       train_dataloader: DataLoaderMultiAspect,
+                       train_ed_batch: EveryDreamBatch,
+                       optimizer: Optimizer,
+                       lr_scheduler) -> tuple[int, int]:
+
     """
-    Load resume states from the given json onto the passed-in
+    Load resume states from the given json onto the passed-in objects
     """
-    with open(path, "rt") as f:
+    ed_resume_states_path = os.path.join(parent_folder, "ed_resume_states.json")
+    optimizer_resume_state_path = os.path.join(parent_folder, "optimizer_resume_state.pt")
+    lr_scheduler_resume_state_path = os.path.join(parent_folder, "lr_scheduler_resume_state.pt")
+
+    # optimizer
+    with open(optimizer_resume_state_path, "rb") as f:
+        optimizer_resume_state = torch.load(f)
+        optimizer.load_state_dict(optimizer_resume_state)
+
+    # lr scheduler
+    with open(lr_scheduler_resume_state_path, "rb") as f:
+        lr_scheduler_resume_state = torch.load(f)
+        lr_scheduler.load_state_dict(lr_scheduler_resume_state)
+
+    # ED stuff
+    with open(ed_resume_states_path, "rt") as f:
         resume_state = json.load(f)
         last_known_version = 1
         if resume_state["version"] > last_known_version:
-            raise ValueError(f"resume state json {path} is version {resume_state['version']} which is newer than "
+            raise ValueError(f"resume state json {ed_resume_states_path} is version {resume_state['version']} which is newer than "
                              f"the last supported version ({last_known_version})")
         set_rng_states(resume_state["random_states"])
-        if target_validator is not None:
-            target_validator.load_state_dict(resume_state["validator_state"])
-        elif resume_state["validator_state"] is not None:
-            logging.warning(f"validator_state found in {path} but not validator was passed to load_resume_state")
-        target_train_dataloader.load_state_dict(resume_state["train_dataloader_state"])
+        train_dataloader.load_state_dict(resume_state["train_dataloader_state"])
+        train_ed_batch.load_state_dict(resume_state["train_ed_batch_state"])
         epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
+
         return epoch, global_step
 
 
@@ -328,7 +346,14 @@ def setup_args(args):
 
     return args
 
-def update_grad_scaler(scaler: GradScaler, global_step, epoch, step):
+def update_grad_scaler(scaler: GradScaler, actual_global_step, force_update=False):
+
+    if force_update:
+        # find the last step before this one when an update would have occurred
+        global_step = next((s for s in [4000, 2000, 1000, 500] if s < actual_global_step), actual_global_step)
+    else:
+        global_step = actual_global_step
+
     if global_step == 500:
         factor = 1.8
         scaler.set_growth_factor(factor)
@@ -439,7 +464,7 @@ def main(args):
         os.makedirs(log_folder)
 
     @torch.no_grad()
-    def __save_model(save_path, unet, text_encoder, tokenizer, scheduler, vae, optimizer, save_ckpt_dir, yaml_name, save_full_precision=False):
+    def save_model(save_path, unet, text_encoder, tokenizer, scheduler, vae, save_ckpt_dir, yaml_name, save_full_precision=False):
         """
         Save the model to disk
         """
@@ -477,14 +502,8 @@ def main(args):
             logging.info(f" * Saving yaml to {yaml_save_path}")
             shutil.copyfile(yaml_name, yaml_save_path)
 
-        if args.save_optimizer:
-            optimizer_path = os.path.join(save_path, "optimizer_state.pt")
-            logging.info(f" Saving optimizer state to {optimizer_path}")
-            save_optimizer(optimizer, optimizer_path)
-            random_state_path = os.path.join(save_path, "random_state.json")
-            logging.info(f" Saving random state to {random_state_path}")
-            save_random_state(random_state_path)
 
+    resume_states_parent_folder = None
     try:
 
         # check for a local file
@@ -494,6 +513,12 @@ def main(args):
             text_encoder = CLIPTextModel.from_pretrained(model_root_folder, subfolder="text_encoder")
             vae = AutoencoderKL.from_pretrained(model_root_folder, subfolder="vae")
             unet = UNet2DConditionModel.from_pretrained(model_root_folder, subfolder="unet")
+
+            # look for resume states
+            possible_resume_states_folder = os.path.join(model_root_folder, "../resume_states/" + os.path.basename(model_root_folder))
+            if os.path.exists(possible_resume_states_folder):
+                resume_states_parent_folder = possible_resume_states_folder
+
         else:
             # try to download from HF using resume_ckpt as a repo id
             downloaded = try_download_model_from_hf(repo_id=args.resume_ckpt)
@@ -587,6 +612,10 @@ def main(args):
         text_encoder_lr_scale = optimizer_config.get("text_encoder_lr_scale", text_encoder_lr_scale)
         if text_encoder_lr_scale != 1.0:
             logging.info(f" * Using text encoder LR scale {text_encoder_lr_scale}")
+
+        if optimizer_config["save_optimizer"]:
+            logging.info(" * Saving optimizer and RNG states alongside checkpoints")
+            save_training_states_for_resume = True
 
         logging.info(f" * Loaded optimizer args from {optimizer_config_path} *")
 
@@ -692,6 +721,21 @@ def main(args):
                                        default_sample_steps=args.sample_steps,
                                        use_xformers=is_xformers_available() and not args.disable_xformers)
 
+    global global_step
+    global epoch
+    epoch = 0
+    global_step = 0
+
+    if resume_states_parent_folder is not None:
+        print(f" * Loading training states from {resume_states_parent_folder}...")
+        epoch, global_step = load_resume_states(resume_states_parent_folder,
+                                                train_dataloader=data_loader,
+                                                train_ed_batch=train_batch,
+                                                optimizer=optimizer,
+                                                lr_scheduler=lr_scheduler)
+        print(f"   Resuming from epoch {epoch}, global step {global_step} with learning rate(s) {lr_scheduler.get_lr()}")
+
+
     """
     Train the model
 
@@ -701,8 +745,21 @@ def main(args):
     print()
     print("** Trainer Starting **")
 
+    def save_model_handler(prefix: str = ""):
+        global epoch, global_step
+        save_path = os.path.join(f"{log_folder}/ckpts/{prefix}{args.project_name}-ep{epoch:02}-gs{global_step:05}")
+        save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae,
+                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision)
+        if save_training_states_for_resume:
+            resume_save_folder = os.path.join(
+                f"{log_folder}/resume_states/{prefix}{args.project_name}-ep{epoch:02}-gs{global_step:05}")
+            save_resume_states(resume_save_folder, epoch, global_step,
+                               train_dataloader=data_loader, train_ed_batch=train_batch,
+                               optimizer=optimizer, lr_scheduler=lr_scheduler)
+
     global interrupted
     interrupted = False
+
 
     def sigterm_handler(signum, frame):
         """
@@ -713,15 +770,14 @@ def main(args):
             global interrupted
             if not interrupted:
                 interrupted=True
-                global global_step
                 #TODO: save model on ctrl-c
-                interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step}")
                 print()
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
-                logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
+                logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, will attemp to save model, press CTRL-C again now to abort{Style.RESET_ALL}")
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
                 time.sleep(2) # give opportunity to ctrl-C again to cancel save
-                __save_model(interrupted_checkpoint_path, unet, text_encoder, tokenizer, noise_scheduler, vae, args.save_ckpt_dir, args.save_full_precision)
+                save_model_handler(prefix="interrupted-")
+
             exit(_SIGTERM_EXIT_CODE)
         else:
             # non-main threads (i.e. dataloader workers) should exit cleanly
@@ -761,13 +817,13 @@ def main(args):
         growth_interval=25,
     )
     logging.info(f" Grad scaler enabled: {scaler.is_enabled()} (amp mode)")
+    if args.amp and global_step > 0:
+        update_grad_scaler(scaler, global_step, force_update=True)
 
-    epoch_pbar = tqdm(range(args.max_epochs), position=0, leave=True, dynamic_ncols=True)
+    epoch_pbar = tqdm(range(args.max_epochs), position=0, initial=epoch, leave=True, dynamic_ncols=True)
     epoch_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Epochs{Style.RESET_ALL}")
     epoch_times = []
 
-    global global_step
-    global_step = 0
     training_start_time = time.time()
     last_epoch_saved_time = training_start_time
 
@@ -934,17 +990,15 @@ def main(args):
                 if args.ckpt_every_n_minutes is not None and (min_since_last_ckpt > args.ckpt_every_n_minutes):
                     last_epoch_saved_time = time.time()
                     logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
-                    save_path = os.path.join(f"{log_folder}/ckpts/{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
+                    save_model_handler()
 
                 if epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 0 and epoch < args.max_epochs - 1 and epoch >= args.save_ckpts_from_n_epochs:
                     logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
-                    save_path = os.path.join(f"{log_folder}/ckpts/{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-                    __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
+                    save_model_handler()
 
                 del batch
                 global_step += 1
-                update_grad_scaler(scaler, global_step, epoch, step) if args.amp else None
+                update_grad_scaler(scaler, global_step) if args.amp else None
                 # end of step
 
             steps_pbar.close()
@@ -968,9 +1022,7 @@ def main(args):
             # end of epoch
 
         # end of training
-
-        save_path = os.path.join(f"{log_folder}/ckpts/last-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
+        save_model_handler(prefix="last-")
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -979,8 +1031,7 @@ def main(args):
 
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
-        save_path = os.path.join(f"{log_folder}/ckpts/errored-{args.project_name}-ep{epoch:02}-gs{global_step:05}")
-        __save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae, optimizer, args.save_ckpt_dir, yaml, args.save_full_precision)
+        save_model_handler(prefix="errored-")
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
