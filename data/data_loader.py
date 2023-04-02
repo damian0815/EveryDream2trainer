@@ -37,8 +37,8 @@ class DataLoaderMultiAspect():
     def __init__(self, image_train_items: list[ImageTrainItem], seed=555, batch_size=1):
         self.seed = seed
         self.batch_size = batch_size
-        self.prepared_train_data = image_train_items
-        self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
+        self.prepared_train_data = sorted(image_train_items,
+                                          key=lambda img: (img.caption.rating(), img.pathname))
         self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
         if self.expected_epoch_size != len(self.prepared_train_data):
             logging.info(f" * DLMA initialized with {len(image_train_items)} source images. After applying multipliers, each epoch will train on at least {self.expected_epoch_size} images.")
@@ -117,7 +117,7 @@ class DataLoaderMultiAspect():
                 for item in runt_bucket:
                     item.runt_size = truncate_count
                 while len(runt_bucket) < batch_size:
-                    runt_bucket.append(random.choice(runt_bucket))
+                    runt_bucket.append(randomizer.choice(runt_bucket))
 
                 current_bucket_size = len(buckets[bucket])
 
@@ -177,21 +177,12 @@ class DataLoaderMultiAspect():
 
     def state_dict(self) -> dict:
         return {
-            "image_train_item_paths_ordered": [p.pathname for p in self.prepared_train_data],
             "seed": self.seed,
+            "rating_overall_sum": self.rating_overall_sum,
+            "ratings_summed": self.ratings_summed
         }
 
     def load_state_dict(self, d: dict):
-        image_train_item_paths_ordered = d["image_train_item_paths_ordered"]
-        remaining_items = self.prepared_train_data.copy()
-        ordered_items = []
-        for p in image_train_item_paths_ordered:
-            index = next((index for index, item in enumerate(remaining_items) if item.pathname == p), None)
-            if index is None:
-                raise ValueError(f"cannot load state dict: {p} was listed in state dict but is not on self")
-            ordered_items.append(remaining_items.pop(index))
-        if len(remaining_items) > 0:
-            raise ValueError(f"there are loaded images that have no corresponding order entry: {remaining_items}")
-
-        self.prepared_train_data = ordered_items
         self.seed = d["seed"]
+        self.rating_overall_sum = d["rating_overall_sum"]
+        self.ratings_summed = d["ratings_summed"]

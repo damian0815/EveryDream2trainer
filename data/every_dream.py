@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import logging
+from typing import Optional
+
 import torch
 from torch.utils.data import Dataset
 from data.data_loader import DataLoaderMultiAspect
@@ -42,7 +44,8 @@ class EveryDreamBatch(Dataset):
                  shuffle_tags=False,
                  rated_dataset=False,
                  rated_dataset_dropout_target=0.5,
-                 name='train'
+                 name='train',
+                 prepopulated_image_buckets: Optional[list[ImageTrainItem]]=None
                  ):
         self.data_loader = data_loader
         self.batch_size = data_loader.batch_size
@@ -57,9 +60,12 @@ class EveryDreamBatch(Dataset):
         self.seed = seed
         self.rated_dataset = rated_dataset
         self.rated_dataset_dropout_target = rated_dataset_dropout_target
-        # First epoch always trains on all images
-        self.image_train_items  = []
-        self.__update_image_train_items(1.0)
+        if prepopulated_image_buckets is not None:
+            self.image_train_items = prepopulated_image_buckets
+        else:
+            # First epoch always trains on all images
+            self.image_train_items = []
+            self.__update_image_train_items(1.0)
         self.name = name
             
         num_images = len(self.image_train_items)
@@ -141,6 +147,27 @@ class EveryDreamBatch(Dataset):
     def __update_image_train_items(self, dropout_fraction: float):
         self.image_train_items = self.data_loader.get_shuffled_image_buckets(dropout_fraction)
 
+
+    def state_dict(self) -> dict:
+        return {
+            "image_train_item_paths_ordered": [p.pathname for p in self.image_train_items],
+            "seed": self.seed,
+        }
+
+    def load_state_dict(self, d: dict):
+        image_train_item_paths_ordered = d["image_train_item_paths_ordered"]
+        remaining_items = self.image_train_items.copy()
+        ordered_items = []
+        for p in image_train_item_paths_ordered:
+            index = next((index for index, item in enumerate(remaining_items) if item.pathname == p), None)
+            if index is None:
+                raise ValueError(f"cannot load state dict: {p} was listed in state dict but is not on self")
+            ordered_items.append(remaining_items.pop(index))
+        if len(remaining_items) > 0:
+            raise ValueError(f"there are loaded images that have no corresponding order entry: {remaining_items}")
+
+        self.image_train_items = ordered_items
+        self.seed = d["seed"]
 
         
 def build_torch_dataloader(dataset, batch_size) -> torch.utils.data.DataLoader:
