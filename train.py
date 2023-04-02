@@ -722,13 +722,12 @@ def main(args):
                                        use_xformers=is_xformers_available() and not args.disable_xformers)
 
     global global_step
-    global epoch
-    epoch = 0
+    resume_epoch = 0
     global_step = 0
 
     if resume_states_parent_folder is not None:
         print(f" * Loading training states from {resume_states_parent_folder}...")
-        epoch, global_step = load_resume_states(resume_states_parent_folder,
+        resume_epoch, global_step = load_resume_states(resume_states_parent_folder,
                                                 train_dataloader=data_loader,
                                                 train_ed_batch=train_batch,
                                                 optimizer=optimizer,
@@ -745,9 +744,9 @@ def main(args):
     print()
     print("** Trainer Starting **")
 
-    def save_model_handler(prefix: str = ""):
-        global epoch, global_step
-        save_path = os.path.join(f"{log_folder}/ckpts/{prefix}{args.project_name}-ep{epoch:02}-gs{global_step:05}")
+    def save_model_handler(global_step, epoch: Optional[int]=None, prefix: str = ""):
+        epoch_str = "" if epoch is None else f"-ep{epoch:02}"
+        save_path = os.path.join(f"{log_folder}/ckpts/{prefix}{args.project_name}{epoch_str}-gs{global_step:05}")
         save_model(save_path, unet, text_encoder, tokenizer, noise_scheduler, vae,
                            save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision)
         if save_training_states_for_resume:
@@ -767,7 +766,7 @@ def main(args):
         """
         is_main_thread = (torch.utils.data.get_worker_info() == None)
         if is_main_thread:
-            global interrupted
+            global interrupted, global_step
             if not interrupted:
                 interrupted=True
                 #TODO: save model on ctrl-c
@@ -776,7 +775,7 @@ def main(args):
                 logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, will attemp to save model, press CTRL-C again now to abort{Style.RESET_ALL}")
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
                 time.sleep(2) # give opportunity to ctrl-C again to cancel save
-                save_model_handler(prefix="interrupted-")
+                save_model_handler(global_step, epoch=None, prefix="interrupted-")
 
             exit(_SIGTERM_EXIT_CODE)
         else:
@@ -820,7 +819,7 @@ def main(args):
     if args.amp and global_step > 0:
         update_grad_scaler(scaler, global_step, force_update=True)
 
-    epoch_pbar = tqdm(range(args.max_epochs), position=0, initial=epoch, leave=True, dynamic_ncols=True)
+    epoch_pbar = tqdm(range(args.max_epochs), position=0, initial=resume_epoch, leave=True, dynamic_ncols=True)
     epoch_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Epochs{Style.RESET_ALL}")
     epoch_times = []
 
@@ -911,9 +910,9 @@ def main(args):
         generate_samples(global_step=0, batch=batch)
 
     try:
-        write_batch_schedule(args, log_folder, train_batch, epoch = 0)
+        write_batch_schedule(args, log_folder, train_batch, epoch=resume_epoch)
         
-        for epoch in range(args.max_epochs):
+        for epoch in range(resume_epoch, args.max_epochs):
             loss_epoch = []
             epoch_start_time = time.time()
             images_per_sec_log_step = []
@@ -990,11 +989,11 @@ def main(args):
                 if args.ckpt_every_n_minutes is not None and (min_since_last_ckpt > args.ckpt_every_n_minutes):
                     last_epoch_saved_time = time.time()
                     logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
-                    save_model_handler()
+                    save_model_handler(global_step, epoch)
 
                 if epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 0 and epoch < args.max_epochs - 1 and epoch >= args.save_ckpts_from_n_epochs:
                     logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
-                    save_model_handler()
+                    save_model_handler(global_step, epoch)
 
                 del batch
                 global_step += 1
@@ -1022,7 +1021,7 @@ def main(args):
             # end of epoch
 
         # end of training
-        save_model_handler(prefix="last-")
+        save_model_handler(global_step, epoch+1, prefix="last-")
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -1031,7 +1030,7 @@ def main(args):
 
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
-        save_model_handler(prefix="errored-")
+        save_model_handler(global_step, epoch, prefix="errored-")
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
