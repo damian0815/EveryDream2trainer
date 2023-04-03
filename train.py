@@ -151,7 +151,7 @@ def save_resume_states(parent_folder: str, epoch, global_step,
     """
     Saves the python, torch, numpy, and CUDA random states to the given path
     """
-    ed_resume_states_path = os.path.join(parent_folder, "ed_resume_states.json")
+    ed_resume_state_path = os.path.join(parent_folder, "ed_resume_state.pt")
     optimizer_resume_state_path = os.path.join(parent_folder, "optimizer_resume_state.pt")
     lr_scheduler_resume_state_path = os.path.join(parent_folder, "lr_scheduler_resume_state.pt")
 
@@ -161,7 +161,7 @@ def save_resume_states(parent_folder: str, epoch, global_step,
     torch.save(lr_scheduler.state_dict(), lr_scheduler_resume_state_path)
 
     random_states = collect_rng_states(include_cuda=True)
-    resume_state = {
+    ed_resume_state = {
         "version": 1,
         "epoch": epoch,
         "global_step": global_step,
@@ -169,8 +169,7 @@ def save_resume_states(parent_folder: str, epoch, global_step,
         "train_dataloader_state": train_dataloader.state_dict(),
         "train_ed_batch_state": train_ed_batch.state_dict()
     }
-    with open(ed_resume_states_path, "wt") as f:
-        json.dump(resume_state, f)
+    torch.save(ed_resume_state, ed_resume_state_path)
 
 
 def load_resume_states(parent_folder: str,
@@ -182,34 +181,27 @@ def load_resume_states(parent_folder: str,
     """
     Load resume states from the given json onto the passed-in objects
     """
-    ed_resume_states_path = os.path.join(parent_folder, "ed_resume_states.json")
+    ed_resume_state_path = os.path.join(parent_folder, "ed_resume_state.pt")
     optimizer_resume_state_path = os.path.join(parent_folder, "optimizer_resume_state.pt")
     lr_scheduler_resume_state_path = os.path.join(parent_folder, "lr_scheduler_resume_state.pt")
 
-    # optimizer
-    with open(optimizer_resume_state_path, "rb") as f:
-        optimizer_resume_state = torch.load(f)
-        optimizer.load_state_dict(optimizer_resume_state)
-
-    # lr scheduler
-    with open(lr_scheduler_resume_state_path, "rb") as f:
-        lr_scheduler_resume_state = torch.load(f)
-        lr_scheduler.load_state_dict(lr_scheduler_resume_state)
+    # optimizer and lr scheduler
+    optimizer.load_state_dict(torch.load(optimizer_resume_state_path))
+    lr_scheduler.load_state_dict(torch.load(lr_scheduler_resume_state_path))
 
     # ED stuff
-    with open(ed_resume_states_path, "rt") as f:
-        resume_state = json.load(f)
-        last_known_version = 1
-        if resume_state["version"] > last_known_version:
-            raise ValueError(f"resume state json {ed_resume_states_path} is version {resume_state['version']} which is newer than "
-                             f"the last supported version ({last_known_version})")
-        set_rng_states(resume_state["random_states"])
-        train_dataloader.load_state_dict(resume_state["train_dataloader_state"])
-        train_ed_batch.load_state_dict(resume_state["train_ed_batch_state"])
-        epoch = resume_state["epoch"]
-        global_step = resume_state["global_step"]
+    ed_resume_state = torch.load(ed_resume_state_path)
+    last_known_version = 1
+    if ed_resume_state["version"] > last_known_version:
+        raise ValueError(f"resume state json {ed_resume_state_path} is version {ed_resume_state['version']} which is newer than "
+                         f"the last supported version ({last_known_version})")
+    set_rng_states(ed_resume_state["random_states"])
+    train_dataloader.load_state_dict(ed_resume_state["train_dataloader_state"])
+    train_ed_batch.load_state_dict(ed_resume_state["train_ed_batch_state"])
+    epoch = ed_resume_state["epoch"]
+    global_step = ed_resume_state["global_step"]
 
-        return epoch, global_step
+    return epoch, global_step
 
 
 def get_gpu_memory(nvsmi):
@@ -613,7 +605,7 @@ def main(args):
         if text_encoder_lr_scale != 1.0:
             logging.info(f" * Using text encoder LR scale {text_encoder_lr_scale}")
 
-        if optimizer_config["save_optimizer"]:
+        if optimizer_config.get("save_optimizer", False):
             logging.info(" * Saving optimizer and RNG states alongside checkpoints")
             save_training_states_for_resume = True
 
@@ -732,7 +724,7 @@ def main(args):
                                                 train_ed_batch=train_batch,
                                                 optimizer=optimizer,
                                                 lr_scheduler=lr_scheduler)
-        print(f"   Resuming from epoch {epoch}, global step {global_step} with learning rate(s) {lr_scheduler.get_lr()}")
+        print(f"   Resuming from epoch {resume_epoch}, global step {global_step} with learning rate(s) {lr_scheduler.get_lr()}")
 
 
     """
