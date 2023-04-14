@@ -780,10 +780,13 @@ def main(args):
         return model_pred, target, timesteps
 
     def get_loss(model_pred, target, timesteps):
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-        if snr_gamma > 0:
+        if snr_gamma == 0:
+            return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        else:
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean([1, 2, 3])
             loss = apply_snr_weight(loss, timesteps, noise_scheduler, snr_gamma)
-        return loss
+            return loss.mean()
 
     def generate_samples(global_step: int, batch):
         with isolate_rng():
