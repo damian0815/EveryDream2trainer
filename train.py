@@ -59,6 +59,7 @@ from data.image_train_item import ImageTrainItem
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
+from utils.snr_weight import apply_snr_weight
 
 if torch.cuda.is_available():
     from utils.gpu import GPU
@@ -525,6 +526,7 @@ def main(args):
     default_lr = 1e-6
     curr_lr = args.lr
     text_encoder_lr_scale = 1.0
+    snr_gamma = 0
 
     if optimizer_config is not None:
         betas = optimizer_config["betas"]
@@ -539,6 +541,8 @@ def main(args):
         text_encoder_lr_scale = optimizer_config.get("text_encoder_lr_scale", text_encoder_lr_scale)
         if text_encoder_lr_scale != 1.0:
             logging.info(f" * Using text encoder LR scale {text_encoder_lr_scale}")
+
+        snr_gamma = optimizer_config.get("snr_gamma", 0)
 
         logging.info(f" * Loaded optimizer args from {optimizer_config_path} *")
 
@@ -773,7 +777,13 @@ def main(args):
         with autocast(enabled=args.amp):
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-        return model_pred, target
+        return model_pred, target, timesteps
+
+    def get_loss(model_pred, target, timesteps):
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        if snr_gamma > 0:
+            loss = apply_snr_weight(loss, timesteps, noise_scheduler, snr_gamma)
+        return loss
 
     def generate_samples(global_step: int, batch):
         with isolate_rng():
@@ -821,9 +831,9 @@ def main(args):
             for step, batch in enumerate(train_dataloader):
                 step_start_time = time.time()
 
-                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
+                model_pred, target, timesteps = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
 
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = get_loss(model_pred, target, timesteps)
 
                 del target, model_pred
 

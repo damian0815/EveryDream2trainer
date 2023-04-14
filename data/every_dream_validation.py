@@ -105,7 +105,7 @@ class EveryDreamValidator:
 
     def do_validation_if_appropriate(self, epoch: int, global_step: int,
                                      get_model_prediction_and_target_callable: Callable[
-                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
+                                         [Any, Any], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         if (epoch % self.every_n_epochs) == 0:
             if self.train_overlapping_dataloader is not None:
                 mean_loss = self._calculate_validation_loss('stabilize-train',
@@ -138,7 +138,7 @@ class EveryDreamValidator:
                 logging.warning(f"Validation loss shows diverging.  Check your val/loss graph.")
 
     def _calculate_validation_loss(self, tag, dataloader, get_model_prediction_and_target: Callable[
-        [Any, Any], tuple[torch.Tensor, torch.Tensor]]) -> float:
+        [Any, Any], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> float:
         with torch.no_grad(), isolate_rng():
             # ok to override seed here because we are in a `with isolate_rng():` block
             random.seed(self.seed)
@@ -149,7 +149,7 @@ class EveryDreamValidator:
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({tag}){Style.RESET_ALL}")
 
             for step, batch in enumerate(dataloader):
-                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
+                model_pred, target, _ = get_model_prediction_and_target(batch["image"], batch["tokens"])
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
