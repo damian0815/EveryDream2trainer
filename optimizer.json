@@ -6,12 +6,14 @@
         "betas": "exponential decay rates for the moment estimates",
         "epsilon": "value added to denominator for numerical stability, unused for lion",
         "weight_decay": "weight decay (L2 penalty)",
-        "text_encoder_lr_scale": "scale the text encoder LR relative to the Unet LR. for example, if `lr` is 2e-6 and `text_encoder_lr_scale` is 0.5, the text encoder's LR will be set to `1e-6`."
+        "text_encoder_lr_scale": "scale the text encoder LR relative to the Unet LR. for example, if `lr` is 2e-6 and `text_encoder_lr_scale` is 0.5, the text encoder's LR will be set to `1e-6`.",
+        "snr_weighting_gamma": "gamma value for the signal-to-noise ratio weighting, or null or 0 to disable. a good starting value is 5. effective range is from 1 (very strong effect) to probably around 20 (very little effect). see https://arxiv.org/abs/2303.09556 for more information."
     },
     "optimizer": "adamw8bit",
     "lr": 1e-6,
     "betas": [0.9, 0.999],
     "epsilon": 1e-8,
     "weight_decay": 0.010,
-    "text_encoder_lr_scale": 0.50
+    "text_encoder_lr_scale": 0.50,
+    "snr_weighting_gamma": null
 }

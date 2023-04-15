@@ -526,7 +526,7 @@ def main(args):
     default_lr = 1e-6
     curr_lr = args.lr
     text_encoder_lr_scale = 1.0
-    snr_gamma = 0
+    snr_weighting_gamma = None
 
     if optimizer_config is not None:
         betas = optimizer_config["betas"]
@@ -542,7 +542,7 @@ def main(args):
         if text_encoder_lr_scale != 1.0:
             logging.info(f" * Using text encoder LR scale {text_encoder_lr_scale}")
 
-        snr_gamma = optimizer_config.get("snr_gamma", 0)
+        snr_weighting_gamma = optimizer_config.get("snr_weighting_gamma", None)
 
         logging.info(f" * Loaded optimizer args from {optimizer_config_path} *")
 
@@ -780,12 +780,12 @@ def main(args):
         return model_pred, target, timesteps
 
     def get_loss(model_pred, target, timesteps):
-        if snr_gamma == 0:
+        if snr_weighting_gamma is None or snr_weighting_gamma == 0:
             return F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         else:
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
             loss = loss.mean([1, 2, 3])
-            loss = apply_snr_weight(loss, timesteps, noise_scheduler, snr_gamma)
+            loss = apply_snr_weight(loss, timesteps, noise_scheduler, snr_weighting_gamma)
             return loss.mean()
 
     def generate_samples(global_step: int, batch):
