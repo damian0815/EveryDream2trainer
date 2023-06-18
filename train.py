@@ -762,8 +762,9 @@ def main(args):
                 return y_min + pos * (y_max-y_min)
             timestep_band_range = noise_scheduler.config.num_train_timesteps * 0.25
             last_timestep = noise_scheduler.config.num_train_timesteps
-            min_random_timestep = lerp(epoch, args.max_epochs-1, 0, 0, last_timestep-timestep_band_range)
-            max_random_timestep = lerp(epoch, args.max_epochs-1, 0,  timestep_band_range, last_timestep)
+            min_random_timestep = int(lerp(epoch, args.max_epochs-1, 0, 0, last_timestep-timestep_band_range))
+            max_random_timestep = int(lerp(epoch, args.max_epochs-1, 0,  timestep_band_range, last_timestep))
+            print(f"epoch {epoch}: min timestep {min_random_timestep}, max {max_random_timestep}")
 
             epoch_len = math.ceil(len(train_batch) / args.batch_size)
             steps_pbar = tqdm(range(epoch_len), position=1, leave=False, dynamic_ncols=True)
