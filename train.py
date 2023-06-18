@@ -666,7 +666,7 @@ def main(args):
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
     # actual prediction function - shared between train and validate
-    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0):
+    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0,  min_timestep=None, max_timestep=None):
         with torch.no_grad():
             with autocast(enabled=args.amp):
                 pixel_values = image.to(memory_format=torch.contiguous_format).to(unet.device)
@@ -683,7 +683,9 @@ def main(args):
 
             bsz = latents.shape[0]
 
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            min_timestep = min_timestep or 0
+            max_timestep = max_timestep or noise_scheduler.config.num_train_timesteps
+            timesteps = torch.randint(min_timestep, max_timestep, (bsz,), device=latents.device)
             timesteps = timesteps.long()
 
             cuda_caption = tokens.to(text_encoder.device)
@@ -754,6 +756,15 @@ def main(args):
             epoch_start_time = time.time()
             images_per_sec_log_step = []
 
+            # linear schedule tracking epoch number
+            def lerp(x, x_min, x_max, y_min, y_max):
+                pos = (x-x_min)/(x_max-x_min)
+                return y_min + pos * (y_max-y_min)
+            timestep_band_range = noise_scheduler.config.num_train_timesteps * 0.25
+            last_timestep = noise_scheduler.config.num_train_timesteps
+            min_random_timestep = lerp(epoch, args.max_epochs-1, 0, 0, last_timestep-timestep_band_range)
+            max_random_timestep = lerp(epoch, args.max_epochs-1, 0,  timestep_band_range, last_timestep)
+
             epoch_len = math.ceil(len(train_batch) / args.batch_size)
             steps_pbar = tqdm(range(epoch_len), position=1, leave=False, dynamic_ncols=True)
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
@@ -766,7 +777,8 @@ def main(args):
             for step, batch in enumerate(train_dataloader):
                 step_start_time = time.time()
 
-                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio)
+                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], args.zero_frequency_noise_ratio,
+                                                                     min_timestep=min_random_timestep, max_timestep=max_random_timestep)
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
