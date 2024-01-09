@@ -1096,17 +1096,6 @@ def main(args):
             basename += f"-gs{global_step:05}"
         return os.path.join(log_folder, "ckpts", basename)
 
-
-    # Pre-train validation to establish a starting point on the loss graph
-    if validator:
-        validator.do_validation(global_step=0,
-                                get_model_prediction_and_target_callable=get_model_prediction_and_target)
-
-    # the sample generator might be configured to generate samples before step 0
-    if sample_generator.generate_pretrain_samples:
-        _, batch = next(enumerate(train_dataloader))
-        generate_samples(global_step=0, batch=batch)
-
     def make_current_ed_state() -> EveryDreamTrainingState:
         return EveryDreamTrainingState(optimizer=ed_optimizer,
                                        train_batch=train_batch,
@@ -1117,6 +1106,16 @@ def main(args):
                                        vae=vae,
                                        unet_ema=unet_ema,
                                        text_encoder_ema=text_encoder_ema)
+
+    # Pre-train validation to establish a starting point on the loss graph
+    if validator:
+        validator.do_validation(global_step=0,
+                                get_model_prediction_and_target_callable=get_model_prediction_and_target)
+
+    # the sample generator might be configured to generate samples before step 0
+    if sample_generator.generate_pretrain_samples:
+        _, batch = next(enumerate(train_dataloader))
+        generate_samples(global_step=0, batch=batch)
 
     epoch = None
     try:        
