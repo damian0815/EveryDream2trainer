@@ -3,7 +3,13 @@ import importlib
 import logging
 import time
 import warnings
+
+import torch
 from PIL import Image
+import torch.nn.functional as F
+
+#from train import EveryDreamTrainingState
+
 
 class BasePlugin:
     def on_epoch_start(self, **kwargs):
@@ -22,6 +28,18 @@ class BasePlugin:
         return caption
     def transform_pil_image(self, img:Image):
         return img
+
+    def get_model_prediction_and_target(self,
+                                        image_latents,
+                                        noise,
+                                        encoder_hidden_states,
+                                        timesteps,
+                                        noise_scheduler,
+                         ed_state: 'EveryDreamTrainingState',
+                         use_amp: bool):
+        return None
+
+
 
 def load_plugin(plugin_path):
     print(f" - Attempting to load plugin: {plugin_path}")
@@ -104,3 +122,27 @@ class PluginRunner:
             for plugin in self.plugins:
                 img = plugin.transform_pil_image(img)
         return img
+
+    def run_get_model_prediction_and_target(self,
+            image_latents,
+            noise,
+            encoder_hidden_states,
+            timesteps: torch.IntTensor,
+            noise_scheduler,
+            ed_state: 'EveryDreamTrainingState',
+            use_amp: bool
+        ):
+
+        with Timer(warn_seconds=self.step_warn_seconds, label="plugin.get_model_prediction_and_target"):
+            for plugin in self.plugins:
+                model_pred_and_target = plugin.get_model_prediction_and_target(
+                    image_latents=image_latents,
+                    noise=noise,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timesteps=timesteps,
+                    noise_scheduler=noise_scheduler,
+                    ed_state=ed_state,
+                    use_amp=use_amp)
+                if model_pred_and_target is not None:
+                    return model_pred_and_target
+            return None

@@ -957,19 +957,33 @@ def main(args):
         else:
             encoder_hidden_states = encoder_hidden_states.last_hidden_state
 
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-        if noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        model_pred_and_target = plugin_runner.run_get_model_prediction_and_target(
+            image_latents=latents,
+            noise=noise,
+            encoder_hidden_states=encoder_hidden_states,
+            timesteps=timesteps,
+            noise_scheduler=noise_scheduler,
+            ed_state=make_current_ed_state(),
+            use_amp=args.amp
+        )
+        if model_pred_and_target is not None:
+            model_pred, target = model_pred_and_target
         else:
-            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-        del noise, latents, cuda_caption
+            # default get_model_prediction_and_target
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        with autocast(enabled=args.amp):
-            #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            if noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            else:
+                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+            with autocast(enabled=args.amp):
+                #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        del noise, latents, cuda_caption
 
         if return_loss:
             if loss_scale is None:
@@ -1106,7 +1120,9 @@ def main(args):
 
     epoch = None
     try:        
-        plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
+        plugin_runner.run_on_training_start(log_folder=log_folder,
+                                            project_name=args.project_name,
+                                            ed_state=make_current_ed_state())
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
