@@ -13,6 +13,10 @@ class SampleCapturedException(Exception):
     def __init__(self, sample):
         self.sample = sample
 
+def throw_output_hook(m, input, output):
+    captured_sample = output
+    raise SampleCapturedException(captured_sample)
+
 """ 
 runs the actual mid block module, grabs the result, then interrupts execution by throwing it as an exception
 gross? yes. works? probably.
@@ -23,13 +27,21 @@ class CapturingThrowingWrappedMidBlock(torch.nn.Module):
         super().__init__()
         self.actual_mid_block = actual_mid_block
 
-    def __call__(self, *args, **kwargs):
+    def forward(self, *args, **kwargs):
         captured_sample = self.actual_mid_block(
             *args,
             **kwargs
         )
         raise SampleCapturedException(captured_sample)
 
+    """def __getattribute__(self, name):
+        print("getting", name)
+        return self.actual_mid_block.__getattr__(name)
+
+    def __setattr__(self, name, value):
+        print("setting", name)
+        self.actual_mid_block.__setattr__(name, value)
+    """
     """
     sample = self.mid_block(
                 sample,
@@ -49,8 +61,8 @@ class PerceptualLoss(BasePlugin):
     def on_training_start(self, **kwargs):
         ed_state: EveryDreamTrainingState = kwargs['ed_state']
         self.unet_frozen = copy.deepcopy(ed_state.unet)
-        actual_mid_block = self.unet_frozen.mid_block
-        self.unet_frozen.mid_block = CapturingThrowingWrappedMidBlock(actual_mid_block)
+        actual_mid_block: torch.nn.Module = self.unet_frozen.mid_block
+        actual_mid_block.register_forward_hook(throw_output_hook)
         del(self.unet_frozen.up_blocks)
 
 
