@@ -1107,21 +1107,21 @@ def main(args):
                                        unet_ema=unet_ema,
                                        text_encoder_ema=text_encoder_ema)
 
-    # Pre-train validation to establish a starting point on the loss graph
-    if validator:
-        validator.do_validation(global_step=0,
-                                get_model_prediction_and_target_callable=get_model_prediction_and_target)
-
-    # the sample generator might be configured to generate samples before step 0
-    if sample_generator.generate_pretrain_samples:
-        _, batch = next(enumerate(train_dataloader))
-        generate_samples(global_step=0, batch=batch)
-
     epoch = None
     try:        
         plugin_runner.run_on_training_start(log_folder=log_folder,
                                             project_name=args.project_name,
                                             ed_state=make_current_ed_state())
+
+        # Pre-train validation to establish a starting point on the loss graph
+        if validator:
+            validator.do_validation(global_step=0,
+                                    get_model_prediction_and_target_callable=get_model_prediction_and_target)
+
+        # the sample generator might be configured to generate samples before step 0
+        if sample_generator.generate_pretrain_samples:
+            _, batch = next(enumerate(train_dataloader))
+            generate_samples(global_step=0, batch=batch)
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
