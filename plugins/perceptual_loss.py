@@ -13,50 +13,17 @@ class SampleCapturedException(Exception):
     def __init__(self, sample):
         self.sample = sample
 
+""" 
+runs the actual mid block module, grabs the result, then interrupts execution by throwing it as an exception
+gross? yes. works? also yes.
+"""
 def throw_output_hook(m, input, output):
     captured_sample = output
     raise SampleCapturedException(captured_sample)
 
-""" 
-runs the actual mid block module, grabs the result, then interrupts execution by throwing it as an exception
-gross? yes. works? probably.
-"""
-class CapturingThrowingWrappedMidBlock(torch.nn.Module):
-
-    def __init__(self, actual_mid_block):
-        super().__init__()
-        self.actual_mid_block = actual_mid_block
-
-    def forward(self, *args, **kwargs):
-        captured_sample = self.actual_mid_block(
-            *args,
-            **kwargs
-        )
-        raise SampleCapturedException(captured_sample)
-
-    """def __getattribute__(self, name):
-        print("getting", name)
-        return self.actual_mid_block.__getattr__(name)
-
-    def __setattr__(self, name, value):
-        print("setting", name)
-        self.actual_mid_block.__setattr__(name, value)
-    """
-    """
-    sample = self.mid_block(
-                sample,
-                emb,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=attention_mask,
-                cross_attention_kwargs=cross_attention_kwargs,
-                encoder_attention_mask=encoder_attention_mask,
-            )"""
-
 class PerceptualLoss(BasePlugin):
-
     def __init__(self):
         self.unet_frozen = None
-
 
     def on_training_start(self, **kwargs):
         ed_state: EveryDreamTrainingState = kwargs['ed_state']
@@ -64,7 +31,6 @@ class PerceptualLoss(BasePlugin):
         actual_mid_block: torch.nn.Module = self.unet_frozen.mid_block
         actual_mid_block.register_forward_hook(throw_output_hook)
         del(self.unet_frozen.up_blocks)
-
 
     def get_model_prediction_and_target(self,
                                         image_latents,
@@ -75,8 +41,8 @@ class PerceptualLoss(BasePlugin):
                          ed_state: EveryDreamTrainingState,
                          use_amp: bool):
 
-        #if noise_scheduler.config.prediction_type not in ["v_prediction", "v-prediction"]:
-        #    raise RuntimeError("Sorry, perceptual loss only works with V-prediction models")
+        if noise_scheduler.config.prediction_type not in ["v_prediction", "v-prediction"]:
+            raise RuntimeError("Sorry, perceptual loss only works with V-prediction models")
 
         x_0 = image_latents
         c = encoder_hidden_states
@@ -90,12 +56,12 @@ class PerceptualLoss(BasePlugin):
         with autocast(enabled=use_amp):
             #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
             v_pred = ed_state.unet(x_t, t, c).sample
-        x_0_pred, eps_pred = self.get_alpha_stuff(x_t=x_t,
-                                                  v_pred=v_pred,
-                                                  noise_scheduler=noise_scheduler,
-                                                  timesteps=t,
-                                                  device=x_0.device,
-                                                  dtype=x_0.dtype)
+        x_0_pred, eps_pred = self.predict_x0_and_eps_from_x_t_and_v_pred(x_t=x_t,
+                                                                         v_pred=v_pred,
+                                                                         noise_scheduler=noise_scheduler,
+                                                                         timesteps=t,
+                                                                         device=x_0.device,
+                                                                         dtype=x_0.dtype)
 
         # Sample new timesteps.
         # Then perform forward diffusion twice.
@@ -122,7 +88,13 @@ class PerceptualLoss(BasePlugin):
 
         return feature_pred, feature_real
 
-    def get_alpha_stuff(self, x_t: torch.FloatTensor, v_pred: torch.FloatTensor, noise_scheduler, timesteps: torch.IntTensor, device, dtype):
+    def predict_x0_and_eps_from_x_t_and_v_pred(self,
+                                               x_t: torch.FloatTensor,
+                                               v_pred: torch.FloatTensor,
+                                               noise_scheduler,
+                                               timesteps: torch.IntTensor,
+                                               device,
+                                               dtype):
 
         alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=dtype)
         timesteps = timesteps.to(device)
@@ -142,24 +114,3 @@ class PerceptualLoss(BasePlugin):
         eps_pred = sqrt_alpha_prod * v_pred + sqrt_one_minus_alpha_prod * x_t
 
         return x_0_pred, eps_pred
-
-
-def get_velocity(
-        self, sample: torch.FloatTensor, noise: torch.FloatTensor, timesteps: torch.IntTensor
-    ) -> torch.FloatTensor:
-        # Make sure alphas_cumprod and timestep have same device and dtype as sample
-        alphas_cumprod = self.alphas_cumprod.to(device=sample.device, dtype=sample.dtype)
-        timesteps = timesteps.to(sample.device)
-
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(sample.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(sample.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-        velocity = sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * sample
-        return velocity

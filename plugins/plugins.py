@@ -2,14 +2,9 @@ import argparse
 import importlib
 import logging
 import time
-import warnings
 
 import torch
 from PIL import Image
-import torch.nn.functional as F
-
-#from train import EveryDreamTrainingState
-
 
 class BasePlugin:
     def on_epoch_start(self, **kwargs):
