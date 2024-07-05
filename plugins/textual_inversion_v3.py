@@ -66,7 +66,7 @@ class TextualInversionPlugin(BasePlugin):
 
         # check for correctly configured text encoder training
         num_te_layers = len(self.text_encoder.text_model.encoder.layers)
-        if False and (optimizer_config is None or
+        if (optimizer_config is None or
             'text_encoder_freezing' not in optimizer_config or
             optimizer_config['text_encoder_freezing'].get('freeze_embeddings') != True or
             optimizer_config['text_encoder_freezing'].get('freeze_final_layer_norm') != True or
@@ -86,8 +86,27 @@ class TextualInversionPlugin(BasePlugin):
                                            for tid in get_token_ids(w)])))
         logging.info(
             f" * Text embedding unlocked tokens: {tokens_to_train} -> {tokenizer.convert_ids_to_tokens(tokens_to_train)}")
-
         self.training_token_ids = torch.tensor(tokens_to_train, device=self.text_encoder.device, dtype=torch.int64)
+
+        embeddings: nn.Embedding = self.text_encoder.get_input_embeddings()
+        with torch.no_grad():
+            stds = embeddings.weight.std(dim=0)
+            means = embeddings.weight.mean(dim=0)
+            for t in self.config['tokens']:
+                tids_to_initialize = get_token_ids(t['token'])
+                # always calculate random weights, even if they're not used, to ensure persistent
+                # behaviour with same seed
+                random_weights = {tid: torch.normal(mean=means, std=stds)
+                                  for tid in tids_to_initialize}
+                if t.get('initialize_random', False):
+                    for tid in tids_to_initialize:
+                        embeddings.weight.data[tid] = random_weights[tid]
+                elif 'initializer' in t:
+                    initializer = t['initializer']
+                    initializer_tids = get_token_ids(initializer)
+                    initializer_weights = [embeddings.weight[i] for i in initializer_tids]
+                    for i, t in enumerate(tids_to_initialize):
+                        embeddings.weight.data[t] = initializer_weights[i % len(initializer_weights)]
 
         """
         with torch.no_grad():
@@ -112,7 +131,6 @@ class TextualInversionPlugin(BasePlugin):
 
         #torch.autograd.set_detect_anomaly(True)
 
-        embeddings: nn.Embedding = self.text_encoder.get_input_embeddings()
         embeddings.training_token_ids = self.training_token_ids
         embeddings.embedding_offsets_individual = self.embedding_offsets_individual
         embeddings.register_forward_hook(_embedding_forward_individual_hook)
@@ -153,15 +171,9 @@ class TextualInversionPlugin(BasePlugin):
         return text_encoder_parameters, unet_parameters
 
 
-    def on_step_start(self, **kwargs):
-        batch = kwargs['batch']
-        tokens = batch['tokens']  # a torch.stack
-        self.this_batch_tokens = torch.unique(torch.flatten(tokens)).tolist()
-        if len(set(self.training_token_ids).intersection(set(self.this_batch_tokens))) > 0:
-            print("* training something this step")
-
     def on_epoch_end(self, **kwargs):
-        print("* TI plugin: non-zero entries count", torch.count_nonzero(self.embedding_offsets_individual))
+        if torch.count_nonzero(self.embedding_offsets_individual).item() == 0:
+            logging.warning(" * TextualInversionPlugin: warning: nothing has happened (possible misconfiguration?)")
         # bounce offsets down into actual embeddings array and reset offsets
         with torch.no_grad():
             embeddings = self.text_encoder.get_input_embeddings()
@@ -171,25 +183,13 @@ class TextualInversionPlugin(BasePlugin):
             embeddings.weight.data = offset_weights.data
             self.embedding_offsets_individual.zero_()
 
-    def on_step_end(self, **kwargs):
-        if False:
-            ed_state: EveryDreamTrainingState = kwargs['ed_state']
-
-            # reset the embeddings that have been touched this step, except the ones we're training, to their original state
-            with (torch.no_grad()):
-                embeddings = ed_state.text_encoder.get_input_embeddings()
-                embeddings_to_restore = [t for t in self.this_batch_tokens if t not in self.training_token_ids]
-                for t in embeddings_to_restore:
-                    embeddings.weight[t] = self.original_text_embeddings[t]
-        else:
-            pass
-
-    def on_model_save(self, **kwargs):
+    """def on_model_save(self, **kwargs):
         ed_state: EveryDreamTrainingState = kwargs['ed_state']
         embeddings = ed_state.text_encoder.get_input_embeddings()
         save_folder = kwargs['save_folder']
         for token_id, token in zip(self.training_token_ids, self.training_token_ids):
             _save_embedding(token=token, embedding=embeddings.weight[token_id], save_folder=save_folder)
+    """
 
     def transform_caption(self, caption:str):
         if all(re.search('(^|[\W])'+word+'([\W]|$)', caption) is None for word in self.training_words):

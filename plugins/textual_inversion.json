@@ -11,7 +11,8 @@
     "example": "the example below trains `hat*`, `dancing shoes` and `cane` as custom tokens, if you have training data where the captions include those tokens."
   },
   "tokens": [
-    { "token": "ay", "initialize_random": true }
+    { "token": "ay" },
+    { "token": "hz" }
   ],
   "fallback_word": "ay"
 }

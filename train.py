@@ -174,7 +174,8 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
         logging.warning("  No model to save, something likely blew up on startup, not saving")
         return
 
-    plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
+    if plugin_runner is not None:
+        plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
 
     if ed_state.unet_ema is not None or ed_state.text_encoder_ema is not None:
         pipeline_ema = StableDiffusionPipeline(
@@ -1284,7 +1285,8 @@ def main(args):
                     save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
                                save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
                                save_full_precision=args.save_full_precision,
-                               save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                               save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                               plugin_runner=plugin_runner)
 
                 plugin_runner.run_on_step_end(epoch=epoch,
                                       global_step=global_step,
@@ -1331,7 +1333,8 @@ def main(args):
         save_path = make_save_path(epoch, global_step, prepend=("" if args.no_prepend_last else "last-"))
         save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                   plugin_runner=plugin_runner)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
