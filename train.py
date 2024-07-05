@@ -70,6 +70,8 @@ import data.aspects as aspects
 import data.resolver as resolver
 from utils.sample_generator import SampleGenerator
 
+from plugins.plugins import PluginRunner
+
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
 
@@ -141,7 +143,7 @@ class EveryDreamTrainingState:
 
 @torch.no_grad()
 def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
-               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True):
+               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True, plugin_runner: PluginRunner = None):
     """
     Save the model to disk
     """
@@ -171,6 +173,8 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if global_step is None or global_step == 0:
         logging.warning("  No model to save, something likely blew up on startup, not saving")
         return
+
+    plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
 
     if ed_state.unet_ema is not None or ed_state.text_encoder_ema is not None:
         pipeline_ema = StableDiffusionPipeline(
@@ -557,7 +561,7 @@ def load_train_json_from_file(args, report_load = False):
 
         args.__dict__.update(read_json)
     except Exception as config_read:
-        print(f"Error on loading training config from {args.config}.")
+        print(f"Error on loading training config from {args.config}:", config_read)
 
 def main(args):
     """
@@ -794,8 +798,8 @@ def main(args):
         logging.info("No plugins specified")
         plugins = []
 
-    from plugins.plugins import PluginRunner
     plugin_runner = PluginRunner(plugins=plugins)
+    plugin_runner.run_on_model_load(unet=unet, text_encoder=text_encoder, tokenizer=tokenizer, optimizer_config=optimizer_config)
 
     data_loader = DataLoaderMultiAspect(
         image_train_items=image_train_items,
@@ -839,6 +843,7 @@ def main(args):
                                        text_encoder,
                                        unet,
                                        epoch_len,
+                                       plugin_runner,
                                        log_writer)
 
     log_args(log_writer, args, optimizer_config, log_folder, log_time)
@@ -881,9 +886,9 @@ def main(args):
                 logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
                 time.sleep(2) # give opportunity to ctrl-C again to cancel save
-                save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
-                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                #save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
+                #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+                #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
             exit(_SIGTERM_EXIT_CODE)
         else:
             # non-main threads (i.e. dataloader workers) should exit cleanly
@@ -1335,11 +1340,12 @@ def main(args):
 
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
-        save_path = make_save_path(epoch, global_step, prepend="errored-")
-        save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
-                   save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
-        logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
+        logging.error(f"{Fore.LIGHTYELLOW_EX}NOT attempting to save model{Style.RESET_ALL}")
+        #save_path = make_save_path(epoch, global_step, prepend="errored-")
+        #save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
+        #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+        #logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")

@@ -27,6 +27,10 @@ from diffusers.optimization import get_scheduler
 from colorama import Fore, Style
 import pprint
 
+from plugins.plugins import PluginRunner
+
+g_embeddings = None
+
 BETAS_DEFAULT = [0.9, 0.999]
 EPSILON_DEFAULT = 1e-8
 WEIGHT_DECAY_DEFAULT = 0.01
@@ -42,7 +46,7 @@ class EveryDreamOptimizer():
     text_encoder: text encoder model parameters
     unet: unet model parameters
     """
-    def __init__(self, args, optimizer_config, text_encoder, unet, epoch_len, log_writer=None):
+    def __init__(self, args, optimizer_config, text_encoder, unet, epoch_len, plugin_runner: PluginRunner, log_writer=None):
         del optimizer_config["doc"]
         print(f"\n raw optimizer_config:")
         pprint.pprint(optimizer_config)
@@ -63,11 +67,13 @@ class EveryDreamOptimizer():
 
         self.text_encoder_params = self._apply_text_encoder_freeze(text_encoder)
         self.unet_params = unet.parameters()
+        self.text_encoder_params, self.unet_params = plugin_runner.run_add_parameters(self.text_encoder_params, self.unet_params)
+        self.text_encoder_params = list(self.text_encoder_params)
 
-        with torch.no_grad():
-            log_action = lambda n, label: logging.info(f"{Fore.LIGHTBLUE_EX} {label} weight normal: {n:.1f}{Style.RESET_ALL}")
-            self._log_weight_normal(text_encoder.text_model.encoder.layers.parameters(), "text encoder", log_action)
-            self._log_weight_normal(unet.parameters(), "unet", log_action)
+        #with torch.no_grad():
+        #    log_action = lambda n, label: logging.info(f"{Fore.LIGHTBLUE_EX} {label} weight normal: {n:.1f}{Style.RESET_ALL}")
+        #    self._log_weight_normal(text_encoder.text_model.encoder.layers.parameters(), "text encoder", log_action)
+        #    self._log_weight_normal(unet.parameters(), "unet", log_action)
 
         self.optimizers = []
         self.optimizer_te, self.optimizer_unet = self.create_optimizers(args,
@@ -122,6 +128,7 @@ class EveryDreamOptimizer():
 
     def step(self, loss, step, global_step):
         self.scaler.scale(loss).backward()
+        #print(g_embeddings.grad)
 
         if ((global_step + 1) % self.grad_accum == 0) or (step == self.epoch_len - 1):
             if self.clip_grad_norm is not None:
@@ -150,9 +157,10 @@ class EveryDreamOptimizer():
                 log_info_te_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
                 with torch.no_grad():
                     self._log_gradient_normal(self.unet_params, "optimizer/unet_grad_norm", log_info_unet_fn)
-                    self._log_gradient_normal(self.text_encoder_params, "optimizer/te_grad_norm", log_info_te_fn)
+                    self._log_gradient_normal(itertools.chain(self.text_encoder_params), "optimizer/te_grad_norm", log_info_te_fn)
 
             self._zero_grad(set_to_none=True)
+
 
         for scheduler in self.lr_schedulers:
             scheduler.step()
@@ -317,6 +325,7 @@ class EveryDreamOptimizer():
             pass
 
     def _create_optimizer(self, label, args, local_optimizer_config, parameters):
+        #l = [parameters]
         betas = BETAS_DEFAULT
         epsilon = EPSILON_DEFAULT
         weight_decay = WEIGHT_DECAY_DEFAULT
@@ -499,7 +508,7 @@ class EveryDreamOptimizer():
             unfreeze_last_n_layers = num_layers
         else:
             # something specified:
-            assert(unfreeze_last_n_layers > 0)
+            #assert(unfreeze_last_n_layers > 0)
             if unfreeze_last_n_layers < num_layers:
                 # if we're unfreezing layers then by default we ought to freeze the embeddings
                 unfreeze_embeddings = False

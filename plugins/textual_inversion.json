@@ -3,14 +3,15 @@
   "documentation": {
     "tokens": {
       "token": "the token (word) to train, given exactly as it appears in tokens",
-      "initializer": "starting point for the embedding. make it close to the intended meaning to kick-start training. should be shorter (in tokens) than the vector_length.",
-      "vector_length": "length of the embedding (default 1). use more if you have more images and/or if what you want to train is complex."
+      "initializer": "(optional) starting point for the embedding. make it close to the intended meaning to kick-start training. should be shorter (in tokens) than the vector_length.",
+      "initialize_random": "(optional, default false) if true, initialize/overwrite any existing embedding with random.",
+      "vector_length": "(optional, default 1) length of the embedding. use more if you have more images and/or if what you want to train is complex."
     },
+    "fallback_word": "word that will be inserted at the head of a caption if there are no training tokens in that caption",
     "example": "the example below trains `hat*`, `dancing shoes` and `cane` as custom tokens, if you have training data where the captions include those tokens."
   },
   "tokens": [
-    { "token": "hat*", "initializer": "a man's hat", "vector_length": 8 },
-    { "token": "dancing shoes", "initializer": "shoes" },
-    { "token": "cane", "initializer": "cane" }
-  ]
+    { "token": "ay", "initialize_random": true }
+  ],
+  "fallback_word": "ay"
 }

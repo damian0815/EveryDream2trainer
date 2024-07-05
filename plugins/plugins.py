@@ -14,6 +14,10 @@ class BasePlugin:
         pass
     def on_training_end(self, **kwargs):
         pass
+    def on_model_load(self, **kwargs):
+        pass
+    def on_model_save(self, **kwargs):
+        pass
     def on_step_start(self, **kwargs):
         pass
     def on_step_end(self, **kwargs):
@@ -22,6 +26,9 @@ class BasePlugin:
         return caption
     def transform_pil_image(self, img:Image):
         return img
+
+    def add_parameters(self, text_encoder_parameters, unet_parameters):
+        return text_encoder_parameters, unet_parameters
 
 def load_plugin(plugin_path):
     print(f" - Attempting to load plugin: {plugin_path}")
@@ -78,6 +85,14 @@ class PluginRunner:
             with Timer(warn_seconds=self.training_warn_seconds, label=f'{plugin.__class__.__name__}'):
                 plugin.on_training_start(**kwargs)
 
+    def run_on_model_load(self, **kwargs):
+        for plugin in self.plugins:
+            plugin.on_model_load(**kwargs)
+
+    def run_on_model_save(self, **kwargs):
+        for plugin in self.plugins:
+            plugin.on_model_save(**kwargs)
+
     def run_on_training_end(self, **kwargs):
         for plugin in self.plugins:
             with Timer(warn_seconds=self.training_warn_seconds, label=f'{plugin.__class__.__name__}'):
@@ -104,3 +119,8 @@ class PluginRunner:
             for plugin in self.plugins:
                 img = plugin.transform_pil_image(img)
         return img
+
+    def run_add_parameters(self, text_encoder_parameters, unet_parameters):
+        for plugin in self.plugins:
+            text_encoder_parameters, unet_parameters = plugin.add_parameters(text_encoder_parameters, unet_parameters)
+        return text_encoder_parameters, unet_parameters
