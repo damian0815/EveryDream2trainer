@@ -15,8 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import re
 
-from optimizer.optimizers import g_embeddings
-
 """ 
 This plugin adds custom tokens to the tokenizer and trains just these tokens, with the rest of the text encoder
 disabled/frozen.
@@ -141,11 +139,8 @@ class TextualInversionPlugin(BasePlugin):
             #print(len([x for x in grad_output if hasattr(x, "requires_grad") and x.requires_grad]))
             return grad_input
 
-        embeddings.register_full_backward_hook(_backward_hook_test)
         #embeddings.register_full_backward_hook(_backward_hook_test)
         #embeddings.weight.requires_grad = True
-        global g_embeddings
-        g_embeddings = embeddings
 
         #bound_method = embedding_forward_individual.__get__(embeddings, embeddings.__class__)
         #setattr(embeddings, 'forward', bound_method)

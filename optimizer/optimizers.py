@@ -29,8 +29,6 @@ import pprint
 
 from plugins.plugins import PluginRunner
 
-g_embeddings = None
-
 BETAS_DEFAULT = [0.9, 0.999]
 EPSILON_DEFAULT = 1e-8
 WEIGHT_DECAY_DEFAULT = 0.01
@@ -128,7 +126,6 @@ class EveryDreamOptimizer():
 
     def step(self, loss, step, global_step):
         self.scaler.scale(loss).backward()
-        #print(g_embeddings.grad)
 
         if ((global_step + 1) % self.grad_accum == 0) or (step == self.epoch_len - 1):
             if self.clip_grad_norm is not None:
