@@ -2,7 +2,8 @@ import torch
 
 class AdaCoor(torch.optim.Optimizer):
     def __init__(self, params, eps=1e-8, *args, **kwargs):
-        defaults = dict(epsilon=eps, lr=1)
+        defaults = dict(eps=eps, lr=1)
+        print("initializing AdaCoor with defaults", defaults)
         super(AdaCoor, self).__init__(params, defaults)
 
     def step(self, closure=None):
@@ -10,11 +11,11 @@ class AdaCoor(torch.optim.Optimizer):
         if closure is not None:
             loss = closure()
         
-        for group in self.param_groups:
+        for i, group in enumerate(self.param_groups):
             with torch.no_grad():
                 
                 # Initialize epsilon as a tensor
-                epsilon = torch.tensor([group['epsilon']], dtype=torch.bfloat16, device=next(iter(group['params'])).device)
+                epsilon = torch.tensor([group['eps']], dtype=torch.bfloat16, device=next(iter(group['params'])).device)
 
                 for p in group['params']:
                     if p.grad is None:
@@ -31,7 +32,7 @@ class AdaCoor(torch.optim.Optimizer):
                     
                     gt_hat = (epsilon * p.grad.data).to(dtype=torch.float32, device=p.device)
 
-                    denom = vt.sqrt().add_(group['epsilon']).to(dtype=p.dtype, device=p.device)
+                    denom = vt.sqrt().add_(group['eps']).to(dtype=p.dtype, device=p.device)
                     p.data.addcdiv_(gt_hat, denom, value=-1.0)
 
         return loss

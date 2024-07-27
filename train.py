@@ -57,6 +57,7 @@ from data.data_loader import DataLoaderMultiAspect
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
+from optimizer import optimizers
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -69,6 +70,8 @@ if torch.cuda.is_available():
 import data.aspects as aspects
 import data.resolver as resolver
 from utils.sample_generator import SampleGenerator
+
+from plugins.plugins import PluginRunner
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
@@ -141,7 +144,7 @@ class EveryDreamTrainingState:
 
 @torch.no_grad()
 def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
-               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True):
+               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True, plugin_runner: PluginRunner = None):
     """
     Save the model to disk
     """
@@ -171,6 +174,9 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if global_step is None or global_step == 0:
         logging.warning("  No model to save, something likely blew up on startup, not saving")
         return
+
+    if plugin_runner is not None:
+        plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
 
     if ed_state.unet_ema is not None or ed_state.text_encoder_ema is not None:
         pipeline_ema = StableDiffusionPipeline(
@@ -391,6 +397,11 @@ def setup_args(args):
 
     args.aspects = aspects.get_aspect_buckets(args.resolution)
 
+    if args.timestep_start < 0:
+        raise ValueError("timestep_start must be >= 0")
+    if args.timestep_end > 1000:
+        raise ValueError("timestep_end must be <= 1000")
+
     return args
 
 
@@ -552,7 +563,7 @@ def load_train_json_from_file(args, report_load = False):
 
         args.__dict__.update(read_json)
     except Exception as config_read:
-        print(f"Error on loading training config from {args.config}.")
+        print(f"Error on loading training config from {args.config}:", config_read)
 
 def main(args):
     """
@@ -621,6 +632,18 @@ def main(args):
             unet = pipe.unet
             del pipe
 
+        if args.teacher is not None:
+            pipe = StableDiffusionPipeline.from_pretrained(args.teacher, dtype=torch.float16)
+            teacher_text_encoder = pipe.text_encoder.to(device, dtype=torch.float16)
+            teacher_unet = pipe.unet.to(device, dtype=torch.float16)
+            teacher_noise_scheduler = pipe.scheduler
+            del pipe
+        else:
+            teacher_text_encoder = None
+            teacher_unet = None
+            teacher_noise_scheduler = None
+
+
         if use_ema_dacay_training and args.ema_resume_model:
             print(f"Loading EMA model: {args.ema_resume_model}")
             ema_model_loaded_from_file=True
@@ -663,8 +686,9 @@ def main(args):
             temp_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
             trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
-            noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
+            noise_scheduler_ref = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=trained_betas)
+            noise_scheduler_base = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=None)
         else:
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder)
@@ -727,14 +751,21 @@ def main(args):
         text_encoder_ema = None
 
     try:
-        #unet = torch.compile(unet)
-        #text_encoder = torch.compile(text_encoder)
-        #vae = torch.compile(vae)
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.allow_tf32 = True
+        print()
+        # currently broken on most systems?
+        #unet = torch.compile(unet, mode="max-autotune")
+        #text_encoder = torch.compile(text_encoder, mode="max-autotune")
+        #vae = torch.compile(vae, mode="max-autotune")
         #logging.info("Successfully compiled models")
     except Exception as ex:
         logging.warning(f"Failed to compile model, continuing anyway, ex: {ex}")
+        pass
+
+    try:
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception as ex:
+        logging.warning(f"Failed to set float32 matmul precision, continuing anyway, ex: {ex}")
         pass
 
     optimizer_config = None
@@ -782,8 +813,8 @@ def main(args):
         logging.info("No plugins specified")
         plugins = []
 
-    from plugins.plugins import PluginRunner
     plugin_runner = PluginRunner(plugins=plugins)
+    plugin_runner.run_on_model_load(unet=unet, text_encoder=text_encoder, tokenizer=tokenizer, optimizer_config=optimizer_config)
 
     data_loader = DataLoaderMultiAspect(
         image_train_items=image_train_items,
@@ -822,12 +853,12 @@ def main(args):
         logging.info(
             f"EMA decay enabled, with ema_decay_rate {args.ema_decay_rate}, ema_update_interval: {args.ema_update_interval}, ema_device: {args.ema_device}.")
 
-
     ed_optimizer = EveryDreamOptimizer(args,
                                        optimizer_config,
                                        text_encoder,
                                        unet,
                                        epoch_len,
+                                       plugin_runner,
                                        log_writer)
 
     log_args(log_writer, args, optimizer_config, log_folder, log_time)
@@ -870,9 +901,9 @@ def main(args):
                 logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
                 time.sleep(2) # give opportunity to ctrl-C again to cancel save
-                save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
-                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                #save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
+                #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+                #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
             exit(_SIGTERM_EXIT_CODE)
         else:
             # non-main threads (i.e. dataloader workers) should exit cleanly
@@ -891,7 +922,7 @@ def main(args):
 
     train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size)
 
-    unet.train() if not args.disable_unet_training else unet.eval()
+    unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else unet.eval()
     text_encoder.train() if not args.disable_textenc_training else text_encoder.eval()
 
     logging.info(f" unet device: {unet.device}, precision: {unet.dtype}, training: {unet.training}")
@@ -920,14 +951,16 @@ def main(args):
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
     # actual prediction function - shared between train and validate
-    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0, return_loss=False, loss_scale=None):
+    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0, return_loss=False, loss_scale=None, embedding_perturbation=0.0):
         with torch.no_grad():
+
             with autocast(enabled=args.amp):
                 pixel_values = image.to(memory_format=torch.contiguous_format).to(unet.device)
                 latents = vae.encode(pixel_values, return_dict=False)
             del pixel_values
             latents = latents[0].sample() * 0.18215
 
+            bsz = latents.shape[0]
             noise = torch.randn_like(latents)
 
             if args.pyramid_noise_discount != None:
@@ -942,34 +975,80 @@ def main(args):
                 zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
                 noise = noise + zero_frequency_noise
 
-            bsz = latents.shape[0]
+            if args.batch_share_noise:
+                noise = noise[:1].repeat((bsz, 1, 1, 1))
 
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = torch.randint(args.timestep_start, args.timestep_end, (bsz,), device=latents.device)
+            if args.batch_share_timesteps:
+                timesteps = timesteps[:1].repeat((bsz,))
             timesteps = timesteps.long()
 
             cuda_caption = tokens.to(text_encoder.device)
 
-        encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
+        def get_encoder_hidden_states(text_encoder):
+            encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
 
-        if args.clip_skip > 0:
-            encoder_hidden_states = text_encoder.text_model.final_layer_norm(
-                encoder_hidden_states.hidden_states[-args.clip_skip])
+            if args.clip_skip > 0:
+                encoder_hidden_states = text_encoder.text_model.final_layer_norm(
+                    encoder_hidden_states.hidden_states[-args.clip_skip])
+            else:
+                encoder_hidden_states = encoder_hidden_states.last_hidden_state
+
+            # https://arxiv.org/pdf/2405.20494
+            perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
+            perturbation_delta =  torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
+            encoder_hidden_states = encoder_hidden_states + perturbation_delta
+            return encoder_hidden_states
+
+        encoder_hidden_states = get_encoder_hidden_states(text_encoder)
+        if teacher_text_encoder is not None:
+            teacher_encoder_hidden_states = get_encoder_hidden_states(teacher_text_encoder)
         else:
-            encoder_hidden_states = encoder_hidden_states.last_hidden_state
+            teacher_encoder_hidden_states = None
+
+        if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
+            ztsnr_mask = torch.randint(low=0, high=2, size=(bsz,), device=noise.device).to(torch.float32)
+        def ztsnr_mix(ztsnr_tensor, base_tensor):
+            m = ztsnr_mask.view([-1] + [1]*(len(base_tensor.shape)-1))
+            #print("mask:", ztsnr_mask.shape, "a:", ztsnr_tensor.shape, "b:", base_tensor.shape)
+            return (1-m) * base_tensor + (m) * ztsnr_tensor
 
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        if args.enable_zero_terminal_snr:
+            if args.mix_zero_terminal_snr:
+                noisy_latents_ztsnr = noisy_latents
+                noisy_latents_base = noise_scheduler_base.add_noise(latents, noise, timesteps)
+                noisy_latents = ztsnr_mix(noisy_latents_ztsnr, noisy_latents_base)
+            elif args.match_zero_terminal_snr:
+                pass
+                
+        def get_vpred_target(noise_scheduler, noise):
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
+                target_ztsnr = target
+                target_base = noise_scheduler_base.get_velocity(latents, noise, timesteps)
+                target = ztsnr_mix(target_ztsnr, target_base)
+            return target
 
         if noise_scheduler.config.prediction_type == "epsilon":
             target = noise
         elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            target = get_vpred_target(noise_scheduler, noise)
         else:
             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
         del noise, latents, cuda_caption
 
+        teacher_pred = None
         with autocast(enabled=args.amp):
             #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            if teacher_encoder_hidden_states is not None:
+                teacher_pred = teacher_unet(noisy_latents, timesteps, teacher_encoder_hidden_states).sample
+                if (teacher_noise_scheduler.config.prediction_type == "epsilon" and
+                        noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]):
+                    # teacher_pred is noise, but we want velocity
+                    teacher_pred = get_vpred_target(teacher_noise_scheduler, teacher_pred)
+
 
         if return_loss:
             if loss_scale is None:
@@ -977,6 +1056,10 @@ def main(args):
 
             if args.min_snr_gamma is not None:
                 snr = compute_snr(timesteps, noise_scheduler)
+                if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
+                    snr_ztsnr = snr
+                    snr_base = compute_snr(timesteps, noise_scheduler_base)
+                    snr = ztsnr_mix(snr_ztsnr, snr_base)
 
                 mse_loss_weights = (
                         torch.stack(
@@ -987,9 +1070,39 @@ def main(args):
                 mse_loss_weights[snr == 0] = 1.0
                 loss_scale = loss_scale * mse_loss_weights.to(loss_scale.device)
 
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * loss_scale.to(unet.device)
-            loss = loss.mean()
+            def get_loss(model_pred, target, loss_scale):
+                loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
+
+                if args.loss_type == "mse_huber":
+                    early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
+                    early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
+                    early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
+                    loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                    loss_mse = loss_mse * loss_scale.to(unet.device) * early_timestep_bias
+                    loss_huber = loss_huber * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
+                    loss = loss_mse.mean() + loss_huber.mean()
+                elif args.loss_type == "huber_mse":
+                    early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
+                    early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
+                    early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
+                    loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                    loss_mse = loss_mse * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
+                    loss_huber = loss_huber * loss_scale.to(unet.device) * early_timestep_bias
+                    loss = loss_huber.mean() + loss_mse.mean()
+                elif args.loss_type == "huber":
+                    loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                    loss_huber = loss_huber * loss_scale.to(unet.device)
+                    loss = loss_huber.mean()
+                else:
+                    loss_mse = loss_mse * loss_scale.to(unet.device)
+                    loss = loss_mse.mean()
+                return loss
+
+            loss = get_loss(model_pred, target, loss_scale)
+            if teacher_pred is not None:
+                loss_mse_teacher = get_loss(model_pred, teacher_pred, loss_scale)
+                loss += loss_mse_teacher
 
             return model_pred, target, loss
 
@@ -1161,7 +1274,8 @@ def main(args):
                                                                            batch["tokens"],
                                                                            args.zero_frequency_noise_ratio,
                                                                            return_loss=True,
-                                                                           loss_scale=batch["loss_scale"])
+                                                                           loss_scale=batch["loss_scale"],
+                                                                           embedding_perturbation=args.embedding_perturbation)
 
                 del target, model_pred
 
@@ -1239,7 +1353,8 @@ def main(args):
                     save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
                                save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
                                save_full_precision=args.save_full_precision,
-                               save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                               save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                               plugin_runner=plugin_runner)
 
                 plugin_runner.run_on_step_end(epoch=epoch,
                                       global_step=global_step,
@@ -1286,7 +1401,8 @@ def main(args):
         save_path = make_save_path(epoch, global_step, prepend=("" if args.no_prepend_last else "last-"))
         save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                   plugin_runner=plugin_runner)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -1295,11 +1411,12 @@ def main(args):
 
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
-        save_path = make_save_path(epoch, global_step, prepend="errored-")
-        save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
-                   save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
-        logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
+        logging.error(f"{Fore.LIGHTYELLOW_EX}NOT attempting to save model{Style.RESET_ALL}")
+        #save_path = make_save_path(epoch, global_step, prepend="errored-")
+        #save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
+        #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+        #logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
@@ -1328,12 +1445,14 @@ if __name__ == "__main__":
     argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
     argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
     argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
+    argparser.add_argument("--embedding_perturbation", type=float, default=0.0, help="random perturbation of text embeddings (def: 0.0)")
     argparser.add_argument("--flip_p", type=float, default=0.0, help="probability of flipping image horizontally (def: 0.0) use 0.0 to 1.0, ex 0.5, not good for specific faces!")
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1), use nvidia-smi to find your GPU ids")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
+    argparser.add_argument("--loss_type", type=str, default="mse_huber", help="type of loss, 'huber', 'mse', or 'mse_huber' for interpolated (def: mse_huber)", choices=["huber", "mse", "mse_huber"])
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
@@ -1356,6 +1475,8 @@ if __name__ == "__main__":
     argparser.add_argument("--save_optimizer", action="store_true", default=False, help="saves optimizer state with ckpt, useful for resuming training later")
     argparser.add_argument("--seed", type=int, default=555, help="seed used for samples and shuffling, use -1 for random")
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
+    argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
+    argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
     argparser.add_argument("--train_sampler", type=str, default="ddpm", help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim"])
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
@@ -1365,6 +1486,8 @@ if __name__ == "__main__":
     argparser.add_argument("--rated_dataset_target_dropout_percent", type=int, default=50, help="how many images (in percent) should be included in the last epoch (Default 50)")
     argparser.add_argument("--zero_frequency_noise_ratio", type=float, default=0.02, help="adds zero frequency noise, for improving contrast (def: 0.0) use 0.0 to 0.15")
     argparser.add_argument("--enable_zero_terminal_snr", action="store_true", default=None, help="Use zero terminal SNR noising beta schedule")
+    argparser.add_argument("--mix_zero_terminal_snr", action="store_true", default=None, help="Mix zero termianl SNR with regular training")
+    argparser.add_argument("--match_zero_terminal_snr", action="store_true", default=None, help="use zero terminal SNR target as regular noise scheduler input")
     argparser.add_argument("--load_settings_every_epoch", action="store_true", default=None, help="Enable reloading of 'train.json' at start of every epoch.")
     argparser.add_argument("--min_snr_gamma", type=int, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
     argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
@@ -1375,6 +1498,10 @@ if __name__ == "__main__":
     argparser.add_argument("--ema_sample_ema_model", action="store_true", default=False, help="Will show samples from EMA model. May be slower when using ema cpu offloading. Can be used with: --ema_sample_nonema_model")
     argparser.add_argument("--ema_resume_model", type=str, default=None, help="The EMA decay checkpoint to resume from for EMA decay, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1-ema-decay")
     argparser.add_argument("--pyramid_noise_discount", type=float, default=None, help="Enables pyramid noise and use specified discount factor for it")
+    argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
+    argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
+    argparser.add_argument("--use_grokfast", action="store_true", help="Use Grokfast")
+    argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

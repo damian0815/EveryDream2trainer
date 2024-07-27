@@ -61,8 +61,8 @@ def chunk_list(l: list, batch_size: int,
 def get_best_size_for_aspect_ratio(aspect_ratio, default_resolution) -> tuple[int, int]:
     sizes = []
     target_pixel_count = default_resolution * default_resolution
-    for w in range(256, 1024, 64):
-        for h in range(256, 1024, 64):
+    for w in range(256, 1280, 64):
+        for h in range(256, 1280, 64):
             if abs((w * h) - target_pixel_count) <= 128 * 64:
                 sizes.append((w, h))
     best_size = min(sizes, key=lambda s: abs(1 - (aspect_ratio / (s[0] / s[1]))))
