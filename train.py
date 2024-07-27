@@ -1500,7 +1500,6 @@ if __name__ == "__main__":
     argparser.add_argument("--pyramid_noise_discount", type=float, default=None, help="Enables pyramid noise and use specified discount factor for it")
     argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
-    argparser.add_argument("--use_grokfast", action="store_true", help="Use Grokfast")
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
 
     # load CLI args to overwrite existing config args

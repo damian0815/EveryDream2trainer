@@ -29,8 +29,6 @@ import pprint
 
 from plugins.plugins import PluginRunner
 
-from .grokfast import gradfilter_ma, gradfilter_ema
-
 
 BETAS_DEFAULT = [0.9, 0.999]
 EPSILON_DEFAULT = 1e-8
@@ -158,10 +156,6 @@ class EveryDreamOptimizer():
                 te_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params, max_norm=self.clip_grad_norm)
                 self.log_writer.add_scalar("optimizer/te_grad_norm", te_grad_norm, global_step)
 
-
-            if self.use_grokfast:
-                self.grokfast_unet_grads = gradfilter_ema(self.unet, grads=self.grokfast_unet_grads)
-                self.grokfast_te_grads = gradfilter_ema(self.text_encoder, grads=self.grokfast_te_grads)
 
             for optimizer in self.optimizers:
                 self.scaler.step(optimizer)
