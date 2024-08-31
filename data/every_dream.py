@@ -47,8 +47,10 @@ class EveryDreamBatch(Dataset):
                  plugin_runner:PluginRunner=None,
                  rated_dataset=False,
                  rated_dataset_dropout_target=0.5,
-                 name='train'
+                 name='train',
+                 contrastive_learning_batch_ids=None,
                  ):
+        self.contrastive_learning_batch_ids = contrastive_learning_batch_ids or []
         self.data_loader = data_loader
         self.batch_size = data_loader.batch_size
         self.debug_level = debug_level
@@ -105,10 +107,12 @@ class EveryDreamBatch(Dataset):
             example["caption"] = train_item["caption"].get_caption()
 
         example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
-        example["image"] = image_transforms(example["image"])        
+        example["image"] = image_transforms(example["image"])
+        example["untransformed_caption"] = example["caption"]
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"])
 
-        if random.random() > (train_item.get("cond_dropout", self.conditional_dropout)):
+        # no cond dropout for contrastive learning
+        if train_item["do_contrastive_learning"] or random.random() > (train_item.get("cond_dropout", self.conditional_dropout)):
             example["tokens"] = self.tokenizer(example["caption"],
                                                 truncation=True,
                                                 padding="max_length",
@@ -125,6 +129,7 @@ class EveryDreamBatch(Dataset):
 
         example["runt_size"] = train_item["runt_size"]
         example["loss_scale"] = train_item["loss_scale"]
+        example["do_contrastive_learning"] = train_item["do_contrastive_learning"]
 
         return example
 
@@ -142,6 +147,7 @@ class EveryDreamBatch(Dataset):
         example["runt_size"] = image_train_tmp.runt_size
         example["shuffle_tags"] = image_train_tmp.shuffle_tags
         example["loss_scale"] = image_train_tmp.loss_scale
+        example["do_contrastive_learning"] = image_train_tmp.batch_id in self.contrastive_learning_batch_ids
 
         return example
 
@@ -215,7 +221,8 @@ def collate_fn(batch):
     Collates batches
     """
     images = [example["image"] for example in batch]
-    captions = [example["caption"] for example in batch]
+    do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
+    captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     tokens = [example["tokens"] for example in batch]
     runt_size = batch[0]["runt_size"]
 
@@ -229,7 +236,8 @@ def collate_fn(batch):
         "image": images,
         "captions": captions,
         "runt_size": runt_size,
-        "loss_scale": loss_scale
+        "loss_scale": loss_scale,
+        "do_contrastive_learning": do_contrastive_learning,
     }
     del batch
     return ret

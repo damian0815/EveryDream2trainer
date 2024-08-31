@@ -11,7 +11,7 @@ IMAGE_EXTENSIONS =  ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif']
 CAPTION_EXTENSIONS = ['.txt', '.caption', '.yaml', '.yml']
 
 def gather_captioned_images(root_dir: str) -> list[tuple[str,Optional[str]]]:
-    for directory, _, filenames in os.walk(root_dir):
+    for directory, _, filenames in os.walk(root_dir, followlinks=True):
         image_filenames = [f for f in filenames if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS]
         for image_filename in image_filenames:
             image_path = os.path.join(directory, image_filename)
@@ -25,7 +25,9 @@ def gather_captioned_images(root_dir: str) -> list[tuple[str,Optional[str]]]:
             yield image_path, caption_path
 
 
-def copy_captioned_image(image_caption_pair: tuple[str, Optional[str]], source_root: str, target_root: str):
+def copy_captioned_image(image_caption_pair: tuple[str, Optional[str]],
+                         source_root: str, target_root: str,
+                         use_symlinks=True):
     image_path = image_caption_pair[0]
     caption_path = image_caption_pair[1]
 
@@ -35,9 +37,16 @@ def copy_captioned_image(image_caption_pair: tuple[str, Optional[str]], source_r
     os.makedirs(target_folder, exist_ok=True)
 
     # copy files
-    shutil.copy2(image_path, os.path.join(target_folder, os.path.basename(image_path)))
-    if caption_path is not None:
-        shutil.copy2(caption_path, os.path.join(target_folder, os.path.basename(caption_path)))
+    target_image_path = os.path.join(target_folder, os.path.basename(image_path))
+    target_caption_path = os.path.join(target_folder, os.path.basename(caption_path))
+    if use_symlinks:
+        os.symlink(image_path, target_image_path)
+        if caption_path is not None:
+            os.symlink(caption_path, target_caption_path)
+    else:
+        shutil.copy2(image_path, target_image_path)
+        if caption_path is not None:
+            shutil.copy2(caption_path, target_caption_path)
 
 
 if __name__ == '__main__':

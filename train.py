@@ -41,7 +41,7 @@ import json
 from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel, DDIMScheduler, DDPMScheduler, \
-    DPMSolverMultistepScheduler, PNDMScheduler
+    DPMSolverMultistepScheduler, PNDMScheduler, StableDiffusionXLPipeline
 #from diffusers.models import AttentionBlock
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
@@ -127,6 +127,7 @@ class EveryDreamTrainingState:
                  text_encoder: CLIPTextModel,
                  tokenizer: CLIPTokenizer,
                  scheduler,
+                 inference_scheduler,
                  vae: AutoencoderKL,
                  unet_ema: Optional[UNet2DConditionModel],
                  text_encoder_ema: Optional[CLIPTextModel]
@@ -137,6 +138,7 @@ class EveryDreamTrainingState:
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.scheduler = scheduler
+        self.inference_scheduler = inference_scheduler
         self.vae = vae
         self.unet_ema = unet_ema
         self.text_encoder_ema = text_encoder_ema
@@ -184,7 +186,7 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
             text_encoder=ed_state.text_encoder_ema,
             tokenizer=ed_state.tokenizer,
             unet=ed_state.unet_ema,
-            scheduler=ed_state.scheduler,
+            scheduler=ed_state.inference_scheduler,
             safety_checker=None, # save vram
             requires_safety_checker=None, # avoid nag
             feature_extractor=None, # must be none of no safety checker
@@ -205,7 +207,7 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
         text_encoder=ed_state.text_encoder,
         tokenizer=ed_state.tokenizer,
         unet=ed_state.unet,
-        scheduler=ed_state.scheduler,
+        scheduler=ed_state.inference_scheduler,
         safety_checker=None,  # save vram
         requires_safety_checker=None,  # avoid nag
         feature_extractor=None,  # must be none of no safety checker
@@ -633,15 +635,14 @@ def main(args):
             del pipe
 
         if args.teacher is not None:
-            pipe = StableDiffusionPipeline.from_pretrained(args.teacher, dtype=torch.float16)
-            teacher_text_encoder = pipe.text_encoder.to(device, dtype=torch.float16)
-            teacher_unet = pipe.unet.to(device, dtype=torch.float16)
-            teacher_noise_scheduler = pipe.scheduler
-            del pipe
+            if args.teacher_is_sdxl:
+                teacher_pipeline = StableDiffusionXLPipeline.from_pretrained(args.teacher, dtype=torch.float16)
+            else:
+                teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher, dtype=torch.float16)
+            teacher_pipeline.to(device)
+            del teacher_pipeline.vae
         else:
-            teacher_text_encoder = None
-            teacher_unet = None
-            teacher_noise_scheduler = None
+            teacher_pipeline = None
 
 
         if use_ema_dacay_training and args.ema_resume_model:
@@ -685,8 +686,8 @@ def main(args):
             from utils.unet_utils import enforce_zero_terminal_snr
             temp_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
             trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
-            inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
-            noise_scheduler_ref = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
+            inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=None)
+            #noise_scheduler_ref = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=trained_betas)
             noise_scheduler_base = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=None)
         else:
@@ -800,6 +801,7 @@ def main(args):
                                         default_batch_size=args.batch_size,
                                         resolution=args.resolution,
                                         log_writer=log_writer,
+                                        approx_epoch_length=len(image_train_items)/args.batch_size
                                         )
         # the validation dataset may need to steal some items from image_train_items
         image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=tokenizer)
@@ -833,7 +835,8 @@ def main(args):
         keep_tags=args.keep_tags,
         plugin_runner=plugin_runner,
         rated_dataset=args.rated_dataset,
-        rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0))
+        rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
+        contrastive_learning_batch_ids=args.contrastive_learning_batch_ids,
     )
 
     torch.cuda.benchmark = False
@@ -870,7 +873,7 @@ def main(args):
                                        default_sample_steps=args.sample_steps,
                                        use_xformers=args.attn_type == "xformers",
                                        use_penultimate_clip_layer=(args.clip_skip >= 2),
-                                       guidance_rescale=0.7 if args.enable_zero_terminal_snr else 0
+                                       guidance_rescale=0 # 0.7 if args.enable_zero_terminal_snr else 0
                                        )
 
     """
@@ -951,7 +954,14 @@ def main(args):
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
     # actual prediction function - shared between train and validate
-    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0, return_loss=False, loss_scale=None, embedding_perturbation=0.0):
+    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0,
+                                        return_loss=False, loss_scale=None,
+                                        embedding_perturbation=0.0, prompt_str=None,
+                                        do_contrastive_learning=False):
+
+        batch_share_timesteps = True if do_contrastive_learning else args.batch_share_timesteps
+        batch_share_noise = True if do_contrastive_learning else args.batch_share_noise
+
         with torch.no_grad():
 
             with autocast(enabled=args.amp):
@@ -975,17 +985,17 @@ def main(args):
                 zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
                 noise = noise + zero_frequency_noise
 
-            if args.batch_share_noise:
+            if batch_share_noise:
                 noise = noise[:1].repeat((bsz, 1, 1, 1))
 
             timesteps = torch.randint(args.timestep_start, args.timestep_end, (bsz,), device=latents.device)
-            if args.batch_share_timesteps:
+            if batch_share_timesteps:
                 timesteps = timesteps[:1].repeat((bsz,))
             timesteps = timesteps.long()
 
             cuda_caption = tokens.to(text_encoder.device)
 
-        def get_encoder_hidden_states(text_encoder):
+        def get_encoder_hidden_states(text_encoder, cuda_caption):
             encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
 
             if args.clip_skip > 0:
@@ -1000,9 +1010,29 @@ def main(args):
             encoder_hidden_states = encoder_hidden_states + perturbation_delta
             return encoder_hidden_states
 
-        encoder_hidden_states = get_encoder_hidden_states(text_encoder)
-        if teacher_text_encoder is not None:
-            teacher_encoder_hidden_states = get_encoder_hidden_states(teacher_text_encoder)
+        encoder_hidden_states = get_encoder_hidden_states(text_encoder, cuda_caption)
+        if teacher_pipeline is not None:
+
+            downgrade_sizes = True
+            if downgrade_sizes:
+                suffix=37637
+                replacements = {2699:3638, 3638:8675, 86765:2442, 2442:871}
+                cce = cuda_caption.cpu().tolist()
+                for i in range(len(cce)):
+                    c = cce[i]
+                    for j in range(len(c)):
+                        if c[j] == suffix:
+                            replacement = replacements.get(c[j - 1], None)
+                            if replacement is not None:
+                                c[j - 1] = replacement
+                cuda_caption_teacher = torch.tensor(cce, dtype=cuda_caption.dtype, device=cuda_caption.device)
+            else:
+                cuda_caption_teacher = cuda_caption
+
+            if type(teacher_pipeline) is StableDiffusionXLPipeline:
+                teacher_encoder_hidden_states = teacher_pipeline.encode_prompt(prompt_str, cuda_caption_teacher)
+            else:
+                teacher_encoder_hidden_states = get_encoder_hidden_states(teacher_pipeline.text_encoder, cuda_caption_teacher)
         else:
             teacher_encoder_hidden_states = None
 
@@ -1014,6 +1044,8 @@ def main(args):
             return (1-m) * base_tensor + (m) * ztsnr_tensor
 
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        if args.latents_perturbation > 0:
+            noisy_latents += torch.randn_like(noisy_latents) * args.latents_perturbation
         if args.enable_zero_terminal_snr:
             if args.mix_zero_terminal_snr:
                 noisy_latents_ztsnr = noisy_latents
@@ -1022,7 +1054,7 @@ def main(args):
             elif args.match_zero_terminal_snr:
                 pass
                 
-        def get_vpred_target(noise_scheduler, noise):
+        def get_vpred_target(noise):
             target = noise_scheduler.get_velocity(latents, noise, timesteps)
             if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
                 target_ztsnr = target
@@ -1033,22 +1065,26 @@ def main(args):
         if noise_scheduler.config.prediction_type == "epsilon":
             target = noise
         elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            target = get_vpred_target(noise_scheduler, noise)
+            target = get_vpred_target(noise)
         else:
             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-        del noise, latents, cuda_caption
+        del noise#, cuda_caption
+        if teacher_encoder_hidden_states is None:
+            del latents
 
         teacher_pred = None
         with autocast(enabled=args.amp):
             #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
             if teacher_encoder_hidden_states is not None:
-                teacher_pred = teacher_unet(noisy_latents, timesteps, teacher_encoder_hidden_states).sample
-                if (teacher_noise_scheduler.config.prediction_type == "epsilon" and
+                teacher_pred = teacher_pipeline.unet(noisy_latents, timesteps, teacher_encoder_hidden_states).sample
+                if (teacher_pipeline.scheduler.config.prediction_type == "epsilon" and
                         noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]):
                     # teacher_pred is noise, but we want velocity
-                    teacher_pred = get_vpred_target(teacher_noise_scheduler, teacher_pred)
+                    teacher_pred = get_vpred_target(teacher_pred)
 
+        if teacher_encoder_hidden_states is not None:
+            del latents
 
         if return_loss:
             if loss_scale is None:
@@ -1070,7 +1106,7 @@ def main(args):
                 mse_loss_weights[snr == 0] = 1.0
                 loss_scale = loss_scale * mse_loss_weights.to(loss_scale.device)
 
-            def get_loss(model_pred, target, loss_scale):
+            def get_loss(model_pred, target, timesteps, loss_scale):
                 loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
 
@@ -1081,7 +1117,7 @@ def main(args):
                     loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
                     loss_mse = loss_mse * loss_scale.to(unet.device) * early_timestep_bias
                     loss_huber = loss_huber * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
-                    loss = loss_mse.mean() + loss_huber.mean()
+                    loss = loss_mse + loss_huber
                 elif args.loss_type == "huber_mse":
                     early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
                     early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
@@ -1089,20 +1125,44 @@ def main(args):
                     loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
                     loss_mse = loss_mse * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
                     loss_huber = loss_huber * loss_scale.to(unet.device) * early_timestep_bias
-                    loss = loss_huber.mean() + loss_mse.mean()
+                    loss = loss_huber + loss_mse
                 elif args.loss_type == "huber":
                     loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
                     loss_huber = loss_huber * loss_scale.to(unet.device)
-                    loss = loss_huber.mean()
+                    loss = loss_huber
                 else:
                     loss_mse = loss_mse * loss_scale.to(unet.device)
-                    loss = loss_mse.mean()
+                    loss = loss_mse
                 return loss
 
-            loss = get_loss(model_pred, target, loss_scale)
-            if teacher_pred is not None:
-                loss_mse_teacher = get_loss(model_pred, teacher_pred, loss_scale)
-                loss += loss_mse_teacher
+            if do_contrastive_learning:
+                assert teacher_pred is None, "contrastive learning with teacher model is not implemented"
+                positive_loss = get_loss(model_pred, target, timesteps, loss_scale)
+                # Generate negative samples
+                max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
+                                                 dtype=positive_loss.dtype).to(positive_loss.device)
+                negative_loss = torch.zeros_like(positive_loss)
+                num_samples = [0] * bsz
+                for i in range(bsz):
+                    for j in range(bsz):
+                        if i != j and not torch.equal(cuda_caption[i], cuda_caption[j]):
+                            contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
+                            contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
+                            negative_loss[i:i+1] += contrastive_loss_clamped_inv
+                            num_samples[i] += 1
+                            del contrastive_loss, contrastive_loss_clamped_inv
+
+                # Average over negative samples
+                negative_loss_scale = args.contrastive_learning_negative_loss_scale / torch.tensor(num_samples, device=negative_loss.device)
+                negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
+                loss = (positive_loss + negative_loss * negative_loss_scale).mean()
+
+            else:
+                loss = get_loss(model_pred, target, timesteps, loss_scale).mean()
+                if teacher_pred is not None:
+                    loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale).mean()
+                    loss += loss_mse_teacher
+            del cuda_caption
 
             return model_pred, target, loss
 
@@ -1197,7 +1257,7 @@ def main(args):
 
 
     # Pre-train validation to establish a starting point on the loss graph
-    if validator:
+    if validator and False:
         validator.do_validation(global_step=0,
                                 get_model_prediction_and_target_callable=get_model_prediction_and_target)
 
@@ -1213,6 +1273,7 @@ def main(args):
                                        text_encoder=text_encoder,
                                        tokenizer=tokenizer,
                                        scheduler=noise_scheduler,
+                                       inference_scheduler=inference_scheduler,
                                        vae=vae,
                                        unet_ema=unet_ema,
                                        text_encoder_ema=text_encoder_ema)
@@ -1275,7 +1336,9 @@ def main(args):
                                                                            args.zero_frequency_noise_ratio,
                                                                            return_loss=True,
                                                                            loss_scale=batch["loss_scale"],
-                                                                           embedding_perturbation=args.embedding_perturbation)
+                                                                           embedding_perturbation=args.embedding_perturbation,
+                                                                           prompt_str=batch["captions"],
+                                                                           do_contrastive_learning=batch["do_contrastive_learning"])
 
                 del target, model_pred
 
@@ -1446,6 +1509,7 @@ if __name__ == "__main__":
     argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
     argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
     argparser.add_argument("--embedding_perturbation", type=float, default=0.0, help="random perturbation of text embeddings (def: 0.0)")
+    argparser.add_argument("--latents_perturbation", type=float, default=0.0, help="random perturbation of latents (def: 0.0)")
     argparser.add_argument("--flip_p", type=float, default=0.0, help="probability of flipping image horizontally (def: 0.0) use 0.0 to 1.0, ex 0.5, not good for specific faces!")
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1), use nvidia-smi to find your GPU ids")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
@@ -1501,6 +1565,11 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
+    argparser.add_argument("--teacher_is_sdxl", action='store_true', help="Pass if the --teacher is an SDXL model")
+    argparser.add_argument("--teacher_loss_scale", type=float, default=1, help="Loss scale factor for the teacher model (default=1)")
+    argparser.add_argument("--contrastive_learning_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[])")
+    argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=1, help="Scaling factor for contrastive learning negative loss")
+    argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

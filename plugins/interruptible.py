@@ -16,6 +16,9 @@ class InterruptiblePlugin(BasePlugin):
     def on_epoch_start(self, **kwargs):
         epoch = kwargs['epoch']
         epoch_length = kwargs['epoch_length']
+        # epoch length = 4000 -> 2 saves
+        # epoch length = 500 -> save every 4th
+        self.every_n_epochs =  2000 / epoch_length
         self.steps_to_save_this_epoch = self._get_save_step_indices(epoch, epoch_length)
 
     def on_step_end(self, **kwargs):

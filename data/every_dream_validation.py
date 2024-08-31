@@ -64,6 +64,7 @@ class EveryDreamValidator:
                  default_batch_size: int,
                  resolution: int,
                  log_writer: SummaryWriter,
+                 approx_epoch_length: int=None
     ):
         self.validation_datasets = []
         self.resolution = resolution
@@ -111,6 +112,12 @@ class EveryDreamValidator:
                   f"update your validation config json{Style.RESET_ALL}")
             self.config.update({'auto_split_proportion': self.config['val_split_proportion']})
 
+        if self.every_n_epochs < 0:
+            if approx_epoch_length is None:
+                raise ValueError("missing approx_epoch_len")
+            every_n_steps = 2000 if self.every_n_epochs == -1 else -self.every_n_epochs
+            every_n_epochs = min(1, every_n_steps/approx_epoch_length)
+            self.config['every_n_epochs'] = every_n_epochs
 
 
     @property
@@ -201,7 +208,7 @@ class EveryDreamValidator:
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({tag}){Style.RESET_ALL}")
 
             for step, batch in enumerate(dataloader):
-                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"])
+                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], prompt_str=batch["captions"])
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
