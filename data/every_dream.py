@@ -15,6 +15,8 @@ limitations under the License.
 """
 import logging
 import os
+import statistics
+from collections import defaultdict
 
 import torch
 from torch.utils.data import Dataset
@@ -69,6 +71,10 @@ class EveryDreamBatch(Dataset):
         self.image_train_items = []
         self.__update_image_train_items(1.0)
         self.name = name
+        self.contrastive_scale_for_caption = build_contrastive_scale_for_caption_dict(
+            data_loader=self.data_loader,
+            contrastive_learning_batch_ids=self.contrastive_learning_batch_ids
+        )
 
         num_images = len(self.image_train_items)
         logging.info(f" ** Dataset '{name}': {num_images / self.batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
@@ -101,7 +107,7 @@ class EveryDreamBatch(Dataset):
             ]
         )
 
-        if self.shuffle_tags or train_item["shuffle_tags"]:
+        if (self.shuffle_tags or train_item["shuffle_tags"]) and not train_item["do_contrastive_learning"]:
             example["caption"] = train_item["caption"].get_shuffled_caption(self.seed, keep_tags=self.keep_tags)
         else:
             example["caption"] = train_item["caption"].get_caption()
@@ -128,10 +134,22 @@ class EveryDreamBatch(Dataset):
         example["tokens"] = torch.tensor(example["tokens"])
 
         example["runt_size"] = train_item["runt_size"]
-        example["loss_scale"] = train_item["loss_scale"]
+
+        additional_scale_factor = 1
+        if train_item["do_contrastive_learning"]:
+            additional_scale_factor = self._get_contrastive_scale_for_caption(
+                batch_id=train_item["batch_id"],
+                caption=example["untransformed_caption"]
+            )
+        example["loss_scale"] = train_item["loss_scale"] * additional_scale_factor
+        example["contrastive_class"] = train_item["contrastive_class"]
         example["do_contrastive_learning"] = train_item["do_contrastive_learning"]
 
         return example
+
+    def _get_contrastive_scale_for_caption(self, batch_id, caption):
+        caption_truncated = caption.split(',')[0]
+        return self.contrastive_scale_for_caption[batch_id][caption_truncated]
 
     def __get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
         example = {}
@@ -147,6 +165,8 @@ class EveryDreamBatch(Dataset):
         example["runt_size"] = image_train_tmp.runt_size
         example["shuffle_tags"] = image_train_tmp.shuffle_tags
         example["loss_scale"] = image_train_tmp.loss_scale
+        example["batch_id"] = image_train_tmp.batch_id
+        example["contrastive_class"] = image_train_tmp.caption.get_caption().split(',')
         example["do_contrastive_learning"] = image_train_tmp.batch_id in self.contrastive_learning_batch_ids
 
         return example
@@ -222,6 +242,7 @@ def collate_fn(batch):
     """
     images = [example["image"] for example in batch]
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
+    contrastive_class = [example["contrastive_class"] for example in batch]
     captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     tokens = [example["tokens"] for example in batch]
     runt_size = batch[0]["runt_size"]
@@ -238,6 +259,26 @@ def collate_fn(batch):
         "runt_size": runt_size,
         "loss_scale": loss_scale,
         "do_contrastive_learning": do_contrastive_learning,
+        "contrastive_class": contrastive_class,
     }
     del batch
     return ret
+
+def build_contrastive_scale_for_caption_dict(data_loader: DataLoaderMultiAspect, contrastive_learning_batch_ids: list[str]) -> dict:
+
+    count_dict = defaultdict(lambda: defaultdict(int))
+
+    for item in data_loader.prepared_train_data:
+        if item.batch_id in contrastive_learning_batch_ids:
+            count_dict[item.batch_id][item.caption.get_caption().split(',')[0]] += 1
+
+    scales_per_caption = defaultdict(lambda: defaultdict(int))
+    for batch_id, caption_counts in count_dict.items():
+        median = statistics.median(caption_counts.values())
+
+        scales_per_caption[batch_id] = {
+            caption: min(10, max(0.1, median/count)) for caption, count in caption_counts.items()
+        }
+
+    return scales_per_caption
+

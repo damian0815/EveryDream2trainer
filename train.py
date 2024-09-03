@@ -530,7 +530,7 @@ def compute_snr(timesteps, noise_scheduler):
             f"Alphas cumprod has zero elements! Resetting to {minimal_value}.."
         )
         alphas_cumprod[alphas_cumprod[:-1] == 0] = minimal_value
-    sqrt_alphas_cumprod = alphas_cumprod**0.5
+    sqrt_alphas_cumprod = alphas_cumprod ** 0.5
     sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
     # Expand the tensors.
     # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
@@ -953,11 +953,22 @@ def main(args):
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
+    accumulated_model_preds = []
+    accumulated_targets = []
+    accumulated_timesteps = []
+    accumulated_loss_scale = []
+    accumulated_contrastive_class = []
+    global prev_timesteps, prev_noise
+    prev_timesteps = None
+    prev_noise = None
+
     # actual prediction function - shared between train and validate
     def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0,
                                         return_loss=False, loss_scale=None,
                                         embedding_perturbation=0.0, prompt_str=None,
-                                        do_contrastive_learning=False):
+                                        contrastive_class=None,
+                                        do_contrastive_learning=False,
+                                        finalize_contrastive_loss=False):
 
         batch_share_timesteps = True if do_contrastive_learning else args.batch_share_timesteps
         batch_share_noise = True if do_contrastive_learning else args.batch_share_noise
@@ -971,26 +982,38 @@ def main(args):
             latents = latents[0].sample() * 0.18215
 
             bsz = latents.shape[0]
-            noise = torch.randn_like(latents)
 
-            if args.pyramid_noise_discount != None:
-                if 0 < args.pyramid_noise_discount:
-                    noise = pyramid_noise_like(noise, discount=args.pyramid_noise_discount)
+            global prev_noise, prev_timesteps
+            if prev_noise is None or not batch_share_noise:
 
-            if zero_frequency_noise_ratio != None:
-                if zero_frequency_noise_ratio < 0:
-                    zero_frequency_noise_ratio = 0
+                noise = torch.randn_like(latents)
+                if args.pyramid_noise_discount != None:
+                    if 0 < args.pyramid_noise_discount:
+                        noise = pyramid_noise_like(noise, discount=args.pyramid_noise_discount)
 
-                # see https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
-                noise = noise + zero_frequency_noise
+                if zero_frequency_noise_ratio != None:
+                    if zero_frequency_noise_ratio < 0:
+                        zero_frequency_noise_ratio = 0
 
-            if batch_share_noise:
-                noise = noise[:1].repeat((bsz, 1, 1, 1))
+                    # see https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
+                    noise = noise + zero_frequency_noise
 
-            timesteps = torch.randint(args.timestep_start, args.timestep_end, (bsz,), device=latents.device)
+                prev_noise = noise
+
+            if prev_timesteps is None or not batch_share_timesteps:
+                timesteps = torch.randint(args.timestep_start, args.timestep_end, (bsz,), device=latents.device)
+                prev_timesteps = timesteps
+
             if batch_share_timesteps:
-                timesteps = timesteps[:1].repeat((bsz,))
+                timesteps = prev_timesteps[:1].repeat((bsz,))
+            if batch_share_noise:
+                noise = prev_noise[:1].repeat((bsz, 1, 1, 1))
+
+            if not do_contrastive_learning or finalize_contrastive_loss:
+                prev_noise = None
+                prev_timesteps = None
+
             timesteps = timesteps.long()
 
             cuda_caption = tokens.to(text_encoder.device)
@@ -1086,25 +1109,50 @@ def main(args):
         if teacher_encoder_hidden_states is not None:
             del latents
 
-        if return_loss:
+        if not return_loss:
+            return model_pred, target
+
+        else:
+
             if loss_scale is None:
                 loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float)
 
-            if args.min_snr_gamma is not None:
+            if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
                 snr = compute_snr(timesteps, noise_scheduler)
-                if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
-                    snr_ztsnr = snr
-                    snr_base = compute_snr(timesteps, noise_scheduler_base)
-                    snr = ztsnr_mix(snr_ztsnr, snr_base)
+                # kohya implementation
+                min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
+                if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+                    snr_weight = torch.div(min_snr_gamma, snr + 1)
+                else:
+                    snr_weight = torch.div(min_snr_gamma, snr)
+                loss_scale = loss_scale * snr_weight.to(loss_scale.device)
 
-                mse_loss_weights = (
-                        torch.stack(
-                            [snr, args.min_snr_gamma * torch.ones_like(timesteps)], dim=1
-                        ).min(dim=1)[0]
-                        / snr
-                )
-                mse_loss_weights[snr == 0] = 1.0
-                loss_scale = loss_scale * mse_loss_weights.to(loss_scale.device)
+            if do_contrastive_learning:
+                accumulated_model_preds.append(model_pred)
+                accumulated_targets.append(target)
+                accumulated_timesteps.append(timesteps)
+                accumulated_loss_scale.append(loss_scale)
+                accumulated_contrastive_class.append(contrastive_class)
+
+                if not finalize_contrastive_loss:
+                    return model_pred, target, None
+
+                # we're stepping now, combine everything
+                model_pred = torch.cat(accumulated_model_preds)
+                target = torch.cat(accumulated_targets)
+                timesteps = torch.cat(accumulated_timesteps)
+                loss_scale = torch.cat(accumulated_loss_scale)
+                contrastive_class = [x
+                              for l in accumulated_contrastive_class
+                              for x in l]
+
+                for i in reversed(range(len(accumulated_model_preds))):
+                    del accumulated_model_preds[i]
+                for i in reversed(range(len(accumulated_targets))):
+                    del accumulated_targets[i]
+                accumulated_timesteps.clear()
+                accumulated_loss_scale.clear()
+                accumulated_contrastive_class.clear()
 
             def get_loss(model_pred, target, timesteps, loss_scale):
                 loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
@@ -1142,10 +1190,11 @@ def main(args):
                 max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
                                                  dtype=positive_loss.dtype).to(positive_loss.device)
                 negative_loss = torch.zeros_like(positive_loss)
+                bsz = model_pred.shape[0]
                 num_samples = [0] * bsz
                 for i in range(bsz):
                     for j in range(bsz):
-                        if i != j and not torch.equal(cuda_caption[i], cuda_caption[j]):
+                        if i != j and contrastive_class[i] != contrastive_class[j]:
                             contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
                             contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
                             negative_loss[i:i+1] += contrastive_loss_clamped_inv
@@ -1153,9 +1202,12 @@ def main(args):
                             del contrastive_loss, contrastive_loss_clamped_inv
 
                 # Average over negative samples
-                negative_loss_scale = args.contrastive_learning_negative_loss_scale / torch.tensor(num_samples, device=negative_loss.device)
+                num_samples_safe = torch.tensor([max(1,x) for x in num_samples], device=negative_loss.device)
+                negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
                 negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
                 loss = (positive_loss + negative_loss * negative_loss_scale).mean()
+                del positive_loss
+                del negative_loss
 
             else:
                 loss = get_loss(model_pred, target, timesteps, loss_scale).mean()
@@ -1165,9 +1217,6 @@ def main(args):
             del cuda_caption
 
             return model_pred, target, loss
-
-        else:
-            return model_pred, target
 
     def generate_samples(global_step: int, batch):
         nonlocal unet
@@ -1319,7 +1368,13 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
-            for step, batch in enumerate(train_dataloader):
+            batch = None
+            # this dance is because want to be able to peek at the next batch's shape
+            for next_step, next_batch in enumerate(itertools.chain(train_dataloader, [None])):
+                if batch is None:
+                    batch = next_batch
+                    continue
+                step = next_step - 1
 
                 step_start_time = time.time()
 
@@ -1331,6 +1386,13 @@ def main(args):
                         batch=batch,
                         ed_state=make_current_ed_state())
 
+                should_finalize_contrastive_loss = (
+                    ed_optimizer.will_do_grad_accum_step(step, global_step)
+                    or next_batch is None
+                    or (batch["image"].shape != next_batch["image"].shape)
+                    or (batch["do_contrastive_learning"] and not next_batch["do_contrastive_learning"])
+                )
+
                 model_pred, target, loss = get_model_prediction_and_target(batch["image"],
                                                                            batch["tokens"],
                                                                            args.zero_frequency_noise_ratio,
@@ -1338,51 +1400,52 @@ def main(args):
                                                                            loss_scale=batch["loss_scale"],
                                                                            embedding_perturbation=args.embedding_perturbation,
                                                                            prompt_str=batch["captions"],
-                                                                           do_contrastive_learning=batch["do_contrastive_learning"])
+                                                                           contrastive_class=batch["contrastive_class"],
+                                                                           do_contrastive_learning=batch["do_contrastive_learning"],
+                                                                           finalize_contrastive_loss=should_finalize_contrastive_loss)
 
                 del target, model_pred
 
-                if batch["runt_size"] > 0:
-                    runt_loss_scale = (batch["runt_size"] / args.batch_size)**1.5 # further discount runts by **1.5
-                    loss = loss * runt_loss_scale
+                if loss is not None:
+                    if batch["runt_size"] > 0:
+                        runt_loss_scale = (batch["runt_size"] / args.batch_size)**1.5 # further discount runts by **1.5
+                        loss = loss * runt_loss_scale
 
-                ed_optimizer.step(loss, step, global_step)
+                    ed_optimizer.step(loss, step, global_step)
 
-                if args.ema_decay_rate != None:
-                    if ((global_step + 1) % args.ema_update_interval) == 0:
-                        # debug_start_time = time.time() # Measure time
+                    if args.ema_decay_rate != None:
+                        if ((global_step + 1) % args.ema_update_interval) == 0:
+                            # debug_start_time = time.time() # Measure time
 
-                        if args.disable_unet_training != True:
-                            update_ema(unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+                            if args.disable_unet_training != True:
+                                update_ema(unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
 
-                        if args.disable_textenc_training != True:
-                            update_ema(text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+                            if args.disable_textenc_training != True:
+                                update_ema(text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
 
-                        # debug_end_time = time.time() # Measure time
-                        # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
-                        # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
+                            # debug_end_time = time.time() # Measure time
+                            # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
+                            # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
 
-                loss_step = loss.detach().item()
+                    loss_step = loss.detach().item()
 
-                steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+                    steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+
+                    loss_log_step.append(loss_step)
+                    loss_epoch.append(loss_step)
+
                 steps_pbar.update(1)
 
                 images_per_sec = args.batch_size / (time.time() - step_start_time)
                 images_per_sec_log_step.append(images_per_sec)
 
-                loss_log_step.append(loss_step)
-                loss_epoch.append(loss_step)
-
                 if (global_step + 1) % args.log_step == 0:
-                    loss_step = sum(loss_log_step) / len(loss_log_step)
                     lr_unet = ed_optimizer.get_unet_lr()
                     lr_textenc = ed_optimizer.get_textenc_lr()
-                    loss_log_step = []
 
                     log_writer.add_scalar(tag="hyperparameter/lr unet", scalar_value=lr_unet, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
-                    log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
                     avg = sum_img / len(images_per_sec_log_step)
@@ -1391,7 +1454,13 @@ def main(args):
                         log_writer.add_scalar(tag="hyperparameter/grad scale", scalar_value=ed_optimizer.get_scale(), global_step=global_step)
                     log_writer.add_scalar(tag="performance/images per second", scalar_value=avg, global_step=global_step)
 
-                    logs = {"loss/log_step": loss_step, "lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": images_per_sec}
+                    logs = {"lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": images_per_sec}
+                    if len(loss_log_step) > 0:
+                        loss_step = sum(loss_log_step) / len(loss_log_step)
+                        log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)
+                        logs["loss/log_step"] = loss_step
+                    loss_log_step = []
+
                     append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                     torch.cuda.empty_cache()
 
@@ -1428,7 +1497,10 @@ def main(args):
                                       batch=batch,
                                       ed_state=make_current_ed_state())
 
-                del batch
+                prev_batch = batch
+                batch = next_batch
+                del prev_batch
+
                 global_step += 1
                 # end of step
 
@@ -1554,6 +1626,7 @@ if __name__ == "__main__":
     argparser.add_argument("--match_zero_terminal_snr", action="store_true", default=None, help="use zero terminal SNR target as regular noise scheduler input")
     argparser.add_argument("--load_settings_every_epoch", action="store_true", default=None, help="Enable reloading of 'train.json' at start of every epoch.")
     argparser.add_argument("--min_snr_gamma", type=int, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
+    argparser.add_argument("--debug_invert_min_snr_gamma", action='store_true', help="invert the timestep/scale equation for min snr gamma")
     argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
     argparser.add_argument("--ema_strength_target", type=float, default=None, help="EMA decay target value in range (0,1). emarate will be calculated from equation: 'ema_decay_rate=ema_strength_target^(total_steps/ema_update_interval)'. Using this parameter will enable the ema feature and overide ema_decay_rate.")
     argparser.add_argument("--ema_update_interval", type=int, default=500, help="How many steps between optimizer steps that EMA decay updates. EMA model will be update on every step modulo grad_accum times ema_update_interval.")

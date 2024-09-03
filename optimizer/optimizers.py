@@ -130,13 +130,19 @@ class EveryDreamOptimizer():
         else:
             return 0.0
 
+    def _should_do_grad_accum_step(self, step, global_step):
+        return (
+            (global_step + 1) % self.grad_accum == 0
+            or ((global_step // self.epoch_len) == self.max_epochs-1 and (step == self.epoch_len - 1))
+        )
+
+    def will_do_grad_accum_step(self, step, global_step):
+        return self._should_do_grad_accum_step(step, global_step)
+
     def step(self, loss, step, global_step):
         self.scaler.scale(loss).backward()
 
-        if (
-            (global_step + 1) % self.grad_accum == 0
-            or ((global_step // self.epoch_len) == self.max_epochs-1 and (step == self.epoch_len - 1))
-        ):
+        if self._should_do_grad_accum_step(step, global_step):
             global shared_timesteps
             shared_timesteps = None
             for optimizer in self.optimizers:
