@@ -118,20 +118,14 @@ class EveryDreamBatch(Dataset):
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"])
 
         # no cond dropout for contrastive learning
-        if train_item["do_contrastive_learning"] or random.random() > (train_item.get("cond_dropout", self.conditional_dropout)):
-            example["tokens"] = self.tokenizer(example["caption"],
-                                                truncation=True,
-                                                padding="max_length",
-                                                max_length=self.tokenizer.model_max_length,
-                                              ).input_ids
-        else:
-            example["tokens"] = self.tokenizer(" ",
-                                                truncation=True,
-                                                padding="max_length",
-                                                max_length=self.tokenizer.model_max_length,
-                                              ).input_ids
+        if random.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
+            example["caption"] = " "
 
-        example["tokens"] = torch.tensor(example["tokens"])
+        example["tokens"] = torch.tensor(self.tokenizer(example["caption"],
+                                            truncation=True,
+                                            padding="max_length",
+                                            max_length=self.tokenizer.model_max_length,
+                                          ).input_ids)
 
         example["runt_size"] = train_item["runt_size"]
 
@@ -139,17 +133,17 @@ class EveryDreamBatch(Dataset):
         if train_item["do_contrastive_learning"]:
             additional_scale_factor = self._get_contrastive_scale_for_caption(
                 batch_id=train_item["batch_id"],
-                caption=example["untransformed_caption"]
+                caption=get_contrastive_class(example["caption"])
             )
         example["loss_scale"] = train_item["loss_scale"] * additional_scale_factor
-        example["contrastive_class"] = train_item["contrastive_class"]
+        example["contrastive_class"] = get_contrastive_class(example["caption"])
         example["do_contrastive_learning"] = train_item["do_contrastive_learning"]
 
         return example
 
     def _get_contrastive_scale_for_caption(self, batch_id, caption):
-        caption_truncated = caption.split(',')[0]
-        return self.contrastive_scale_for_caption[batch_id][caption_truncated]
+        caption_truncated = get_contrastive_class(caption)
+        return self.contrastive_scale_for_caption[batch_id].get(caption_truncated, 1.0)
 
     def __get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
         example = {}
@@ -166,7 +160,7 @@ class EveryDreamBatch(Dataset):
         example["shuffle_tags"] = image_train_tmp.shuffle_tags
         example["loss_scale"] = image_train_tmp.loss_scale
         example["batch_id"] = image_train_tmp.batch_id
-        example["contrastive_class"] = image_train_tmp.caption.get_caption().split(',')
+        example["contrastive_class"] = get_contrastive_class(image_train_tmp.caption.get_caption())
         example["do_contrastive_learning"] = image_train_tmp.batch_id in self.contrastive_learning_batch_ids
 
         return example
@@ -270,7 +264,8 @@ def build_contrastive_scale_for_caption_dict(data_loader: DataLoaderMultiAspect,
 
     for item in data_loader.prepared_train_data:
         if item.batch_id in contrastive_learning_batch_ids:
-            count_dict[item.batch_id][item.caption.get_caption().split(',')[0]] += 1
+            contrastive_class = get_contrastive_class(item.caption.get_caption())
+            count_dict[item.batch_id][contrastive_class] += 1
 
     scales_per_caption = defaultdict(lambda: defaultdict(int))
     for batch_id, caption_counts in count_dict.items():
@@ -282,3 +277,20 @@ def build_contrastive_scale_for_caption_dict(data_loader: DataLoaderMultiAspect,
 
     return scales_per_caption
 
+
+def get_contrastive_class(caption: str) -> str:
+    if caption == ' ':
+        return caption
+    caption = caption.strip()
+    if len(caption) > 0 and caption[-1] == '.':
+        caption = caption[:-1]
+    csv = caption.split(',')
+    if len(csv) <= 1:
+        return caption
+    def count_words(selection: list[str]) -> int:
+        return len(", ".join(selection).split(" "))
+    segment_count = 1
+    min_word_count = 8
+    while count_words(csv[:segment_count]) < min_word_count and segment_count < len(csv):
+        segment_count += 1
+    return ", ".join(csv[:segment_count])

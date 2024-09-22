@@ -156,6 +156,7 @@ class ImageTrainItem:
         self.batch_id = batch_id or DEFAULT_BATCH_ID
         self.loss_scale = 1 if loss_scale is None else loss_scale
         self.target_wh = None
+        self.is_runt = False
 
         self.image_size = None
         if image is None or len(image) == 0:
@@ -284,7 +285,7 @@ class ImageTrainItem:
         width, height = image.size
 
         img_jitter = min((width-self.target_wh[0])/self.target_wh[0], (height-self.target_wh[1])/self.target_wh[1])
-        img_jitter = min(img_jitter, crop_jitter)
+        img_jitter = min(img_jitter, 0.0 if self.runt_size > 0 else crop_jitter)
         img_jitter = max(img_jitter, 0.0)
         
         if img_jitter > 0.0:

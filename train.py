@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-
+import contextlib
 import os
 import pprint
 import sys
@@ -801,7 +801,7 @@ def main(args):
                                         default_batch_size=args.batch_size,
                                         resolution=args.resolution,
                                         log_writer=log_writer,
-                                        approx_epoch_length=len(image_train_items)/args.batch_size
+                                        approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
                                         )
         # the validation dataset may need to steal some items from image_train_items
         image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=tokenizer)
@@ -970,6 +970,7 @@ def main(args):
                                         do_contrastive_learning=False,
                                         finalize_contrastive_loss=False):
 
+
         batch_share_timesteps = True if do_contrastive_learning else args.batch_share_timesteps
         batch_share_noise = True if do_contrastive_learning else args.batch_share_noise
 
@@ -1018,205 +1019,249 @@ def main(args):
 
             cuda_caption = tokens.to(text_encoder.device)
 
-        def get_encoder_hidden_states(text_encoder, cuda_caption):
-            encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True)
+        with torch.autograd.graph.save_on_cpu() if args.contrastive_learning_save_on_cpu else contextlib.nullcontext():
+            def get_encoder_hidden_states(text_encoder, cuda_caption):
+                encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
 
-            if args.clip_skip > 0:
-                encoder_hidden_states = text_encoder.text_model.final_layer_norm(
-                    encoder_hidden_states.hidden_states[-args.clip_skip])
+                if args.clip_skip > 0:
+                    encoder_hidden_states = text_encoder.text_model.final_layer_norm(
+                        encoder_output.hidden_states[-args.clip_skip])
+                else:
+                    encoder_hidden_states = encoder_output.last_hidden_state
+
+                # https://arxiv.org/pdf/2405.20494
+                perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
+                perturbation_delta =  torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
+                encoder_hidden_states = encoder_hidden_states + perturbation_delta
+                return encoder_hidden_states, encoder_output.pooler_output
+
+            encoder_hidden_states, text_features = get_encoder_hidden_states(text_encoder, cuda_caption)
+            if teacher_pipeline is not None:
+
+                downgrade_sizes = True
+                if downgrade_sizes:
+                    suffix=37637
+                    replacements = {2699:3638, 3638:8675, 86765:2442, 2442:871}
+                    cce = cuda_caption.cpu().tolist()
+                    for i in range(len(cce)):
+                        c = cce[i]
+                        for j in range(len(c)):
+                            if c[j] == suffix:
+                                replacement = replacements.get(c[j - 1], None)
+                                if replacement is not None:
+                                    c[j - 1] = replacement
+                    cuda_caption_teacher = torch.tensor(cce, dtype=cuda_caption.dtype, device=cuda_caption.device)
+                else:
+                    cuda_caption_teacher = cuda_caption
+
+                if type(teacher_pipeline) is StableDiffusionXLPipeline:
+                    teacher_encoder_hidden_states = teacher_pipeline.encode_prompt(prompt_str, cuda_caption_teacher)
+                else:
+                    teacher_encoder_hidden_states, teacher_text_features = get_encoder_hidden_states(teacher_pipeline.text_encoder, cuda_caption_teacher)
             else:
-                encoder_hidden_states = encoder_hidden_states.last_hidden_state
+                teacher_encoder_hidden_states = None
 
-            # https://arxiv.org/pdf/2405.20494
-            perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
-            perturbation_delta =  torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
-            encoder_hidden_states = encoder_hidden_states + perturbation_delta
-            return encoder_hidden_states
-
-        encoder_hidden_states = get_encoder_hidden_states(text_encoder, cuda_caption)
-        if teacher_pipeline is not None:
-
-            downgrade_sizes = True
-            if downgrade_sizes:
-                suffix=37637
-                replacements = {2699:3638, 3638:8675, 86765:2442, 2442:871}
-                cce = cuda_caption.cpu().tolist()
-                for i in range(len(cce)):
-                    c = cce[i]
-                    for j in range(len(c)):
-                        if c[j] == suffix:
-                            replacement = replacements.get(c[j - 1], None)
-                            if replacement is not None:
-                                c[j - 1] = replacement
-                cuda_caption_teacher = torch.tensor(cce, dtype=cuda_caption.dtype, device=cuda_caption.device)
-            else:
-                cuda_caption_teacher = cuda_caption
-
-            if type(teacher_pipeline) is StableDiffusionXLPipeline:
-                teacher_encoder_hidden_states = teacher_pipeline.encode_prompt(prompt_str, cuda_caption_teacher)
-            else:
-                teacher_encoder_hidden_states = get_encoder_hidden_states(teacher_pipeline.text_encoder, cuda_caption_teacher)
-        else:
-            teacher_encoder_hidden_states = None
-
-        if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
-            ztsnr_mask = torch.randint(low=0, high=2, size=(bsz,), device=noise.device).to(torch.float32)
-        def ztsnr_mix(ztsnr_tensor, base_tensor):
-            m = ztsnr_mask.view([-1] + [1]*(len(base_tensor.shape)-1))
-            #print("mask:", ztsnr_mask.shape, "a:", ztsnr_tensor.shape, "b:", base_tensor.shape)
-            return (1-m) * base_tensor + (m) * ztsnr_tensor
-
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        if args.latents_perturbation > 0:
-            noisy_latents += torch.randn_like(noisy_latents) * args.latents_perturbation
-        if args.enable_zero_terminal_snr:
-            if args.mix_zero_terminal_snr:
-                noisy_latents_ztsnr = noisy_latents
-                noisy_latents_base = noise_scheduler_base.add_noise(latents, noise, timesteps)
-                noisy_latents = ztsnr_mix(noisy_latents_ztsnr, noisy_latents_base)
-            elif args.match_zero_terminal_snr:
-                pass
-                
-        def get_vpred_target(noise):
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
             if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
-                target_ztsnr = target
-                target_base = noise_scheduler_base.get_velocity(latents, noise, timesteps)
-                target = ztsnr_mix(target_ztsnr, target_base)
-            return target
+                ztsnr_mask = torch.randint(low=0, high=2, size=(bsz,), device=noise.device).to(torch.float32)
+            def ztsnr_mix(ztsnr_tensor, base_tensor):
+                m = ztsnr_mask.view([-1] + [1]*(len(base_tensor.shape)-1))
+                #print("mask:", ztsnr_mask.shape, "a:", ztsnr_tensor.shape, "b:", base_tensor.shape)
+                return (1-m) * base_tensor + (m) * ztsnr_tensor
 
-        if noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            target = get_vpred_target(noise)
-        else:
-            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-        del noise#, cuda_caption
-        if teacher_encoder_hidden_states is None:
-            del latents
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            if args.latents_perturbation > 0:
+                noisy_latents += torch.randn_like(noisy_latents) * args.latents_perturbation
+            if args.enable_zero_terminal_snr:
+                if args.mix_zero_terminal_snr:
+                    noisy_latents_ztsnr = noisy_latents
+                    noisy_latents_base = noise_scheduler_base.add_noise(latents, noise, timesteps)
+                    noisy_latents = ztsnr_mix(noisy_latents_ztsnr, noisy_latents_base)
+                elif args.match_zero_terminal_snr:
+                    pass
 
-        teacher_pred = None
-        with autocast(enabled=args.amp):
-            #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            def get_vpred_target(noise):
+                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
+                    target_ztsnr = target
+                    target_base = noise_scheduler_base.get_velocity(latents, noise, timesteps)
+                    target = ztsnr_mix(target_ztsnr, target_base)
+                return target
+
+            if noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+                target = get_vpred_target(noise)
+            else:
+                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            del noise#, cuda_caption
+            if teacher_encoder_hidden_states is None:
+                del latents
+
+            teacher_pred = None
+            with autocast(enabled=args.amp):
+                #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                if teacher_encoder_hidden_states is not None:
+                    teacher_pred = teacher_pipeline.unet(noisy_latents, timesteps, teacher_encoder_hidden_states).sample
+                    if (teacher_pipeline.scheduler.config.prediction_type == "epsilon" and
+                            noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]):
+                        # teacher_pred is noise, but we want velocity
+                        teacher_pred = get_vpred_target(teacher_pred)
+
             if teacher_encoder_hidden_states is not None:
-                teacher_pred = teacher_pipeline.unet(noisy_latents, timesteps, teacher_encoder_hidden_states).sample
-                if (teacher_pipeline.scheduler.config.prediction_type == "epsilon" and
-                        noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]):
-                    # teacher_pred is noise, but we want velocity
-                    teacher_pred = get_vpred_target(teacher_pred)
+                del latents
 
-        if teacher_encoder_hidden_states is not None:
-            del latents
-
-        if not return_loss:
-            return model_pred, target
-
-        else:
-
-            if loss_scale is None:
-                loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float)
-
-            if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
-                snr = compute_snr(timesteps, noise_scheduler)
-                # kohya implementation
-                min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
-                if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-                    snr_weight = torch.div(min_snr_gamma, snr + 1)
-                else:
-                    snr_weight = torch.div(min_snr_gamma, snr)
-                loss_scale = loss_scale * snr_weight.to(loss_scale.device)
-
-            if do_contrastive_learning:
-                accumulated_model_preds.append(model_pred)
-                accumulated_targets.append(target)
-                accumulated_timesteps.append(timesteps)
-                accumulated_loss_scale.append(loss_scale)
-                accumulated_contrastive_class.append(contrastive_class)
-
-                if not finalize_contrastive_loss:
-                    return model_pred, target, None
-
-                # we're stepping now, combine everything
-                model_pred = torch.cat(accumulated_model_preds)
-                target = torch.cat(accumulated_targets)
-                timesteps = torch.cat(accumulated_timesteps)
-                loss_scale = torch.cat(accumulated_loss_scale)
-                contrastive_class = [x
-                              for l in accumulated_contrastive_class
-                              for x in l]
-
-                for i in reversed(range(len(accumulated_model_preds))):
-                    del accumulated_model_preds[i]
-                for i in reversed(range(len(accumulated_targets))):
-                    del accumulated_targets[i]
-                accumulated_timesteps.clear()
-                accumulated_loss_scale.clear()
-                accumulated_contrastive_class.clear()
-
-            def get_loss(model_pred, target, timesteps, loss_scale):
-                loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
-
-                if args.loss_type == "mse_huber":
-                    early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
-                    early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
-                    early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
-                    loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
-                    loss_mse = loss_mse * loss_scale.to(unet.device) * early_timestep_bias
-                    loss_huber = loss_huber * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
-                    loss = loss_mse + loss_huber
-                elif args.loss_type == "huber_mse":
-                    early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
-                    early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
-                    early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
-                    loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
-                    loss_mse = loss_mse * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
-                    loss_huber = loss_huber * loss_scale.to(unet.device) * early_timestep_bias
-                    loss = loss_huber + loss_mse
-                elif args.loss_type == "huber":
-                    loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
-                    loss_huber = loss_huber * loss_scale.to(unet.device)
-                    loss = loss_huber
-                else:
-                    loss_mse = loss_mse * loss_scale.to(unet.device)
-                    loss = loss_mse
-                return loss
-
-            if do_contrastive_learning:
-                assert teacher_pred is None, "contrastive learning with teacher model is not implemented"
-                positive_loss = get_loss(model_pred, target, timesteps, loss_scale)
-                # Generate negative samples
-                max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
-                                                 dtype=positive_loss.dtype).to(positive_loss.device)
-                negative_loss = torch.zeros_like(positive_loss)
-                bsz = model_pred.shape[0]
-                num_samples = [0] * bsz
-                for i in range(bsz):
-                    for j in range(bsz):
-                        if i != j and contrastive_class[i] != contrastive_class[j]:
-                            contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
-                            contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
-                            negative_loss[i:i+1] += contrastive_loss_clamped_inv
-                            num_samples[i] += 1
-                            del contrastive_loss, contrastive_loss_clamped_inv
-
-                # Average over negative samples
-                num_samples_safe = torch.tensor([max(1,x) for x in num_samples], device=negative_loss.device)
-                negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
-                negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
-                loss = (positive_loss + negative_loss * negative_loss_scale).mean()
-                del positive_loss
-                del negative_loss
+            if not return_loss:
+                return model_pred, target
 
             else:
-                loss = get_loss(model_pred, target, timesteps, loss_scale).mean()
-                if teacher_pred is not None:
-                    loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale).mean()
-                    loss += loss_mse_teacher
-            del cuda_caption
 
-            return model_pred, target, loss
+                if loss_scale is None:
+                    loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float)
+
+                if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
+                    snr = compute_snr(timesteps, noise_scheduler)
+                    # kohya implementation
+                    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
+                    if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+                        snr_weight = min_snr_gamma / snr + 1
+                    else:
+                        snr_weight = min_snr_gamma / snr
+                    loss_scale = loss_scale * snr_weight.to(loss_scale.device)
+
+                if do_contrastive_learning:
+                    accumulated_model_preds.append(model_pred)
+                    accumulated_targets.append(target)
+                    accumulated_timesteps.append(timesteps)
+                    accumulated_loss_scale.append(loss_scale)
+                    accumulated_contrastive_class.append(contrastive_class)
+
+                    if not finalize_contrastive_loss:
+                        return model_pred, target, None
+
+
+                    # we're stepping now, combine everything
+                    model_pred = torch.cat(accumulated_model_preds)
+                    target = torch.cat(accumulated_targets)
+                    timesteps = torch.cat(accumulated_timesteps)
+                    loss_scale = torch.cat(accumulated_loss_scale)
+                    contrastive_class = [x
+                                  for l in accumulated_contrastive_class
+                                  for x in l]
+
+                    print('finalizing contrastive loss over', model_pred.shape[0], 'samples, classes', contrastive_class)
+
+                    for i in reversed(range(len(accumulated_model_preds))):
+                        del accumulated_model_preds[i]
+                    for i in reversed(range(len(accumulated_targets))):
+                        del accumulated_targets[i]
+                    accumulated_timesteps.clear()
+                    accumulated_loss_scale.clear()
+                    accumulated_contrastive_class.clear()
+
+                def get_loss(model_pred, target, timesteps, loss_scale):
+                    loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
+
+                    if args.loss_type == "mse_huber":
+                        early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
+                        early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
+                        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
+                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                        loss_mse = loss_mse * loss_scale.to(unet.device) * early_timestep_bias
+                        loss_huber = loss_huber * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
+                        loss = loss_mse + loss_huber
+                        del loss_mse
+                        del loss_huber
+                    elif args.loss_type == "huber_mse":
+                        early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
+                        early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
+                        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
+                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                        loss_mse = loss_mse * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
+                        loss_huber = loss_huber * loss_scale.to(unet.device) * early_timestep_bias
+                        loss = loss_huber + loss_mse
+                        del loss_mse
+                        del loss_huber
+                    elif args.loss_type == "huber":
+                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                        loss_huber = loss_huber * loss_scale.to(unet.device)
+                        loss = loss_huber
+                        del loss_huber
+                    else:
+                        loss_mse = loss_mse * loss_scale.to(unet.device)
+                        loss = loss_mse
+                        del loss_mse
+                    return loss
+
+                if do_contrastive_learning:
+                    assert teacher_pred is None, "contrastive learning with teacher model is not implemented"
+                    positive_loss = get_loss(model_pred, target, timesteps, loss_scale)
+                    # Generate negative samples
+                    #max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
+                    #                                 dtype=positive_loss.dtype).to(positive_loss.device)
+                    negative_loss = torch.zeros_like(positive_loss)
+                    bsz = model_pred.shape[0]
+                    num_samples = [0] * bsz
+                    for i in range(bsz):
+                        for j in range(bsz):
+                            # skip self and cond_dropout samples
+                            if i == j or contrastive_class[i] == " " or contrastive_class[j] == " ":
+                                continue
+                            if contrastive_class[i] != contrastive_class[j]:
+                                #dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
+                                delta_negative = F.l1_loss(model_pred[i:i+1], target[j:j+1], reduction='none')
+                                margin = args.contrastive_learning_max_negative_loss
+                                l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
+                                if not args.contrastive_learning_use_l1_loss:
+                                    l_negative = torch.pow(l_negative, 2.0)
+
+                                diminishing_factor = 1 #torch.exp(-alpha * dist_negative)
+                                l_negative_diminished = l_negative * diminishing_factor
+                                negative_loss[i:i+1] += l_negative_diminished
+                                del l_negative_diminished
+                                del l_negative
+                                del delta_negative
+
+                                """contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
+    
+                                dist_negative = torch.sqrt(contrastive_loss)
+                                diminishing_factor = torch.exp(-args.contrastive_learning_alpha * dist_negative)
+                                contrastive_loss_diminished = contrastive_loss * diminishing_factor
+                                negative_loss[i:i + 1] = contrastive_loss_diminished
+                                del contrastive_loss_diminished
+                                del contrastive_loss
+                                """
+
+                                #contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
+                                #negative_loss[i:i+1] += contrastive_loss_clamped_inv
+                                #del contrastive_loss_clamped_inv
+                                #del contrastive_loss
+
+                                num_samples[i] += 1
+
+                    print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
+
+                    # Average over negative samples
+                    num_samples_safe =  torch.tensor([1] * len(num_samples)
+                                                     if args.contrastive_learning_no_average_negatives
+                                                     else [max(1,x) for x in num_samples]
+                                                     , device=negative_loss.device)
+
+                    negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
+                    negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
+                    loss = (positive_loss + negative_loss * negative_loss_scale).mean()
+                    del positive_loss
+                    del negative_loss
+
+                else:
+                    loss = get_loss(model_pred, target, timesteps, loss_scale).mean()
+                    if teacher_pred is not None:
+                        loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale).mean()
+                        loss += loss_mse_teacher
+                del cuda_caption
+
+                return model_pred, target, loss
 
     def generate_samples(global_step: int, batch):
         nonlocal unet
@@ -1306,7 +1351,7 @@ def main(args):
 
 
     # Pre-train validation to establish a starting point on the loss graph
-    if validator and False:
+    if validator and not args.no_initial_validation:
         validator.do_validation(global_step=0,
                                 get_model_prediction_and_target_callable=get_model_prediction_and_target)
 
@@ -1330,6 +1375,7 @@ def main(args):
     epoch = None
     try:        
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
+        needs_samples = False
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1392,12 +1438,18 @@ def main(args):
                     or (batch["image"].shape != next_batch["image"].shape)
                     or (batch["do_contrastive_learning"] and not next_batch["do_contrastive_learning"])
                 )
+                #print("should_finalize_contrastive_loss:", should_finalize_contrastive_loss, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
+
+                loss_scale = batch["loss_scale"]
+                if batch["runt_size"] > 0:
+                    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
+                    loss_scale = loss_scale * runt_loss_scale
 
                 model_pred, target, loss = get_model_prediction_and_target(batch["image"],
                                                                            batch["tokens"],
                                                                            args.zero_frequency_noise_ratio,
                                                                            return_loss=True,
-                                                                           loss_scale=batch["loss_scale"],
+                                                                           loss_scale=loss_scale,
                                                                            embedding_perturbation=args.embedding_perturbation,
                                                                            prompt_str=batch["captions"],
                                                                            contrastive_class=batch["contrastive_class"],
@@ -1406,34 +1458,36 @@ def main(args):
 
                 del target, model_pred
 
+                ed_optimizer.step(loss, step, global_step)
+                if (global_step + 1) % sample_generator.sample_steps == 0:
+                    needs_samples = True
+
+                if args.ema_decay_rate != None:
+                    if ((global_step + 1) % args.ema_update_interval) == 0:
+                        # debug_start_time = time.time() # Measure time
+
+                        if args.disable_unet_training != True:
+                            update_ema(unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+
+                        if args.disable_textenc_training != True:
+                            update_ema(text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+
+                        # debug_end_time = time.time() # Measure time
+                        # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
+                        # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
+
                 if loss is not None:
-                    if batch["runt_size"] > 0:
-                        runt_loss_scale = (batch["runt_size"] / args.batch_size)**1.5 # further discount runts by **1.5
-                        loss = loss * runt_loss_scale
-
-                    ed_optimizer.step(loss, step, global_step)
-
-                    if args.ema_decay_rate != None:
-                        if ((global_step + 1) % args.ema_update_interval) == 0:
-                            # debug_start_time = time.time() # Measure time
-
-                            if args.disable_unet_training != True:
-                                update_ema(unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
-
-                            if args.disable_textenc_training != True:
-                                update_ema(text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
-
-                            # debug_end_time = time.time() # Measure time
-                            # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
-                            # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
-
-
                     loss_step = loss.detach().item()
 
                     steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
 
                     loss_log_step.append(loss_step)
                     loss_epoch.append(loss_step)
+                    del loss
+
+                    if needs_samples:
+                        generate_samples(global_step=global_step, batch=batch)
+                        needs_samples = False
 
                 steps_pbar.update(1)
 
@@ -1466,9 +1520,6 @@ def main(args):
 
                 if validator and step in validation_steps:
                     validator.do_validation(global_step, get_model_prediction_and_target)
-
-                if (global_step + 1) % sample_generator.sample_steps == 0:
-                    generate_samples(global_step=global_step, batch=batch)
 
                 min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 
@@ -1617,6 +1668,7 @@ if __name__ == "__main__":
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
     argparser.add_argument("--validation_config", default=None, help="Path to a JSON configuration file for the validator.  Default is no validation.")
+    argparser.add_argument("--no_initial_validation", action="store_true", help="If passed, don't do validation before the first step")
     argparser.add_argument("--write_schedule", action="store_true", default=False, help="write schedule of images and their batches to file (def: False)")
     argparser.add_argument("--rated_dataset", action="store_true", default=False, help="enable rated image set training, to less often train on lower rated images through the epochs")
     argparser.add_argument("--rated_dataset_target_dropout_percent", type=int, default=50, help="how many images (in percent) should be included in the last epoch (Default 50)")
@@ -1625,7 +1677,7 @@ if __name__ == "__main__":
     argparser.add_argument("--mix_zero_terminal_snr", action="store_true", default=None, help="Mix zero termianl SNR with regular training")
     argparser.add_argument("--match_zero_terminal_snr", action="store_true", default=None, help="use zero terminal SNR target as regular noise scheduler input")
     argparser.add_argument("--load_settings_every_epoch", action="store_true", default=None, help="Enable reloading of 'train.json' at start of every epoch.")
-    argparser.add_argument("--min_snr_gamma", type=int, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
+    argparser.add_argument("--min_snr_gamma", type=float, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
     argparser.add_argument("--debug_invert_min_snr_gamma", action='store_true', help="invert the timestep/scale equation for min snr gamma")
     argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
     argparser.add_argument("--ema_strength_target", type=float, default=None, help="EMA decay target value in range (0,1). emarate will be calculated from equation: 'ema_decay_rate=ema_strength_target^(total_steps/ema_update_interval)'. Using this parameter will enable the ema feature and overide ema_decay_rate.")
@@ -1643,6 +1695,9 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_learning_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[])")
     argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=1, help="Scaling factor for contrastive learning negative loss")
     argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")
+    argparser.add_argument("--contrastive_learning_use_l1_loss", action="store_true", help="use L1 loss instead of MSE for contrastive negative term")
+    argparser.add_argument("--contrastive_learning_no_average_negatives", action="store_true", help="do not average negative terms per batch")
+    argparser.add_argument("--contrastive_learning_save_on_cpu", action="store_true", help="Store grads on CPU (allows larger grad_accum sizes but slower)")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

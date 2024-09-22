@@ -15,6 +15,8 @@ limitations under the License.
 """
 import bisect
 import logging
+from collections import defaultdict
+
 import math
 import copy
 
@@ -104,7 +106,7 @@ class DataLoaderMultiAspect():
 
         randomizer.shuffle(picked_images)
 
-        buckets = {}
+        buckets = defaultdict(list)
         batch_size = self.batch_size
         grad_accum = self.grad_accum
 
@@ -112,8 +114,6 @@ class DataLoaderMultiAspect():
             bucket_key = (image.batch_id if batch_id_override is None else batch_id_override,
                           image.target_wh[0],
                           image.target_wh[1])
-            if bucket_key not in buckets:
-                buckets[bucket_key] = []
             buckets[bucket_key].append(image)
 
         for image_caption_pair in picked_images:
@@ -152,8 +152,8 @@ class DataLoaderMultiAspect():
         # at this point items have a partially deterministic order
         # (in particular: rarer aspect ratios are more likely to cluster at the end due to stochastic sampling)
         # so we shuffle them to mitigate this, using chunked_shuffle to keep batches with the same aspect ratio together
-        items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size, randomizer=randomizer)
-                             for k,v in items_by_batch_id.items()}
+        items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size*grad_accum, randomizer=randomizer)
+                             for k,v in items_by_batch_id.items()} 
         # paranoia: verify that this hasn't fucked up the aspect ratio batching
         for items in items_by_batch_id.values():
             batches = chunk(items, chunk_size=batch_size)

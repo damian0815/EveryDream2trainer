@@ -27,7 +27,7 @@ def gather_captioned_images(root_dir: str) -> list[tuple[str,Optional[str]]]:
 
 def copy_captioned_image(image_caption_pair: tuple[str, Optional[str]],
                          source_root: str, target_root: str,
-                         use_symlinks=True):
+                         use_symlinks: bool):
     image_path = image_caption_pair[0]
     caption_path = image_caption_pair[1]
 
@@ -38,7 +38,7 @@ def copy_captioned_image(image_caption_pair: tuple[str, Optional[str]],
 
     # copy files
     target_image_path = os.path.join(target_folder, os.path.basename(image_path))
-    target_caption_path = os.path.join(target_folder, os.path.basename(caption_path))
+    target_caption_path = None if caption_path is None else os.path.join(target_folder, os.path.basename(caption_path))
     if use_symlinks:
         os.symlink(image_path, target_image_path)
         if caption_path is not None:
@@ -57,6 +57,7 @@ if __name__ == '__main__':
     parser.add_argument('--val_output_folder', type=str, required=True, help="Output folder for the 'val' dataset.")
     parser.add_argument('--split_proportion', type=float, required=True, help="Proportion of images to use for 'val' (a number between 0 and 1)")
     parser.add_argument('--seed', type=int, required=False, default=555, help='Random seed for shuffling')
+    parser.add_argument("--use_symlinks", action="store_true", help="save as symlinks (experimental)")
     args = parser.parse_args()
 
     images = list(gather_captioned_images(args.source_root))
@@ -72,10 +73,10 @@ if __name__ == '__main__':
     print(f"Split to 'train' set with {len(train_split)} images and 'val' set with {len(val_split)}")
     print(f"Copying 'val' set to {args.val_output_folder}...")
     for v in tqdm(val_split):
-        copy_captioned_image(v, args.source_root, args.val_output_folder)
+        copy_captioned_image(v, args.source_root, args.val_output_folder, args.use_symlinks)
 
     if args.train_output_folder is not None:
         print(f"Copying 'train' set to {args.train_output_folder}...")
         for v in tqdm(train_split):
-            copy_captioned_image(v, args.source_root, args.train_output_folder)
+            copy_captioned_image(v, args.source_root, args.train_output_folder, args.use_symlinks)
     print("Done.")

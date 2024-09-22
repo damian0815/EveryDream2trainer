@@ -140,9 +140,10 @@ class EveryDreamOptimizer():
         return self._should_do_grad_accum_step(step, global_step)
 
     def step(self, loss, step, global_step):
-        self.scaler.scale(loss).backward()
+        if loss is not None:
+            self.scaler.scale(loss).backward()
 
-        if self._should_do_grad_accum_step(step, global_step):
+        if loss is not None and self._should_do_grad_accum_step(step, global_step):
             global shared_timesteps
             shared_timesteps = None
             for optimizer in self.optimizers:
@@ -162,7 +163,6 @@ class EveryDreamOptimizer():
                 te_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params, max_norm=self.clip_grad_norm)
                 self.log_writer.add_scalar("optimizer/te_grad_norm", te_grad_norm, global_step)
 
-
             for optimizer in self.optimizers:
                 self.scaler.step(optimizer)
 
@@ -175,7 +175,6 @@ class EveryDreamOptimizer():
                     self._log_gradient_normal(itertools.chain(self.text_encoder_params), "optimizer/te_grad_norm", log_info_te_fn)
 
             self._zero_grad(set_to_none=True)
-
 
         for scheduler in self.lr_schedulers:
             scheduler.step()

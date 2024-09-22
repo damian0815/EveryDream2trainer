@@ -36,7 +36,28 @@ class MyTestCase(unittest.TestCase):
         snr_ztsnr = compute_snr(timesteps=timesteps, noise_scheduler=noise_scheduler_ztsnr)
         print(snr_base, snr_ztsnr)
 
-
+def get_minsnr_weight(timesteps, gamma):
+    scheduler_config = {
+        "_class_name": "DDIMScheduler",
+        "_diffusers_version": "0.8.0",
+        "beta_end": 0.012,
+        "beta_schedule": "scaled_linear",
+        "beta_start": 0.00085,
+        "clip_sample": False,
+        "num_train_timesteps": 1000,
+        "prediction_type": "v_prediction",
+        "set_alpha_to_one": False,
+        "skip_prk_steps": True,
+        "steps_offset": 1,
+        "trained_betas": None
+    }
+    noise_scheduler = DDPMScheduler.from_config(scheduler_config)
+    snr = compute_snr(timesteps=timesteps, noise_scheduler=noise_scheduler)
+    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+    if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+        return min_snr_gamma / (snr + 1)
+    else:
+        return min_snr_gamma / snr
 
 if __name__ == '__main__':
     unittest.main()
