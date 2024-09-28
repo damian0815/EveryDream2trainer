@@ -37,6 +37,7 @@ class EveryDreamDataLoaderWrapper(DataLoader):
         print(len(batch))
         captions = [example["caption"] for example in batch]
         images = [example["image"] for example in batch]
+        masks = [example["mask"] for example in batch]
 
         print("collate_fn2")
         images = torch.stack(images)
@@ -52,6 +53,7 @@ class EveryDreamDataLoaderWrapper(DataLoader):
         batch = {
             "captions": captions,
             "images": images,
+            "masks": masks
         }
-        print(f"{batch['captions']} {batch['images'].shape}")
+        print(f"{batch['captions']} {batch['images'].shape}, {batch['masks'].shape if batch['masks'] is not None else 'no masks'}")
         return batch

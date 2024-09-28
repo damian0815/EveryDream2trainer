@@ -51,6 +51,7 @@ class EveryDreamBatch(Dataset):
                  rated_dataset_dropout_target=0.5,
                  name='train',
                  contrastive_learning_batch_ids=None,
+                 use_masks=False
                  ):
         self.contrastive_learning_batch_ids = contrastive_learning_batch_ids or []
         self.data_loader = data_loader
@@ -71,6 +72,7 @@ class EveryDreamBatch(Dataset):
         self.image_train_items = []
         self.__update_image_train_items(1.0)
         self.name = name
+        self.use_masks = use_masks
         self.contrastive_scale_for_caption = build_contrastive_scale_for_caption_dict(
             data_loader=self.data_loader,
             contrastive_learning_batch_ids=self.contrastive_learning_batch_ids
@@ -114,10 +116,18 @@ class EveryDreamBatch(Dataset):
 
         example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
         example["image"] = image_transforms(example["image"])
+        if train_item["mask"] is not None:
+            mask_transforms = transforms.Compose(
+                [
+                    transforms.ToTensor()
+                ]
+            )
+            example["mask"] = mask_transforms(train_item["mask"])
+        else:
+            example["mask"] = None
         example["untransformed_caption"] = example["caption"]
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"])
 
-        # no cond dropout for contrastive learning
         if random.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
             example["caption"] = " "
 
@@ -149,10 +159,12 @@ class EveryDreamBatch(Dataset):
         example = {}
         save = debug_level > 2
 
-        image_train_tmp = image_train_item.hydrate(save=save, crop_jitter=self.crop_jitter)
+        image_train_tmp = image_train_item.hydrate(save=save, crop_jitter=self.crop_jitter, load_mask=self.use_masks)
 
-        example["image"] = image_train_tmp.image.copy()  # hack for now to avoid memory leak
+        example["image"] = image_train_tmp.image.copy() # hack for now to avoid memory leak
+        example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy() # hack for now to avoid memory leak
         image_train_tmp.image = None # hack for now to avoid memory leak
+        image_train_tmp.mask = None # hack for now to avoid memory leak
         example["caption"] = image_train_tmp.caption
         if image_train_tmp.cond_dropout is not None:
             example["cond_dropout"] = image_train_tmp.cond_dropout
@@ -235,6 +247,7 @@ def collate_fn(batch):
     Collates batches
     """
     images = [example["image"] for example in batch]
+    masks = [example["mask"] for example in batch]
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
     contrastive_class = [example["contrastive_class"] for example in batch]
     captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
@@ -244,11 +257,21 @@ def collate_fn(batch):
     images = torch.stack(images)
     images = images.to(memory_format=torch.contiguous_format).float()
 
+    if any(m is not None for m in masks):
+        masks = [m if m is not None
+                 else torch.ones([1, images[0].shape[1]//8, images[0].shape[2]//8], dtype=torch.float32).to(images.device)
+                 for m in masks]
+        masks = torch.stack(masks)
+        masks = masks.to(memory_format=torch.contiguous_format).float()
+    else:
+        masks = None
+
     loss_scale = torch.tensor([example.get("loss_scale", 1) for example in batch])
 
     ret = {
         "tokens": torch.stack(tuple(tokens)),
         "image": images,
+        "mask": masks,
         "captions": captions,
         "runt_size": runt_size,
         "loss_scale": loss_scale,

@@ -958,6 +958,7 @@ def main(args):
     accumulated_timesteps = []
     accumulated_loss_scale = []
     accumulated_contrastive_class = []
+    accumulated_mask = []
     global prev_timesteps, prev_noise
     prev_timesteps = None
     prev_noise = None
@@ -968,7 +969,8 @@ def main(args):
                                         embedding_perturbation=0.0, prompt_str=None,
                                         contrastive_class=None,
                                         do_contrastive_learning=False,
-                                        finalize_contrastive_loss=False):
+                                        finalize_contrastive_loss=False,
+                                        mask=None):
 
 
         batch_share_timesteps = True if do_contrastive_learning else args.batch_share_timesteps
@@ -1129,22 +1131,28 @@ def main(args):
                         snr_weight = min_snr_gamma / snr
                     loss_scale = loss_scale * snr_weight.to(loss_scale.device)
 
+                if mask is not None:
+                    mask = mask.repeat(1, target.shape[1], 1, 1).to(target.device)
+                else:
+                    mask = torch.ones_like(target)
+
                 if do_contrastive_learning:
                     accumulated_model_preds.append(model_pred)
                     accumulated_targets.append(target)
                     accumulated_timesteps.append(timesteps)
                     accumulated_loss_scale.append(loss_scale)
                     accumulated_contrastive_class.append(contrastive_class)
+                    accumulated_mask.append(mask)
 
                     if not finalize_contrastive_loss:
                         return model_pred, target, None
-
 
                     # we're stepping now, combine everything
                     model_pred = torch.cat(accumulated_model_preds)
                     target = torch.cat(accumulated_targets)
                     timesteps = torch.cat(accumulated_timesteps)
                     loss_scale = torch.cat(accumulated_loss_scale)
+                    mask = torch.cat(accumulated_mask)
                     contrastive_class = [x
                                   for l in accumulated_contrastive_class
                                   for x in l]
@@ -1158,6 +1166,7 @@ def main(args):
                     accumulated_timesteps.clear()
                     accumulated_loss_scale.clear()
                     accumulated_contrastive_class.clear()
+                    accumulated_mask.clear()
 
                 def get_loss(model_pred, target, timesteps, loss_scale):
                     loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
@@ -1250,12 +1259,12 @@ def main(args):
 
                     negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
                     negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
-                    loss = (positive_loss + negative_loss * negative_loss_scale).mean()
+                    loss = ((positive_loss + negative_loss * negative_loss_scale) * mask).mean()
                     del positive_loss
                     del negative_loss
 
                 else:
-                    loss = get_loss(model_pred, target, timesteps, loss_scale).mean()
+                    loss = (get_loss(model_pred, target, timesteps, loss_scale) * mask).mean()
                     if teacher_pred is not None:
                         loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale).mean()
                         loss += loss_mse_teacher
@@ -1437,6 +1446,10 @@ def main(args):
                     or next_batch is None
                     or (batch["image"].shape != next_batch["image"].shape)
                     or (batch["do_contrastive_learning"] and not next_batch["do_contrastive_learning"])
+                    or (
+                            args.contrastive_learning_max_grad_accum is not None
+                            and len(accumulated_model_preds) + 1 >= args.contrastive_learning_max_grad_accum
+                    )
                 )
                 #print("should_finalize_contrastive_loss:", should_finalize_contrastive_loss, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
 
@@ -1454,7 +1467,8 @@ def main(args):
                                                                            prompt_str=batch["captions"],
                                                                            contrastive_class=batch["contrastive_class"],
                                                                            do_contrastive_learning=batch["do_contrastive_learning"],
-                                                                           finalize_contrastive_loss=should_finalize_contrastive_loss)
+                                                                           finalize_contrastive_loss=should_finalize_contrastive_loss,
+                                                                           mask=batch["mask"])
 
                 del target, model_pred
 
@@ -1698,6 +1712,8 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_learning_use_l1_loss", action="store_true", help="use L1 loss instead of MSE for contrastive negative term")
     argparser.add_argument("--contrastive_learning_no_average_negatives", action="store_true", help="do not average negative terms per batch")
     argparser.add_argument("--contrastive_learning_save_on_cpu", action="store_true", help="Store grads on CPU (allows larger grad_accum sizes but slower)")
+    argparser.add_argument("--contrastive_learning_max_grad_accum", type=int, default=None, help="Max batch size for contrastive learning (overrides grad_accum)")
+    argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg_mask in the data folder and use as mask for the loss")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

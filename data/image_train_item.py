@@ -26,6 +26,7 @@ import PIL.Image as Image
 import PIL.ImageOps as ImageOps
 import numpy as np
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 
 OptionalImageCaption = typing.Optional['ImageCaption']
 
@@ -170,13 +171,28 @@ class ImageTrainItem:
         self.error = None
         self.__compute_target_width_height()
 
-    def load_image(self):
+    @property
+    def pathname_mask(self):
+        return self.pathname + "_alpha"
+
+    def load_image(self) -> PIL.Image:
         try:
             image = PIL.Image.open(self.pathname).convert('RGB')
             image = self._try_transpose(image, print_error=False)
         except SyntaxError as e:
             pass
         return image
+
+    def load_mask(self) -> PIL.Image:
+        if not os.path.exists(self.pathname_mask):
+            return None
+        try:
+            mask = PIL.Image.open(self.pathname_mask).convert('RGB')
+            mask = self._try_transpose(mask, print_error=False)
+        except SyntaxError as e:
+            pass
+        return mask
+
     
     def _try_transpose(self, image, print_error=False):
         try:
@@ -208,8 +224,7 @@ class ImageTrainItem:
             pass
         return False
 
-
-    def _percent_random_crop(self, image, crop_jitter=0.02):
+    def _get_random_crop_settings(self, image, crop_jitter=0.02):
         """
         randomly crops the image by a percentage of the image size on each of the four sides
         """
@@ -220,6 +235,17 @@ class ImageTrainItem:
         right_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
         top_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
         bottom_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
+
+        return left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels
+
+    def _percent_random_crop(self, image, crop_jitter=0.02, crop_settings=None):
+        """
+        randomly crops the image by a percentage of the image size on each of the four sides
+        """
+        width, height = image.size
+        if crop_settings is None:
+            crop_settings = self._get_random_crop_settings(image, crop_jitter=crop_jitter)
+        left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = crop_settings
 
         # print(f"{left_crop_pixels}, {right_crop_pixels}, {top_crop_pixels}, {bottom_crop_pixels}, ")
 
@@ -279,29 +305,49 @@ class ImageTrainItem:
             raise e
         return image
 
-    def hydrate(self, save=False, crop_jitter=0.02):
+    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False):
         image = self.load_image()
+        mask = self.load_mask() if load_mask else None
 
         width, height = image.size
+        if mask is not None:
+            if mask.size[0] != width or mask.size[1] != height:
+                logging.error(f"found a mask at {self.pathname_mask} but it was the wrong size (image size {image.size}, mask size {mask.size}) - ignoring mask")
+                mask = None
 
         img_jitter = min((width-self.target_wh[0])/self.target_wh[0], (height-self.target_wh[1])/self.target_wh[1])
         img_jitter = min(img_jitter, 0.0 if self.runt_size > 0 else crop_jitter)
         img_jitter = max(img_jitter, 0.0)
         
         if img_jitter > 0.0:
-            image = self._percent_random_crop(image, img_jitter)
+            crop_settings = self._get_random_crop_settings(image, img_jitter)
+            image = self._percent_random_crop(image, crop_settings=crop_settings)
+            if mask is not None:
+                mask = self._percent_random_crop(image, crop_settings=crop_settings)
 
         image = self._trim_to_aspect(image, self.target_wh)
+        if mask is not None:
+            mask = self._trim_to_aspect(mask, self.target_wh)
 
-        self.image = image.resize(self.target_wh)
+        image = image.resize(self.target_wh)
+        if mask:
+            mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
 
-        self.image = self.flip(self.image)
+        if random.random() < self.flip.p:
+            image = TF.hflip(image)
+            if mask is not None:
+                mask = TF.hflip(mask)
+
+        self.image = image
+        self.mask = mask
 
         if save:
             self._debug_save_image(self.image, "final")
 
         self.image = np.array(self.image).astype(np.uint8)
-        
+        if self.mask is not None:
+            self.mask = np.array(self.mask.convert('L')).astype(np.float32) / 255
+
         return self
 
     def __compute_target_width_height(self):
