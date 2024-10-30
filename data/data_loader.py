@@ -38,14 +38,16 @@ class DataLoaderMultiAspect():
     seed: random seed
     batch_size: number of images per batch
     """
-    def __init__(self, image_train_items: list[ImageTrainItem], seed=555, batch_size=1, grad_accum=1):
+    def __init__(self, image_train_items: list[ImageTrainItem], seed=555, batch_size=1, grad_accum=1, chunk_shuffle_batch_size=None, batch_id_dropout_p=0):
         self.seed = seed
         self.batch_size = batch_size
         self.grad_accum = grad_accum
+        self.chunk_shuffle_batch_size = chunk_shuffle_batch_size or batch_size
         self.prepared_train_data = image_train_items
         random.Random(self.seed).shuffle(self.prepared_train_data)
         self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
         self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
+        self.batch_id_dropout_p = batch_id_dropout_p
         if self.expected_epoch_size != len(self.prepared_train_data):
             logging.info(f" * DLMA initialized with {len(image_train_items)} source images. After applying multipliers, each epoch will train on at least {self.expected_epoch_size} images.")
         else:
@@ -118,7 +120,8 @@ class DataLoaderMultiAspect():
 
         for image_caption_pair in picked_images:
             image_caption_pair.runt_size = 0
-            add_image_to_appropriate_bucket(image_caption_pair)
+            batch_id_override = DEFAULT_BATCH_ID if randomizer.random() > self.batch_id_dropout_p else None
+            add_image_to_appropriate_bucket(image_caption_pair, batch_id_override=batch_id_override)
 
         # handled named batch runts by demoting them to the DEFAULT_BATCH_ID
         for key, bucket_contents in [(k, b) for k, b in buckets.items() if k[0] != DEFAULT_BATCH_ID]:
@@ -167,8 +170,7 @@ class DataLoaderMultiAspect():
                                                                    batch_size=batch_size,
                                                                    grad_accum=grad_accum)
 
-        effective_batch_size = batch_size * grad_accum
-        items = chunked_shuffle(items, chunk_size=effective_batch_size, randomizer=randomizer)
+        items = chunked_shuffle(items, chunk_size=self.chunk_shuffle_batch_size, randomizer=randomizer)
 
         return items
 

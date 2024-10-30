@@ -21,6 +21,7 @@ from itertools import chain
 from typing import Generator, Any
 
 import torch
+from peft import LoraConfig
 from torch.cuda.amp import autocast, GradScaler
 from diffusers.optimization import get_scheduler
 
@@ -69,8 +70,12 @@ class EveryDreamOptimizer():
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
-        self.text_encoder_params = self._apply_text_encoder_freeze(text_encoder)
-        self.unet_params = unet.parameters()
+        if args.lora:
+            self.text_encoder_params, self.unet_params = self.setup_lora_training(args, text_encoder, unet)
+        else:
+            self.text_encoder_params = self._apply_text_encoder_freeze(text_encoder)
+            self.unet_params = unet.parameters()
+
         self.text_encoder_params, self.unet_params = plugin_runner.run_add_parameters(self.text_encoder_params, self.unet_params)
         self.text_encoder_params = list(self.text_encoder_params)
 
@@ -92,18 +97,21 @@ class EveryDreamOptimizer():
 
         self.load(args.resume_ckpt)
 
-        self.scaler = GradScaler(
-            enabled=args.amp,
-            init_scale=2**17.5,
-            growth_factor=2,
-            backoff_factor=1.0/2,
-            growth_interval=25,
-        )
+        if args.amp:
+            self.scaler = GradScaler(
+                enabled=args.amp,
+                init_scale=2**17.5,
+                growth_factor=2,
+                backoff_factor=1.0/2,
+                growth_interval=25,
+            )
+        else:
+            self.scaler = None
 
-        logging.info(f" Grad scaler enabled: {self.scaler.is_enabled()} (amp mode)")
+        logging.info(f" Grad scaler enabled: {self.scaler is not None and self.scaler.is_enabled()} (amp mode)")
 
     def _log_gradient_normal(self, parameters: Generator, label: str, log_action=None):
-        total_norm = self._get_norm(parameters, lambda p: p.grad.data)
+        total_norm = self._get_norm([p for p in parameters if p.grad is not None], lambda p: p.grad.data)
         log_action(total_norm, label)
 
     def _log_weight_normal(self, parameters: Generator, label: str, log_action=None):
@@ -141,13 +149,17 @@ class EveryDreamOptimizer():
 
     def step(self, loss, step, global_step):
         if loss is not None:
-            self.scaler.scale(loss).backward()
+            if self.scaler is None:
+                loss.backward()
+            else:
+                self.scaler.scale(loss).backward()
 
         if loss is not None and self._should_do_grad_accum_step(step, global_step):
             global shared_timesteps
             shared_timesteps = None
-            for optimizer in self.optimizers:
-                self.scaler.unscale_(optimizer)
+            if self.scaler is not None:
+                for optimizer in self.optimizers:
+                    self.scaler.unscale_(optimizer)
 
             if self.clip_grad_norm is not None:
                 if self.log_grad_norm:
@@ -163,10 +175,14 @@ class EveryDreamOptimizer():
                 te_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params, max_norm=self.clip_grad_norm)
                 self.log_writer.add_scalar("optimizer/te_grad_norm", te_grad_norm, global_step)
 
-            for optimizer in self.optimizers:
-                self.scaler.step(optimizer)
+            if self.scaler is None:
+                for optimizer in self.optimizers:
+                    optimizer.step()
+            else:
+                for optimizer in self.optimizers:
+                    self.scaler.step(optimizer)
+                self.scaler.update()
 
-            self.scaler.update()
             if self.log_grad_norm and self.log_writer:
                 log_info_unet_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
                 log_info_te_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
@@ -187,6 +203,8 @@ class EveryDreamOptimizer():
             optimizer.zero_grad(set_to_none=set_to_none)
     
     def get_scale(self):
+        if self.scaler is None:
+            return 1
         return self.scaler.get_scale()
     
     def get_unet_lr(self):
@@ -296,6 +314,8 @@ class EveryDreamOptimizer():
         return ret_val
 
     def _update_grad_scaler(self, global_step):
+        if self.scaler is None:
+            return
         if global_step == 500:
             factor = 1.8
             self.scaler.set_growth_factor(factor)
@@ -561,6 +581,45 @@ class EveryDreamOptimizer():
                 p.requires_grad = False
 
         return parameters
+
+    def setup_lora_training(self, args, text_encoder, unet):
+
+        if args.disable_textenc_training:
+            text_encoder_params = []
+        else:
+            suffixes = ["q_proj", "k_proj", "v_proj", "out_proj"]
+            target_modules = [k for k, _ in text_encoder.named_modules() if any(suffix in k for suffix in suffixes)]
+            unfreeze_last_n_layers = self.te_freeze_config.get("unfreeze_last_n_layers", None)
+            if unfreeze_last_n_layers is not None:
+                layer_count = len(text_encoder.text_model.encoder.layers)
+                last_n_layers = range(layer_count-unfreeze_last_n_layers, layer_count+1)
+                target_modules = [k for k in target_modules if any(f'.layers.{l}' in k for l in last_n_layers)]
+            print("lora freezing means we put lora on: ", target_modules)
+            text_lora_config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                init_lora_weights="gaussian",
+                target_modules=target_modules
+            )
+            text_encoder.add_adapter(text_lora_config)
+            text_encoder_params = list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
+
+        if args.disable_unet_training:
+            unet_params = []
+        else:
+            unet_lora_config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                init_lora_weights="gaussian",
+                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            )
+            unet.add_adapter(unet_lora_config)
+            #if args.lora_resume:
+
+            unet_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
+
+        return text_encoder_params, unet_params
+
 
 
 def log_optimizer(label: str, optimizer: torch.optim.Optimizer, betas, epsilon, weight_decay, lr):

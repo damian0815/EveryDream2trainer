@@ -143,7 +143,8 @@ class ImageTrainItem:
                  cond_dropout=None,
                  shuffle_tags=False,
                  batch_id: str=None,
-                 loss_scale: float=None
+                 loss_scale: float=None,
+                 contrastive_class: str=None,
                  ):
         self.caption = caption
         self.aspects = aspects
@@ -156,6 +157,7 @@ class ImageTrainItem:
         self.shuffle_tags = shuffle_tags
         self.batch_id = batch_id or DEFAULT_BATCH_ID
         self.loss_scale = 1 if loss_scale is None else loss_scale
+        self.contrastive_class = contrastive_class
         self.target_wh = None
         self.is_runt = False
 
@@ -316,7 +318,7 @@ class ImageTrainItem:
                 mask = None
 
         img_jitter = min((width-self.target_wh[0])/self.target_wh[0], (height-self.target_wh[1])/self.target_wh[1])
-        img_jitter = min(img_jitter, 0.0 if self.runt_size > 0 else crop_jitter)
+        img_jitter = min(img_jitter, crop_jitter)
         img_jitter = max(img_jitter, 0.0)
         
         if img_jitter > 0.0:

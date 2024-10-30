@@ -29,7 +29,9 @@ import traceback
 import shutil
 from typing import Optional
 
+import safetensors.torch
 import torch.nn.functional as F
+from peft import LoraConfig
 from torch.cuda.amp import autocast
 
 from colorama import Fore, Style
@@ -42,6 +44,8 @@ from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel, DDIMScheduler, DDPMScheduler, \
     DPMSolverMultistepScheduler, PNDMScheduler, StableDiffusionXLPipeline
+from diffusers.utils import convert_state_dict_to_diffusers
+from peft.utils import get_peft_model_state_dict
 #from diffusers.models import AttentionBlock
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
@@ -143,10 +147,36 @@ class EveryDreamTrainingState:
         self.unet_ema = unet_ema
         self.text_encoder_ema = text_encoder_ema
 
+def convert_diffusers_lora_to_civitai(diffusers_folder, civitai_path):
+    broken = safetensors.torch.load_file(os.path.join(diffusers_folder, 'pytorch_lora_weights.safetensors'))
+
+    fixed = {}
+    for i, (orig_k, v) in enumerate(broken.items()):
+        k = orig_k
+        k = k.replace('text_encoder.', 'lora_te_')
+        k = k.replace('unet.', 'lora_unet_')
+        if '.lora' in k:
+            parts = k.split('.lora')
+            assert (len(parts) == 2)
+            pre = parts[0].replace('.', '_')
+            post = parts[1]
+            post = post.replace('_linear_layer.', '')
+            post = post.replace('.down.', 'down.')
+            post = post.replace('.up.', 'up.')
+            k = pre + '.lora_' + post
+            # if i > offset:
+            #    print(parts)
+            #    print(k)
+        #print(f'{orig_k} -> {k}')
+        fixed[k] = v
+
+    safetensors.torch.save_file(fixed, civitai_path)
+
 
 @torch.no_grad()
 def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
-               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True, plugin_runner: PluginRunner = None):
+               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True, save_lora=False,
+               plugin_runner: PluginRunner = None):
     """
     Save the model to disk
     """
@@ -201,29 +231,58 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
 
             save_ckpt_file(diffusers_model_path, sd_ckpt_path_ema)
 
+    if save_lora:
 
-    pipeline = StableDiffusionPipeline(
-        vae=ed_state.vae,
-        text_encoder=ed_state.text_encoder,
-        tokenizer=ed_state.tokenizer,
-        unet=ed_state.unet,
-        scheduler=ed_state.inference_scheduler,
-        safety_checker=None,  # save vram
-        requires_safety_checker=None,  # avoid nag
-        feature_extractor=None,  # must be none of no safety checker
-    )
+        if hasattr(ed_state.unet, 'peft_config'):
+            unet_lora_state_dict = convert_state_dict_to_diffusers(
+                get_peft_model_state_dict(ed_state.unet)
+            )
+        else:
+            unet_lora_state_dict = None
+        if hasattr(ed_state.text_encoder, 'peft_config'):
+            text_encoder_lora_state_dict = convert_state_dict_to_diffusers(
+                get_peft_model_state_dict(ed_state.text_encoder)
+            )
+        else:
+            text_encoder_lora_state_dict = None
 
-    diffusers_model_path = save_path
-    logging.info(f" * Saving diffusers model to {diffusers_model_path}")
-    pipeline.save_pretrained(diffusers_model_path)
+        print("saving diffusers LoRA to", save_path)
+        StableDiffusionPipeline.save_lora_weights(
+            save_directory=save_path,
+            unet_lora_layers=unet_lora_state_dict,
+            text_encoder_lora_layers=text_encoder_lora_state_dict,
+            safe_serialization=True,
+        )
 
-    if save_ckpt:
-        sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
-        save_ckpt_file(diffusers_model_path, sd_ckpt_path)
+        civitai_path = save_path + "_civitai_format.safetensors"
+        print("saving civitai format LoRA to", civitai_path)
+        convert_diffusers_lora_to_civitai(save_path, civitai_path)
 
-    if save_optimizer_flag:
-        logging.info(f" Saving optimizer state to {save_path}")
-        ed_state.optimizer.save(save_path)
+
+    else:
+        pipeline = StableDiffusionPipeline(
+            vae=ed_state.vae,
+            text_encoder=ed_state.text_encoder,
+            tokenizer=ed_state.tokenizer,
+            unet=ed_state.unet,
+            scheduler=ed_state.inference_scheduler,
+            safety_checker=None,  # save vram
+            requires_safety_checker=None,  # avoid nag
+            feature_extractor=None,  # must be none of no safety checker
+        )
+
+
+        diffusers_model_path = save_path
+        logging.info(f" * Saving diffusers model to {diffusers_model_path}")
+        pipeline.save_pretrained(diffusers_model_path)
+
+        if save_ckpt:
+            sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
+            save_ckpt_file(diffusers_model_path, sd_ckpt_path)
+
+        if save_optimizer_flag:
+            logging.info(f" Saving optimizer state to {save_path}")
+            ed_state.optimizer.save(save_path)
 
 
 def setup_local_logger(args):
@@ -518,11 +577,11 @@ def update_ema(model, ema_model, decay, default_device, ema_device):
         if need_to_delete_original:
             del(original_model_on_proper_device)
 
-def compute_snr(timesteps, noise_scheduler):
+def compute_snr(timesteps, noise_scheduler, max_sigma):
     """
     Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
     """
-    minimal_value = 1e-9
+    minimal_value = 1/max_sigma
     alphas_cumprod = noise_scheduler.alphas_cumprod
     # Use .any() to check if any elements in the tensor are zero
     if (alphas_cumprod[:-1] == 0).any():
@@ -550,9 +609,7 @@ def compute_snr(timesteps, noise_scheduler):
 
     # Compute SNR, first without epsilon
     snr = (alpha / sigma) ** 2
-    # Check if the first element in SNR tensor is zero
-    if torch.any(snr == 0):
-        snr[snr == 0] = minimal_value
+    snr[snr < minimal_value] = minimal_value
     return snr
 
 def load_train_json_from_file(args, report_load = False):
@@ -680,7 +737,6 @@ def main(args):
                 text_encoder_ema = text_encoder_ema.to(ema_device)
                 release_memory(text_encoder_ema_on_wrong_device, text_encoder_ema_current_device)
 
-
         if args.enable_zero_terminal_snr:
             # Use zero terminal SNR
             from utils.unet_utils import enforce_zero_terminal_snr
@@ -796,7 +852,7 @@ def main(args):
     image_train_items = resolve_image_train_items(args)
 
     validator = None
-    if args.validation_config is not None:
+    if args.validation_config is not None and args.validation_config != "None":
         validator = EveryDreamValidator(args.validation_config,
                                         default_batch_size=args.batch_size,
                                         resolution=args.resolution,
@@ -822,7 +878,11 @@ def main(args):
         image_train_items=image_train_items,
         seed=seed,
         batch_size=args.batch_size,
-        grad_accum=args.grad_accum
+        grad_accum=args.grad_accum,
+        chunk_shuffle_batch_size=(args.batch_size
+                              if args.contrastive_learning_max_grad_accum is None
+                              else args.batch_size * args.contrastive_learning_max_grad_accum),
+        batch_id_dropout_p=args.batch_id_dropout_p
     )
 
     train_batch = EveryDreamBatch(
@@ -837,6 +897,9 @@ def main(args):
         rated_dataset=args.rated_dataset,
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
         contrastive_learning_batch_ids=args.contrastive_learning_batch_ids,
+        contrastive_class_uses_full_caption=args.contrastive_learning_delta_loss_method,
+        contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
+        cond_dropout_noise_p=args.cond_dropout_noise_p
     )
 
     torch.cuda.benchmark = False
@@ -1122,7 +1185,7 @@ def main(args):
                     loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float)
 
                 if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
-                    snr = compute_snr(timesteps, noise_scheduler)
+                    snr = compute_snr(timesteps, noise_scheduler, max_sigma=22000)
                     # kohya implementation
                     min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
                     if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
@@ -1218,19 +1281,28 @@ def main(args):
                             if i == j or contrastive_class[i] == " " or contrastive_class[j] == " ":
                                 continue
                             if contrastive_class[i] != contrastive_class[j]:
-                                #dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
-                                delta_negative = F.l1_loss(model_pred[i:i+1], target[j:j+1], reduction='none')
-                                margin = args.contrastive_learning_max_negative_loss
-                                l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
-                                if not args.contrastive_learning_use_l1_loss:
-                                    l_negative = torch.pow(l_negative, 2.0)
+                                if args.contrastive_learning_delta_loss_method:
+                                    delta_to_wrong = model_pred[j:j+1] - model_pred[i:i+1]
+                                    target_delta_to_wrong = target[j:j+1] - target[i:i+1]
+                                    l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
+                                    negative_loss[i:i+1] += l_negative
+                                    del delta_to_wrong
+                                    del target_delta_to_wrong
+                                    del l_negative
+                                else:
+                                    #dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
+                                    delta_negative = F.l1_loss(model_pred[i:i+1].float(), target[j:j+1].float(), reduction='none')
+                                    margin = args.contrastive_learning_max_negative_loss
+                                    l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
+                                    if not args.contrastive_learning_use_l1_loss:
+                                        l_negative = torch.pow(l_negative, 2.0)
 
-                                diminishing_factor = 1 #torch.exp(-alpha * dist_negative)
-                                l_negative_diminished = l_negative * diminishing_factor
-                                negative_loss[i:i+1] += l_negative_diminished
-                                del l_negative_diminished
-                                del l_negative
-                                del delta_negative
+                                    diminishing_factor = 1 #torch.exp(-alpha * dist_negative)
+                                    l_negative_diminished = l_negative * diminishing_factor
+                                    negative_loss[i:i+1] += l_negative_diminished
+                                    del l_negative_diminished
+                                    del l_negative
+                                    del delta_negative
 
                                 """contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
     
@@ -1259,6 +1331,16 @@ def main(args):
 
                     negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
                     negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
+                    if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
+                        # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases
+                        max_timestep = noise_scheduler.config.num_train_timesteps
+                        negative_loss_timestep_start = args.contrastive_learning_delta_timestep_start
+                        # linear bias with offset
+                        early_timestep_bias = torch.maximum((timesteps-negative_loss_timestep_start)
+                                                            / (max_timestep-negative_loss_timestep_start), torch.tensor(0).to(timesteps.device))
+                        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
+                        negative_loss_scale = negative_loss_scale * early_timestep_bias
+
                     loss = ((positive_loss + negative_loss * negative_loss_scale) * mask).mean()
                     del positive_loss
                     del negative_loss
@@ -1551,6 +1633,7 @@ def main(args):
                                save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
                                save_full_precision=args.save_full_precision,
                                save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                               save_lora=args.lora,
                                plugin_runner=plugin_runner)
 
                 plugin_runner.run_on_step_end(epoch=epoch,
@@ -1601,7 +1684,7 @@ def main(args):
         save_path = make_save_path(epoch, global_step, prepend=("" if args.no_prepend_last else "last-"))
         save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt, save_lora=args.lora,
                    plugin_runner=plugin_runner)
 
         total_elapsed_time = time.time() - training_start_time
@@ -1615,7 +1698,7 @@ def main(args):
         #save_path = make_save_path(epoch, global_step, prepend="errored-")
         #save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
         #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt, save_lora=args.lora)
         #logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
         raise ex
 
@@ -1707,13 +1790,25 @@ if __name__ == "__main__":
     argparser.add_argument("--teacher_is_sdxl", action='store_true', help="Pass if the --teacher is an SDXL model")
     argparser.add_argument("--teacher_loss_scale", type=float, default=1, help="Loss scale factor for the teacher model (default=1)")
     argparser.add_argument("--contrastive_learning_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[])")
-    argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=1, help="Scaling factor for contrastive learning negative loss")
+    argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=0.2, help="Scaling factor for contrastive learning negative loss")
     argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")
     argparser.add_argument("--contrastive_learning_use_l1_loss", action="store_true", help="use L1 loss instead of MSE for contrastive negative term")
     argparser.add_argument("--contrastive_learning_no_average_negatives", action="store_true", help="do not average negative terms per batch")
     argparser.add_argument("--contrastive_learning_save_on_cpu", action="store_true", help="Store grads on CPU (allows larger grad_accum sizes but slower)")
     argparser.add_argument("--contrastive_learning_max_grad_accum", type=int, default=None, help="Max batch size for contrastive learning (overrides grad_accum)")
+    argparser.add_argument("--contrastive_learning_delta_loss_method", action="store_true", help="If passed, contrastive learning works with deltas from correct to incorrect targets / predictions")
+    argparser.add_argument("--contrastive_learning_delta_timestep_start", type=int, default=150, help="Where to start scaling delta negative loss")
+    argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="dropout probability for contrastive learning, 0..1")
+
+    argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
+    argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
+
     argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg_mask in the data folder and use as mask for the loss")
+
+    argparser.add_argument("--lora", action='store_true', help="If passed, do LoRA training")
+    argparser.add_argument("--lora_resume", type=str, default=None, help="resume from this lora ckpt")
+    argparser.add_argument("--lora_rank", type=int, default=16)
+    argparser.add_argument("--lora_alpha", type=int, default=8)
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

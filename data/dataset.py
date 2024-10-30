@@ -55,6 +55,7 @@ class ImageConfig:
     flip_p: float = None
     shuffle_tags: bool = False
     loss_scale: float = None
+    contrastive_class: str = None
 
     def merge(self, other):
         if other is None:
@@ -70,7 +71,8 @@ class ImageConfig:
             flip_p=overlay(other.flip_p, self.flip_p),
             shuffle_tags=overlay(other.shuffle_tags, self.shuffle_tags),
             batch_id=overlay(other.batch_id, self.batch_id),
-            loss_scale=overlay(other.loss_scale, self.loss_scale)
+            loss_scale=overlay(other.loss_scale, self.loss_scale),
+            contrastive_class=overlay(other.contrastive_class, self.contrastive_class)
         )
 
     @classmethod
@@ -86,7 +88,8 @@ class ImageConfig:
             flip_p=data.get("flip_p"),
             shuffle_tags=data.get("shuffle_tags"),
             batch_id=data.get("batch_id"),
-            loss_scale=data.get("loss_scale")
+            loss_scale=data.get("loss_scale"),
+            contrastive_class=data.get("contrastive_class"),
             )
 
         # Alternatively parse from dedicated `caption` attribute
@@ -172,9 +175,12 @@ class Dataset:
         if 'local.yml' in fileset:
             cfgs.append(ImageConfig.from_file(fileset['local.yml']))
         if 'batch_id.txt' in fileset:
-            cfgs.append(ImageConfig(batch_id=read_text(fileset['batch_id.txt'])))
+            cfgs.append(ImageConfig(batch_id=read_text(fileset['batch_id.txt']).strip()))
         if 'loss_scale.txt' in fileset:
             cfgs.append(ImageConfig(loss_scale=read_float(fileset['loss_scale.txt'])))
+        if 'contrastive_class.txt' in fileset:
+            cfgs.append(ImageConfig(contrastive_class=read_text(fileset['contrastive_class.txt'])))
+
         
         result = ImageConfig.fold(cfgs)
         if 'shuffle_tags.txt' in fileset:
@@ -270,7 +276,8 @@ class Dataset:
                     cond_dropout=config.cond_dropout,
                     shuffle_tags=config.shuffle_tags,
                     batch_id=config.batch_id,
-                    loss_scale=config.loss_scale
+                    loss_scale=config.loss_scale,
+                    contrastive_class=config.contrastive_class,
                 )
                 items.append(item)
             except Exception as e:
