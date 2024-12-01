@@ -22,6 +22,7 @@ from typing import Generator, Any
 
 import torch
 from peft import LoraConfig
+
 from torch.cuda.amp import autocast, GradScaler
 from diffusers.optimization import get_scheduler
 
@@ -75,6 +76,14 @@ class EveryDreamOptimizer():
         else:
             self.text_encoder_params = self._apply_text_encoder_freeze(text_encoder)
             self.unet_params = unet.parameters()
+
+        if args.jacobian_descent:
+            from torchjd.aggregation import UPGrad
+            import torchjd
+            self.jacobian_aggregator = UPGrad()
+            self.jacobian_backward = torchjd.backward
+        else:
+            self.jacobian_aggregator = None
 
         self.text_encoder_params, self.unet_params = plugin_runner.run_add_parameters(self.text_encoder_params, self.unet_params)
         self.text_encoder_params = list(self.text_encoder_params)
@@ -147,12 +156,19 @@ class EveryDreamOptimizer():
     def will_do_grad_accum_step(self, step, global_step):
         return self._should_do_grad_accum_step(step, global_step)
 
-    def step(self, loss, step, global_step):
+    def step(self, loss: torch.Tensor | list[torch.Tensor], step: int, global_step: int):
         if loss is not None:
-            if self.scaler is None:
-                loss.backward()
+
+            loss_scaled_if_necessary = loss if self.scaler is None else self.scaler.scale(loss)
+            if self.jacobian_aggregator is not None:
+                self.jacobian_backward(
+                    tensors=loss_scaled_if_necessary,
+                    inputs=itertools.chain(self.text_encoder_params, self.unet_params),
+                    A=self.jacobian_aggregator,
+                    parallel_chunk_size=None
+                )
             else:
-                self.scaler.scale(loss).backward()
+                loss_scaled_if_necessary.backward()
 
         if loss is not None and self._should_do_grad_accum_step(step, global_step):
             global shared_timesteps
@@ -258,7 +274,7 @@ class EveryDreamOptimizer():
 
         if args.lr_decay_steps is None or args.lr_decay_steps < 1:
             # sets cosine so the zero crossing is past the end of training, this results in a terminal LR that is about 25% of the nominal LR
-            args.lr_decay_steps = int(self.epoch_len * args.max_epochs * 1.5)
+            args.lr_decay_steps = int(self.epoch_len * args.max_epochs * 1.1)
 
         if args.lr_warmup_steps is None:
             # set warmup to 2% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 3% of max epochs

@@ -116,7 +116,9 @@ class EveryDreamValidator:
             if approx_epoch_length is None:
                 raise ValueError("missing approx_epoch_len")
             every_n_steps = 2000 if self.every_n_epochs == -1 else -self.every_n_epochs
-            every_n_epochs = min(1, every_n_steps/approx_epoch_length)
+            every_n_epochs = every_n_steps / approx_epoch_length
+            if every_n_epochs > 1:
+                every_n_epochs = round(every_n_epochs)
             print(f'validating every {every_n_epochs} ({every_n_steps} steps at epoch length {approx_epoch_length})')
             self.config['every_n_epochs'] = every_n_epochs
 

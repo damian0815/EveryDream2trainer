@@ -31,8 +31,19 @@ class InterruptiblePlugin(BasePlugin):
             ckpt_name = f"rolling-{project_name}-ep{epoch:02}-gs{global_step:05}"
             save_path = os.path.join(log_folder, "ckpts", ckpt_name)
             print(f"{type(self)} saving model to {save_path}")
-            save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None, yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=True)
-            self._remove_previous()
+            try:
+                save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None,
+                           yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=True)
+                self._remove_previous()
+            except OSError as e:
+                if e.errno == errno.ENOSPC:
+                    print("out of disk space for safe save, trying unsafe")
+                    shutil.rmtree(save_path, ignore_errors=True)
+                    self._remove_previous()
+                    save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None,
+                       yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=True)
+                else:
+                    raise
             self.previous_save_path = save_path
 
     def on_training_end(self, **kwargs):

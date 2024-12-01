@@ -1084,7 +1084,7 @@ def main(args):
 
             cuda_caption = tokens.to(text_encoder.device)
 
-        with torch.autograd.graph.save_on_cpu() if args.contrastive_learning_save_on_cpu else contextlib.nullcontext():
+        with (((torch.autograd.graph.save_on_cpu() if args.contrastive_learning_save_on_cpu else contextlib.nullcontext()))):
             def get_encoder_hidden_states(text_encoder, cuda_caption):
                 encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
 
@@ -1341,15 +1341,20 @@ def main(args):
                         early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
                         negative_loss_scale = negative_loss_scale * early_timestep_bias
 
-                    loss = ((positive_loss + negative_loss * negative_loss_scale) * mask).mean()
+                    loss = (positive_loss + negative_loss * negative_loss_scale) * mask
+                    if not args.jacobian_descent:
+                        loss = loss.mean()
                     del positive_loss
                     del negative_loss
 
                 else:
-                    loss = (get_loss(model_pred, target, timesteps, loss_scale) * mask).mean()
+                    loss = get_loss(model_pred, target, timesteps, loss_scale) * mask
                     if teacher_pred is not None:
-                        loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale).mean()
+                        loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale) * mask
                         loss += loss_mse_teacher
+                    if not args.jacobian_descent:
+                        loss = loss.mean()
+
                 del cuda_caption
 
                 return model_pred, target, loss
@@ -1573,6 +1578,8 @@ def main(args):
                         # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
                 if loss is not None:
+                    if len(loss.shape)>1:
+                        loss = loss.mean()
                     loss_step = loss.detach().item()
 
                     steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
@@ -1803,6 +1810,7 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
 
+    argparser.add_argument("--jacobian_descent", action='store_true', help="Do Jacobian Descent (see torchjd). Uses more VRAM.")
     argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg_mask in the data folder and use as mask for the loss")
 
     argparser.add_argument("--lora", action='store_true', help="If passed, do LoRA training")

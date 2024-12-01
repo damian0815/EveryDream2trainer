@@ -124,7 +124,7 @@ class EveryDreamBatch(Dataset):
         else:
             example["caption"] = train_item["caption"].get_caption()
 
-        if self.random_instance.random() > self.contrastive_learning_dropout_p:
+        if self.random_instance.random() <= self.contrastive_learning_dropout_p:
             example["do_contrastive_learning"] = False
 
         example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])

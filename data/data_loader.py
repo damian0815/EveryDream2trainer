@@ -120,7 +120,7 @@ class DataLoaderMultiAspect():
 
         for image_caption_pair in picked_images:
             image_caption_pair.runt_size = 0
-            batch_id_override = DEFAULT_BATCH_ID if randomizer.random() > self.batch_id_dropout_p else None
+            batch_id_override = DEFAULT_BATCH_ID if randomizer.random() <= self.batch_id_dropout_p else None
             add_image_to_appropriate_bucket(image_caption_pair, batch_id_override=batch_id_override)
 
         # handled named batch runts by demoting them to the DEFAULT_BATCH_ID
