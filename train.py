@@ -677,10 +677,15 @@ def main(args):
         hf_cache_path = get_hf_ckpt_cache_path(args.resume_ckpt)
         if os.path.exists(hf_cache_path) or os.path.exists(args.resume_ckpt):
             model_root_folder, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
-            text_encoder = CLIPTextModel.from_pretrained(model_root_folder, subfolder="text_encoder")
-            vae = AutoencoderKL.from_pretrained(model_root_folder, subfolder="vae")
-            unet = UNet2DConditionModel.from_pretrained(model_root_folder, subfolder="unet")
+            pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_pretrained(args.resume_ckpt)
+            if args.lora_resume:
+                pipe.load_lora_weights(args.lora_resume)
+            text_encoder = pipe.text_encoder
+            vae = pipe.vae
+            unet = pipe.unet
         else:
+            if args.lora_resume:
+                raise "Can't do lora_resume with downloaded models"
             # try to download from HF using resume_ckpt as a repo id
             downloaded = try_download_model_from_hf(repo_id=args.resume_ckpt)
             if downloaded is None:
@@ -879,9 +884,7 @@ def main(args):
         seed=seed,
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
-        chunk_shuffle_batch_size=(args.batch_size
-                              if args.contrastive_learning_max_grad_accum is None
-                              else args.batch_size * args.contrastive_learning_max_grad_accum),
+        chunk_shuffle_batch_size=args.batch_size * args.max_backward_accum,
         batch_id_dropout_p=args.batch_id_dropout_p
     )
 
@@ -1032,7 +1035,7 @@ def main(args):
                                         embedding_perturbation=0.0, prompt_str=None,
                                         contrastive_class=None,
                                         do_contrastive_learning=False,
-                                        finalize_contrastive_loss=False,
+                                        do_backward=False,
                                         mask=None):
 
 
@@ -1076,7 +1079,7 @@ def main(args):
             if batch_share_noise:
                 noise = prev_noise[:1].repeat((bsz, 1, 1, 1))
 
-            if not do_contrastive_learning or finalize_contrastive_loss:
+            if not do_contrastive_learning or do_backward:
                 prev_noise = None
                 prev_timesteps = None
 
@@ -1199,37 +1202,40 @@ def main(args):
                 else:
                     mask = torch.ones_like(target)
 
+                accumulated_model_preds.append(model_pred)
+                accumulated_targets.append(target)
+                accumulated_timesteps.append(timesteps)
+                accumulated_loss_scale.append(loss_scale)
+                accumulated_mask.append(mask)
+
                 if do_contrastive_learning:
-                    accumulated_model_preds.append(model_pred)
-                    accumulated_targets.append(target)
-                    accumulated_timesteps.append(timesteps)
-                    accumulated_loss_scale.append(loss_scale)
                     accumulated_contrastive_class.append(contrastive_class)
-                    accumulated_mask.append(mask)
 
-                    if not finalize_contrastive_loss:
-                        return model_pred, target, None
+                if not do_backward:
+                    return model_pred, target, None
 
-                    # we're stepping now, combine everything
-                    model_pred = torch.cat(accumulated_model_preds)
-                    target = torch.cat(accumulated_targets)
-                    timesteps = torch.cat(accumulated_timesteps)
-                    loss_scale = torch.cat(accumulated_loss_scale)
-                    mask = torch.cat(accumulated_mask)
+                # we're stepping now, combine everything
+                model_pred = torch.cat(accumulated_model_preds)
+                target = torch.cat(accumulated_targets)
+                timesteps = torch.cat(accumulated_timesteps)
+                loss_scale = torch.cat(accumulated_loss_scale)
+                mask = torch.cat(accumulated_mask)
+
+                if do_contrastive_learning:
                     contrastive_class = [x
                                   for l in accumulated_contrastive_class
                                   for x in l]
 
                     print('finalizing contrastive loss over', model_pred.shape[0], 'samples, classes', contrastive_class)
-
-                    for i in reversed(range(len(accumulated_model_preds))):
-                        del accumulated_model_preds[i]
-                    for i in reversed(range(len(accumulated_targets))):
-                        del accumulated_targets[i]
-                    accumulated_timesteps.clear()
-                    accumulated_loss_scale.clear()
                     accumulated_contrastive_class.clear()
-                    accumulated_mask.clear()
+
+                for i in reversed(range(len(accumulated_model_preds))):
+                    del accumulated_model_preds[i]
+                for i in reversed(range(len(accumulated_targets))):
+                    del accumulated_targets[i]
+                accumulated_timesteps.clear()
+                accumulated_loss_scale.clear()
+                accumulated_mask.clear()
 
                 def get_loss(model_pred, target, timesteps, loss_scale):
                     loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
@@ -1512,6 +1518,7 @@ def main(args):
 
             batch = None
             # this dance is because want to be able to peek at the next batch's shape
+            do_everything_contrastive_learning = None
             for next_step, next_batch in enumerate(itertools.chain(train_dataloader, [None])):
                 if batch is None:
                     batch = next_batch
@@ -1528,17 +1535,26 @@ def main(args):
                         batch=batch,
                         ed_state=make_current_ed_state())
 
-                should_finalize_contrastive_loss = (
+                if do_everything_contrastive_learning is None:
+                    if batch["do_contrastive_learning"]:
+                        do_everything_contrastive_learning = False
+                    else:
+                        do_everything_contrastive_learning = args.everything_contrastive_learning_p > random.random()
+
+                if do_everything_contrastive_learning:
+                    batch["do_contrastive_learning"] = True
+                    batch["contrastive_class"] = batch["captions"] #[f"everything_{n}" for n in len(batch["image"])]
+
+                should_do_backward = (
                     ed_optimizer.will_do_grad_accum_step(step, global_step)
                     or next_batch is None
-                    or (batch["image"].shape != next_batch["image"].shape)
-                    or (batch["do_contrastive_learning"] and not next_batch["do_contrastive_learning"])
-                    or (
-                            args.contrastive_learning_max_grad_accum is not None
-                            and len(accumulated_model_preds) + 1 >= args.contrastive_learning_max_grad_accum
-                    )
+                    or batch["image"].shape != next_batch["image"].shape
+                    or (not do_everything_contrastive_learning and (batch["do_contrastive_learning"] != next_batch["do_contrastive_learning"]))
+                    or len(accumulated_model_preds) + 1 >= args.max_backward_accum
                 )
-                #print("should_finalize_contrastive_loss:", should_finalize_contrastive_loss, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
+                #print("should_do_backward:", should_do_backward, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
+                if should_do_backward:
+                    do_everything_contrastive_learning = None
 
                 loss_scale = batch["loss_scale"]
                 if batch["runt_size"] > 0:
@@ -1554,7 +1570,7 @@ def main(args):
                                                                            prompt_str=batch["captions"],
                                                                            contrastive_class=batch["contrastive_class"],
                                                                            do_contrastive_learning=batch["do_contrastive_learning"],
-                                                                           finalize_contrastive_loss=should_finalize_contrastive_loss,
+                                                                           do_backward=should_do_backward,
                                                                            mask=batch["mask"])
 
                 del target, model_pred
@@ -1652,11 +1668,23 @@ def main(args):
                                       batch=batch,
                                       ed_state=make_current_ed_state())
 
+                if (epoch == args.max_epochs-1
+                        and ed_optimizer.will_do_grad_accum_step(step, global_step)
+                        and epoch_len-step < args.grad_accum
+                ):
+                    print(f"only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
+                    break
+
                 prev_batch = batch
                 batch = next_batch
                 del prev_batch
 
                 global_step += 1
+
+                if args.max_steps is not None and global_step >= args.max_steps:
+                    print(f"max_steps reached, stopping")
+                    break
+
                 # end of step
 
             steps_pbar.close()
@@ -1681,6 +1709,10 @@ def main(args):
                 log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_epoch, global_step=global_step)
 
             gc.collect()
+
+            if args.max_steps is not None and global_step >= args.max_steps:
+                break
+
             # end of epoch
 
         # end of training
@@ -1693,6 +1725,10 @@ def main(args):
                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
                    save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt, save_lora=args.lora,
                    plugin_runner=plugin_runner)
+
+        print("generating final samples")
+        _, batch = next(enumerate(train_dataloader))
+        generate_samples(global_step=global_step, batch=batch)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -1725,6 +1761,7 @@ if __name__ == "__main__":
 
     argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
     argparser.add_argument("--amp", action="store_true",  default=True, help="deprecated, use --disable_amp if you wish to disable AMP")
+    argparser.add_argument("--init_grad_scale", type=int, default=None, help="initial value for GradScaler (default=2^17.5)")
     argparser.add_argument("--attn_type", type=str, default="sdp", help="Attention mechanismto use", choices=["xformers", "sdp", "slice"])
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
     argparser.add_argument("--ckpt_every_n_minutes", type=int, default=None, help="Save checkpoint every n minutes, def: 20")
@@ -1741,6 +1778,7 @@ if __name__ == "__main__":
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1), use nvidia-smi to find your GPU ids")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
+    argparser.add_argument("--max_backward_accum", type=int, default=1, help="Max loss steps to accumulate before calling backward")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--loss_type", type=str, default="mse_huber", help="type of loss, 'huber', 'mse', or 'mse_huber' for interpolated (def: mse_huber)", choices=["huber", "mse", "mse_huber"])
@@ -1749,6 +1787,8 @@ if __name__ == "__main__":
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
+    argparser.add_argument("--max_steps", type=int, default=None, help="Maximum number of steps to train for")
+    argparser.add_argument("--auto_decay_steps_multiplier", type=float, default=1.1, help="Multiplier for calculating decay steps from epoch count")
     argparser.add_argument("--no_prepend_last", action="store_true", help="Do not prepend 'last-' to the final checkpoint filename")
     argparser.add_argument("--no_save_ckpt", action="store_true", help="Save only diffusers files, not .safetensors files (save disk space if you do not need LDM-style checkpoints)" )
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
@@ -1802,10 +1842,10 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_learning_use_l1_loss", action="store_true", help="use L1 loss instead of MSE for contrastive negative term")
     argparser.add_argument("--contrastive_learning_no_average_negatives", action="store_true", help="do not average negative terms per batch")
     argparser.add_argument("--contrastive_learning_save_on_cpu", action="store_true", help="Store grads on CPU (allows larger grad_accum sizes but slower)")
-    argparser.add_argument("--contrastive_learning_max_grad_accum", type=int, default=None, help="Max batch size for contrastive learning (overrides grad_accum)")
     argparser.add_argument("--contrastive_learning_delta_loss_method", action="store_true", help="If passed, contrastive learning works with deltas from correct to incorrect targets / predictions")
     argparser.add_argument("--contrastive_learning_delta_timestep_start", type=int, default=150, help="Where to start scaling delta negative loss")
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="dropout probability for contrastive learning, 0..1")
+    argparser.add_argument("--everything_contrastive_learning_p", type=float, default=0, help="probability to run contrastive learning on everything, 0..1")
 
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
@@ -1814,7 +1854,7 @@ if __name__ == "__main__":
     argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg_mask in the data folder and use as mask for the loss")
 
     argparser.add_argument("--lora", action='store_true', help="If passed, do LoRA training")
-    argparser.add_argument("--lora_resume", type=str, default=None, help="resume from this lora ckpt")
+    argparser.add_argument("--lora_resume", type=str, default=None, help="resume from this lora (must be a huggingface format folder)")
     argparser.add_argument("--lora_rank", type=int, default=16)
     argparser.add_argument("--lora_alpha", type=int, default=8)
 

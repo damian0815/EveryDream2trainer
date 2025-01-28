@@ -17,23 +17,32 @@ class CaptionMungerPlugin(BasePlugin):
     def transform_caption_parts(self, caption:str) -> str:
 
         parts = [s.strip() for s in caption.split("||")]
-        random.shuffle(parts)
+
+        shuffle_p = 0.3
+        truncate_p = 0.3
+        if shuffle_p > random.random():
+            random.shuffle(parts)
+        if truncate_p > random.random():
+            truncate_after_idx = random.randint(0, len(parts))
+            parts = parts[:truncate_after_idx]
         return ", ".join(parts)
 
 
     def transform_caption(self, caption:str) -> str:
 
+        prefix = ""
+        if "<<then>>" in caption:
+            parts = [p.strip() for p in caption.split("<<then>>")]
+            prefix = parts[0]
+            caption = "<<or>>".join(parts[1:])
+
+        if "<<or>>" in caption:
+            options = [o.strip() for o in caption.split("<<or>>")]
+            caption = random.choice(options)
+
         if "||" in caption:
-
-            transformed_caption = self.transform_caption_parts(caption)
-            #print(caption, "->", transformed_caption)
-
-
-        if caption.strip() == "fondle" and fondle_p > random.random():
-            #prefix = "a pixellated blurry video still of "
-            #options = ["fondle", "fondling", "a woman being fondled", "fondling a woman", "a fondle of a woman", "a fondle on a woman", "touching", "touching a woman", "a woman being touched"]
-            #caption = prefix + random.choice(options)
-            caption = "fondle. a hand is fondling a woman. close up. pov. video still"
+            #print("ignoring || in caption")
+            return self.transform_caption_parts(caption)
 
         # split to sentences
         in_sentences = [s.strip() for s in caption.split(".")]
@@ -78,8 +87,9 @@ class CaptionMungerPlugin(BasePlugin):
         if ending_dot_p > random.random():
             out_caption += "."
 
-        #print(f"transformed caption from '{caption}' to '{out_caption}'")
+        out_caption = prefix + '. ' + out_caption
 
+        #print(f"transformed caption from '{caption}' to '{out_caption}'")
         return out_caption
 
 def partial_shuffle(l, factor=5):

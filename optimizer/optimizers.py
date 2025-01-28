@@ -21,6 +21,7 @@ from itertools import chain
 from typing import Generator, Any
 
 import torch
+from diffusers.loaders import StableDiffusionLoraLoaderMixin
 from peft import LoraConfig
 
 from torch.cuda.amp import autocast, GradScaler
@@ -67,6 +68,7 @@ class EveryDreamOptimizer():
         pprint.pprint(self.te_config)
 
         self.grad_accum = args.grad_accum
+        self.next_grad_accum_step = self.grad_accum
         self.clip_grad_norm = args.clip_grad_norm
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
@@ -109,7 +111,7 @@ class EveryDreamOptimizer():
         if args.amp:
             self.scaler = GradScaler(
                 enabled=args.amp,
-                init_scale=2**17.5,
+                init_scale=args.init_grad_scale or 2**17.5,
                 growth_factor=2,
                 backoff_factor=1.0/2,
                 growth_interval=25,
@@ -274,7 +276,10 @@ class EveryDreamOptimizer():
 
         if args.lr_decay_steps is None or args.lr_decay_steps < 1:
             # sets cosine so the zero crossing is past the end of training, this results in a terminal LR that is about 25% of the nominal LR
-            args.lr_decay_steps = int(self.epoch_len * args.max_epochs * 1.1)
+            total_steps = self.epoch_len * args.max_epochs
+            if args.max_steps is not None:
+                total_steps = min(args.max_steps, total_steps)
+            args.lr_decay_steps = int(total_steps * args.auto_decay_steps_multiplier)
 
         if args.lr_warmup_steps is None:
             # set warmup to 2% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 3% of max epochs
@@ -603,35 +608,35 @@ class EveryDreamOptimizer():
         if args.disable_textenc_training:
             text_encoder_params = []
         else:
-            suffixes = ["q_proj", "k_proj", "v_proj", "out_proj"]
-            target_modules = [k for k, _ in text_encoder.named_modules() if any(suffix in k for suffix in suffixes)]
-            unfreeze_last_n_layers = self.te_freeze_config.get("unfreeze_last_n_layers", None)
-            if unfreeze_last_n_layers is not None:
-                layer_count = len(text_encoder.text_model.encoder.layers)
-                last_n_layers = range(layer_count-unfreeze_last_n_layers, layer_count+1)
-                target_modules = [k for k in target_modules if any(f'.layers.{l}' in k for l in last_n_layers)]
-            print("lora freezing means we put lora on: ", target_modules)
-            text_lora_config = LoraConfig(
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                init_lora_weights="gaussian",
-                target_modules=target_modules
-            )
-            text_encoder.add_adapter(text_lora_config)
+            if not args.lora_resume:
+                suffixes = ["q_proj", "k_proj", "v_proj", "out_proj"]
+                target_modules = [k for k, _ in text_encoder.named_modules() if any(suffix in k for suffix in suffixes)]
+                unfreeze_last_n_layers = self.te_freeze_config.get("unfreeze_last_n_layers", None)
+                if unfreeze_last_n_layers is not None:
+                    layer_count = len(text_encoder.text_model.encoder.layers)
+                    last_n_layers = range(layer_count-unfreeze_last_n_layers, layer_count+1)
+                    target_modules = [k for k in target_modules if any(f'.layers.{l}' in k for l in last_n_layers)]
+                print("lora freezing means we put lora on: ", target_modules)
+                text_lora_config = LoraConfig(
+                    r=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    init_lora_weights="gaussian",
+                    target_modules=target_modules
+                )
+                text_encoder.add_adapter(text_lora_config)
             text_encoder_params = list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
 
         if args.disable_unet_training:
             unet_params = []
         else:
-            unet_lora_config = LoraConfig(
-                r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                init_lora_weights="gaussian",
-                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-            )
-            unet.add_adapter(unet_lora_config)
-            #if args.lora_resume:
-
+            if not args.lora_resume:
+                unet_lora_config = LoraConfig(
+                    r=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    init_lora_weights="gaussian",
+                    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+                )
+                unet.add_adapter(unet_lora_config)
             unet_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
 
         return text_encoder_params, unet_params
