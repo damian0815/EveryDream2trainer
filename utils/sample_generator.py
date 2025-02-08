@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import random
 from typing import Generator, Callable, Any
 
+import PIL
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from colorama import Fore, Style
@@ -132,7 +133,7 @@ class SampleGenerator:
                     f"    Will generate samples from random training image captions until the problem is fixed.")
                 self.sample_requests = self._make_random_caption_sample_requests()
 
-    def update_random_captions(self, possible_captions: list[str]):
+    def update_random_captions(self, possible_captions: list[str]|dict[str, str]):
         random_prompt_sample_requests = [r for r in self.sample_requests if r.wants_random_caption]
         for i, r in enumerate(random_prompt_sample_requests):
             r.prompt = possible_captions[i % len(possible_captions)]
@@ -168,6 +169,7 @@ class SampleGenerator:
             self.show_progress_bars = config.get('show_progress_bars', self.show_progress_bars)
             self.generate_pretrain_samples = config.get('generate_pretrain_samples', self.generate_pretrain_samples)
             self.sample_steps = config.get('generate_samples_every_n_steps', self.sample_steps)
+            self.sample_invokeai_info_dicts_json = config.get('invokeai_info_dicts_json', None)
             sample_requests_config = config.get('samples', None)
             if sample_requests_config is None:
                 self.sample_requests = self._make_random_caption_sample_requests()
@@ -200,6 +202,17 @@ class SampleGenerator:
 
         sample_index = 0
         with autocast():
+
+            if self.sample_invokeai_info_dicts_json is not None:
+                try:
+                    with open(self.sample_invokeai_info_dicts_json, 'rt') as f:
+                        invokeai_info_dicts = json.load(f)
+                    self.generate_invokeai_samples(invokeai_info_dicts, pipe=pipe,
+                                                   global_step=global_step, extra_info=extra_info)
+                    return
+                except Exception as e:
+                    print("caught exception", e, "generating samples from", self.sample_invokeai_info_dicts_json, "doing regular sample gen")
+
             batch: list[SampleRequest]
             def sample_compatibility_test(a: SampleRequest, b: SampleRequest) -> bool:
                 return a.size == b.size
@@ -270,24 +283,41 @@ class SampleGenerator:
                         x_offset += image.width
 
                     prompt = prompts[prompt_idx]
-                    clean_prompt = clean_filename(prompt)
-
-                    result.save(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg", format="JPEG", quality=95, optimize=True, progressive=False)
-                    with open(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt", "w", encoding='utf-8') as f:
-                        f.write(str(batch[prompt_idx]))
-
-                    tfimage = transforms.ToTensor()(result)
-                    if batch[prompt_idx].wants_random_caption:
-                        self.log_writer.add_image(tag=f"sample_{sample_index}{extra_info}", img_tensor=tfimage, global_step=global_step)
-                    else:
-                        self.log_writer.add_image(tag=f"sample_{sample_index}_{extra_info}{clean_prompt[:100]}", img_tensor=tfimage, global_step=global_step)
+                    self.save_sample_image(result,
+                                           sample_index=sample_index,
+                                           global_step=global_step,
+                                           prompt=prompt,
+                                           is_random_caption=batch[prompt_idx].wants_random_caption,
+                                           extra_info=extra_info)
                     sample_index += 1
 
                     del result
-                    del tfimage
                 del batch_images
 
                 pbar.update(1)
+
+    def save_sample_image(self,
+                          result: PIL.Image,
+                          sample_index: int,
+                          global_step: int,
+                          prompt: str,
+                          is_random_caption: bool,
+                          extra_info: str):
+        clean_prompt = clean_filename(prompt)
+
+        result.save(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg",
+                    format="JPEG", quality=95, optimize=True, progressive=False)
+        with open(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt",
+                  "w", encoding='utf-8') as f:
+            f.write(prompt)
+        tfimage = transforms.ToTensor()(result)
+        if is_random_caption:
+            self.log_writer.add_image(tag=f"sample_{sample_index}{extra_info}", img_tensor=tfimage,
+                                      global_step=global_step)
+        else:
+            self.log_writer.add_image(tag=f"sample_{sample_index}_{extra_info}{clean_prompt[:100]}", img_tensor=tfimage,
+                                      global_step=global_step)
+        del tfimage
 
     @torch.no_grad()
     def create_inference_pipe(self, unet, text_encoder, tokenizer, vae, diffusers_scheduler_config: dict):
@@ -351,3 +381,6 @@ class SampleGenerator:
             return KDPM2AncestralDiscreteScheduler.from_config(scheduler_config)
         else:
             raise ValueError(f"unknown scheduler '{scheduler}'")
+
+    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info):
+        pass

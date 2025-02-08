@@ -53,7 +53,6 @@ class EveryDreamBatch(Dataset):
                  name='train',
                  contrastive_learning_batch_ids=None,
                  use_masks=False,
-                 contrastive_class_uses_full_caption=True,
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0
                  ):
@@ -77,15 +76,8 @@ class EveryDreamBatch(Dataset):
         self.__update_image_train_items(1.0)
         self.name = name
         self.use_masks = use_masks
-        self.contrastive_class_uses_full_caption = contrastive_class_uses_full_caption
         self.contrastive_learning_dropout_p = contrastive_learning_dropout_p
         self.cond_dropout_noise_p = cond_dropout_noise_p
-        self.contrastive_scale_for_caption = build_contrastive_scale_for_caption_dict(
-            data_loader=self.data_loader,
-            contrastive_learning_batch_ids=self.contrastive_learning_batch_ids,
-            use_full_caption=self.contrastive_class_uses_full_caption
-        )
-        #self.contrastive_scale_for_caption = {}
         self.random_instance = random.Random(seed)
 
         num_images = len(self.image_train_items)
@@ -140,42 +132,40 @@ class EveryDreamBatch(Dataset):
             example["mask"] = None
         example["untransformed_caption"] = example["caption"]
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"])
+        if type(example["caption"] is dict):
+            caption_dict = example["caption"]
+        else:
+            caption_dict = {"default": example["caption"]}
 
-        if self.random_instance.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
-            example["caption"] = " "
-            if self.random_instance.random() <= self.cond_dropout_noise_p:
-                #example["image"] = torch.randn_like(example["image"])
-                perlin_shape = example["image"].shape[1:]
-                perlin3 = torch.stack([rand_perlin_2d_octaves(perlin_shape, (1, 1), 7)
-                                       for _ in range(3)]
-                                      ).to(example["image"].device, dtype=example["image"].dtype)
-                example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
+        for k in caption_dict.keys():
+            if self.random_instance.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
+                caption_dict[k] = " "
 
-        example["tokens"] = torch.tensor(self.tokenizer(example["caption"],
+        if self.random_instance.random() <= self.cond_dropout_noise_p:
+            #example["image"] = torch.randn_like(example["image"])
+            perlin_shape = example["image"].shape[1:]
+            perlin3 = torch.stack([rand_perlin_2d_octaves(perlin_shape, (1, 1), 7)
+                                   for _ in range(3)]
+                                  ).to(example["image"].device, dtype=example["image"].dtype)
+            example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
+
+        example["caption"] = caption_dict
+        example["tokens"] = {k: torch.tensor(self.tokenizer(caption_dict[k],
                                             truncation=True,
                                             padding="max_length",
                                             max_length=self.tokenizer.model_max_length,
                                           ).input_ids)
+                             for k in caption_dict.keys()}
 
         example["runt_size"] = train_item["runt_size"]
 
-        contrastive_class = train_item["contrastive_class"] or get_contrastive_class_from_caption(example["caption"],
-                                                                                                  self.contrastive_class_uses_full_caption)
-
         additional_scale_factor = 1
         if train_item["do_contrastive_learning"]:
-            additional_scale_factor = self._get_contrastive_scale_for_class(
-                batch_id=train_item["batch_id"],
-                contrastive_class=contrastive_class
-            )
+            additional_scale_factor = 1
         example["loss_scale"] = train_item["loss_scale"] * additional_scale_factor
-        example["contrastive_class"] = contrastive_class
         example["do_contrastive_learning"] = train_item["do_contrastive_learning"]
 
         return example
-
-    def _get_contrastive_scale_for_class(self, batch_id, contrastive_class):
-        return self.contrastive_scale_for_caption.get(batch_id, {}).get(contrastive_class, 1.0)
 
     def __get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
         example = {}
@@ -198,7 +188,6 @@ class EveryDreamBatch(Dataset):
         example["shuffle_tags"] = image_train_tmp.shuffle_tags
         example["loss_scale"] = image_train_tmp.loss_scale
         example["batch_id"] = image_train_tmp.batch_id
-        example["contrastive_class"] = image_train_tmp.contrastive_class
         example["do_contrastive_learning"] = do_contrastive_learning
 
         return example
@@ -278,9 +267,14 @@ def collate_fn(batch):
     images = [example["image"] for example in batch]
     masks = [example["mask"] for example in batch]
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
-    contrastive_class = [example["contrastive_class"] for example in batch]
-    captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
-    tokens = [example["tokens"] for example in batch]
+
+    #captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
+    caption_variants = list(batch[0]["caption"].keys())
+    captions = {k: [example["caption"][k] for example in batch]
+                for k in caption_variants}
+    tokens = {k: torch.stack([example["tokens"][k] for example in batch])
+              for k in caption_variants}
+
     runt_size = batch[0]["runt_size"]
 
     images = torch.stack(images)
@@ -298,55 +292,15 @@ def collate_fn(batch):
     loss_scale = torch.tensor([example.get("loss_scale", 1) for example in batch])
 
     ret = {
-        "tokens": torch.stack(tuple(tokens)),
+        "tokens": tokens,
         "image": images,
         "mask": masks,
         "captions": captions,
         "runt_size": runt_size,
         "loss_scale": loss_scale,
         "do_contrastive_learning": do_contrastive_learning,
-        "contrastive_class": contrastive_class,
     }
     del batch
     return ret
-
-def build_contrastive_scale_for_caption_dict(data_loader: DataLoaderMultiAspect, contrastive_learning_batch_ids: list[str], use_full_caption: bool) -> dict:
-
-    count_dict = defaultdict(lambda: defaultdict(int))
-
-    for item in data_loader.prepared_train_data:
-        if item.batch_id in contrastive_learning_batch_ids:
-            contrastive_class = item.contrastive_class or get_contrastive_class_from_caption(item.caption.get_caption(),
-                                                                                             use_full_caption=use_full_caption)
-            count_dict[item.batch_id][contrastive_class] += 1
-
-    scales_per_caption = defaultdict(lambda: defaultdict(int))
-    for batch_id, caption_counts in count_dict.items():
-        median = statistics.median(caption_counts.values())
-
-        scales_per_caption[batch_id] = {
-            caption: min(10, max(0.1, median/count)) for caption, count in caption_counts.items()
-        }
-
-    return scales_per_caption
-
-def get_contrastive_class_from_caption(caption: str, use_full_caption: bool) -> str:
-    if caption == ' ':
-        return caption
-    caption = caption.strip()
-    if len(caption) > 0 and caption[-1] == '.':
-        caption = caption[:-1]
-    if use_full_caption:
-        return caption
-    csv = caption.split(',')
-    if len(csv) <= 1:
-        return caption
-    def count_words(selection: list[str]) -> int:
-        return len(", ".join(selection).split(" "))
-    segment_count = 1
-    min_word_count = 8
-    while count_words(csv[:segment_count]) < min_word_count and segment_count < len(csv):
-        segment_count += 1
-    return ", ".join(csv[:segment_count])
 
 

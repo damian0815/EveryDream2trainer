@@ -900,7 +900,6 @@ def main(args):
         rated_dataset=args.rated_dataset,
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
         contrastive_learning_batch_ids=args.contrastive_learning_batch_ids,
-        contrastive_class_uses_full_caption=args.contrastive_learning_delta_loss_method,
         contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
         cond_dropout_noise_p=args.cond_dropout_noise_p
     )
@@ -1023,7 +1022,7 @@ def main(args):
     accumulated_targets = []
     accumulated_timesteps = []
     accumulated_loss_scale = []
-    accumulated_contrastive_class = []
+    accumulated_caption_str = []
     accumulated_mask = []
     global prev_timesteps, prev_noise
     prev_timesteps = None
@@ -1031,9 +1030,10 @@ def main(args):
 
     # actual prediction function - shared between train and validate
     def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0,
-                                        return_loss=False, loss_scale=None,
-                                        embedding_perturbation=0.0, prompt_str=None,
-                                        contrastive_class=None,
+                                        return_loss=False,
+                                        loss_scale=None,
+                                        embedding_perturbation=0.0,
+                                        caption_str=None,
                                         do_contrastive_learning=False,
                                         do_backward=False,
                                         mask=None):
@@ -1123,7 +1123,7 @@ def main(args):
                     cuda_caption_teacher = cuda_caption
 
                 if type(teacher_pipeline) is StableDiffusionXLPipeline:
-                    teacher_encoder_hidden_states = teacher_pipeline.encode_prompt(prompt_str, cuda_caption_teacher)
+                    teacher_encoder_hidden_states = teacher_pipeline.encode_prompt(caption_str, cuda_caption_teacher)
                 else:
                     teacher_encoder_hidden_states, teacher_text_features = get_encoder_hidden_states(teacher_pipeline.text_encoder, cuda_caption_teacher)
             else:
@@ -1209,7 +1209,7 @@ def main(args):
                 accumulated_mask.append(mask)
 
                 if do_contrastive_learning:
-                    accumulated_contrastive_class.append(contrastive_class)
+                    accumulated_caption_str.append(caption_str)
 
                 if not do_backward:
                     return model_pred, target, None
@@ -1222,12 +1222,12 @@ def main(args):
                 mask = torch.cat(accumulated_mask)
 
                 if do_contrastive_learning:
-                    contrastive_class = [x
-                                  for l in accumulated_contrastive_class
+                    contrastive_samples = [x
+                                  for l in accumulated_caption_str
                                   for x in l]
 
-                    print('finalizing contrastive loss over', model_pred.shape[0], 'samples, classes', contrastive_class)
-                    accumulated_contrastive_class.clear()
+                    print('finalizing contrastive loss over', model_pred.shape[0], 'samples')
+                    accumulated_caption_str.clear()
 
                 for i in reversed(range(len(accumulated_model_preds))):
                     del accumulated_model_preds[i]
@@ -1282,50 +1282,54 @@ def main(args):
                     bsz = model_pred.shape[0]
                     num_samples = [0] * bsz
                     for i in range(bsz):
+                        if (caption_str[i] is None or caption_str[i] == " "):
+                            continue
+
                         for j in range(bsz):
-                            # skip self and cond_dropout samples
-                            if i == j or contrastive_class[i] == " " or contrastive_class[j] == " ":
+                            if (i == j # skip self
+                                    or caption_str[j] is None or caption_str[j] == " " # skip missing or dropout
+                                    or caption_str[i] == caption_str[j] # skip equal captions
+                                    ):
                                 continue
-                            if contrastive_class[i] != contrastive_class[j]:
-                                if args.contrastive_learning_delta_loss_method:
-                                    delta_to_wrong = model_pred[j:j+1] - model_pred[i:i+1]
-                                    target_delta_to_wrong = target[j:j+1] - target[i:i+1]
-                                    l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
-                                    negative_loss[i:i+1] += l_negative
-                                    del delta_to_wrong
-                                    del target_delta_to_wrong
-                                    del l_negative
-                                else:
-                                    #dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
-                                    delta_negative = F.l1_loss(model_pred[i:i+1].float(), target[j:j+1].float(), reduction='none')
-                                    margin = args.contrastive_learning_max_negative_loss
-                                    l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
-                                    if not args.contrastive_learning_use_l1_loss:
-                                        l_negative = torch.pow(l_negative, 2.0)
+                            if args.contrastive_learning_delta_loss_method:
+                                delta_to_wrong = model_pred[j:j+1] - model_pred[i:i+1]
+                                target_delta_to_wrong = target[j:j+1] - target[i:i+1]
+                                l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
+                                negative_loss[i:i+1] += l_negative
+                                del delta_to_wrong
+                                del target_delta_to_wrong
+                                del l_negative
+                            else:
+                                #dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
+                                delta_negative = F.l1_loss(model_pred[i:i+1].float(), target[j:j+1].float(), reduction='none')
+                                margin = args.contrastive_learning_max_negative_loss
+                                l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
+                                if not args.contrastive_learning_use_l1_loss:
+                                    l_negative = torch.pow(l_negative, 2.0)
 
-                                    diminishing_factor = 1 #torch.exp(-alpha * dist_negative)
-                                    l_negative_diminished = l_negative * diminishing_factor
-                                    negative_loss[i:i+1] += l_negative_diminished
-                                    del l_negative_diminished
-                                    del l_negative
-                                    del delta_negative
+                                diminishing_factor = 1 #torch.exp(-alpha * dist_negative)
+                                l_negative_diminished = l_negative * diminishing_factor
+                                negative_loss[i:i+1] += l_negative_diminished
+                                del l_negative_diminished
+                                del l_negative
+                                del delta_negative
 
-                                """contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
-    
-                                dist_negative = torch.sqrt(contrastive_loss)
-                                diminishing_factor = torch.exp(-args.contrastive_learning_alpha * dist_negative)
-                                contrastive_loss_diminished = contrastive_loss * diminishing_factor
-                                negative_loss[i:i + 1] = contrastive_loss_diminished
-                                del contrastive_loss_diminished
-                                del contrastive_loss
-                                """
+                            """contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
 
-                                #contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
-                                #negative_loss[i:i+1] += contrastive_loss_clamped_inv
-                                #del contrastive_loss_clamped_inv
-                                #del contrastive_loss
+                            dist_negative = torch.sqrt(contrastive_loss)
+                            diminishing_factor = torch.exp(-args.contrastive_learning_alpha * dist_negative)
+                            contrastive_loss_diminished = contrastive_loss * diminishing_factor
+                            negative_loss[i:i + 1] = contrastive_loss_diminished
+                            del contrastive_loss_diminished
+                            del contrastive_loss
+                            """
 
-                                num_samples[i] += 1
+                            #contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
+                            #negative_loss[i:i+1] += contrastive_loss_clamped_inv
+                            #del contrastive_loss_clamped_inv
+                            #del contrastive_loss
+
+                            num_samples[i] += 1
 
                     print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
 
@@ -1378,7 +1382,10 @@ def main(args):
                 next_sample_step = math.ceil((global_step + 1) / sample_generator.sample_steps) * sample_generator.sample_steps
                 print(f" * SampleGenerator config changed, now generating images samples every " +
                       f"{sample_generator.sample_steps} training steps (next={next_sample_step})")
-            sample_generator.update_random_captions(batch["captions"])
+            flattened_captions_dict = [v
+                                       for _, l in batch["captions"].items()
+                                       for v in l]
+            sample_generator.update_random_captions(flattened_captions_dict)
 
             models_info = []
 
@@ -1535,47 +1542,52 @@ def main(args):
                         batch=batch,
                         ed_state=make_current_ed_state())
 
-                if do_everything_contrastive_learning is None:
-                    if batch["do_contrastive_learning"]:
-                        do_everything_contrastive_learning = False
-                    else:
-                        do_everything_contrastive_learning = args.everything_contrastive_learning_p > random.random()
+                assert type(batch["captions"]) is dict
+                for caption_variant in batch["captions"].keys():
 
-                if do_everything_contrastive_learning:
-                    batch["do_contrastive_learning"] = True
-                    batch["contrastive_class"] = batch["captions"] #[f"everything_{n}" for n in len(batch["image"])]
+                    if do_everything_contrastive_learning is None:
+                        if batch["do_contrastive_learning"]:
+                            do_everything_contrastive_learning = False
+                        else:
+                            do_everything_contrastive_learning = args.everything_contrastive_learning_p > random.random()
 
-                should_do_backward = (
-                    ed_optimizer.will_do_grad_accum_step(step, global_step)
-                    or next_batch is None
-                    or batch["image"].shape != next_batch["image"].shape
-                    or (not do_everything_contrastive_learning and (batch["do_contrastive_learning"] != next_batch["do_contrastive_learning"]))
-                    or len(accumulated_model_preds) + 1 >= args.max_backward_accum
-                )
-                #print("should_do_backward:", should_do_backward, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
-                if should_do_backward:
-                    do_everything_contrastive_learning = None
+                    if do_everything_contrastive_learning:
+                        batch["do_contrastive_learning"] = True
 
-                loss_scale = batch["loss_scale"]
-                if batch["runt_size"] > 0:
-                    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
-                    loss_scale = loss_scale * runt_loss_scale
+                    should_do_backward = (
+                        ed_optimizer.will_do_grad_accum_step(step, global_step)
+                        or next_batch is None
+                        or batch["image"].shape != next_batch["image"].shape
+                        or (not do_everything_contrastive_learning and (batch["do_contrastive_learning"] != next_batch["do_contrastive_learning"]))
+                        or len(accumulated_model_preds) + 1 >= args.max_backward_accum
+                    )
+                    #print("should_do_backward:", should_do_backward, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
+                    if should_do_backward:
+                        do_everything_contrastive_learning = None
 
-                model_pred, target, loss = get_model_prediction_and_target(batch["image"],
-                                                                           batch["tokens"],
-                                                                           args.zero_frequency_noise_ratio,
-                                                                           return_loss=True,
-                                                                           loss_scale=loss_scale,
-                                                                           embedding_perturbation=args.embedding_perturbation,
-                                                                           prompt_str=batch["captions"],
-                                                                           contrastive_class=batch["contrastive_class"],
-                                                                           do_contrastive_learning=batch["do_contrastive_learning"],
-                                                                           do_backward=should_do_backward,
-                                                                           mask=batch["mask"])
+                    loss_scale = batch["loss_scale"]
+                    if batch["runt_size"] > 0:
+                        runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
+                        loss_scale = loss_scale * runt_loss_scale
 
-                del target, model_pred
+                    tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
+                    caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
+                    model_pred, target, loss = get_model_prediction_and_target(batch["image"],
+                                                                               tokens,
+                                                                               args.zero_frequency_noise_ratio,
+                                                                               return_loss=True,
+                                                                               loss_scale=loss_scale,
+                                                                               embedding_perturbation=args.embedding_perturbation,
+                                                                               caption_str=caption_str,
+                                                                               do_contrastive_learning=batch["do_contrastive_learning"],
+                                                                               do_backward=should_do_backward,
+                                                                               mask=batch["mask"])
 
-                ed_optimizer.step(loss, step, global_step)
+                    del target, model_pred
+
+                    ed_optimizer.step(loss, step, global_step)
+
+
                 if (global_step + 1) % sample_generator.sample_steps == 0:
                     needs_samples = True
 

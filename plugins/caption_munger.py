@@ -1,3 +1,4 @@
+import json
 import random
 from plugins.plugins import BasePlugin
 
@@ -28,7 +29,16 @@ class CaptionMungerPlugin(BasePlugin):
         return ", ".join(parts)
 
 
+    def transform_caption_json_raw(self, captions_json) -> dict[str,str]:
+        d = json.loads(captions_json)
+        return {k: (self.transform_caption(v) if len(v.strip())>0 else None)
+                for k, v in d.items()}
+
     def transform_caption(self, caption:str) -> str:
+        if caption.startswith("<<json>>"):
+            return self.transform_caption_json_raw(
+                caption.replace("<<json>>", "")
+            )
 
         prefix = ""
         if "<<then>>" in caption:
@@ -87,7 +97,8 @@ class CaptionMungerPlugin(BasePlugin):
         if ending_dot_p > random.random():
             out_caption += "."
 
-        out_caption = prefix + '. ' + out_caption
+        if len(prefix.strip()) > 0:
+            out_caption = prefix + '. ' + out_caption
 
         #print(f"transformed caption from '{caption}' to '{out_caption}'")
         return out_caption

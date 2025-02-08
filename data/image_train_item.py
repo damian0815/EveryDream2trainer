@@ -144,7 +144,6 @@ class ImageTrainItem:
                  shuffle_tags=False,
                  batch_id: str=None,
                  loss_scale: float=None,
-                 contrastive_class: str=None,
                  ):
         self.caption = caption
         self.aspects = aspects
@@ -157,7 +156,6 @@ class ImageTrainItem:
         self.shuffle_tags = shuffle_tags
         self.batch_id = batch_id or DEFAULT_BATCH_ID
         self.loss_scale = 1 if loss_scale is None else loss_scale
-        self.contrastive_class = contrastive_class
         self.target_wh = None
         self.is_runt = False
 
