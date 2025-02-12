@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-import contextlib
 import os
 import pprint
 import sys
@@ -21,7 +20,6 @@ import math
 import signal
 import argparse
 import logging
-import threading
 import time
 import gc
 import random
@@ -30,9 +28,6 @@ import shutil
 from typing import Optional
 
 import safetensors.torch
-import torch.nn.functional as F
-from peft import LoraConfig
-from torch.cuda.amp import autocast
 
 from colorama import Fore, Style
 import numpy as np
@@ -43,12 +38,10 @@ import json
 from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel, DDIMScheduler, DDPMScheduler, \
-    DPMSolverMultistepScheduler, PNDMScheduler, StableDiffusionXLPipeline
+    PNDMScheduler, StableDiffusionXLPipeline
 from diffusers.utils import convert_state_dict_to_diffusers
 from peft.utils import get_peft_model_state_dict
 #from diffusers.models import AttentionBlock
-from diffusers.optimization import get_scheduler
-from diffusers.utils.import_utils import is_xformers_available
 from transformers import CLIPTextModel, CLIPTokenizer
 #from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -61,7 +54,8 @@ from data.data_loader import DataLoaderMultiAspect
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
-from optimizer import optimizers
+from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
+    _get_loss, get_model_prediction_and_target_wrapper, get_latents
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -333,16 +327,6 @@ def setup_local_logger(args):
 #     """
 #     optimizer.load_state_dict(torch.load(path))
 
-def pyramid_noise_like(x, discount=0.8):
-  b, c, w, h = x.shape # EDIT: w and h get over-written, rename for a different variant!
-  u = torch.nn.Upsample(size=(w, h), mode='bilinear')
-  noise = torch.randn_like(x)
-  for i in range(10):
-    r = random.random()*2+2 # Rather than always going 2x, 
-    w, h = max(1, int(w/(r**i))), max(1, int(h/(r**i)))
-    noise += u(torch.randn(b, c, w, h).to(x)) * discount**i
-    if w==1 or h==1: break # Lowest resolution is 1x1
-  return noise/noise.std() # Scaled back to roughly unit variance
 
 def get_gpu_memory(nvsmi):
     """
@@ -583,41 +567,6 @@ def update_ema(model, ema_model, decay, default_device, ema_device):
 
         if need_to_delete_original:
             del(original_model_on_proper_device)
-
-def compute_snr(timesteps, noise_scheduler, max_sigma):
-    """
-    Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
-    """
-    minimal_value = 1/max_sigma
-    alphas_cumprod = noise_scheduler.alphas_cumprod
-    # Use .any() to check if any elements in the tensor are zero
-    if (alphas_cumprod[:-1] == 0).any():
-        logging.warning(
-            f"Alphas cumprod has zero elements! Resetting to {minimal_value}.."
-        )
-        alphas_cumprod[alphas_cumprod[:-1] == 0] = minimal_value
-    sqrt_alphas_cumprod = alphas_cumprod ** 0.5
-    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
-    # Expand the tensors.
-    # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
-    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[
-        timesteps
-    ].float()
-    while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
-        sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
-    alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
-
-    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(
-        device=timesteps.device
-    )[timesteps].float()
-    while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
-        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
-    sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
-
-    # Compute SNR, first without epsilon
-    snr = (alpha / sigma) ** 2
-    snr[snr < minimal_value] = minimal_value
-    return snr
 
 def load_train_json_from_file(args, report_load = False):
     try:
@@ -868,7 +817,7 @@ def main(args):
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
         validator = EveryDreamValidator(args.validation_config,
-                                        default_batch_size=args.batch_size,
+                                        default_batch_size=min(4, args.batch_size),
                                         resolution=args.resolution,
                                         log_writer=log_writer,
                                         approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
@@ -893,7 +842,7 @@ def main(args):
         seed=seed,
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
-        chunk_shuffle_batch_size=args.batch_size * args.max_backward_accum,
+        chunk_shuffle_batch_size=args.batch_size,
         batch_id_dropout_p=args.batch_id_dropout_p
     )
 
@@ -1039,345 +988,6 @@ def main(args):
     prev_noise = None
 
     # actual prediction function - shared between train and validate
-    def get_model_prediction_and_target(image, tokens, zero_frequency_noise_ratio=0.0,
-                                        return_loss=False,
-                                        loss_scale=None,
-                                        embedding_perturbation=0.0,
-                                        caption_str=None,
-                                        do_contrastive_learning=False,
-                                        do_backward=False,
-                                        mask=None):
-
-
-        batch_share_timesteps = True if do_contrastive_learning else args.batch_share_timesteps
-        batch_share_noise = True if do_contrastive_learning else args.batch_share_noise
-
-        with torch.no_grad():
-
-            with autocast(enabled=args.amp):
-                pixel_values = image.to(memory_format=torch.contiguous_format).to(unet.device)
-                latents = vae.encode(pixel_values, return_dict=False)
-            del pixel_values
-            latents = latents[0].sample() * 0.18215
-
-            bsz = latents.shape[0]
-
-            global prev_noise, prev_timesteps
-            if prev_noise is None or not batch_share_noise:
-
-                noise = torch.randn_like(latents)
-                if args.pyramid_noise_discount != None:
-                    if 0 < args.pyramid_noise_discount:
-                        noise = pyramid_noise_like(noise, discount=args.pyramid_noise_discount)
-
-                if zero_frequency_noise_ratio != None:
-                    if zero_frequency_noise_ratio < 0:
-                        zero_frequency_noise_ratio = 0
-
-                    # see https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    zero_frequency_noise = zero_frequency_noise_ratio * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
-                    noise = noise + zero_frequency_noise
-
-                prev_noise = noise
-
-            if prev_timesteps is None or not batch_share_timesteps:
-                timesteps = torch.randint(args.timestep_start, args.timestep_end, (bsz,), device=latents.device)
-                prev_timesteps = timesteps
-
-            if batch_share_timesteps:
-                timesteps = prev_timesteps[:1].repeat((bsz,))
-            if batch_share_noise:
-                noise = prev_noise[:1].repeat((bsz, 1, 1, 1))
-
-            timesteps = timesteps.long()
-
-            cuda_caption = tokens.to(text_encoder.device)
-
-        with (((torch.autograd.graph.save_on_cpu() if args.contrastive_learning_save_on_cpu else contextlib.nullcontext()))):
-            def get_encoder_hidden_states(text_encoder, cuda_caption):
-                encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
-
-                if args.clip_skip > 0:
-                    encoder_hidden_states = text_encoder.text_model.final_layer_norm(
-                        encoder_output.hidden_states[-args.clip_skip])
-                else:
-                    encoder_hidden_states = encoder_output.last_hidden_state
-
-                # https://arxiv.org/pdf/2405.20494
-                perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
-                perturbation_delta =  torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
-                encoder_hidden_states = encoder_hidden_states + perturbation_delta
-                return encoder_hidden_states, encoder_output.pooler_output
-
-            encoder_hidden_states, text_features = get_encoder_hidden_states(text_encoder, cuda_caption)
-            if teacher_pipeline is not None:
-
-                downgrade_sizes = True
-                if downgrade_sizes:
-                    suffix=37637
-                    replacements = {2699:3638, 3638:8675, 86765:2442, 2442:871}
-                    cce = cuda_caption.cpu().tolist()
-                    for i in range(len(cce)):
-                        c = cce[i]
-                        for j in range(len(c)):
-                            if c[j] == suffix:
-                                replacement = replacements.get(c[j - 1], None)
-                                if replacement is not None:
-                                    c[j - 1] = replacement
-                    cuda_caption_teacher = torch.tensor(cce, dtype=cuda_caption.dtype, device=cuda_caption.device)
-                else:
-                    cuda_caption_teacher = cuda_caption
-
-                if type(teacher_pipeline) is StableDiffusionXLPipeline:
-                    teacher_encoder_hidden_states = teacher_pipeline.encode_prompt(caption_str, cuda_caption_teacher)
-                else:
-                    teacher_encoder_hidden_states, teacher_text_features = get_encoder_hidden_states(teacher_pipeline.text_encoder, cuda_caption_teacher)
-            else:
-                teacher_encoder_hidden_states = None
-
-            if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
-                ztsnr_mask = torch.randint(low=0, high=2, size=(bsz,), device=noise.device).to(torch.float32)
-            def ztsnr_mix(ztsnr_tensor, base_tensor):
-                m = ztsnr_mask.view([-1] + [1]*(len(base_tensor.shape)-1))
-                #print("mask:", ztsnr_mask.shape, "a:", ztsnr_tensor.shape, "b:", base_tensor.shape)
-                return (1-m) * base_tensor + (m) * ztsnr_tensor
-
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            if args.latents_perturbation > 0:
-                noisy_latents += torch.randn_like(noisy_latents) * args.latents_perturbation
-            if args.enable_zero_terminal_snr:
-                if args.mix_zero_terminal_snr:
-                    noisy_latents_ztsnr = noisy_latents
-                    noisy_latents_base = noise_scheduler_base.add_noise(latents, noise, timesteps)
-                    noisy_latents = ztsnr_mix(noisy_latents_ztsnr, noisy_latents_base)
-                elif args.match_zero_terminal_snr:
-                    pass
-
-            def get_vpred_target(noise):
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                if args.enable_zero_terminal_snr and args.mix_zero_terminal_snr:
-                    target_ztsnr = target
-                    target_base = noise_scheduler_base.get_velocity(latents, noise, timesteps)
-                    target = ztsnr_mix(target_ztsnr, target_base)
-                return target
-
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-                target = get_vpred_target(noise)
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            del noise#, cuda_caption
-            if teacher_encoder_hidden_states is None:
-                del latents
-
-            teacher_pred = None
-            with autocast(enabled=args.amp):
-                #print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                if teacher_encoder_hidden_states is not None:
-                    teacher_pred = teacher_pipeline.unet(noisy_latents, timesteps, teacher_encoder_hidden_states).sample
-                    if (teacher_pipeline.scheduler.config.prediction_type == "epsilon" and
-                            noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]):
-                        # teacher_pred is noise, but we want velocity
-                        teacher_pred = get_vpred_target(teacher_pred)
-
-            if teacher_encoder_hidden_states is not None:
-                del latents
-
-            if not return_loss:
-                return model_pred, target
-
-            else:
-
-                if loss_scale is None:
-                    loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float)
-
-                if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
-                    snr = compute_snr(timesteps, noise_scheduler, max_sigma=22000)
-                    # kohya implementation
-                    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
-                    if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-                        snr_weight = min_snr_gamma / snr + 1
-                    else:
-                        snr_weight = min_snr_gamma / snr
-                    loss_scale = loss_scale * snr_weight.to(loss_scale.device)
-
-                if mask is not None:
-                    mask = mask.repeat(1, target.shape[1], 1, 1).to(target.device)
-                else:
-                    mask = torch.ones_like(target)
-
-                accumulated_model_preds.append(model_pred)
-                accumulated_targets.append(target)
-                accumulated_timesteps.append(timesteps)
-                accumulated_loss_scale.append(loss_scale)
-                accumulated_mask.append(mask)
-
-                if do_contrastive_learning:
-                    accumulated_caption_str.append(caption_str)
-
-                if not do_backward:
-                    return model_pred, target, None
-
-                # we're stepping now, combine everything
-                model_pred = torch.cat(accumulated_model_preds)
-                target = torch.cat(accumulated_targets)
-                timesteps = torch.cat(accumulated_timesteps)
-                loss_scale = torch.cat(accumulated_loss_scale)
-                mask = torch.cat(accumulated_mask)
-
-                if do_contrastive_learning:
-                    caption_str = [x
-                                  for l in accumulated_caption_str
-                                  for x in l]
-
-                    #print('finalizing contrastive loss over', model_pred.shape[0], 'samples')
-                    accumulated_caption_str.clear()
-
-                for i in reversed(range(len(accumulated_model_preds))):
-                    del accumulated_model_preds[i]
-                for i in reversed(range(len(accumulated_targets))):
-                    del accumulated_targets[i]
-                accumulated_timesteps.clear()
-                accumulated_loss_scale.clear()
-                accumulated_mask.clear()
-
-                def get_loss(model_pred, target, timesteps, loss_scale, reduction="none"):
-                    loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction=reduction)
-                    loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
-
-                    if args.loss_type == "mse_huber":
-                        early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
-                        early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
-                        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
-                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
-                        loss_mse = loss_mse * loss_scale.to(unet.device) * early_timestep_bias
-                        loss_huber = loss_huber * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
-                        loss = loss_mse + loss_huber
-                        del loss_mse
-                        del loss_huber
-                    elif args.loss_type == "huber_mse":
-                        early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
-                        early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
-                        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
-                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
-                        loss_mse = loss_mse * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
-                        loss_huber = loss_huber * loss_scale.to(unet.device) * early_timestep_bias
-                        loss = loss_huber + loss_mse
-                        del loss_mse
-                        del loss_huber
-                    elif args.loss_type == "huber":
-                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
-                        loss_huber = loss_huber * loss_scale.to(unet.device)
-                        loss = loss_huber
-                        del loss_huber
-                    else:
-                        loss_mse = loss_mse * loss_scale.to(unet.device)
-                        loss = loss_mse
-                        del loss_mse
-                    return loss
-
-                if do_contrastive_learning:
-                    assert teacher_pred is None, "contrastive learning with teacher model is not implemented"
-                    positive_loss = get_loss(model_pred, target, timesteps, loss_scale)
-                    # Generate negative samples
-                    #max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
-                    #                                 dtype=positive_loss.dtype).to(positive_loss.device)
-                    negative_loss = torch.zeros_like(positive_loss)
-                    bsz = model_pred.shape[0]
-                    num_samples = [0] * bsz
-                    for i in range(bsz):
-                        if (caption_str[i] is None or caption_str[i] == " "):
-                            continue
-
-                        for j in range(bsz):
-                            if (i == j # skip self
-                                    or caption_str[j] is None
-                                    or len(caption_str[j].strip()) == 0 # skip missing or dropout
-                                    or caption_str[i] == caption_str[j] # skip equal captions
-                                    ):
-                                continue
-                            if args.contrastive_learning_delta_loss_method:
-                                delta_to_wrong = model_pred[j:j+1] - model_pred[i:i+1]
-                                target_delta_to_wrong = target[j:j+1] - target[i:i+1]
-                                l_negative = get_loss(delta_to_wrong.float(),
-                                                      target_delta_to_wrong.float(),
-                                                      timesteps=timesteps[j:j+1], loss_scale=torch.tensor(1),
-                                                      reduction='none')
-                                #l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
-                                negative_loss[i:i+1] += l_negative
-                                del delta_to_wrong
-                                del target_delta_to_wrong
-                                del l_negative
-                            else:
-                                #dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
-                                delta_negative = F.l1_loss(model_pred[i:i+1].float(), target[j:j+1].float(), reduction='none')
-                                margin = args.contrastive_learning_max_negative_loss
-                                l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
-                                if not args.contrastive_learning_use_l1_loss:
-                                    l_negative = torch.pow(l_negative, 2.0)
-
-                                diminishing_factor = 1 #torch.exp(-alpha * dist_negative)
-                                l_negative_diminished = l_negative * diminishing_factor
-                                negative_loss[i:i+1] += l_negative_diminished
-                                del l_negative_diminished
-                                del l_negative
-                                del delta_negative
-
-                            """contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
-
-                            dist_negative = torch.sqrt(contrastive_loss)
-                            diminishing_factor = torch.exp(-args.contrastive_learning_alpha * dist_negative)
-                            contrastive_loss_diminished = contrastive_loss * diminishing_factor
-                            negative_loss[i:i + 1] = contrastive_loss_diminished
-                            del contrastive_loss_diminished
-                            del contrastive_loss
-                            """
-
-                            #contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
-                            #negative_loss[i:i+1] += contrastive_loss_clamped_inv
-                            #del contrastive_loss_clamped_inv
-                            #del contrastive_loss
-
-                            num_samples[i] += 1
-
-                    #print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
-
-                    # Average over negative samples
-                    num_samples_safe =  torch.tensor(([1] * len(num_samples)
-                                                     if args.contrastive_learning_no_average_negatives
-                                                     else [max(1,x) for x in num_samples]
-                                                      ), device=negative_loss.device)
-
-                    negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
-                    negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
-                    if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
-                        # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases
-                        max_timestep = noise_scheduler.config.num_train_timesteps
-                        negative_loss_timestep_start = args.contrastive_learning_delta_timestep_start
-                        # linear bias with offset
-                        early_timestep_bias = torch.maximum((timesteps-negative_loss_timestep_start)
-                                                            / (max_timestep-negative_loss_timestep_start), torch.tensor(0).to(timesteps.device))
-                        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
-                        negative_loss_scale = negative_loss_scale * early_timestep_bias
-
-                    loss = (positive_loss + negative_loss * negative_loss_scale) * mask
-                    del positive_loss
-                    del negative_loss
-
-                else:
-                    loss = get_loss(model_pred, target, timesteps, loss_scale) * mask
-                    if teacher_pred is not None:
-                        loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale) * mask
-                        loss += loss_mse_teacher
-
-                del cuda_caption
-
-                if not args.jacobian_descent:
-                    loss = loss.mean()
-
-                return model_pred, target, loss
 
     def generate_samples(global_step: int, batch):
         nonlocal unet
@@ -1468,11 +1078,10 @@ def main(args):
             basename += f"-gs{global_step:05}"
         return os.path.join(log_folder, "ckpts", basename)
 
-
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
         validator.do_validation(global_step=0,
-                                get_model_prediction_and_target_callable=get_model_prediction_and_target)
+                                get_model_prediction_and_target_callable=get_model_prediction_and_target_wrapper)
 
         prev_timesteps = None
         prev_noise = None
@@ -1564,59 +1173,78 @@ def main(args):
                 if do_everything_contrastive_learning:
                     batch["do_contrastive_learning"] = True
 
+                do_contrastive_learning = batch["do_contrastive_learning"]
+
                 loss_scale = batch["loss_scale"]
-                if batch["runt_size"] > 0:
-                    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
-                    loss_scale = loss_scale * runt_loss_scale
+                #if batch["runt_size"] > 0:
+                #    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
+                #    loss_scale = loss_scale * runt_loss_scale
 
                 did_backward = False
                 loss = None
                 assert type(batch["captions"]) is dict
                 caption_variants = list(sorted(batch["captions"].keys()))
-                last_caption_variant = caption_variants[-1]
                 for caption_variant in caption_variants:
-
-                    # do a backward step when
-                    # - we have filled up to max
-                    # or
-                    # - we'll do a optimizer backward() step after this loss calc
-                    # or
-                    # - the batch config is about to change in ways that make accumulation incompatible
-                    do_backward = (len(accumulated_model_preds) + 1 >= args.max_backward_accum) or (
-                        (caption_variant == last_caption_variant) and (
-                            ed_optimizer.will_do_grad_accum_step(step, global_step)
-                            or next_batch is None
-                            or batch["image"].shape != next_batch["image"].shape
-                            or (not do_everything_contrastive_learning and (
-                                batch["do_contrastive_learning"] != next_batch["do_contrastive_learning"]))
-                        )
-                    )
-                    # print("should_do_backward:", should_do_backward, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
 
                     tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
                     caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
-                    model_pred, target, loss = get_model_prediction_and_target(batch["image"],
-                                                                               tokens,
-                                                                               args.zero_frequency_noise_ratio,
-                                                                               return_loss=True,
-                                                                               loss_scale=loss_scale,
-                                                                               embedding_perturbation=args.embedding_perturbation,
-                                                                               caption_str=caption_str,
-                                                                               do_contrastive_learning=batch["do_contrastive_learning"],
-                                                                               do_backward=do_backward,
-                                                                               mask=batch["mask"])
 
+                    batch_size = tokens.shape[0]
+
+                    latents = get_latents(batch["image"], vae, device=unet.device, args=args)
+
+                    with torch.no_grad():
+                        noise = _get_noise(latents.shape, device=unet.device, dtype=batch["image"].dtype,
+                                       pyramid_noise_discount=args.pyramid_noise_discount,
+                                       zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                                       batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
+                                       )
+                        timesteps = _get_timesteps(batch_size=batch_size,
+                                               batch_share_timesteps=(do_contrastive_learning or args.batch_share_timesteps),
+                                               device=unet.device,
+                                               timesteps_range=(args.timestep_start, args.timestep_end))
+
+                    slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
+                    runt_size = batch["runt_size"]
+
+                    model_pred_all = []
+                    target_all = []
+                    for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
+                        latents_slice = latents[slice_start:slice_end]
+                        tokens_slice = tokens[slice_start:slice_end]
+                        noise_slice = noise[slice_start:slice_end]
+                        timesteps_slice = timesteps[slice_start:slice_end]
+                        model_pred, target = _get_model_prediction_and_target(latents=latents_slice,
+                                                                              tokens=tokens_slice,
+                                                                              noise=noise_slice,
+                                                                              timesteps=timesteps_slice,
+                                                                              unet=unet,
+                                                                              text_encoder=text_encoder,
+                                                                              noise_scheduler=noise_scheduler,
+                                                                              args=args
+                                                                              )
+                        model_pred_all.append(model_pred)
+                        target_all.append(target)
+
+                    model_pred = torch.cat(model_pred_all)
+                    target = torch.cat(target_all)
+                    del model_pred_all, target_all
+
+                    slice_end = batch_size-runt_size
+                    mask = None if batch["mask"] is None else batch["mask"][0:slice_end]
+                    loss = _get_loss(model_pred, target, caption_str=caption_str[0:slice_end], mask=mask,
+                                     timesteps=timesteps,
+                                     loss_scale=loss_scale,
+                                     noise_scheduler=noise_scheduler,
+                                     do_contrastive_learning=do_contrastive_learning,
+                                     args=args
+                                     )
                     del target, model_pred
 
-                    if do_backward:
-                        assert loss is not None
-                        if not args.jacobian_descent:
-                            loss = loss.mean()
+                    if not args.jacobian_descent:
+                        loss = loss.mean()
 
-                        ed_optimizer.backward(loss)
-                        did_backward = True
-                    else:
-                        assert did_backward or loss is None
+                    ed_optimizer.backward(loss)
 
                 ed_optimizer.step(step, global_step)
 
@@ -1691,7 +1319,7 @@ def main(args):
 
                 if validator and step in validation_steps:
                     prev_timesteps_save, prev_noise_save = prev_timesteps, prev_noise
-                    validator.do_validation(global_step, get_model_prediction_and_target)
+                    validator.do_validation(global_step, get_model_prediction_and_target_wrapper)
                     prev_timesteps, prev_noise = prev_timesteps_save, prev_noise_save
 
                 min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
@@ -1804,6 +1432,13 @@ def main(args):
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
 
 
+def get_slices(batch_size, slice_size, runt_size):
+    num_slices = math.ceil(batch_size / slice_size)
+    for slice_index in range(num_slices):
+        slice_start = slice_index * slice_size
+        slice_end = min(slice_start + slice_size, batch_size-runt_size)
+        yield slice_start, slice_end
+
 if __name__ == "__main__":
     check_git()
     supported_resolutions = aspects.get_supported_resolutions()
@@ -1832,7 +1467,7 @@ if __name__ == "__main__":
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1), use nvidia-smi to find your GPU ids")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
-    argparser.add_argument("--max_backward_accum", type=int, default=1, help="Max loss steps to accumulate before calling backward")
+    argparser.add_argument("--forward_slice_size", type=int, default=1, help="Slice forward step into chunks of <= this ")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--loss_type", type=str, default="mse_huber", help="type of loss, 'huber', 'mse', or 'mse_huber' for interpolated (def: mse_huber)", choices=["huber", "mse", "mse_huber"])
