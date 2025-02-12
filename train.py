@@ -80,17 +80,24 @@ from plugins.plugins import PluginRunner
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
 
-def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_betas=None):
+def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_betas=None, rescale_betas_zero_snr=False):
     noise_scheduler = None
     if train_sampler.lower() == "pndm":
         logging.info(f" * Using PNDM noise scheduler for training: {train_sampler}")
-        noise_scheduler = PNDMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
+        noise_scheduler = PNDMScheduler.from_pretrained(model_root_folder,
+                                                        subfolder="scheduler",
+                                                        trained_betas=trained_betas,
+                                                        rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "ddim":
         logging.info(f" * Using DDIM noise scheduler for training: {train_sampler}")
-        noise_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
+        noise_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
+                                                        trained_betas=trained_betas,
+                                                        rescale_betas_zero_snr=rescale_betas_zero_snr)
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
-        noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
+        noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
+                                                        trained_betas=trained_betas,
+                                                        rescale_betas_zero_snr=rescale_betas_zero_snr)
     return noise_scheduler
 
 def get_hf_ckpt_cache_path(ckpt_path):
@@ -749,7 +756,9 @@ def main(args):
             trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=None)
             #noise_scheduler_ref = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
-            noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=trained_betas)
+            noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder,
+                                                           trained_betas=trained_betas, rescale_betas_zero_snr=False#True
+            )
             noise_scheduler_base = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=None)
         else:
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
@@ -938,7 +947,8 @@ def main(args):
                                        default_sample_steps=args.sample_steps,
                                        use_xformers=args.attn_type == "xformers",
                                        use_penultimate_clip_layer=(args.clip_skip >= 2),
-                                       guidance_rescale=0 # 0.7 if args.enable_zero_terminal_snr else 0
+                                       guidance_rescale=0, # 0.7 if args.enable_zero_terminal_snr else 0
+                                       is_ztsnr=args.enable_zero_terminal_snr
                                        )
 
     """
@@ -969,9 +979,9 @@ def main(args):
                 logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
                 time.sleep(2) # give opportunity to ctrl-C again to cancel save
-                #save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
-                #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
+                save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
+                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+                           save_optimizer_flag=True, save_ckpt=not args.no_save_ckpt)
             exit(_SIGTERM_EXIT_CODE)
         else:
             # non-main threads (i.e. dataloader workers) should exit cleanly
@@ -1078,10 +1088,6 @@ def main(args):
                 timesteps = prev_timesteps[:1].repeat((bsz,))
             if batch_share_noise:
                 noise = prev_noise[:1].repeat((bsz, 1, 1, 1))
-
-            if not do_contrastive_learning or do_backward:
-                prev_noise = None
-                prev_timesteps = None
 
             timesteps = timesteps.long()
 
@@ -1222,11 +1228,11 @@ def main(args):
                 mask = torch.cat(accumulated_mask)
 
                 if do_contrastive_learning:
-                    contrastive_samples = [x
+                    caption_str = [x
                                   for l in accumulated_caption_str
                                   for x in l]
 
-                    print('finalizing contrastive loss over', model_pred.shape[0], 'samples')
+                    #print('finalizing contrastive loss over', model_pred.shape[0], 'samples')
                     accumulated_caption_str.clear()
 
                 for i in reversed(range(len(accumulated_model_preds))):
@@ -1237,15 +1243,15 @@ def main(args):
                 accumulated_loss_scale.clear()
                 accumulated_mask.clear()
 
-                def get_loss(model_pred, target, timesteps, loss_scale):
-                    loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                def get_loss(model_pred, target, timesteps, loss_scale, reduction="none"):
+                    loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction=reduction)
                     loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
 
                     if args.loss_type == "mse_huber":
                         early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
                         early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
                         early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
-                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
                         loss_mse = loss_mse * loss_scale.to(unet.device) * early_timestep_bias
                         loss_huber = loss_huber * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
                         loss = loss_mse + loss_huber
@@ -1255,14 +1261,14 @@ def main(args):
                         early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
                         early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(unet.device)
                         early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
-                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
                         loss_mse = loss_mse * loss_scale.to(unet.device) * (1.0 - early_timestep_bias)
                         loss_huber = loss_huber * loss_scale.to(unet.device) * early_timestep_bias
                         loss = loss_huber + loss_mse
                         del loss_mse
                         del loss_huber
                     elif args.loss_type == "huber":
-                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction="none", delta=1.0)
+                        loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
                         loss_huber = loss_huber * loss_scale.to(unet.device)
                         loss = loss_huber
                         del loss_huber
@@ -1287,14 +1293,19 @@ def main(args):
 
                         for j in range(bsz):
                             if (i == j # skip self
-                                    or caption_str[j] is None or caption_str[j] == " " # skip missing or dropout
+                                    or caption_str[j] is None
+                                    or len(caption_str[j].strip()) == 0 # skip missing or dropout
                                     or caption_str[i] == caption_str[j] # skip equal captions
                                     ):
                                 continue
                             if args.contrastive_learning_delta_loss_method:
                                 delta_to_wrong = model_pred[j:j+1] - model_pred[i:i+1]
                                 target_delta_to_wrong = target[j:j+1] - target[i:i+1]
-                                l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
+                                l_negative = get_loss(delta_to_wrong.float(),
+                                                      target_delta_to_wrong.float(),
+                                                      timesteps=timesteps[j:j+1], loss_scale=torch.tensor(1),
+                                                      reduction='none')
+                                #l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
                                 negative_loss[i:i+1] += l_negative
                                 del delta_to_wrong
                                 del target_delta_to_wrong
@@ -1331,13 +1342,13 @@ def main(args):
 
                             num_samples[i] += 1
 
-                    print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
+                    #print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
 
                     # Average over negative samples
-                    num_samples_safe =  torch.tensor([1] * len(num_samples)
+                    num_samples_safe =  torch.tensor(([1] * len(num_samples)
                                                      if args.contrastive_learning_no_average_negatives
                                                      else [max(1,x) for x in num_samples]
-                                                     , device=negative_loss.device)
+                                                      ), device=negative_loss.device)
 
                     negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
                     negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(unet.device)
@@ -1352,8 +1363,6 @@ def main(args):
                         negative_loss_scale = negative_loss_scale * early_timestep_bias
 
                     loss = (positive_loss + negative_loss * negative_loss_scale) * mask
-                    if not args.jacobian_descent:
-                        loss = loss.mean()
                     del positive_loss
                     del negative_loss
 
@@ -1362,10 +1371,11 @@ def main(args):
                     if teacher_pred is not None:
                         loss_mse_teacher = get_loss(model_pred, teacher_pred, timesteps, loss_scale*args.teacher_loss_scale) * mask
                         loss += loss_mse_teacher
-                    if not args.jacobian_descent:
-                        loss = loss.mean()
 
                 del cuda_caption
+
+                if not args.jacobian_descent:
+                    loss = loss.mean()
 
                 return model_pred, target, loss
 
@@ -1464,6 +1474,9 @@ def main(args):
         validator.do_validation(global_step=0,
                                 get_model_prediction_and_target_callable=get_model_prediction_and_target)
 
+        prev_timesteps = None
+        prev_noise = None
+
     # the sample generator might be configured to generate samples before step 0
     if sample_generator.generate_pretrain_samples:
         _, batch = next(enumerate(train_dataloader))
@@ -1542,33 +1555,43 @@ def main(args):
                         batch=batch,
                         ed_state=make_current_ed_state())
 
+                if do_everything_contrastive_learning is None:
+                    if batch["do_contrastive_learning"]:
+                        do_everything_contrastive_learning = False
+                    else:
+                        do_everything_contrastive_learning = args.everything_contrastive_learning_p > random.random()
+
+                if do_everything_contrastive_learning:
+                    batch["do_contrastive_learning"] = True
+
+                loss_scale = batch["loss_scale"]
+                if batch["runt_size"] > 0:
+                    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
+                    loss_scale = loss_scale * runt_loss_scale
+
+                did_backward = False
+                loss = None
                 assert type(batch["captions"]) is dict
-                for caption_variant in batch["captions"].keys():
+                caption_variants = list(sorted(batch["captions"].keys()))
+                last_caption_variant = caption_variants[-1]
+                for caption_variant in caption_variants:
 
-                    if do_everything_contrastive_learning is None:
-                        if batch["do_contrastive_learning"]:
-                            do_everything_contrastive_learning = False
-                        else:
-                            do_everything_contrastive_learning = args.everything_contrastive_learning_p > random.random()
-
-                    if do_everything_contrastive_learning:
-                        batch["do_contrastive_learning"] = True
-
-                    should_do_backward = (
-                        ed_optimizer.will_do_grad_accum_step(step, global_step)
-                        or next_batch is None
-                        or batch["image"].shape != next_batch["image"].shape
-                        or (not do_everything_contrastive_learning and (batch["do_contrastive_learning"] != next_batch["do_contrastive_learning"]))
-                        or len(accumulated_model_preds) + 1 >= args.max_backward_accum
+                    # do a backward step when
+                    # - we have filled up to max
+                    # or
+                    # - we'll do a optimizer backward() step after this loss calc
+                    # or
+                    # - the batch config is about to change in ways that make accumulation incompatible
+                    do_backward = (len(accumulated_model_preds) + 1 >= args.max_backward_accum) or (
+                        (caption_variant == last_caption_variant) and (
+                            ed_optimizer.will_do_grad_accum_step(step, global_step)
+                            or next_batch is None
+                            or batch["image"].shape != next_batch["image"].shape
+                            or (not do_everything_contrastive_learning and (
+                                batch["do_contrastive_learning"] != next_batch["do_contrastive_learning"]))
+                        )
                     )
-                    #print("should_do_backward:", should_do_backward, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
-                    if should_do_backward:
-                        do_everything_contrastive_learning = None
-
-                    loss_scale = batch["loss_scale"]
-                    if batch["runt_size"] > 0:
-                        runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
-                        loss_scale = loss_scale * runt_loss_scale
+                    # print("should_do_backward:", should_do_backward, " will do grad accum step: ", ed_optimizer.will_do_grad_accum_step(step, global_step), "shapes: ", batch["image"].shape, next_batch["image"].shape, ", do contrastive:", batch["do_contrastive_learning"], next_batch["do_contrastive_learning"])
 
                     tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
                     caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
@@ -1580,13 +1603,30 @@ def main(args):
                                                                                embedding_perturbation=args.embedding_perturbation,
                                                                                caption_str=caption_str,
                                                                                do_contrastive_learning=batch["do_contrastive_learning"],
-                                                                               do_backward=should_do_backward,
+                                                                               do_backward=do_backward,
                                                                                mask=batch["mask"])
 
                     del target, model_pred
 
-                    ed_optimizer.step(loss, step, global_step)
+                    if do_backward:
+                        assert loss is not None
+                        if not args.jacobian_descent:
+                            loss = loss.mean()
 
+                        ed_optimizer.backward(loss)
+                        did_backward = True
+                    else:
+                        assert did_backward or loss is None
+
+                ed_optimizer.step(step, global_step)
+
+                if did_backward:
+                    # reset our randomized contrastive enabler after doing a backward step
+                    do_everything_contrastive_learning = None
+
+                if (not batch["do_contrastive_learning"]) or did_backward:
+                    prev_noise = None
+                    prev_timesteps = None
 
                 if (global_step + 1) % sample_generator.sample_steps == 0:
                     needs_samples = True
@@ -1650,7 +1690,9 @@ def main(args):
                     torch.cuda.empty_cache()
 
                 if validator and step in validation_steps:
+                    prev_timesteps_save, prev_noise_save = prev_timesteps, prev_noise
                     validator.do_validation(global_step, get_model_prediction_and_target)
+                    prev_timesteps, prev_noise = prev_timesteps_save, prev_noise_save
 
                 min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 

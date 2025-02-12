@@ -31,7 +31,7 @@ class CaptionMungerPlugin(BasePlugin):
 
     def transform_caption_json_raw(self, captions_json) -> dict[str,str]:
         d = json.loads(captions_json)
-        return {k: (self.transform_caption(v) if len(v.strip())>0 else None)
+        return {k: (self.transform_caption(v) if (v and len(v.strip())>0) else None)
                 for k, v in d.items()}
 
     def transform_caption(self, caption:str) -> str:
@@ -52,7 +52,8 @@ class CaptionMungerPlugin(BasePlugin):
 
         if "||" in caption:
             #print("ignoring || in caption")
-            return self.transform_caption_parts(caption)
+            caption = caption.replace("||", ", ")
+            #return self.transform_caption_parts(caption)
 
         # split to sentences
         in_sentences = [s.strip() for s in caption.split(".")]

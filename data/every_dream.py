@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import os
 import statistics
+import traceback
 from collections import defaultdict
 
 import torch
@@ -132,7 +133,7 @@ class EveryDreamBatch(Dataset):
             example["mask"] = None
         example["untransformed_caption"] = example["caption"]
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"])
-        if type(example["caption"] is dict):
+        if type(example["caption"]) is dict:
             caption_dict = example["caption"]
         else:
             caption_dict = {"default": example["caption"]}
@@ -150,12 +151,18 @@ class EveryDreamBatch(Dataset):
             example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
 
         example["caption"] = caption_dict
-        example["tokens"] = {k: torch.tensor(self.tokenizer(caption_dict[k],
-                                            truncation=True,
-                                            padding="max_length",
-                                            max_length=self.tokenizer.model_max_length,
-                                          ).input_ids)
-                             for k in caption_dict.keys()}
+        try:
+            example["tokens"] = {k: torch.tensor(self.tokenizer(caption_dict[k] or '',
+                                                truncation=True,
+                                                padding="max_length",
+                                                max_length=self.tokenizer.model_max_length,
+                                              ).input_ids)
+                                 for k in caption_dict.keys()}
+        except ValueError as e:
+            traceback.print_exc()
+            print('caption_dict:', caption_dict)
+            print('train_item:', train_item)
+            raise
 
         example["runt_size"] = train_item["runt_size"]
 
@@ -173,7 +180,7 @@ class EveryDreamBatch(Dataset):
 
         do_contrastive_learning = (image_train_item.batch_id in self.contrastive_learning_batch_ids)
         crop_jitter = (0.0
-                       if image_train_item.runt_size > 0 and do_contrastive_learning
+                       if image_train_item.runt_size > 0 # and do_contrastive_learning
                        else self.crop_jitter)
         image_train_tmp = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=self.use_masks)
 

@@ -19,6 +19,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm.auto import tqdm
 from compel import Compel
+import traceback
+
+from .sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
 
 
 def clean_filename(filename):
@@ -82,6 +85,8 @@ class SampleGenerator:
     log_folder: str
     log_writer: SummaryWriter
 
+    is_ztsnr: bool
+
     def __init__(self,
                  log_folder: str,
                  log_writer: SummaryWriter,
@@ -92,6 +97,7 @@ class SampleGenerator:
                  default_sample_steps: int,
                  use_xformers: bool,
                  use_penultimate_clip_layer: bool,
+                 is_ztsnr: bool,
                  guidance_rescale: float = 0):
         self.log_folder = log_folder
         self.log_writer = log_writer
@@ -102,6 +108,7 @@ class SampleGenerator:
         self.generate_pretrain_samples = False
         self.use_penultimate_clip_layer = use_penultimate_clip_layer
         self.guidance_rescale = guidance_rescale
+        self.is_ztsnr = is_ztsnr
 
         self.default_resolution = default_resolution
         self.default_seed = default_seed
@@ -211,6 +218,7 @@ class SampleGenerator:
                                                    global_step=global_step, extra_info=extra_info)
                     return
                 except Exception as e:
+                    print(traceback.format_exc())
                     print("caught exception", e, "generating samples from", self.sample_invokeai_info_dicts_json, "doing regular sample gen")
 
             batch: list[SampleRequest]
@@ -302,11 +310,12 @@ class SampleGenerator:
                           global_step: int,
                           prompt: str,
                           is_random_caption: bool,
-                          extra_info: str):
+                          extra_info: str,
+                          pngmetadata: dict=None):
         clean_prompt = clean_filename(prompt)
 
         result.save(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg",
-                    format="JPEG", quality=95, optimize=True, progressive=False)
+                    format="JPEG", quality=95, optimize=True, progressive=False, pngmetadata=pngmetadata)
         with open(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt",
                   "w", encoding='utf-8') as f:
             f.write(prompt)
@@ -383,4 +392,17 @@ class SampleGenerator:
             raise ValueError(f"unknown scheduler '{scheduler}'")
 
     def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info):
-        pass
+
+        params = [ImageGenerationParams.from_invokeai_metadata(d)
+                  for d in sample_invokeai_info_dicts]
+        def save_image(image, sample_index, prompt, pngmetadata):
+            return self.save_sample_image(image, sample_index, global_step=global_step, prompt=prompt,
+                                          is_random_caption=False, extra_info=extra_info, pngmetadata=pngmetadata)
+
+        generate_images_diffusers(pipe=pipe,
+                                  model_name=f'training-global_step{global_step}-{extra_info}',
+                                  model_type='sd-2',
+                                  all_params=params,
+                                  batch_size=self.batch_size,
+                                  image_save_cb=save_image,
+                                  extra_cfgs=self.cfgs[1:])

@@ -181,7 +181,7 @@ class EveryDreamValidator:
 
     def do_validation(self, global_step: int,
                       get_model_prediction_and_target_callable: Callable[
-                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
+                                         [Any, Any, Any], tuple[torch.Tensor, torch.Tensor]]):
         mean_loss_accumulator = 0
         for i, dataset in enumerate(self.validation_datasets):
             mean_loss = self._calculate_validation_loss(dataset.name,
@@ -211,14 +211,17 @@ class EveryDreamValidator:
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({tag}){Style.RESET_ALL}")
 
             for step, batch in enumerate(dataloader):
-                model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"], prompt_str=batch["captions"])
+                keys = list(batch["captions"].keys())
+                for key in keys:
+                    model_pred, target = get_model_prediction_and_target(image=batch["image"],
+                                                                         tokens=batch["tokens"][key],
+                                                                         caption_str=batch["captions"][key])
 
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                del target, model_pred
-
-                loss_step = loss.detach().item()
-                loss_validation_epoch.append(loss_step)
+                    del target, model_pred
+                    loss_step = loss.detach().item()
+                    loss_validation_epoch.append(loss_step)
 
                 steps_pbar.update(1)
 

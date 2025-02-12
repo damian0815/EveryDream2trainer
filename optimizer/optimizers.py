@@ -158,9 +158,8 @@ class EveryDreamOptimizer():
     def will_do_grad_accum_step(self, step, global_step):
         return self._should_do_grad_accum_step(step, global_step)
 
-    def step(self, loss: torch.Tensor | list[torch.Tensor], step: int, global_step: int):
+    def backward(self, loss: torch.Tensor | list[torch.Tensor]):
         if loss is not None:
-
             loss_scaled_if_necessary = loss if self.scaler is None else self.scaler.scale(loss)
             if self.jacobian_aggregator is not None:
                 self.jacobian_backward(
@@ -172,7 +171,10 @@ class EveryDreamOptimizer():
             else:
                 loss_scaled_if_necessary.backward()
 
-        if loss is not None and self._should_do_grad_accum_step(step, global_step):
+
+    def step(self, step: int, global_step: int, ):
+
+        if self._should_do_grad_accum_step(step, global_step):
             global shared_timesteps
             shared_timesteps = None
             if self.scaler is not None:

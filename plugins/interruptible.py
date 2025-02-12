@@ -18,8 +18,9 @@ class InterruptiblePlugin(BasePlugin):
         epoch_length = kwargs['epoch_length']
         # epoch length = 4000 -> 2 saves
         # epoch length = 500 -> save every 4th
-        self.every_n_epochs =  2000 / epoch_length
+        self.every_n_epochs = 1000 / epoch_length
         self.steps_to_save_this_epoch = self._get_save_step_indices(epoch, epoch_length)
+        print("every_n_epochs:", self.every_n_epochs, "-> steps to save:", self.steps_to_save_this_epoch)
 
     def on_step_end(self, **kwargs):
         local_step = kwargs['local_step']
@@ -56,7 +57,7 @@ class InterruptiblePlugin(BasePlugin):
 
     def _get_save_step_indices(self, epoch, epoch_length_steps: int) -> list[int]:
         if self.every_n_epochs >= 1:
-            if ((epoch+1) % self.every_n_epochs) == 0:
+            if ((epoch+1) % round(self.every_n_epochs)) == 0:
                 # last step only
                 return [epoch_length_steps-1]
             else:
