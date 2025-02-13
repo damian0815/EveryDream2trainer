@@ -111,47 +111,18 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
                         or caption_str[i] == caption_str[j]  # skip equal captions
                 ):
                     continue
-                if args.contrastive_learning_delta_loss_method:
-                    delta_to_wrong = model_pred[j:j + 1] - model_pred[i:i + 1]
-                    target_delta_to_wrong = target[j:j + 1] - target[i:i + 1]
-                    l_negative = compute_loss(delta_to_wrong.float(),
-                                          target_delta_to_wrong.float(),
-                                          timesteps=timesteps[j:j + 1], loss_scale=torch.tensor(1),
-                                          reduction='none')
-                    # l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
-                    negative_loss[i:i + 1] += l_negative
-                    del delta_to_wrong
-                    del target_delta_to_wrong
-                    del l_negative
-                else:
-                    # dist_negative = torch.nn.functional.pairwise_distance(target[j:j + 1], model_pred[i:i + 1])
-                    delta_negative = F.l1_loss(model_pred[i:i + 1].float(), target[j:j + 1].float(), reduction='none')
-                    margin = args.contrastive_learning_max_negative_loss
-                    l_negative = torch.max(margin - delta_negative, torch.zeros_like(delta_negative))
-                    if not args.contrastive_learning_use_l1_loss:
-                        l_negative = torch.pow(l_negative, 2.0)
-
-                    diminishing_factor = 1  # torch.exp(-alpha * dist_negative)
-                    l_negative_diminished = l_negative * diminishing_factor
-                    negative_loss[i:i + 1] += l_negative_diminished
-                    del l_negative_diminished
-                    del l_negative
-                    del delta_negative
-
-                """contrastive_loss = get_loss(model_pred[i:i + 1], target[j:j + 1], timesteps[i:i + 1], loss_scale[i:i + 1])
-
-                dist_negative = torch.sqrt(contrastive_loss)
-                diminishing_factor = torch.exp(-args.contrastive_learning_alpha * dist_negative)
-                contrastive_loss_diminished = contrastive_loss * diminishing_factor
-                negative_loss[i:i + 1] = contrastive_loss_diminished
-                del contrastive_loss_diminished
-                del contrastive_loss
-                """
-
-                # contrastive_loss_clamped_inv = torch.maximum(max_negative_loss - contrastive_loss, torch.zeros_like(max_negative_loss))
-                # negative_loss[i:i+1] += contrastive_loss_clamped_inv
-                # del contrastive_loss_clamped_inv
-                # del contrastive_loss
+                delta_to_wrong = model_pred[j:j + 1] - model_pred[i:i + 1]
+                target_delta_to_wrong = target[j:j + 1] - target[i:i + 1]
+                l_negative = compute_loss(delta_to_wrong.float(),
+                                      target_delta_to_wrong.float(),
+                                      timesteps=timesteps[j:j + 1],
+                                      loss_scale=loss_scale[j:j + 1],
+                                      reduction='none')
+                # l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
+                negative_loss[i:i + 1] += l_negative
+                del delta_to_wrong
+                del target_delta_to_wrong
+                del l_negative
 
                 num_samples[i] += 1
 
@@ -164,7 +135,7 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
                                          ), device=negative_loss.device)
 
         negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
-        negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).expand_as(positive_loss).to(device)
+        negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).to(device).expand_as(positive_loss)
         if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
             # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases
             max_timestep = noise_scheduler.config.num_train_timesteps
@@ -172,8 +143,8 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
             # linear bias with offset
             early_timestep_bias = torch.maximum((timesteps - negative_loss_timestep_start)
                                                 / (max_timestep - negative_loss_timestep_start),
-                                                torch.tensor(0).to(timesteps.device))
-            early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss).to(device)
+                                                torch.tensor(0).to(device))
+            early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss)
             negative_loss_scale = negative_loss_scale * early_timestep_bias
 
         loss = (positive_loss + negative_loss * negative_loss_scale) * mask
@@ -183,10 +154,7 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
         return loss
 
 
-def _get_model_prediction_and_target(latents, tokens, noise, timesteps, unet, text_encoder, noise_scheduler, args):
-    encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
-                                                   clip_skip=args.clip_skip,
-                                                   embedding_perturbation=args.embedding_perturbation)
+def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler, args):
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps,
                                                           args.latents_perturbation)
     del latents

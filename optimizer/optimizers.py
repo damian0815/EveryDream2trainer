@@ -159,17 +159,16 @@ class EveryDreamOptimizer():
         return self._should_do_grad_accum_step(step, global_step)
 
     def backward(self, loss: torch.Tensor | list[torch.Tensor]):
-        if loss is not None:
-            loss_scaled_if_necessary = loss if self.scaler is None else self.scaler.scale(loss)
-            if self.jacobian_aggregator is not None:
-                self.jacobian_backward(
-                    tensors=loss_scaled_if_necessary,
-                    inputs=itertools.chain(self.text_encoder_params, self.unet_params),
-                    A=self.jacobian_aggregator,
-                    parallel_chunk_size=None
-                )
-            else:
-                loss_scaled_if_necessary.backward()
+        loss_scaled_if_necessary = loss if self.scaler is None else self.scaler.scale(loss)
+        if self.jacobian_aggregator is not None:
+            self.jacobian_backward(
+                tensors=loss_scaled_if_necessary,
+                inputs=itertools.chain(self.text_encoder_params, self.unet_params),
+                A=self.jacobian_aggregator,
+                parallel_chunk_size=None
+            )
+        else:
+            loss_scaled_if_necessary.backward()
 
 
     def step(self, step: int, global_step: int, ):

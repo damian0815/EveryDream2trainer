@@ -55,7 +55,7 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
-    _get_loss, get_latents
+    _get_loss, get_latents, _encode_caption_tokens
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -1088,8 +1088,11 @@ def main(args):
                            pyramid_noise_discount=args.pyramid_noise_discount,
                            zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                            batch_share_noise=False)
+        encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
+                                                       clip_skip=args.clip_skip,
+                                                       embedding_perturbation=args.embedding_perturbation)
 
-        model_pred, target = _get_model_prediction_and_target(latents, tokens, noise, timesteps, unet, text_encoder,
+        model_pred, target = _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet,
                                                               noise_scheduler, args=args)
         return model_pred, target
 
@@ -1195,81 +1198,104 @@ def main(args):
                 #    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
                 #    loss_scale = loss_scale * runt_loss_scale
 
-                did_backward = False
-                loss = None
                 assert type(batch["captions"]) is dict
                 caption_variants = list(sorted(batch["captions"].keys()))
-                for caption_variant in caption_variants:
+                model_pred_all = []
+                target_all = []
+                caption_str_all = []
+                timesteps_all = []
+                loss_scale_all = []
+                mask_all = []
 
-                    tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
-                    caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
+                image_shape = batch["image"].shape
+                batch_size = image_shape[0]
 
-                    batch_size = tokens.shape[0]
-
-                    with torch.no_grad():
-                        image_shape = batch["image"].shape
-                        noise_shape = (image_shape[0], 4, image_shape[2]//8, image_shape[3]//8)
-                        noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
+                with torch.no_grad():
+                    noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
+                    noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
                                        pyramid_noise_discount=args.pyramid_noise_discount,
                                        zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                        batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
                                        )
-                        timesteps = _get_timesteps(batch_size=batch_size,
-                                               batch_share_timesteps=(do_contrastive_learning or args.batch_share_timesteps),
+                    timesteps = _get_timesteps(batch_size=batch_size,
+                                               batch_share_timesteps=(
+                                                           do_contrastive_learning or args.batch_share_timesteps),
                                                device=unet.device,
                                                timesteps_range=(args.timestep_start, args.timestep_end))
 
-                    slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
-                    runt_size = batch["runt_size"]
+                slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
+                runt_size = batch["runt_size"]
+                latents_slices = []
+                for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
+                    latents_slice = get_latents(batch["image"][slice_start:slice_end], vae, device=unet.device, args=args)
+                    latents_slices.append(latents_slice)
+                latents = torch.cat(latents_slices)
+                del latents_slices
 
-                    model_pred_all = []
-                    target_all = []
+                for caption_variant in caption_variants:
+                    tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
+                    caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
+                    encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
+                                                                   clip_skip=args.clip_skip,
+                                                                   embedding_perturbation=args.embedding_perturbation)
+
                     for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
-                        latents_slice = get_latents(batch["image"][slice_start:slice_end], vae, device=unet.device, args=args)
-                        tokens_slice = tokens[slice_start:slice_end]
+                        latents_slice = latents[slice_start:slice_end]
+                        encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
                         noise_slice = noise[slice_start:slice_end]
                         timesteps_slice = timesteps[slice_start:slice_end]
                         model_pred, target = _get_model_prediction_and_target(latents=latents_slice,
-                                                                              tokens=tokens_slice,
+                                                                              encoder_hidden_states=encoder_hidden_states_slice,
                                                                               noise=noise_slice,
                                                                               timesteps=timesteps_slice,
                                                                               unet=unet,
-                                                                              text_encoder=text_encoder,
                                                                               noise_scheduler=noise_scheduler,
                                                                               args=args
                                                                               )
                         model_pred_all.append(model_pred)
                         target_all.append(target)
 
-                    model_pred = torch.cat(model_pred_all)
-                    target = torch.cat(target_all)
-                    del model_pred_all, target_all
+                    slice_end = batch_size - runt_size
+                    caption_str_all.append(caption_str[:slice_end])
+                    timesteps_all.append(timesteps[:slice_end])
+                    loss_scale_all.append(loss_scale[:slice_end])
+                    if batch["mask"] is not None:
+                        mask_all.append(batch["mask"][:slice_end])
 
-                    slice_end = batch_size-runt_size
-                    mask = None if batch["mask"] is None else batch["mask"][:slice_end]
-                    loss = _get_loss(model_pred, target, caption_str=caption_str[:slice_end], mask=mask,
-                                     timesteps=timesteps[:slice_end],
-                                     loss_scale=loss_scale[:slice_end],
-                                     noise_scheduler=noise_scheduler,
-                                     do_contrastive_learning=do_contrastive_learning,
-                                     args=args
-                                     )
-                    del target, model_pred
+                model_pred = torch.cat(model_pred_all)
+                target = torch.cat(target_all)
+                timesteps = torch.cat(timesteps_all)
+                loss_scale = torch.cat(loss_scale_all)
+                mask = None if len(mask_all) == 0 else torch.cat(mask_all)
 
-                    if not args.jacobian_descent:
-                        loss = loss.mean()
+                del model_pred_all, target_all, timesteps_all, loss_scale_all, mask_all
 
-                    ed_optimizer.backward(loss)
+                loss = _get_loss(model_pred,
+                                 target,
+                                 caption_str=caption_str_all,
+                                 mask=mask,
+                                 timesteps=timesteps,
+                                 loss_scale=loss_scale,
+                                 noise_scheduler=noise_scheduler,
+                                 do_contrastive_learning=do_contrastive_learning,
+                                 args=args
+                                 )
+                del target, model_pred
+
+                loss = loss.mean()
+                ed_optimizer.backward(loss)
+
+                loss_step = loss.detach().item()
+                del loss
+
+                steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+                loss_log_step.append(loss_step)
+                loss_epoch.append(loss_step)
 
                 ed_optimizer.step(step, global_step)
 
-                if did_backward:
-                    # reset our randomized contrastive enabler after doing a backward step
-                    do_everything_contrastive_learning = None
-
-                if (not batch["do_contrastive_learning"]) or did_backward:
-                    prev_noise = None
-                    prev_timesteps = None
+                # reset our randomized contrastive enabler after doing a backward step
+                do_everything_contrastive_learning = None
 
                 if (global_step + 1) % sample_generator.sample_steps == 0:
                     needs_samples = True
@@ -1287,16 +1313,6 @@ def main(args):
                         # debug_end_time = time.time() # Measure time
                         # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
                         # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
-
-                if len(loss.shape)>1:
-                    loss = loss.mean()
-                loss_step = loss.detach().item()
-
-                steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
-
-                loss_log_step.append(loss_step)
-                loss_epoch.append(loss_step)
-                del loss
 
                 if needs_samples:
                     generate_samples(global_step=global_step, batch=batch)
