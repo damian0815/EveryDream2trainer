@@ -1200,13 +1200,6 @@ def main(args):
 
                 assert type(batch["captions"]) is dict
                 caption_variants = list(sorted(batch["captions"].keys()))
-                model_pred_all = []
-                target_all = []
-                caption_str_all = []
-                timesteps_all = []
-                loss_scale_all = []
-                mask_all = []
-
                 image_shape = batch["image"].shape
                 batch_size = image_shape[0]
 
@@ -1239,6 +1232,9 @@ def main(args):
                                                                    clip_skip=args.clip_skip,
                                                                    embedding_perturbation=args.embedding_perturbation)
 
+                    model_pred_all = []
+                    target_all = []
+
                     for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
                         latents_slice = latents[slice_start:slice_end]
                         encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
@@ -1256,41 +1252,33 @@ def main(args):
                         target_all.append(target)
 
                     slice_end = batch_size - runt_size
-                    caption_str_all.append(caption_str[:slice_end])
-                    timesteps_all.append(timesteps[:slice_end])
-                    loss_scale_all.append(loss_scale[:slice_end])
-                    if batch["mask"] is not None:
-                        mask_all.append(batch["mask"][:slice_end])
+                    mask = None if batch["mask"] is None else batch["mask"][:slice_end]
 
-                model_pred = torch.cat(model_pred_all)
-                target = torch.cat(target_all)
-                timesteps = torch.cat(timesteps_all)
-                loss_scale = torch.cat(loss_scale_all)
-                mask = None if len(mask_all) == 0 else torch.cat(mask_all)
+                    model_pred = torch.cat(model_pred_all)
+                    target = torch.cat(target_all)
+                    del model_pred_all, target_all
 
-                del model_pred_all, target_all, timesteps_all, loss_scale_all, mask_all
+                    loss = _get_loss(model_pred,
+                                     target,
+                                     caption_str=caption_str[:slice_end],
+                                     mask=mask,
+                                     timesteps=timesteps[:slice_end],
+                                     loss_scale=loss_scale[:slice_end],
+                                     noise_scheduler=noise_scheduler,
+                                     do_contrastive_learning=do_contrastive_learning,
+                                     args=args
+                                     )
+                    del target, model_pred
 
-                loss = _get_loss(model_pred,
-                                 target,
-                                 caption_str=caption_str_all,
-                                 mask=mask,
-                                 timesteps=timesteps,
-                                 loss_scale=loss_scale,
-                                 noise_scheduler=noise_scheduler,
-                                 do_contrastive_learning=do_contrastive_learning,
-                                 args=args
-                                 )
-                del target, model_pred
+                    loss = loss.mean()
+                    ed_optimizer.backward(loss)
 
-                loss = loss.mean()
-                ed_optimizer.backward(loss)
+                    loss_step = loss.detach().item()
+                    del loss
 
-                loss_step = loss.detach().item()
-                del loss
-
-                steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
-                loss_log_step.append(loss_step)
-                loss_epoch.append(loss_step)
+                    steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+                    loss_log_step.append(loss_step)
+                    loss_epoch.append(loss_step)
 
                 ed_optimizer.step(step, global_step)
 
