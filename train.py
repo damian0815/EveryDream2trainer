@@ -55,7 +55,7 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
-    _get_loss, get_model_prediction_and_target_wrapper, get_latents
+    _get_loss, get_latents
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -817,7 +817,7 @@ def main(args):
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
         validator = EveryDreamValidator(args.validation_config,
-                                        default_batch_size=min(4, args.batch_size),
+                                        default_batch_size=args.forward_slice_size or args.batch_size,
                                         resolution=args.resolution,
                                         log_writer=log_writer,
                                         approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
@@ -1078,6 +1078,21 @@ def main(args):
             basename += f"-gs{global_step:05}"
         return os.path.join(log_folder, "ckpts", basename)
 
+    def get_model_prediction_and_target_wrapper(image, tokens):
+        timesteps = _get_timesteps(batch_size=image.shape[0],
+                                   batch_share_timesteps=False,
+                                   device=unet.device,
+                                   timesteps_range=(args.timestep_start, args.timestep_end))
+        latents = get_latents(image, vae, device=unet.device, args=args)
+        noise = _get_noise(latents.shape, unet.device, image.dtype,
+                           pyramid_noise_discount=args.pyramid_noise_discount,
+                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                           batch_share_noise=False)
+
+        model_pred, target = _get_model_prediction_and_target(latents, tokens, noise, timesteps, unet, text_encoder,
+                                                              noise_scheduler, args=args)
+        return model_pred, target
+
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
         validator.do_validation(global_step=0,
@@ -1191,10 +1206,10 @@ def main(args):
 
                     batch_size = tokens.shape[0]
 
-                    latents = get_latents(batch["image"], vae, device=unet.device, args=args)
-
                     with torch.no_grad():
-                        noise = _get_noise(latents.shape, device=unet.device, dtype=batch["image"].dtype,
+                        image_shape = batch["image"].shape
+                        noise_shape = (image_shape[0], 4, image_shape[2]//8, image_shape[3]//8)
+                        noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
                                        pyramid_noise_discount=args.pyramid_noise_discount,
                                        zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                        batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
@@ -1210,7 +1225,7 @@ def main(args):
                     model_pred_all = []
                     target_all = []
                     for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
-                        latents_slice = latents[slice_start:slice_end]
+                        latents_slice = get_latents(batch["image"][slice_start:slice_end], vae, device=unet.device, args=args)
                         tokens_slice = tokens[slice_start:slice_end]
                         noise_slice = noise[slice_start:slice_end]
                         timesteps_slice = timesteps[slice_start:slice_end]
@@ -1231,10 +1246,10 @@ def main(args):
                     del model_pred_all, target_all
 
                     slice_end = batch_size-runt_size
-                    mask = None if batch["mask"] is None else batch["mask"][0:slice_end]
-                    loss = _get_loss(model_pred, target, caption_str=caption_str[0:slice_end], mask=mask,
-                                     timesteps=timesteps,
-                                     loss_scale=loss_scale,
+                    mask = None if batch["mask"] is None else batch["mask"][:slice_end]
+                    loss = _get_loss(model_pred, target, caption_str=caption_str[:slice_end], mask=mask,
+                                     timesteps=timesteps[:slice_end],
+                                     loss_scale=loss_scale[:slice_end],
                                      noise_scheduler=noise_scheduler,
                                      do_contrastive_learning=do_contrastive_learning,
                                      args=args
@@ -1273,20 +1288,19 @@ def main(args):
                         # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
                         # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
-                if loss is not None:
-                    if len(loss.shape)>1:
-                        loss = loss.mean()
-                    loss_step = loss.detach().item()
+                if len(loss.shape)>1:
+                    loss = loss.mean()
+                loss_step = loss.detach().item()
 
-                    steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+                steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
 
-                    loss_log_step.append(loss_step)
-                    loss_epoch.append(loss_step)
-                    del loss
+                loss_log_step.append(loss_step)
+                loss_epoch.append(loss_step)
+                del loss
 
-                    if needs_samples:
-                        generate_samples(global_step=global_step, batch=batch)
-                        needs_samples = False
+                if needs_samples:
+                    generate_samples(global_step=global_step, batch=batch)
+                    needs_samples = False
 
                 steps_pbar.update(1)
 
@@ -1437,6 +1451,8 @@ def get_slices(batch_size, slice_size, runt_size):
     for slice_index in range(num_slices):
         slice_start = slice_index * slice_size
         slice_end = min(slice_start + slice_size, batch_size-runt_size)
+        if slice_end <= slice_start:
+            break
         yield slice_start, slice_end
 
 if __name__ == "__main__":

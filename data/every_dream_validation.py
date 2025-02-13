@@ -181,7 +181,7 @@ class EveryDreamValidator:
 
     def do_validation(self, global_step: int,
                       get_model_prediction_and_target_callable: Callable[
-                                         [Any, Any, Any], tuple[torch.Tensor, torch.Tensor]]):
+                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
         mean_loss_accumulator = 0
         for i, dataset in enumerate(self.validation_datasets):
             mean_loss = self._calculate_validation_loss(dataset.name,
@@ -214,8 +214,7 @@ class EveryDreamValidator:
                 keys = list(batch["captions"].keys())
                 for key in keys:
                     model_pred, target = get_model_prediction_and_target(image=batch["image"],
-                                                                         tokens=batch["tokens"][key],
-                                                                         caption_str=batch["captions"][key])
+                                                                         tokens=batch["tokens"][key])
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 

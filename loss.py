@@ -33,36 +33,6 @@ def get_latents(image, vae, device, args):
         latents = latents[0].sample() * 0.18215
         return latents
 
-def get_model_prediction_and_target_wrapper(args, unet, vae, text_encoder, noise_scheduler,
-                                            image, tokens,
-                                            return_loss=False,
-                                            do_contrastive_learning=False):
-    batch_share_timesteps = True if do_contrastive_learning else args.batch_share_timesteps
-    timesteps = _get_timesteps(batch_size=image.shape[0],
-                               batch_share_timesteps=batch_share_timesteps,
-                               device=unet.device,
-                               timesteps_range=(args.timestep_start, args.timestep_end))
-    batch_share_noise = True if do_contrastive_learning else args.batch_share_noise
-    latents = get_latents(image, vae, device=unet.device, args=args)
-    noise = _get_noise(latents.shape, unet.device, image.dtype,
-                       pyramid_noise_discount=args.pyramid_noise_discount,
-                       zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
-                       batch_share_noise=batch_share_noise)
-
-    model_pred, target = _get_model_prediction_and_target(latents, tokens, noise, timesteps, unet, text_encoder,
-                                                                     noise_scheduler, args=args)
-
-    if not return_loss:
-        return model_pred, target
-
-    loss = _get_loss()
-
-    if not args.jacobian_descent:
-        loss = loss.mean()
-
-    return model_pred, target, loss
-
-
 
 def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, noise_scheduler, do_contrastive_learning, args):
 
