@@ -43,7 +43,7 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
         # kohya implementation
         min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
         if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            snr_weight = min_snr_gamma / snr + 1
+            snr_weight = min_snr_gamma / (snr + 1)
         else:
             snr_weight = min_snr_gamma / snr
         loss_scale = loss_scale * snr_weight.to(loss_scale.device)
@@ -157,8 +157,6 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
 def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler, args):
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps,
                                                           args.latents_perturbation)
-    del latents
-    del noise
     with autocast(enabled=args.amp):
         # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
