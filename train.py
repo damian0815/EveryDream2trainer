@@ -1207,13 +1207,17 @@ def main(args):
                         def lerp(x, in_min, in_max, out_min, out_max):
                             pct = (x - in_min) / (in_max-in_min)
                             return out_min + pct * (out_max-out_min)
+                        def get_random_max_time(lower_bound):
+                            r = random.random()
+                            return round(lerp(pow(r, 6), 0, 1, lower_bound, args.timestep_end))
                         t_min_initial = int(lerp(800, 0, 1000, args.timestep_start, args.timestep_end))
-                        t_max_final = int(lerp(400, 0, 1000, args.timestep_start, args.timestep_end))
+                        t_max_final = int(lerp(200, 0, 1000, args.timestep_start, args.timestep_end))
+                        random_expand_t_max_final = get_random_max_time(lower_bound=t_max_final)
                         timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
                                                                        t_min_initial=t_min_initial,
                                                                        t_max_initial=args.timestep_end,
                                                                        t_min_final=args.timestep_start,
-                                                                       t_max_final=t_max_final,
+                                                                       t_max_final=random_expand_t_max_final,
                                                                        alpha=args.timestep_curriculum_alpha)
                         #print('timestep range:', timestep_range)
 
