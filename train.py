@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import contextlib
 import os
 import pprint
 import sys
@@ -55,7 +56,8 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
-    _get_loss, get_latents, _encode_caption_tokens
+    _get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
+    get_exponential_scaled_value
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -73,6 +75,8 @@ from plugins.plugins import PluginRunner
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
+_WANT_SAMPLES_SEMAPHORE_FILE = 'i_want_samples.semaphore'
+
 
 def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_betas=None, rescale_betas_zero_snr=False):
     noise_scheduler = None
@@ -977,18 +981,6 @@ def main(args):
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
-    accumulated_model_preds = []
-    accumulated_targets = []
-    accumulated_timesteps = []
-    accumulated_loss_scale = []
-    accumulated_caption_str = []
-    accumulated_mask = []
-    global prev_timesteps, prev_noise
-    prev_timesteps = None
-    prev_noise = None
-
-    # actual prediction function - shared between train and validate
-
     def generate_samples(global_step: int, batch):
         nonlocal unet
         nonlocal text_encoder
@@ -1101,9 +1093,6 @@ def main(args):
         validator.do_validation(global_step=0,
                                 get_model_prediction_and_target_callable=get_model_prediction_and_target_wrapper)
 
-        prev_timesteps = None
-        prev_noise = None
-
     # the sample generator might be configured to generate samples before step 0
     if sample_generator.generate_pretrain_samples:
         _, batch = next(enumerate(train_dataloader))
@@ -1163,14 +1152,10 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
-            batch = None
             # this dance is because want to be able to peek at the next batch's shape
-            do_everything_contrastive_learning = None
-            for next_step, next_batch in enumerate(itertools.chain(train_dataloader, [None])):
-                if batch is None:
-                    batch = next_batch
-                    continue
-                step = next_step - 1
+            for step, batch in enumerate(train_dataloader):
+                train_progress_01 = compute_train_process_01(epoch=epoch, max_epochs=args.max_epochs,
+                                                             step=step, steps_per_epoch=epoch_len)
 
                 step_start_time = time.time()
 
@@ -1182,14 +1167,17 @@ def main(args):
                         batch=batch,
                         ed_state=make_current_ed_state())
 
-                if do_everything_contrastive_learning is None:
-                    if batch["do_contrastive_learning"]:
-                        do_everything_contrastive_learning = False
-                    else:
-                        do_everything_contrastive_learning = args.everything_contrastive_learning_p > random.random()
+                if args.everything_contrastive_learning_p > 0 and not batch["do_contrastive_learning"]:
+                    batch["do_contrastive_learning"] = args.everything_contrastive_learning_p > random.random()
 
-                if do_everything_contrastive_learning:
-                    batch["do_contrastive_learning"] = True
+                if args.contrastive_learning_curriculum_alpha == 0:
+                    contrastive_learning_negative_loss_scale = args.contrastive_learning_negative_loss_scale
+                else:
+                    contrastive_learning_negative_loss_scale = get_exponential_scaled_value(train_progress_01,
+                                                               initial_value=args.contrastive_learning_negative_loss_scale,
+                                                               final_value=0,
+                                                               alpha=args.contrastive_learning_curriculum_alpha)
+                    #print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
 
                 do_contrastive_learning = batch["do_contrastive_learning"]
 
@@ -1200,6 +1188,8 @@ def main(args):
 
                 assert type(batch["captions"]) is dict
                 caption_variants = list(sorted(batch["captions"].keys()))
+                if not args.all_caption_variants:
+                    caption_variants = [random.choice(caption_variants)]
                 image_shape = batch["image"].shape
                 batch_size = image_shape[0]
 
@@ -1210,25 +1200,48 @@ def main(args):
                                        zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                        batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
                                        )
+
+                    if args.timestep_curriculum_alpha == 0:
+                        timestep_range = (args.timestep_start, args.timestep_end)
+                    else:
+                        def lerp(x, in_min, in_max, out_min, out_max):
+                            pct = (x - in_min) / (in_max-in_min)
+                            return out_min + pct * (out_max-out_min)
+                        t_min_initial = int(lerp(800, 0, 1000, args.timestep_start, args.timestep_end))
+                        t_max_final = int(lerp(400, 0, 1000, args.timestep_start, args.timestep_end))
+                        timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
+                                                                       t_min_initial=t_min_initial,
+                                                                       t_max_initial=args.timestep_end,
+                                                                       t_min_final=args.timestep_start,
+                                                                       t_max_final=t_max_final,
+                                                                       alpha=args.timestep_curriculum_alpha)
+                        #print('timestep range:', timestep_range)
+
                     timesteps = _get_timesteps(batch_size=batch_size,
                                                batch_share_timesteps=(
                                                            do_contrastive_learning or args.batch_share_timesteps),
                                                device=unet.device,
-                                               timesteps_range=(args.timestep_start, args.timestep_end))
+                                               timesteps_range=timestep_range)
 
                 slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
                 runt_size = batch["runt_size"]
-                latents_slices = []
-                for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
-                    latents_slice = get_latents(batch["image"][slice_start:slice_end], vae, device=unet.device, args=args)
-                    latents_slices.append(latents_slice)
-                latents = torch.cat(latents_slices)
-                del latents_slices
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
+                    latents_slices = []
+                    pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
+                    for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
+                        latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
+                        latents_slice = latents_slice[0].sample() * 0.18215
+                        latents_slices.append(latents_slice)
+                    del pixel_values
+                    latents = torch.cat(latents_slices)
+                    del latents_slices
 
                 for caption_variant in caption_variants:
                     tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
                     caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
-                    encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
+
+                    with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
+                        encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
                                                                    clip_skip=args.clip_skip,
                                                                    embedding_perturbation=args.embedding_perturbation)
 
@@ -1266,6 +1279,7 @@ def main(args):
                                      loss_scale=loss_scale[:slice_end],
                                      noise_scheduler=noise_scheduler,
                                      do_contrastive_learning=do_contrastive_learning,
+                                     contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                      args=args
                                      )
                     del target, model_pred
@@ -1281,9 +1295,6 @@ def main(args):
                     loss_epoch.append(loss_step)
 
                 ed_optimizer.step(step, global_step)
-
-                # reset our randomized contrastive enabler after doing a backward step
-                do_everything_contrastive_learning = None
 
                 if (global_step + 1) % sample_generator.sample_steps == 0:
                     needs_samples = True
@@ -1302,9 +1313,11 @@ def main(args):
                         # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
                         # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
-                if needs_samples:
+                if needs_samples or os.path.exists(_WANT_SAMPLES_SEMAPHORE_FILE):
                     generate_samples(global_step=global_step, batch=batch)
                     needs_samples = False
+                    if os.path.exists(_WANT_SAMPLES_SEMAPHORE_FILE):
+                        os.unlink(_WANT_SAMPLES_SEMAPHORE_FILE)
 
                 steps_pbar.update(1)
 
@@ -1317,6 +1330,8 @@ def main(args):
 
                     log_writer.add_scalar(tag="hyperparameter/lr unet", scalar_value=lr_unet, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timestep_range[0], global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timestep_range[1], global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
                     avg = sum_img / len(images_per_sec_log_step)
@@ -1335,10 +1350,9 @@ def main(args):
                     append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                     torch.cuda.empty_cache()
 
+
                 if validator and step in validation_steps:
-                    prev_timesteps_save, prev_noise_save = prev_timesteps, prev_noise
                     validator.do_validation(global_step, get_model_prediction_and_target_wrapper)
-                    prev_timesteps, prev_noise = prev_timesteps_save, prev_noise_save
 
                 min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 
@@ -1374,10 +1388,6 @@ def main(args):
                 ):
                     print(f"only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
                     break
-
-                prev_batch = batch
-                batch = next_batch
-                del prev_batch
 
                 global_step += 1
 
@@ -1515,6 +1525,7 @@ if __name__ == "__main__":
     argparser.add_argument("--save_optimizer", action="store_true", default=False, help="saves optimizer state with ckpt, useful for resuming training later")
     argparser.add_argument("--seed", type=int, default=555, help="seed used for samples and shuffling, use -1 for random")
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
+    argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
     argparser.add_argument("--train_sampler", type=str, default="ddpm", help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim"])
@@ -1554,7 +1565,9 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_learning_delta_loss_method", action="store_true", help="If passed, contrastive learning works with deltas from correct to incorrect targets / predictions")
     argparser.add_argument("--contrastive_learning_delta_timestep_start", type=int, default=150, help="Where to start scaling delta negative loss")
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="dropout probability for contrastive learning, 0..1")
+    argparser.add_argument("--contrastive_learning_curriculum_alpha", type=float, default=0, help="if passed, exponentially disable contrastive learning as training progresses")
     argparser.add_argument("--everything_contrastive_learning_p", type=float, default=0, help="probability to run contrastive learning on everything, 0..1")
+    argparser.add_argument("--all_caption_variants", action='store_true', help='if passed, use ALL caption variants every step')
 
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")

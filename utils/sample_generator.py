@@ -177,6 +177,7 @@ class SampleGenerator:
             self.generate_pretrain_samples = config.get('generate_pretrain_samples', self.generate_pretrain_samples)
             self.sample_steps = config.get('generate_samples_every_n_steps', self.sample_steps)
             self.sample_invokeai_info_dicts_json = config.get('invokeai_info_dicts_json', None)
+            self.append_invokeai_info_dicts = config.get('append_invokeai_info_dicts', False)
             sample_requests_config = config.get('samples', None)
             if sample_requests_config is None:
                 self.sample_requests = self._make_random_caption_sample_requests()
@@ -209,100 +210,101 @@ class SampleGenerator:
 
         sample_index = 0
         with autocast():
+            try:
+                if self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts:
+                    batch: list[SampleRequest]
+                    def sample_compatibility_test(a: SampleRequest, b: SampleRequest) -> bool:
+                        return a.size == b.size
+                    batches = list(chunk_list(self.sample_requests, self.batch_size,
+                                            compatibility_test=sample_compatibility_test))
+                    pbar = tqdm(total=len(batches), disable=disable_progress_bars, position=1, leave=False,
+                                      desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
+                    compel = Compel(tokenizer=pipe.tokenizer,
+                                    text_encoder=pipe.text_encoder,
+                                    use_penultimate_clip_layer=self.use_penultimate_clip_layer)
+                    for batch in batches:
+                        prompts = [p.prompt for p in batch]
+                        negative_prompts = [p.negative_prompt for p in batch]
+                        seeds = [(p.seed if p.seed != -1 else random.randint(0, 2 ** 30))
+                                 for p in batch]
+                        # all sizes in a batch are the same
+                        size = batch[0].size
+                        generators = [torch.Generator(pipe.device).manual_seed(seed) for seed in seeds]
 
-            if self.sample_invokeai_info_dicts_json is not None:
-                try:
+                        batch_images = []
+                        for cfg in self.cfgs:
+                            pipe.set_progress_bar_config(disable=disable_progress_bars, position=2, leave=False,
+                                                         desc=f"{Fore.LIGHTYELLOW_EX}CFG scale {cfg}{Style.RESET_ALL}")
+                            prompt_embeds = compel(prompts)
+                            negative_prompt_embeds = compel(negative_prompts)
+                            images = pipe(prompt_embeds=prompt_embeds,
+                                          negative_prompt_embeds=negative_prompt_embeds,
+                                          num_inference_steps=self.num_inference_steps,
+                                          num_images_per_prompt=1,
+                                          guidance_scale=cfg,
+                                          generator=generators,
+                                          width=size[0],
+                                          height=size[1],
+                                          guidance_rescale=self.guidance_rescale
+                                          ).images
+
+                            for image in images:
+                                draw = ImageDraw.Draw(image)
+                                print_msg = f"cfg:{cfg:.1f}"
+
+                                l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
+                                text_width = r - l
+                                text_height = b - t
+
+                                x = float(image.width - text_width - 10)
+                                y = float(image.height - text_height - 10)
+
+                                draw.rectangle((x, y, image.width, image.height), fill="white")
+                                draw.text((x, y), print_msg, fill="black", font=font)
+
+                            batch_images.append(images)
+                            del images
+
+                        del generators
+                        #print("batch_images:", batch_images)
+
+                        width = size[0] * len(self.cfgs)
+                        height = size[1]
+
+                        for prompt_idx in range(len(batch)):
+                            #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
+                            result = Image.new('RGB', (width, height))
+                            x_offset = 0
+
+                            for cfg_idx in range(len(self.cfgs)):
+                                image = batch_images[cfg_idx][prompt_idx]
+                                result.paste(image, (x_offset, 0))
+                                x_offset += image.width
+
+                            prompt = prompts[prompt_idx]
+                            self.save_sample_image(result,
+                                                   sample_index=sample_index,
+                                                   global_step=global_step,
+                                                   prompt=prompt,
+                                                   is_random_caption=batch[prompt_idx].wants_random_caption,
+                                                   extra_info=extra_info)
+                            sample_index += 1
+
+                            del result
+                        del batch_images
+
+                        pbar.update(1)
+
+                if self.sample_invokeai_info_dicts_json is not None:
                     with open(self.sample_invokeai_info_dicts_json, 'rt') as f:
                         invokeai_info_dicts = json.load(f)
                     self.generate_invokeai_samples(invokeai_info_dicts, pipe=pipe,
-                                                   global_step=global_step, extra_info=extra_info)
-                    return
-                except Exception as e:
+                                                   global_step=global_step, extra_info=extra_info,
+                                                   index_offset=len(self.sample_requests))
+
+            except Exception as e:
                     print(traceback.format_exc())
-                    print("caught exception", e, "generating samples from", self.sample_invokeai_info_dicts_json, "doing regular sample gen")
-
-            batch: list[SampleRequest]
-            def sample_compatibility_test(a: SampleRequest, b: SampleRequest) -> bool:
-                return a.size == b.size
-            batches = list(chunk_list(self.sample_requests, self.batch_size,
-                                    compatibility_test=sample_compatibility_test))
-            pbar = tqdm(total=len(batches), disable=disable_progress_bars, position=1, leave=False,
-                              desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
-            compel = Compel(tokenizer=pipe.tokenizer,
-                            text_encoder=pipe.text_encoder,
-                            use_penultimate_clip_layer=self.use_penultimate_clip_layer)
-            for batch in batches:
-                prompts = [p.prompt for p in batch]
-                negative_prompts = [p.negative_prompt for p in batch]
-                seeds = [(p.seed if p.seed != -1 else random.randint(0, 2 ** 30))
-                         for p in batch]
-                # all sizes in a batch are the same
-                size = batch[0].size
-                generators = [torch.Generator(pipe.device).manual_seed(seed) for seed in seeds]
-
-                batch_images = []
-                for cfg in self.cfgs:
-                    pipe.set_progress_bar_config(disable=disable_progress_bars, position=2, leave=False,
-                                                 desc=f"{Fore.LIGHTYELLOW_EX}CFG scale {cfg}{Style.RESET_ALL}")
-                    prompt_embeds = compel(prompts)
-                    negative_prompt_embeds = compel(negative_prompts)
-                    images = pipe(prompt_embeds=prompt_embeds,
-                                  negative_prompt_embeds=negative_prompt_embeds,
-                                  num_inference_steps=self.num_inference_steps,
-                                  num_images_per_prompt=1,
-                                  guidance_scale=cfg,
-                                  generator=generators,
-                                  width=size[0],
-                                  height=size[1],
-                                  guidance_rescale=self.guidance_rescale
-                                  ).images
-
-                    for image in images:
-                        draw = ImageDraw.Draw(image)
-                        print_msg = f"cfg:{cfg:.1f}"
-
-                        l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
-                        text_width = r - l
-                        text_height = b - t
-
-                        x = float(image.width - text_width - 10)
-                        y = float(image.height - text_height - 10)
-
-                        draw.rectangle((x, y, image.width, image.height), fill="white")
-                        draw.text((x, y), print_msg, fill="black", font=font)
-
-                    batch_images.append(images)
-                    del images
-
-                del generators
-                #print("batch_images:", batch_images)
-
-                width = size[0] * len(self.cfgs)
-                height = size[1]
-
-                for prompt_idx in range(len(batch)):
-                    #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
-                    result = Image.new('RGB', (width, height))
-                    x_offset = 0
-
-                    for cfg_idx in range(len(self.cfgs)):
-                        image = batch_images[cfg_idx][prompt_idx]
-                        result.paste(image, (x_offset, 0))
-                        x_offset += image.width
-
-                    prompt = prompts[prompt_idx]
-                    self.save_sample_image(result,
-                                           sample_index=sample_index,
-                                           global_step=global_step,
-                                           prompt=prompt,
-                                           is_random_caption=batch[prompt_idx].wants_random_caption,
-                                           extra_info=extra_info)
-                    sample_index += 1
-
-                    del result
-                del batch_images
-
-                pbar.update(1)
+                    print("caught exception", e, "generating samples")
 
     def save_sample_image(self,
                           result: PIL.Image,
@@ -391,7 +393,7 @@ class SampleGenerator:
         else:
             raise ValueError(f"unknown scheduler '{scheduler}'")
 
-    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info):
+    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0):
 
         params = [ImageGenerationParams.from_invokeai_metadata(d)
                   for d in sample_invokeai_info_dicts]
@@ -405,4 +407,5 @@ class SampleGenerator:
                                   all_params=params,
                                   batch_size=self.batch_size,
                                   image_save_cb=save_image,
-                                  extra_cfgs=self.cfgs[1:])
+                                  extra_cfgs=self.cfgs[1:],
+                                  index_offset=index_offset)

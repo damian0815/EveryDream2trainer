@@ -2,7 +2,7 @@ import yaml
 import json
 
 from attrs import define, field
-from data.image_train_item import ImageCaption, ImageTrainItem
+from data.image_train_item import ImageCaption, ImageTrainItem, check_caption_json
 from utils.fs_helpers import *
 from typing import Iterable
 
@@ -115,11 +115,14 @@ class ImageConfig:
         if os.path.isfile(text):
             return ImageConfig.from_file(text)
 
-        split_caption = list(map(str.strip, text.split(",")))
-        return ImageConfig(
-            main_prompts=split_caption[0], 
-            tags=map(Tag.parse, split_caption[1:])
-            )
+        if text.startswith("<<json>>"):
+            return ImageConfig(main_prompts=text, tags=[])
+        else:
+            split_caption = list(map(str.strip, text.split(",")))
+            return ImageConfig(
+                main_prompts=split_caption[0],
+                tags=map(Tag.parse, split_caption[1:])
+                )
 
     @classmethod    
     def from_file(cls, file: str):
@@ -211,7 +214,11 @@ class Dataset:
             for img in filter(is_image, files):
                 img_cfg = Dataset.__sidecar_cfg(img, fileset)
                 resolved_cfg = ImageConfig.fold([global_cfg, local_cfg, img_cfg])
-                image_configs[img] = Dataset.__ensure_caption(resolved_cfg, img)
+                ensured = Dataset.__ensure_caption(resolved_cfg, img)
+                #for m in ensured.main_prompts.keys():
+                #    check_caption_json(m)
+                image_configs[img] = ensured
+
             return global_cfg
 
         walk_and_visit(data_root, process_dir, ImageConfig())

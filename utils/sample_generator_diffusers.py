@@ -239,7 +239,8 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
                               generator_device='cpu',
                               pbar_update_cb=None,
                               pbar_desc=None,
-                              extra_cfgs=None
+                              extra_cfgs=None,
+                              index_offset=0
                               ):
     extra_cfgs = extra_cfgs or []
     all_params = sorted(all_params, key=lambda x: get_critical_params(x))
@@ -258,7 +259,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
             if pbar_update_cb:
                 pbar_update_cb(n, skipped=skipped)
 
-        base_sample_index = 0
+        base_sample_index = index_offset
 
         for k, params in itertools.groupby(all_params, lambda x: get_critical_params(x)):
             params = list(params)

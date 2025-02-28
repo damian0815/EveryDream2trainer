@@ -9,6 +9,34 @@ import torch.nn.functional as F
 #from train import pyramid_noise_like, compute_snr
 
 
+def compute_train_process_01(epoch, max_epochs, step, steps_per_epoch):
+    total_steps = steps_per_epoch * max_epochs
+    steps_completed = steps_per_epoch * epoch + step
+    return steps_completed / total_steps
+
+"""
+alpha=2-4: Slow advance (spread hugs initial_value)
+alpha=1: Linear progression
+alpha<1: Quick advance (spread hugs final_value)
+"""
+def get_exponential_scaled_value(progress_01, initial_value, final_value, alpha=3.0):
+    # Apply non-linear scaling with alpha (higher alpha = faster early descent)
+    scaled_progress = progress_01 ** alpha
+    return initial_value + scaled_progress * (final_value - initial_value)
+
+
+def get_timestep_curriculum_range(progress_01,
+                                  t_min_initial=800, t_max_initial=1000,
+                                  t_min_final=0, t_max_final=400,
+                                  alpha=3.0):
+    # Interpolate boundaries
+    min_t = get_exponential_scaled_value(progress_01, t_min_initial, t_min_final, alpha=alpha)
+    max_t = get_exponential_scaled_value(progress_01, t_max_initial, t_max_final, alpha=alpha)
+
+    assert min_t <= max_t
+    return int(min_t), int(max_t)
+
+
 def get_encoder_hidden_states(text_encoder, cuda_caption, clip_skip, embedding_perturbation):
     encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
 
@@ -34,7 +62,9 @@ def get_latents(image, vae, device, args):
         return latents
 
 
-def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, noise_scheduler, do_contrastive_learning, args):
+def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, noise_scheduler,
+              do_contrastive_learning,
+              contrastive_learning_negative_loss_scale, args):
 
     device = model_pred.device
 
@@ -134,7 +164,7 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
                                          else [max(1, x) for x in num_samples]
                                          ), device=negative_loss.device)
 
-        negative_loss_scale = args.contrastive_learning_negative_loss_scale / num_samples_safe
+        negative_loss_scale = contrastive_learning_negative_loss_scale / num_samples_safe
         negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).to(device).expand_as(positive_loss)
         if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
             # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases

@@ -22,7 +22,7 @@ from collections import defaultdict
 import torch
 from torch.utils.data import Dataset
 from data.data_loader import DataLoaderMultiAspect
-from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
+from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID, check_caption_json
 import random
 from torchvision import transforms
 from transformers import CLIPTokenizer
@@ -116,6 +116,7 @@ class EveryDreamBatch(Dataset):
             example["caption"] = train_item["caption"].get_shuffled_caption(self.seed, keep_tags=self.keep_tags)
         else:
             example["caption"] = train_item["caption"].get_caption()
+        check_caption_json(example["caption"])
 
         if self.random_instance.random() <= self.contrastive_learning_dropout_p:
             example["do_contrastive_learning"] = False

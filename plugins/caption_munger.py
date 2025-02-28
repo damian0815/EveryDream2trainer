@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 from plugins.plugins import BasePlugin
 
@@ -30,7 +31,11 @@ class CaptionMungerPlugin(BasePlugin):
 
 
     def transform_caption_json_raw(self, captions_json) -> dict[str,str]:
-        d = json.loads(captions_json)
+        try:
+            d = json.loads(captions_json)
+        except Exception as e:
+            logging.error(f"unable to load json from {captions_json}: {e}")
+            raise
         return {k: (self.transform_caption(v) if (v and len(v.strip())>0) else None)
                 for k, v in d.items()}
 

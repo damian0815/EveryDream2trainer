@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import bisect
+import json
 import logging
 import math
 import os
@@ -29,6 +30,15 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 
 OptionalImageCaption = typing.Optional['ImageCaption']
+
+def check_caption_json(caption_str: str):
+    if '<<json>>' in caption_str:
+        try:
+            json.loads(caption_str.replace("<<json>>", ""))
+        except Exception as e:
+            logging.error(f"caught {e} loading caption from {caption_str}")
+            raise
+
 
 class ImageCaption:
     """
@@ -53,6 +63,8 @@ class ImageCaption:
 
         if use_weights and len(tag_weights) > len(tags):
             self.__tag_weights = tag_weights[:len(tags)]
+
+        #check_caption_json(", ".join([self.__main_prompt] + self.__tags))
 
     def rating(self) -> float:
         return self.__rating
