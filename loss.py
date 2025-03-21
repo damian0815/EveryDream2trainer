@@ -30,8 +30,8 @@ def get_timestep_curriculum_range(progress_01,
                                   t_min_final=0, t_max_final=400,
                                   alpha=3.0):
     # Interpolate boundaries
-    min_t = get_exponential_scaled_value(progress_01, t_min_initial, t_min_final, alpha=alpha)
-    max_t = get_exponential_scaled_value(progress_01, t_max_initial, t_max_final, alpha=alpha)
+    min_t = min(1000, max(0, get_exponential_scaled_value(progress_01*2, t_min_initial, t_min_final, alpha=alpha)))
+    max_t = min(1000, max(0, get_exponential_scaled_value(progress_01, t_max_initial, t_max_final, alpha=alpha)))
 
     assert min_t <= max_t
     return int(min_t), int(max_t)

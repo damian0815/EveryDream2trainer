@@ -12,11 +12,11 @@ from colorama import Fore, Style
 from data.image_train_item import ImageCaption, ImageTrainItem
 
 class DataResolver:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, aspects):
         """
         :param args: EveryDream configuration, an `argparse.Namespace` object.
         """
-        self.aspects = args.aspects
+        self.aspects = aspects
         self.flip_p = args.flip_p
 
     def image_train_items(self, data_root: str) -> list[ImageTrainItem]:
@@ -75,37 +75,37 @@ def strategy(data_root: str) -> typing.Type[DataResolver]:
         
     raise ValueError(f"data_root '{data_root}' is not a valid directory or JSON file.")
                     
-def resolve_root(path: str, args: argparse.Namespace) -> list[ImageTrainItem]:
+def resolve_root(path: str, args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
     """
     Resolve the training data from the root path.
     :param path: The root path to resolve.
     :param args: EveryDream configuration, an `argparse.Namespace` object.
     """
     resolver = strategy(path)
-    return resolver(args).image_train_items(path)
+    return resolver(args, aspects).image_train_items(path)
 
-def resolve(value: typing.Union[dict, str], args: argparse.Namespace) -> list[ImageTrainItem]:
+def resolve(value: typing.Union[dict, str], args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
     """
     Resolve the training data from the value.
     :param value: The value to resolve, either a dict, an array, or a string.
     :param args: EveryDream configuration, an `argparse.Namespace` object.
     """
     if isinstance(value, str):
-        return resolve_root(value, args)
+        return resolve_root(value, args, resolution, aspects)
     
     if isinstance(value, dict):
         resolver = value.get('resolver', None)
         match resolver:
             case 'directory' | 'json':
                 path = value.get('path', None)
-                return resolve_root(path, args)
+                return resolve_root(path, args, resolution, aspects)
             case 'multi':
-                return resolve(value.get('resolvers', []), args)
+                return resolve(value.get('resolvers', []), args, resolution, aspects)
             case _:
                 raise ValueError(f"Cannot resolve training data for resolver value '{resolver}'")
 
     if isinstance(value, list):
         items = []
         for item in value:
-            items += resolve(item, args)
+            items += resolve(item, args, resolution, aspects)
         return items 

@@ -451,8 +451,6 @@ def setup_args(args):
 
         logging.info(logging.info(f"{Fore.CYAN} * Activating rated images learning with a target rate of {args.rated_dataset_target_dropout_percent}% {Style.RESET_ALL}"))
 
-    args.aspects = aspects.get_aspect_buckets(args.resolution)
-
     if args.timestep_start < 0:
         raise ValueError("timestep_start must be >= 0")
     if args.timestep_end > 1000:
@@ -502,11 +500,11 @@ def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem
                             f"of {effective_multiplier}, which may cause problems. Consider adding {runt_size} or "
                             f"more images with aspect ratio {aspect_ratio_description}{batch_id_description}, or reducing your batch_size.")
 
-def resolve_image_train_items(args: argparse.Namespace) -> list[ImageTrainItem]:
-    logging.info(f"* DLMA resolution {args.resolution}, buckets: {args.aspects}")
+def resolve_image_train_items(args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
+    logging.info(f"* DLMA resolution {resolution}, buckets: {aspects}")
     logging.info(" Preloading images...")
 
-    resolved_items = resolver.resolve(args.data_root, args)
+    resolved_items = resolver.resolve(args.data_root, args, resolution, aspects)
     image_paths = set(map(lambda item: item.pathname, resolved_items))
 
     # Remove erroneous items
@@ -816,13 +814,16 @@ def main(args):
                                comment=args.run_name if args.run_name is not None else log_time,
                               )
 
-    image_train_items = resolve_image_train_items(args)
+    image_train_items = []
+    for resolution in args.resolution:
+        this_aspects = aspects.get_aspect_buckets(resolution)
+        image_train_items.extend(resolve_image_train_items(args, resolution, this_aspects))
 
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
         validator = EveryDreamValidator(args.validation_config,
                                         default_batch_size=args.forward_slice_size or args.batch_size,
-                                        resolution=args.resolution,
+                                        resolution=args.resolution[0],
                                         log_writer=log_writer,
                                         approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
                                         )
@@ -894,7 +895,7 @@ def main(args):
     log_args(log_writer, args, optimizer_config, log_folder, log_time)
 
     sample_generator = SampleGenerator(log_folder=log_folder, log_writer=log_writer,
-                                       default_resolution=args.resolution, default_seed=args.seed,
+                                       default_resolution=args.resolution[0], default_seed=args.seed,
                                        config_file_path=args.sample_prompts,
                                        batch_size=max(1,args.batch_size//2),
                                        default_sample_steps=args.sample_steps,
@@ -1114,6 +1115,7 @@ def main(args):
     try:        
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
         needs_samples = False
+        actual_effective_batch_size = 0
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1191,6 +1193,7 @@ def main(args):
                 if not args.all_caption_variants:
                     caption_variants = [random.choice(caption_variants)]
                 image_shape = batch["image"].shape
+
                 batch_size = image_shape[0]
 
                 with torch.no_grad():
@@ -1209,7 +1212,7 @@ def main(args):
                             return out_min + pct * (out_max-out_min)
                         def get_random_max_time(lower_bound):
                             r = random.random()
-                            return round(lerp(pow(r, 6), 0, 1, lower_bound, args.timestep_end))
+                            return round(lerp(pow(r, 8), 0, 1, lower_bound, args.timestep_end))
                         t_min_initial = int(lerp(800, 0, 1000, args.timestep_start, args.timestep_end))
                         t_max_final = int(lerp(200, 0, 1000, args.timestep_start, args.timestep_end))
                         random_expand_t_max_final = get_random_max_time(lower_bound=t_max_final)
@@ -1228,6 +1231,15 @@ def main(args):
                                                timesteps_range=timestep_range)
 
                 slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
+                slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
+                actual_image_size = image_shape[2] * image_shape[3]
+                slice_size_scale_factor = slice_size_image_size_reference / actual_image_size
+                slice_size = max(1, round(slice_size * slice_size_scale_factor))
+
+                # if True, divide the batch into 2 for loss+backward pass
+                # should only apply when doing multires when eg base res is 768 and curr res is 1024
+                subdivide_batch = slice_size_scale_factor < 0.85
+
                 runt_size = batch["runt_size"]
                 with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                     latents_slices = []
@@ -1252,7 +1264,10 @@ def main(args):
                     model_pred_all = []
                     target_all = []
 
-                    for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
+                    slices = list(get_slices(batch_size, slice_size, runt_size=runt_size))
+                    loss_start_sample_index = 0
+                    for slice_index, (slice_start, slice_end) in enumerate(slices):
+                        #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {slice_size}')
                         latents_slice = latents[slice_start:slice_end]
                         encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
                         noise_slice = noise[slice_start:slice_end]
@@ -1267,36 +1282,42 @@ def main(args):
                                                                               )
                         model_pred_all.append(model_pred)
                         target_all.append(target)
+                        actual_effective_batch_size += (slice_end - slice_start)
 
-                    slice_end = batch_size - runt_size
-                    mask = None if batch["mask"] is None else batch["mask"][:slice_end]
+                        if slice_index == (len(slices)-1) or (slice_index == len(slices) // 2 and subdivide_batch):
 
-                    model_pred = torch.cat(model_pred_all)
-                    target = torch.cat(target_all)
-                    del model_pred_all, target_all
+                            loss_end_sample_index = min(slice_end, batch_size - runt_size)
+                            mask = None if batch["mask"] is None else batch["mask"][loss_start_sample_index:loss_end_sample_index]
 
-                    loss = _get_loss(model_pred,
-                                     target,
-                                     caption_str=caption_str[:slice_end],
-                                     mask=mask,
-                                     timesteps=timesteps[:slice_end],
-                                     loss_scale=loss_scale[:slice_end],
-                                     noise_scheduler=noise_scheduler,
-                                     do_contrastive_learning=do_contrastive_learning,
-                                     contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
-                                     args=args
-                                     )
-                    del target, model_pred
+                            model_pred = torch.cat(model_pred_all)
+                            target = torch.cat(target_all)
 
-                    loss = loss.mean()
-                    ed_optimizer.backward(loss)
+                            model_pred_all = []
+                            target_all = []
 
-                    loss_step = loss.detach().item()
-                    del loss
+                            loss = _get_loss(model_pred,
+                                             target,
+                                             caption_str=caption_str[loss_start_sample_index:loss_end_sample_index],
+                                             mask=mask,
+                                             timesteps=timesteps[loss_start_sample_index:loss_end_sample_index],
+                                             loss_scale=loss_scale[loss_start_sample_index:loss_end_sample_index],
+                                             noise_scheduler=noise_scheduler,
+                                             do_contrastive_learning=do_contrastive_learning,
+                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
+                                             args=args
+                                             )
+                            del target, model_pred
+                            loss_start_sample_index = loss_end_sample_index
 
-                    steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
-                    loss_log_step.append(loss_step)
-                    loss_epoch.append(loss_step)
+                            loss = loss.mean()
+                            ed_optimizer.backward(loss)
+
+                            loss_step = loss.detach().item()
+                            del loss
+
+                            steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+                            loss_log_step.append(loss_step)
+                            loss_epoch.append(loss_step)
 
                 ed_optimizer.step(step, global_step)
 
@@ -1354,7 +1375,6 @@ def main(args):
                     append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                     torch.cuda.empty_cache()
 
-
                 if validator and step in validation_steps:
                     validator.do_validation(global_step, get_model_prediction_and_target_wrapper)
 
@@ -1385,6 +1405,10 @@ def main(args):
                                       data_root=args.data_root,
                                       batch=batch,
                                       ed_state=make_current_ed_state())
+
+                if ed_optimizer.will_do_grad_accum_step(step, global_step):
+                    log_writer.add_scalar("hyperparameter/effective batch size", scalar_value=actual_effective_batch_size, global_step=global_step)
+                    actual_effective_batch_size = 0
 
                 if (epoch == args.max_epochs-1
                         and ed_optimizer.will_do_grad_accum_step(step, global_step)
@@ -1517,7 +1541,7 @@ if __name__ == "__main__":
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
-    argparser.add_argument("--resolution", type=int, default=512, help="resolution to train", choices=supported_resolutions)
+    argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=supported_resolutions)
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
     argparser.add_argument("--run_name", type=str, required=False, default=None, help="Run name for wandb (child of project name), and comment for tensorboard, (def: None)")
     argparser.add_argument("--sample_prompts", type=str, default="sample_prompts.txt", help="Text file with prompts to generate test samples from, or JSON file with sample generator settings (default: sample_prompts.txt)")

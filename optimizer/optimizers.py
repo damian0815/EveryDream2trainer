@@ -281,6 +281,7 @@ class EveryDreamOptimizer():
             if args.max_steps is not None:
                 total_steps = min(args.max_steps, total_steps)
             args.lr_decay_steps = int(total_steps * args.auto_decay_steps_multiplier)
+            print('total_steps:', total_steps, ' -> lr_decay_steps:', args.lr_decay_steps)
 
         if args.lr_warmup_steps is None:
             # set warmup to 2% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 3% of max epochs

@@ -276,7 +276,7 @@ class EveryDreamValidator:
             flip_p=0.0,
             seed=self.seed,
         )
-        val_items = resolver.resolve_root(val_data_root, args)
+        val_items = resolver.resolve_root(val_data_root, args, self.resolution, args.aspects)
         val_items.sort(key=lambda i: i.pathname)
         random.shuffle(val_items)
         return val_items
