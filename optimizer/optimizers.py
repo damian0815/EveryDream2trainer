@@ -39,6 +39,7 @@ WEIGHT_DECAY_DEFAULT = 0.01
 LR_DEFAULT = 1e-6
 OPTIMIZER_TE_STATE_FILENAME = "optimizer_te.pt"
 OPTIMIZER_UNET_STATE_FILENAME = "optimizer_unet.pt"
+SCALER_STATE_FILENAME = 'scaler.pt'
 
 shared_timesteps: torch.Tensor = None
 
@@ -238,6 +239,7 @@ class EveryDreamOptimizer():
         """
         self._save_optimizer(self.optimizer_te, os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME)) if self.optimizer_te is not None else None
         self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)) if self.optimizer_unet is not None else None
+        self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME)) if self.scaler is not None else None
 
     def load(self, ckpt_path: str):
         """
@@ -245,10 +247,13 @@ class EveryDreamOptimizer():
         """
         te_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME)
         unet_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)
+        scaler_state_path = os.path.join(ckpt_path, SCALER_STATE_FILENAME)
         if os.path.exists(te_optimizer_state_path) and self.optimizer_te is not None:
             self._load_optimizer(self.optimizer_te, te_optimizer_state_path)
         if os.path.exists(unet_optimizer_state_path) and self.optimizer_unet is not None:
             self._load_optimizer(self.optimizer_unet, unet_optimizer_state_path)
+        if os.path.exists(scaler_state_path) and self.scaler is not None:
+            self._load_optimizer(self.scaler, scaler_state_path)
 
     def create_optimizers(self, args, text_encoder_params, unet_params):
         """

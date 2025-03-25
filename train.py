@@ -459,7 +459,7 @@ def setup_args(args):
     return args
 
 
-def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem], batch_size) -> None:
+def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem], batch_size, check_load_all=False, tokenizer=None) -> None:
     undersized_items = [item for item in items if item.is_undersized]
     if len(undersized_items) > 0:
         underized_log_path = os.path.join(log_folder, "undersized_images.txt")
@@ -471,6 +471,20 @@ def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem
                 message = f" *** {undersized_item.pathname} with size: {undersized_item.image_size} is smaller than target size: {undersized_item.target_wh}\n"
                 undersized_images_file.write(message)
 
+    if check_load_all:
+        data_loader = DataLoaderMultiAspect(items)
+        ed_batch = EveryDreamBatch(data_loader, tokenizer=tokenizer)
+        error_count = 0
+        print("checking we can load all images...")
+        for i in tqdm(items):
+            try:
+                _ = ed_batch.get_image_for_trainer(i)
+            except Exception as e:
+                logging.error(f" * while loading {i.pathname}, caught {e}")
+                error_count += 1
+        if error_count > 0:
+            logging.error(f"{error_count} broken images found, these will crash training, please delete or fix")
+            exit(2)
 
     # warn on underfilled aspect ratio buckets
 
@@ -505,17 +519,25 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects) -> 
     logging.info(" Preloading images...")
 
     resolved_items = resolver.resolve(args.data_root, args, resolution, aspects)
-    image_paths = set(map(lambda item: item.pathname, resolved_items))
 
     # Remove erroneous items
     for item in resolved_items:
         if item.error is not None:
             logging.error(f"{Fore.LIGHTRED_EX} *** Error opening {Fore.LIGHTYELLOW_EX}{item.pathname}{Fore.LIGHTRED_EX} to get metadata. File may be corrupt and will be skipped.{Style.RESET_ALL}")
             logging.error(f" *** exception: {item.error}")
-    image_train_items = [item for item in resolved_items if item.error is None]
-    print (f" * Found {len(image_paths)} files in '{args.data_root}'")
+    resolved_items = [item for item in resolved_items if item.error is None]
 
-    return image_train_items
+    # drop undersized, if requested
+    if args.skip_undersized_images:
+        full_count = len(resolved_items)
+        resolved_items = [i for i in resolved_items if not i.is_undersized]
+        post_drop_undersize_count = len(resolved_items)
+        if full_count != post_drop_undersize_count:
+            logging.info(f" * From {full_count} images, dropped {full_count - post_drop_undersize_count} undersized images ({post_drop_undersize_count} remaining). Remove --skip_undersized_images to log which ones.")
+
+    print (f" * Found {len(resolved_items)} items in '{args.data_root}'")
+
+    return resolved_items
 
 def write_batch_schedule(log_folder: str, train_batch: EveryDreamBatch, epoch: int):
     with open(f"{log_folder}/ep{epoch}_batch_schedule.txt", "w", encoding='utf-8') as f:
@@ -830,7 +852,8 @@ def main(args):
         # the validation dataset may need to steal some items from image_train_items
         image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=tokenizer)
 
-    report_image_train_item_problems(log_folder, image_train_items, batch_size=args.batch_size)
+    report_image_train_item_problems(log_folder, image_train_items, batch_size=args.batch_size,
+                                     check_load_all=args.test_images, tokenizer=tokenizer)
 
     from plugins.plugins import load_plugin
     if args.plugins is not None:
@@ -1204,26 +1227,33 @@ def main(args):
                                        batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
                                        )
 
+                    def lerp(x, in_min, in_max, out_min, out_max):
+                        if (in_max-in_min) == 0:
+                            return in_min
+                        pct = (x - in_min) / (in_max - in_min)
+                        return out_min + pct * (out_max - out_min)
+
                     if args.timestep_curriculum_alpha == 0:
                         timestep_range = (args.timestep_start, args.timestep_end)
                     else:
-                        def lerp(x, in_min, in_max, out_min, out_max):
-                            pct = (x - in_min) / (in_max-in_min)
-                            return out_min + pct * (out_max-out_min)
-                        def get_random_max_time(lower_bound):
-                            r = random.random()
-                            return round(lerp(pow(r, 8), 0, 1, lower_bound, args.timestep_end))
-                        t_min_initial = int(lerp(800, 0, 1000, args.timestep_start, args.timestep_end))
-                        t_max_final = int(lerp(200, 0, 1000, args.timestep_start, args.timestep_end))
-                        random_expand_t_max_final = get_random_max_time(lower_bound=t_max_final)
+                        t_min_initial = args.timestep_initial_start
+                        t_max_initial = args.timestep_initial_end
+                        t_min_final = args.timestep_start
+                        t_max_final = args.timestep_end
                         timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
                                                                        t_min_initial=t_min_initial,
-                                                                       t_max_initial=args.timestep_end,
-                                                                       t_min_final=args.timestep_start,
-                                                                       t_max_final=random_expand_t_max_final,
+                                                                       t_max_initial=t_max_initial,
+                                                                       t_min_final=t_min_final,
+                                                                       t_max_final=t_max_final,
                                                                        alpha=args.timestep_curriculum_alpha)
                         #print('timestep range:', timestep_range)
 
+                    # randomly expand
+                    timestep_range = (
+                        # maybe make 8 a CLI arg?
+                        round(lerp(pow(random.random(), 8), 0, 1, timestep_range[0], 0)),
+                        round(lerp(pow(random.random(), 8), 0, 1, timestep_range[1], 1000)),
+                    )
                     timesteps = _get_timesteps(batch_size=batch_size,
                                                batch_share_timesteps=(
                                                            do_contrastive_learning or args.batch_share_timesteps),
@@ -1516,6 +1546,7 @@ if __name__ == "__main__":
     argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
     argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
+    argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
     argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
     argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
     argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
@@ -1553,9 +1584,11 @@ if __name__ == "__main__":
     argparser.add_argument("--save_optimizer", action="store_true", default=False, help="saves optimizer state with ckpt, useful for resuming training later")
     argparser.add_argument("--seed", type=int, default=555, help="seed used for samples and shuffling, use -1 for random")
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
-    argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
+    argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
+    argparser.add_argument("--timestep_initial_start", type=int, default=800, help="If using timestep_curriculum_alpha, the initial start timestep (default 800); will transition to --timestep_start")
+    argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")
     argparser.add_argument("--train_sampler", type=str, default="ddpm", help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim"])
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
@@ -1607,6 +1640,8 @@ if __name__ == "__main__":
     argparser.add_argument("--lora_resume", type=str, default=None, help="resume from this lora (must be a huggingface format folder)")
     argparser.add_argument("--lora_rank", type=int, default=16)
     argparser.add_argument("--lora_alpha", type=int, default=8)
+
+    argparser.add_argument("--test_images", action="store_true", help="check all images by trying to load them")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

@@ -57,6 +57,13 @@ class EveryDreamBatch(Dataset):
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0
                  ):
+
+        if tokenizer is None:
+            raise ValueError("must pass tokenizer")
+        if plugin_runner is None:
+            print("EveryDreamBatch using empty PluginRunner")
+            plugin_runner = PluginRunner()
+
         self.contrastive_learning_batch_ids = contrastive_learning_batch_ids or []
         self.data_loader = data_loader
         self.batch_size = data_loader.batch_size
@@ -100,7 +107,7 @@ class EveryDreamBatch(Dataset):
     def __getitem__(self, i):
         example = {}
 
-        train_item = self.__get_image_for_trainer(self.image_train_items[i], self.debug_level)
+        train_item = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
 
         std_dev = 0.5
         mean = 0.5
@@ -175,7 +182,7 @@ class EveryDreamBatch(Dataset):
 
         return example
 
-    def __get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
+    def get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
         example = {}
         save = debug_level > 2
 

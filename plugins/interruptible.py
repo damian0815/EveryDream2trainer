@@ -19,7 +19,7 @@ class InterruptiblePlugin(BasePlugin):
         # epoch length = 2000 -> save 4x per epoch
         # epoch length = 500 -> save every epoch
         # epoch length = 260 -> save every 2nd epoch
-        self.every_n_epochs = 500 / epoch_length
+        self.every_n_epochs = 4000 / epoch_length
         self.steps_to_save_this_epoch = self._get_save_step_indices(epoch, epoch_length)
         print("every_n_epochs:", self.every_n_epochs, "-> steps to save:", self.steps_to_save_this_epoch)
 
