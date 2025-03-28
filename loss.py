@@ -30,7 +30,7 @@ def get_timestep_curriculum_range(progress_01,
                                   t_min_final=0, t_max_final=400,
                                   alpha=3.0):
     # Interpolate boundaries
-    min_t = min(1000, max(0, get_exponential_scaled_value(progress_01*2, t_min_initial, t_min_final, alpha=alpha)))
+    min_t = min(1000, max(0, get_exponential_scaled_value(progress_01, t_min_initial, t_min_final, alpha=alpha)))
     max_t = min(1000, max(0, get_exponential_scaled_value(progress_01, t_max_initial, t_max_final, alpha=alpha)))
 
     assert min_t <= max_t
@@ -217,9 +217,9 @@ def _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps, la
     return noisy_latents, target
 
 
-def _get_timesteps(batch_size, batch_share_timesteps, device, timesteps_range):
-    timestep_start, timestep_end = timesteps_range
-    timesteps = torch.randint(timestep_start, timestep_end, (batch_size,), device=device)
+def _get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges):
+    timesteps = torch.cat([torch.randint(a, b, size=(1,), device=device)
+                           for a,b in timesteps_ranges])
     if batch_share_timesteps:
         timesteps = timesteps[:1].repeat((batch_size,))
     timesteps = timesteps.long()

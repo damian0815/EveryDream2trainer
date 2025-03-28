@@ -33,6 +33,13 @@ def read_float(file):
     except Exception as e:
         logging.warning(f" *** Could not parse to float in file {file}: {e}")
 
+def read_int_pair(file):
+    try:
+        pair = read_text(file).split(' ')
+        return int(pair[0]), int(pair[1])
+    except Exception as e:
+        logging.warning(f" *** Could not parse to float in file {file}: {e}")
+
 import os
 
 def walk_and_visit(path, visit_fn, context=None):

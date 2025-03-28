@@ -156,6 +156,7 @@ class ImageTrainItem:
                  shuffle_tags=False,
                  batch_id: str=None,
                  loss_scale: float=None,
+                 timesteps_range: tuple[int]=None
                  ):
         self.caption = caption
         self.aspects = aspects
@@ -168,6 +169,7 @@ class ImageTrainItem:
         self.shuffle_tags = shuffle_tags
         self.batch_id = batch_id or DEFAULT_BATCH_ID
         self.loss_scale = 1 if loss_scale is None else loss_scale
+        self.timesteps_range = timesteps_range
         self.target_wh = None
         self.is_runt = False
 
@@ -317,7 +319,7 @@ class ImageTrainItem:
             raise e
         return image
 
-    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False):
+    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False) -> 'ImageTrainItem':
         image = self.load_image()
         mask = self.load_mask() if load_mask else None
 

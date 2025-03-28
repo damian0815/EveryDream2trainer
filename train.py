@@ -451,11 +451,6 @@ def setup_args(args):
 
         logging.info(logging.info(f"{Fore.CYAN} * Activating rated images learning with a target rate of {args.rated_dataset_target_dropout_percent}% {Style.RESET_ALL}"))
 
-    if args.timestep_start < 0:
-        raise ValueError("timestep_start must be >= 0")
-    if args.timestep_end > 1000:
-        raise ValueError("timestep_end must be <= 1000")
-
     return args
 
 
@@ -1095,10 +1090,11 @@ def main(args):
         return os.path.join(log_folder, "ckpts", basename)
 
     def get_model_prediction_and_target_wrapper(image, tokens):
-        timesteps = _get_timesteps(batch_size=image.shape[0],
+        batch_size = image.shape[0]
+        timesteps = _get_timesteps(batch_size=batch_size,
                                    batch_share_timesteps=False,
                                    device=unet.device,
-                                   timesteps_range=(args.timestep_start, args.timestep_end))
+                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size)
         latents = get_latents(image, vae, device=unet.device, args=args)
         noise = _get_noise(latents.shape, unet.device, image.dtype,
                            pyramid_noise_discount=args.pyramid_noise_discount,
@@ -1248,17 +1244,20 @@ def main(args):
                                                                        alpha=args.timestep_curriculum_alpha)
                         #print('timestep range:', timestep_range)
 
+                    timesteps_ranges = batch["timesteps_range"] or [timestep_range for _ in range(len(batch))]
+
                     # randomly expand
-                    timestep_range = (
+                    timesteps_ranges = [(
                         # maybe make 8 a CLI arg?
-                        round(lerp(pow(random.random(), 8), 0, 1, timestep_range[0], 0)),
-                        round(lerp(pow(random.random(), 8), 0, 1, timestep_range[1], 1000)),
-                    )
+                        min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
+                        min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
+                    ) for tsr in timesteps_ranges]
+
                     timesteps = _get_timesteps(batch_size=batch_size,
                                                batch_share_timesteps=(
                                                            do_contrastive_learning or args.batch_share_timesteps),
                                                device=unet.device,
-                                               timesteps_range=timestep_range)
+                                               timesteps_ranges=timesteps_ranges)
 
                 slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
                 slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
@@ -1385,8 +1384,8 @@ def main(args):
 
                     log_writer.add_scalar(tag="hyperparameter/lr unet", scalar_value=lr_unet, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
-                    log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timestep_range[0], global_step=global_step)
-                    log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timestep_range[1], global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timesteps_ranges[0][0], global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timesteps_ranges[0][1], global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
                     avg = sum_img / len(images_per_sec_log_step)

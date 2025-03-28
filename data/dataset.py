@@ -55,6 +55,7 @@ class ImageConfig:
     flip_p: float = None
     shuffle_tags: bool = False
     loss_scale: float = None
+    timesteps_range: tuple[int, int] = None
 
     def merge(self, other):
         if other is None:
@@ -71,6 +72,7 @@ class ImageConfig:
             shuffle_tags=overlay(other.shuffle_tags, self.shuffle_tags),
             batch_id=overlay(other.batch_id, self.batch_id),
             loss_scale=overlay(other.loss_scale, self.loss_scale),
+            timesteps_range=overlay(other.timesteps_range, self.timesteps_range),
         )
 
     @classmethod
@@ -87,7 +89,8 @@ class ImageConfig:
             shuffle_tags=data.get("shuffle_tags"),
             batch_id=data.get("batch_id"),
             loss_scale=data.get("loss_scale"),
-            )
+            timesteps_range=data.get("timesteps_range"),
+        )
 
         # Alternatively parse from dedicated `caption` attribute
         if cap_attr := data.get('caption'):
@@ -178,6 +181,8 @@ class Dataset:
             cfgs.append(ImageConfig(batch_id=read_text(fileset['batch_id.txt']).strip()))
         if 'loss_scale.txt' in fileset:
             cfgs.append(ImageConfig(loss_scale=read_float(fileset['loss_scale.txt'])))
+        if 'timesteps_range.txt' in fileset:
+            cfgs.append(ImageConfig(timesteps_range=read_int_pair(fileset['timesteps_range.txt'])))
 
         
         result = ImageConfig.fold(cfgs)
@@ -279,6 +284,7 @@ class Dataset:
                     shuffle_tags=config.shuffle_tags,
                     batch_id=config.batch_id,
                     loss_scale=config.loss_scale,
+                    timesteps_range=config.timesteps_range,
                 )
                 items.append(item)
             except Exception as e:

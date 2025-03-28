@@ -178,7 +178,9 @@ class EveryDreamBatch(Dataset):
         if train_item["do_contrastive_learning"]:
             additional_scale_factor = 1
         example["loss_scale"] = train_item["loss_scale"] * additional_scale_factor
+
         example["do_contrastive_learning"] = train_item["do_contrastive_learning"]
+        example["timesteps_range"] = train_item["timesteps_range"]
 
         return example
 
@@ -204,6 +206,7 @@ class EveryDreamBatch(Dataset):
         example["loss_scale"] = image_train_tmp.loss_scale
         example["batch_id"] = image_train_tmp.batch_id
         example["do_contrastive_learning"] = do_contrastive_learning
+        example["timesteps_range"] = image_train_tmp.timesteps_range
 
         return example
 
@@ -305,6 +308,9 @@ def collate_fn(batch):
         masks = None
 
     loss_scale = torch.tensor([example.get("loss_scale", 1) for example in batch])
+    timesteps_range = [example["timesteps_range"] for example in batch]
+    if all(tsr is None for tsr in timesteps_range):
+        timesteps_range = None
 
     ret = {
         "tokens": tokens,
@@ -314,6 +320,7 @@ def collate_fn(batch):
         "runt_size": runt_size,
         "loss_scale": loss_scale,
         "do_contrastive_learning": do_contrastive_learning,
+        "timesteps_range": timesteps_range,
     }
     del batch
     return ret

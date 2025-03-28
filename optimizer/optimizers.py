@@ -107,8 +107,6 @@ class EveryDreamOptimizer():
         schedulers = self.create_lr_schedulers(args, optimizer_config)
         self.lr_schedulers.extend(schedulers)
 
-        self.load(args.resume_ckpt)
-
         if args.amp:
             self.scaler = GradScaler(
                 enabled=args.amp,
@@ -119,6 +117,8 @@ class EveryDreamOptimizer():
             )
         else:
             self.scaler = None
+
+        self.load(args.resume_ckpt)
 
         logging.info(f" Grad scaler enabled: {self.scaler is not None and self.scaler.is_enabled()} (amp mode)")
 
