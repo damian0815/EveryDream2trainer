@@ -8,11 +8,41 @@ import torch.nn.functional as F
 
 #from train import pyramid_noise_like, compute_snr
 
+def subdivide_batch(batch, current_batch_size, desired_batch_size):
+    if desired_batch_size >= current_batch_size:
+        yield batch
+        return
+    runt_size = batch['runt_size']
+    non_runt_size = current_batch_size - runt_size
+    for i, offset in enumerate(range(0, non_runt_size, desired_batch_size)):
+        sub_batch = _subdivide_batch_part(batch, offset, desired_batch_size)
+        end = min(current_batch_size, offset + desired_batch_size)
+        sub_batch['runt_size'] = max(0, end - non_runt_size)
+        yield sub_batch
 
-def compute_train_process_01(epoch, max_epochs, step, steps_per_epoch):
+def _subdivide_batch_part(part, offset, count):
+    if type(part) is list or type(part) is torch.Tensor:
+        return part[offset:offset + count]
+    elif type(part) is dict:
+        return {k: _subdivide_batch_part(v, offset, count) for k, v in part.items()}
+    else:
+        return part
+
+def choose_effective_batch_size(args, train_progress_01):
+    return max(1, round(get_exponential_scaled_value(
+        train_progress_01,
+        initial_value=args.initial_batch_size or args.batch_size,
+        final_value=args.final_batch_size or args.batch_size,
+        alpha=args.batch_size_curriculum_alpha
+    )))
+
+
+def compute_train_process_01(epoch, step, steps_per_epoch, max_epochs, max_global_steps):
     total_steps = steps_per_epoch * max_epochs
+    if max_global_steps is not None:
+        total_steps = min(total_steps, max_global_steps)
     steps_completed = steps_per_epoch * epoch + step
-    return steps_completed / total_steps
+    return min(1, steps_completed / total_steps)
 
 """
 alpha=2-4: Slow advance (spread hugs initial_value)
@@ -90,7 +120,7 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
 
         if args.loss_type == "mse_huber":
             early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
-            early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(device)
+            early_timestep_bias = early_timestep_bias.float().to(device)
             early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
             loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
             loss_mse = loss_mse * loss_scale.to(device) * early_timestep_bias

@@ -41,8 +41,6 @@ OPTIMIZER_TE_STATE_FILENAME = "optimizer_te.pt"
 OPTIMIZER_UNET_STATE_FILENAME = "optimizer_unet.pt"
 SCALER_STATE_FILENAME = 'scaler.pt'
 
-shared_timesteps: torch.Tensor = None
-
 class EveryDreamOptimizer():
     """
     Wrapper to manage optimizers
@@ -171,52 +169,58 @@ class EveryDreamOptimizer():
         else:
             loss_scaled_if_necessary.backward()
 
+    def step_optimizer(self, global_step):
+        if self.scaler is not None:
+            for optimizer in self.optimizers:
+                self.scaler.unscale_(optimizer)
 
-    def step(self, step: int, global_step: int, ):
+        if self.clip_grad_norm is not None:
+            if self.log_grad_norm:
+                pre_clip_norm = torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=float('inf'))
+                self.log_writer.add_scalar("optimizer/unet_pre_clip_norm", pre_clip_norm, global_step)
 
-        if self._should_do_grad_accum_step(step, global_step):
-            global shared_timesteps
-            shared_timesteps = None
-            if self.scaler is not None:
-                for optimizer in self.optimizers:
-                    self.scaler.unscale_(optimizer)
+                pre_clip_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params,
+                                                               max_norm=float('inf'))
+                self.log_writer.add_scalar("optimizer/te_pre_clip_norm", pre_clip_norm, global_step)
 
-            if self.clip_grad_norm is not None:
-                if self.log_grad_norm:
-                    pre_clip_norm = torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=float('inf'))
-                    self.log_writer.add_scalar("optimizer/unet_pre_clip_norm", pre_clip_norm, global_step)
+            unet_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(),
+                                                            max_norm=self.clip_grad_norm)
+            self.log_writer.add_scalar("optimizer/unet_grad_norm", unet_grad_norm, global_step)
 
-                    pre_clip_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params, max_norm=float('inf'))
-                    self.log_writer.add_scalar("optimizer/te_pre_clip_norm", pre_clip_norm, global_step)
+            te_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params,
+                                                          max_norm=self.clip_grad_norm)
+            self.log_writer.add_scalar("optimizer/te_grad_norm", te_grad_norm, global_step)
 
-                unet_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=self.clip_grad_norm)
-                self.log_writer.add_scalar("optimizer/unet_grad_norm", unet_grad_norm, global_step)
+        if self.scaler is None:
+            for optimizer in self.optimizers:
+                optimizer.step()
+        else:
+            for optimizer in self.optimizers:
+                self.scaler.step(optimizer)
+            self.scaler.update()
 
-                te_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params, max_norm=self.clip_grad_norm)
-                self.log_writer.add_scalar("optimizer/te_grad_norm", te_grad_norm, global_step)
+        if self.log_grad_norm and self.log_writer:
+            log_info_unet_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
+            log_info_te_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
+            with torch.no_grad():
+                self._log_gradient_normal(self.unet_params, "optimizer/unet_grad_norm", log_info_unet_fn)
+                self._log_gradient_normal(itertools.chain(self.text_encoder_params), "optimizer/te_grad_norm",
+                                          log_info_te_fn)
 
-            if self.scaler is None:
-                for optimizer in self.optimizers:
-                    optimizer.step()
-            else:
-                for optimizer in self.optimizers:
-                    self.scaler.step(optimizer)
-                self.scaler.update()
+        self._zero_grad(set_to_none=True)
 
-            if self.log_grad_norm and self.log_writer:
-                log_info_unet_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
-                log_info_te_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
-                with torch.no_grad():
-                    self._log_gradient_normal(self.unet_params, "optimizer/unet_grad_norm", log_info_unet_fn)
-                    self._log_gradient_normal(itertools.chain(self.text_encoder_params), "optimizer/te_grad_norm", log_info_te_fn)
-
-            self._zero_grad(set_to_none=True)
-
+    def step_schedulers(self, global_step):
         for scheduler in self.lr_schedulers:
             scheduler.step()
 
         if self.apply_grad_scaler_step_tweaks:
             self._update_grad_scaler(global_step)
+
+    def step(self, step: int, global_step: int, ):
+        if self._should_do_grad_accum_step(step, global_step):
+            self.step_optimizer(global_step)
+
+        self.step_schedulers(global_step)
 
     def _zero_grad(self, set_to_none=False):
         for optimizer in self.optimizers:

@@ -287,11 +287,19 @@ def collate_fn(batch):
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
 
     #captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
-    caption_variants = list(batch[0]["caption"].keys())
-    captions = {k: [example["caption"][k] for example in batch]
+    caption_variants = list(set(k
+                            for b in batch
+                            for k in b["caption"].keys()
+                            if k is not "default"))
+    if len(caption_variants) == 0:
+        caption_variants = ["default"]
+    captions = {k: [example["caption"].get(k, example["caption"].get("default", None)) for example in batch]
                 for k in caption_variants}
-    tokens = {k: torch.stack([example["tokens"][k] for example in batch])
+    assert all(c is not None for c in captions.values())
+    tokens = {k: torch.stack([example["tokens"].get(k, example["tokens"].get("default", None)) for example in batch])
               for k in caption_variants}
+    assert all(t is not None for t in tokens.values())
+
 
     runt_size = batch[0]["runt_size"]
 

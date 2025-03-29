@@ -57,7 +57,7 @@ from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
     _get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
-    get_exponential_scaled_value
+    get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -76,6 +76,7 @@ from plugins.plugins import PluginRunner
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
 _WANT_SAMPLES_SEMAPHORE_FILE = 'i_want_samples.semaphore'
+_WANT_VALIDATION_SEMAPHORE_FILE = 'i_want_validation.semaphore'
 
 
 def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_betas=None, rescale_betas_zero_snr=False):
@@ -331,6 +332,12 @@ def setup_local_logger(args):
 #     """
 #     optimizer.load_state_dict(torch.load(path))
 
+def check_semaphore_file_and_unlink(sempahore_file) -> bool:
+    try:
+        os.unlink(sempahore_file)
+        return True
+    except FileNotFoundError:
+        return False
 
 def get_gpu_memory(nvsmi):
     """
@@ -1135,6 +1142,9 @@ def main(args):
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
         needs_samples = False
         actual_effective_batch_size = 0
+        effective_batch_size_to_log = 0
+        seen_images_count = 0
+        desired_effective_batch_size = choose_effective_batch_size(args, 0)
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1173,182 +1183,204 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
-            # this dance is because want to be able to peek at the next batch's shape
-            for step, batch in enumerate(train_dataloader):
-                train_progress_01 = compute_train_process_01(epoch=epoch, max_epochs=args.max_epochs,
-                                                             step=step, steps_per_epoch=epoch_len)
+            for step, full_batch in enumerate(train_dataloader):
+
+                train_progress_01 = compute_train_process_01(epoch=epoch, step=step, steps_per_epoch=epoch_len,
+                                                             max_epochs=args.max_epochs, max_global_steps=args.max_steps)
 
                 step_start_time = time.time()
 
                 plugin_runner.run_on_step_start(epoch=epoch,
-                        local_step=step,
-                        global_step=global_step,
-                        project_name=args.project_name,
-                        log_folder=log_folder,
-                        batch=batch,
-                        ed_state=make_current_ed_state())
+                                                local_step=step,
+                                                global_step=global_step,
+                                                project_name=args.project_name,
+                                                log_folder=log_folder,
+                                                batch=full_batch,
+                                                ed_state=make_current_ed_state())
 
-                if args.everything_contrastive_learning_p > 0 and not batch["do_contrastive_learning"]:
-                    batch["do_contrastive_learning"] = args.everything_contrastive_learning_p > random.random()
+                full_batch_size = full_batch["image"].shape[0]
 
-                if args.contrastive_learning_curriculum_alpha == 0:
-                    contrastive_learning_negative_loss_scale = args.contrastive_learning_negative_loss_scale
-                else:
-                    contrastive_learning_negative_loss_scale = get_exponential_scaled_value(train_progress_01,
-                                                               initial_value=args.contrastive_learning_negative_loss_scale,
-                                                               final_value=0,
-                                                               alpha=args.contrastive_learning_curriculum_alpha)
-                    #print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
-
-                do_contrastive_learning = batch["do_contrastive_learning"]
-
-                loss_scale = batch["loss_scale"]
-                #if batch["runt_size"] > 0:
-                #    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
-                #    loss_scale = loss_scale * runt_loss_scale
-
-                assert type(batch["captions"]) is dict
-                caption_variants = list(sorted(batch["captions"].keys()))
-                if not args.all_caption_variants:
-                    caption_variants = [random.choice(caption_variants)]
-                image_shape = batch["image"].shape
-
-                batch_size = image_shape[0]
-
-                with torch.no_grad():
-                    noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
-                    noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
-                                       pyramid_noise_discount=args.pyramid_noise_discount,
-                                       zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
-                                       batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
-                                       )
-
-                    def lerp(x, in_min, in_max, out_min, out_max):
-                        if (in_max-in_min) == 0:
-                            return in_min
-                        pct = (x - in_min) / (in_max - in_min)
-                        return out_min + pct * (out_max - out_min)
-
-                    if args.timestep_curriculum_alpha == 0:
-                        timestep_range = (args.timestep_start, args.timestep_end)
+                if (desired_effective_batch_size > 1
+                        and args.everything_contrastive_learning_p > 0
+                        and not full_batch["do_contrastive_learning"]
+                ):
+                    if args.everything_contrastive_learning_curriculum_alpha > 0:
+                        everything_contrastive_learning_p = get_exponential_scaled_value(train_progress_01,
+                                                                                         initial_value=args.everything_contrastive_learning_p,
+                                                                                         final_value=0,
+                                                                                         alpha=args.everything_contrastive_learning_curriculum_alpha)
                     else:
-                        t_min_initial = args.timestep_initial_start
-                        t_max_initial = args.timestep_initial_end
-                        t_min_final = args.timestep_start
-                        t_max_final = args.timestep_end
-                        timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
-                                                                       t_min_initial=t_min_initial,
-                                                                       t_max_initial=t_max_initial,
-                                                                       t_min_final=t_min_final,
-                                                                       t_max_final=t_max_final,
-                                                                       alpha=args.timestep_curriculum_alpha)
-                        #print('timestep range:', timestep_range)
+                        everything_contrastive_learning_p = args.everything_contrastive_learning_p
+                    full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
-                    timesteps_ranges = batch["timesteps_range"] or [timestep_range for _ in range(len(batch))]
+                for batch in subdivide_batch(full_batch, full_batch_size, desired_effective_batch_size):
 
-                    # randomly expand
-                    timesteps_ranges = [(
-                        # maybe make 8 a CLI arg?
-                        min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
-                        min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
-                    ) for tsr in timesteps_ranges]
+                    if args.contrastive_learning_curriculum_alpha == 0:
+                        contrastive_learning_negative_loss_scale = args.contrastive_learning_negative_loss_scale
+                    else:
+                        contrastive_learning_negative_loss_scale = get_exponential_scaled_value(train_progress_01,
+                                                                   initial_value=args.contrastive_learning_negative_loss_scale,
+                                                                   final_value=0,
+                                                                   alpha=args.contrastive_learning_curriculum_alpha)
+                        #print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
 
-                    timesteps = _get_timesteps(batch_size=batch_size,
-                                               batch_share_timesteps=(
-                                                           do_contrastive_learning or args.batch_share_timesteps),
-                                               device=unet.device,
-                                               timesteps_ranges=timesteps_ranges)
+                    do_contrastive_learning = batch["do_contrastive_learning"]
 
-                slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
-                slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
-                actual_image_size = image_shape[2] * image_shape[3]
-                slice_size_scale_factor = slice_size_image_size_reference / actual_image_size
-                slice_size = max(1, round(slice_size * slice_size_scale_factor))
+                    loss_scale = batch["loss_scale"]
+                    #if batch["runt_size"] > 0:
+                    #    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
+                    #    loss_scale = loss_scale * runt_loss_scale
 
-                # if True, divide the batch into 2 for loss+backward pass
-                # should only apply when doing multires when eg base res is 768 and curr res is 1024
-                subdivide_batch = slice_size_scale_factor < 0.85
+                    assert type(batch["captions"]) is dict
+                    caption_variants = list(sorted(batch["captions"].keys()))
+                    if not args.all_caption_variants:
+                        caption_variants = [random.choice(caption_variants)]
+                    image_shape = batch["image"].shape
 
-                runt_size = batch["runt_size"]
-                with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
-                    latents_slices = []
-                    pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
-                    for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
-                        latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
-                        latents_slice = latents_slice[0].sample() * 0.18215
-                        latents_slices.append(latents_slice)
-                    del pixel_values
-                    latents = torch.cat(latents_slices)
-                    del latents_slices
+                    batch_size = image_shape[0]
 
-                for caption_variant in caption_variants:
-                    tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
-                    caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
+                    with torch.no_grad():
+                        noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
+                        noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
+                                           pyramid_noise_discount=args.pyramid_noise_discount,
+                                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                                           batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
+                                           )
 
-                    with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
-                        encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
-                                                                   clip_skip=args.clip_skip,
-                                                                   embedding_perturbation=args.embedding_perturbation)
+                        def lerp(x, in_min, in_max, out_min, out_max):
+                            if (in_max-in_min) == 0:
+                                return in_min
+                            pct = (x - in_min) / (in_max - in_min)
+                            return out_min + pct * (out_max - out_min)
 
-                    model_pred_all = []
-                    target_all = []
+                        if args.timestep_curriculum_alpha == 0:
+                            timestep_range = (args.timestep_start, args.timestep_end)
+                        else:
+                            t_min_initial = args.timestep_initial_start
+                            t_max_initial = args.timestep_initial_end
+                            t_min_final = args.timestep_start
+                            t_max_final = args.timestep_end
+                            timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
+                                                                           t_min_initial=t_min_initial,
+                                                                           t_max_initial=t_max_initial,
+                                                                           t_min_final=t_min_final,
+                                                                           t_max_final=t_max_final,
+                                                                           alpha=args.timestep_curriculum_alpha)
+                            #print('timestep range:', timestep_range)
 
-                    slices = list(get_slices(batch_size, slice_size, runt_size=runt_size))
-                    loss_start_sample_index = 0
-                    for slice_index, (slice_start, slice_end) in enumerate(slices):
-                        #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {slice_size}')
-                        latents_slice = latents[slice_start:slice_end]
-                        encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
-                        noise_slice = noise[slice_start:slice_end]
-                        timesteps_slice = timesteps[slice_start:slice_end]
-                        model_pred, target = _get_model_prediction_and_target(latents=latents_slice,
-                                                                              encoder_hidden_states=encoder_hidden_states_slice,
-                                                                              noise=noise_slice,
-                                                                              timesteps=timesteps_slice,
-                                                                              unet=unet,
-                                                                              noise_scheduler=noise_scheduler,
-                                                                              args=args
-                                                                              )
-                        model_pred_all.append(model_pred)
-                        target_all.append(target)
-                        actual_effective_batch_size += (slice_end - slice_start)
+                        timesteps_ranges = batch["timesteps_range"] or ([timestep_range] * batch_size)
 
-                        if slice_index == (len(slices)-1) or (slice_index == len(slices) // 2 and subdivide_batch):
+                        # randomly expand
+                        timesteps_ranges = [(
+                            # maybe make 8 a CLI arg?
+                            min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
+                            min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
+                        ) for tsr in timesteps_ranges]
 
-                            loss_end_sample_index = min(slice_end, batch_size - runt_size)
-                            mask = None if batch["mask"] is None else batch["mask"][loss_start_sample_index:loss_end_sample_index]
+                        timesteps = _get_timesteps(batch_size=batch_size,
+                                                   batch_share_timesteps=(
+                                                               do_contrastive_learning or args.batch_share_timesteps),
+                                                   device=unet.device,
+                                                   timesteps_ranges=timesteps_ranges)
 
-                            model_pred = torch.cat(model_pred_all)
-                            target = torch.cat(target_all)
+                    slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
+                    slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
+                    actual_image_size = image_shape[2] * image_shape[3]
+                    slice_size_scale_factor = slice_size_image_size_reference / actual_image_size
+                    slice_size = max(1, round(slice_size * slice_size_scale_factor))
 
-                            model_pred_all = []
-                            target_all = []
+                    # if True, divide the batch into 2 for loss+backward pass
+                    # should only apply when doing multires when eg base res is 768 and curr res is 1024
+                    should_subdivide_batch = slice_size_scale_factor < 0.85
 
-                            loss = _get_loss(model_pred,
-                                             target,
-                                             caption_str=caption_str[loss_start_sample_index:loss_end_sample_index],
-                                             mask=mask,
-                                             timesteps=timesteps[loss_start_sample_index:loss_end_sample_index],
-                                             loss_scale=loss_scale[loss_start_sample_index:loss_end_sample_index],
-                                             noise_scheduler=noise_scheduler,
-                                             do_contrastive_learning=do_contrastive_learning,
-                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
-                                             args=args
-                                             )
-                            del target, model_pred
-                            loss_start_sample_index = loss_end_sample_index
+                    runt_size = batch["runt_size"]
+                    with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
+                        latents_slices = []
+                        pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
+                        for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
+                            latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
+                            latents_slice = latents_slice[0].sample() * 0.18215
+                            latents_slices.append(latents_slice)
+                        del pixel_values
+                        latents = torch.cat(latents_slices)
+                        del latents_slices
 
-                            loss = loss.mean()
-                            ed_optimizer.backward(loss)
+                    for caption_variant in caption_variants:
+                        tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
+                        caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
 
-                            loss_step = loss.detach().item()
-                            del loss
+                        with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
+                            encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
+                                                                       clip_skip=args.clip_skip,
+                                                                       embedding_perturbation=args.embedding_perturbation)
 
-                            steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
-                            loss_log_step.append(loss_step)
-                            loss_epoch.append(loss_step)
+                        model_pred_all = []
+                        target_all = []
 
-                ed_optimizer.step(step, global_step)
+                        slices = list(get_slices(batch_size, slice_size, runt_size=runt_size))
+                        loss_start_sample_index = 0
+                        for slice_index, (slice_start, slice_end) in enumerate(slices):
+                            #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {slice_size}')
+                            latents_slice = latents[slice_start:slice_end]
+                            encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+                            noise_slice = noise[slice_start:slice_end]
+                            timesteps_slice = timesteps[slice_start:slice_end]
+                            model_pred, target = _get_model_prediction_and_target(latents=latents_slice,
+                                                                                  encoder_hidden_states=encoder_hidden_states_slice,
+                                                                                  noise=noise_slice,
+                                                                                  timesteps=timesteps_slice,
+                                                                                  unet=unet,
+                                                                                  noise_scheduler=noise_scheduler,
+                                                                                  args=args
+                                                                                  )
+                            model_pred_all.append(model_pred)
+                            target_all.append(target)
+
+                            if slice_index == (len(slices)-1) or (slice_index == len(slices) // 2 and should_subdivide_batch):
+
+                                loss_end_sample_index = min(slice_end, batch_size - runt_size)
+                                mask = None if batch["mask"] is None else batch["mask"][loss_start_sample_index:loss_end_sample_index]
+
+                                model_pred = torch.cat(model_pred_all)
+                                target = torch.cat(target_all)
+
+                                model_pred_all = []
+                                target_all = []
+
+                                loss = _get_loss(model_pred,
+                                                 target,
+                                                 caption_str=caption_str[loss_start_sample_index:loss_end_sample_index],
+                                                 mask=mask,
+                                                 timesteps=timesteps[loss_start_sample_index:loss_end_sample_index],
+                                                 loss_scale=loss_scale[loss_start_sample_index:loss_end_sample_index],
+                                                 noise_scheduler=noise_scheduler,
+                                                 do_contrastive_learning=do_contrastive_learning,
+                                                 contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
+                                                 args=args
+                                                 )
+                                del target, model_pred
+                                loss_start_sample_index = loss_end_sample_index
+
+                                loss = loss.mean()
+                                ed_optimizer.backward(loss)
+
+                                loss_step = loss.detach().item()
+                                del loss
+
+                                steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
+                                loss_log_step.append(loss_step)
+                                loss_epoch.append(loss_step)
+
+                    seen_images_count += batch_size
+                    actual_effective_batch_size += batch_size
+                    if seen_images_count >= desired_effective_batch_size:
+                        ed_optimizer.step_optimizer(global_step)
+                        seen_images_count -= desired_effective_batch_size
+                        desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                        effective_batch_size_to_log = actual_effective_batch_size
+                        actual_effective_batch_size = 0
+
+                ed_optimizer.step_schedulers(global_step)
 
                 if (global_step + 1) % sample_generator.sample_steps == 0:
                     needs_samples = True
@@ -1367,11 +1399,9 @@ def main(args):
                         # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
                         # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
-                if needs_samples or os.path.exists(_WANT_SAMPLES_SEMAPHORE_FILE):
-                    generate_samples(global_step=global_step, batch=batch)
+                if needs_samples or check_semaphore_file_and_unlink(_WANT_SAMPLES_SEMAPHORE_FILE):
+                    generate_samples(global_step=global_step, batch=full_batch)
                     needs_samples = False
-                    if os.path.exists(_WANT_SAMPLES_SEMAPHORE_FILE):
-                        os.unlink(_WANT_SAMPLES_SEMAPHORE_FILE)
 
                 steps_pbar.update(1)
 
@@ -1386,6 +1416,7 @@ def main(args):
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timesteps_ranges[0][0], global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timesteps_ranges[0][1], global_step=global_step)
+                    log_writer.add_scalar("hyperparameter/effective batch size", scalar_value=effective_batch_size_to_log, global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
                     avg = sum_img / len(images_per_sec_log_step)
@@ -1404,7 +1435,10 @@ def main(args):
                     append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                     torch.cuda.empty_cache()
 
-                if validator and step in validation_steps:
+                if validator and (
+                        step in validation_steps
+                        or check_semaphore_file_and_unlink(_WANT_VALIDATION_SEMAPHORE_FILE)
+                ):
                     validator.do_validation(global_step, get_model_prediction_and_target_wrapper)
 
                 min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
@@ -1434,10 +1468,6 @@ def main(args):
                                       data_root=args.data_root,
                                       batch=batch,
                                       ed_state=make_current_ed_state())
-
-                if ed_optimizer.will_do_grad_accum_step(step, global_step):
-                    log_writer.add_scalar("hyperparameter/effective batch size", scalar_value=actual_effective_batch_size, global_step=global_step)
-                    actual_effective_batch_size = 0
 
                 if (epoch == args.max_epochs-1
                         and ed_optimizer.will_do_grad_accum_step(step, global_step)
@@ -1540,6 +1570,9 @@ if __name__ == "__main__":
     argparser.add_argument("--init_grad_scale", type=int, default=None, help="initial value for GradScaler (default=2^17.5)")
     argparser.add_argument("--attn_type", type=str, default="sdp", help="Attention mechanismto use", choices=["xformers", "sdp", "slice"])
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
+    argparser.add_argument("--batch_size_curriculum_alpha", type=float, default=0.5, help="curriculum alpha, default=0.5 (rapid (squared) falloff from initial)")
+    argparser.add_argument("--initial_batch_size", type=int, default=None, help="initial batch size for curriculum")
+    argparser.add_argument("--final_batch_size", type=int, default=None, help="final batch size for curriculum")
     argparser.add_argument("--ckpt_every_n_minutes", type=int, default=None, help="Save checkpoint every n minutes, def: 20")
     argparser.add_argument("--clip_grad_norm", type=float, default=None, help="Clip gradient norm (def: disabled) (ex: 1.5), useful if loss=nan?")
     argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
@@ -1627,6 +1660,7 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="dropout probability for contrastive learning, 0..1")
     argparser.add_argument("--contrastive_learning_curriculum_alpha", type=float, default=0, help="if passed, exponentially disable contrastive learning as training progresses")
     argparser.add_argument("--everything_contrastive_learning_p", type=float, default=0, help="probability to run contrastive learning on everything, 0..1")
+    argparser.add_argument("--everything_contrastive_learning_curriculum_alpha", type=float, default=0, help="if >0, attenuate everything_contrastive_learning_p to 0 using this alpha as timestep approaches 0")
     argparser.add_argument("--all_caption_variants", action='store_true', help='if passed, use ALL caption variants every step')
 
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
