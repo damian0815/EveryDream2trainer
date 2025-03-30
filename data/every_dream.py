@@ -91,6 +91,14 @@ class EveryDreamBatch(Dataset):
         num_images = len(self.image_train_items)
         logging.info(f" ** Dataset '{name}': {num_images / self.batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
 
+        self.cond_dropout_caption = ' '
+        self.cond_dropout_tokens = torch.tensor(self.tokenizer(self.cond_dropout_caption,
+                                        truncation=True,
+                                        padding="max_length",
+                                        max_length=self.tokenizer.model_max_length,
+                                        ).input_ids)
+
+
     def shuffle(self, epoch_n: int, max_epochs: int):
         self.seed += 1
 
@@ -146,9 +154,9 @@ class EveryDreamBatch(Dataset):
         else:
             caption_dict = {"default": example["caption"]}
 
-        for k in caption_dict.keys():
-            if self.random_instance.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
-                caption_dict[k] = " "
+        #for k in caption_dict.keys():
+        #    if self.random_instance.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
+        #        caption_dict[k] = " "
 
         if self.random_instance.random() <= self.cond_dropout_noise_p:
             #example["image"] = torch.randn_like(example["image"])

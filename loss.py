@@ -8,6 +8,21 @@ import torch.nn.functional as F
 
 #from train import pyramid_noise_like, compute_snr
 
+def nibble_batch(batch, take_count):
+    runt_size = batch['runt_size']
+    current_batch_size = batch['image'].shape[0]
+    non_runt_size = current_batch_size - runt_size
+    assert non_runt_size > 0
+    if non_runt_size <= take_count:
+        return batch, None
+
+    nibble = _subdivide_batch_part(batch, 0, take_count)
+    nibble['runt_size'] = 0
+
+    remainder = _subdivide_batch_part(batch, take_count, None)
+    return nibble, remainder
+
+
 def subdivide_batch(batch, current_batch_size, desired_batch_size):
     if desired_batch_size >= current_batch_size:
         yield batch
@@ -15,16 +30,16 @@ def subdivide_batch(batch, current_batch_size, desired_batch_size):
     runt_size = batch['runt_size']
     non_runt_size = current_batch_size - runt_size
     for i, offset in enumerate(range(0, non_runt_size, desired_batch_size)):
-        sub_batch = _subdivide_batch_part(batch, offset, desired_batch_size)
+        sub_batch = _subdivide_batch_part(batch, offset, offset+desired_batch_size)
         end = min(current_batch_size, offset + desired_batch_size)
         sub_batch['runt_size'] = max(0, end - non_runt_size)
         yield sub_batch
 
-def _subdivide_batch_part(part, offset, count):
+def _subdivide_batch_part(part, start, end):
     if type(part) is list or type(part) is torch.Tensor:
-        return part[offset:offset + count]
+        return part[start:end]
     elif type(part) is dict:
-        return {k: _subdivide_batch_part(v, offset, count) for k, v in part.items()}
+        return {k: _subdivide_batch_part(v, start, end) for k, v in part.items()}
     else:
         return part
 

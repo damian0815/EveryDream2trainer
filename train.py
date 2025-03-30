@@ -57,7 +57,7 @@ from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
     _get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
-    get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size
+    get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size, nibble_batch
 from utils.huggingface_downloader import try_download_model_from_hf
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
@@ -1141,8 +1141,7 @@ def main(args):
     try:        
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
         needs_samples = False
-        actual_effective_batch_size = 0
-        effective_batch_size_to_log = 0
+        effective_batch_size = 0
         seen_images_count = 0
         desired_effective_batch_size = choose_effective_batch_size(args, 0)
 
@@ -1200,6 +1199,36 @@ def main(args):
 
                 full_batch_size = full_batch["image"].shape[0]
 
+                def lerp(x, in_min, in_max, out_min, out_max):
+                    if (in_max - in_min) == 0:
+                        return in_min
+                    pct = (x - in_min) / (in_max - in_min)
+                    return out_min + pct * (out_max - out_min)
+
+                if args.timestep_curriculum_alpha == 0:
+                    timestep_range = (args.timestep_start, args.timestep_end)
+                else:
+                    t_min_initial = args.timestep_initial_start
+                    t_max_initial = args.timestep_initial_end
+                    t_min_final = args.timestep_start
+                    t_max_final = args.timestep_end
+                    timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
+                                                                   t_min_initial=t_min_initial,
+                                                                   t_max_initial=t_max_initial,
+                                                                   t_min_final=t_min_final,
+                                                                   t_max_final=t_max_final,
+                                                                   alpha=args.timestep_curriculum_alpha)
+                    # print('timestep range:', timestep_range)
+
+                timesteps_ranges = full_batch["timesteps_range"] or ([timestep_range] * full_batch_size)
+
+                # randomly expand
+                timesteps_ranges = [(
+                    # maybe make 8 a CLI arg?
+                    min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
+                    min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
+                ) for tsr in timesteps_ranges]
+
                 if (desired_effective_batch_size > 1
                         and args.everything_contrastive_learning_p > 0
                         and not full_batch["do_contrastive_learning"]
@@ -1213,7 +1242,20 @@ def main(args):
                         everything_contrastive_learning_p = args.everything_contrastive_learning_p
                     full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
-                for batch in subdivide_batch(full_batch, full_batch_size, desired_effective_batch_size):
+
+                do_contrastive_learning = full_batch["do_contrastive_learning"]
+                timesteps = _get_timesteps(batch_size=full_batch_size,
+                                           batch_share_timesteps=(
+                                                   do_contrastive_learning or args.batch_share_timesteps),
+                                           device=unet.device,
+                                           timesteps_ranges=timesteps_ranges)
+
+
+                remaining_batch = full_batch
+                while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
+                    assert desired_effective_batch_size - seen_images_count > 0
+                    images_to_nibble = max(1, desired_effective_batch_size - seen_images_count)
+                    batch, remaining_batch = nibble_batch(remaining_batch, images_to_nibble)
 
                     if args.contrastive_learning_curriculum_alpha == 0:
                         contrastive_learning_negative_loss_scale = args.contrastive_learning_negative_loss_scale
@@ -1223,8 +1265,6 @@ def main(args):
                                                                    final_value=0,
                                                                    alpha=args.contrastive_learning_curriculum_alpha)
                         #print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
-
-                    do_contrastive_learning = batch["do_contrastive_learning"]
 
                     loss_scale = batch["loss_scale"]
                     #if batch["runt_size"] > 0:
@@ -1246,42 +1286,6 @@ def main(args):
                                            zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                            batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
                                            )
-
-                        def lerp(x, in_min, in_max, out_min, out_max):
-                            if (in_max-in_min) == 0:
-                                return in_min
-                            pct = (x - in_min) / (in_max - in_min)
-                            return out_min + pct * (out_max - out_min)
-
-                        if args.timestep_curriculum_alpha == 0:
-                            timestep_range = (args.timestep_start, args.timestep_end)
-                        else:
-                            t_min_initial = args.timestep_initial_start
-                            t_max_initial = args.timestep_initial_end
-                            t_min_final = args.timestep_start
-                            t_max_final = args.timestep_end
-                            timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
-                                                                           t_min_initial=t_min_initial,
-                                                                           t_max_initial=t_max_initial,
-                                                                           t_min_final=t_min_final,
-                                                                           t_max_final=t_max_final,
-                                                                           alpha=args.timestep_curriculum_alpha)
-                            #print('timestep range:', timestep_range)
-
-                        timesteps_ranges = batch["timesteps_range"] or ([timestep_range] * batch_size)
-
-                        # randomly expand
-                        timesteps_ranges = [(
-                            # maybe make 8 a CLI arg?
-                            min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
-                            min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
-                        ) for tsr in timesteps_ranges]
-
-                        timesteps = _get_timesteps(batch_size=batch_size,
-                                                   batch_share_timesteps=(
-                                                               do_contrastive_learning or args.batch_share_timesteps),
-                                                   device=unet.device,
-                                                   timesteps_ranges=timesteps_ranges)
 
                     slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
                     slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
@@ -1363,6 +1367,7 @@ def main(args):
 
                                 loss = loss.mean()
                                 ed_optimizer.backward(loss)
+                                seen_images_count += (loss_end_sample_index - loss_start_sample_index)
 
                                 loss_step = loss.detach().item()
                                 del loss
@@ -1371,14 +1376,11 @@ def main(args):
                                 loss_log_step.append(loss_step)
                                 loss_epoch.append(loss_step)
 
-                    seen_images_count += batch_size
-                    actual_effective_batch_size += batch_size
                     if seen_images_count >= desired_effective_batch_size:
+                        effective_batch_size = seen_images_count
                         ed_optimizer.step_optimizer(global_step)
-                        seen_images_count -= desired_effective_batch_size
+                        seen_images_count = 0
                         desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
-                        effective_batch_size_to_log = actual_effective_batch_size
-                        actual_effective_batch_size = 0
 
                 ed_optimizer.step_schedulers(global_step)
 
@@ -1416,7 +1418,7 @@ def main(args):
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timesteps_ranges[0][0], global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timesteps_ranges[0][1], global_step=global_step)
-                    log_writer.add_scalar("hyperparameter/effective batch size", scalar_value=effective_batch_size_to_log, global_step=global_step)
+                    log_writer.add_scalar("hyperparameter/effective batch size", scalar_value=effective_batch_size, global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
                     avg = sum_img / len(images_per_sec_log_step)
@@ -1675,6 +1677,7 @@ if __name__ == "__main__":
     argparser.add_argument("--lora_alpha", type=int, default=8)
 
     argparser.add_argument("--test_images", action="store_true", help="check all images by trying to load them")
+
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)
