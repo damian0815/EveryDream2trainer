@@ -1244,12 +1244,43 @@ def main(args):
 
 
                 do_contrastive_learning = full_batch["do_contrastive_learning"]
-                timesteps = _get_timesteps(batch_size=full_batch_size,
+                timesteps: torch.LongTensor = _get_timesteps(batch_size=full_batch_size,
                                            batch_share_timesteps=(
                                                    do_contrastive_learning or args.batch_share_timesteps),
                                            device=unet.device,
                                            timesteps_ranges=timesteps_ranges)
 
+                # apply cond dropout
+                initial_batch_size = args.initial_batch_size or args.batch_size
+                final_batch_size = args.final_batch_size or args.batch_size
+                if final_batch_size == initial_batch_size:
+                    cdp_01_bs = 0
+                else:
+                    cdp_01_bs = min(1, max(0, (desired_effective_batch_size - initial_batch_size)
+                                       / (final_batch_size - initial_batch_size)))
+                for i in range(timesteps.shape[0]):
+                    cdp_01_ts = 1 - (timesteps[i].cpu().item() / 999)
+                    if args.cond_dropout_curriculum_source == 'timestep':
+                        cdp_01 = cdp_01_ts
+                    elif args.cond_dropout_curriculum_source == 'batch_size':
+                        assert args.final_batch_size != args.initial_batch_size
+                        cdp_01 = cdp_01_bs
+                    elif args.cond_dropout_curriculum_source == 'global_step':
+                        cdp_01 = train_progress_01
+                    elif args.cond_dropout_curriculum_source == 'batch_size_and_timestep':
+                        assert args.final_batch_size != args.initial_batch_size
+                        cdp_01 = cdp_01_bs * cdp_01_ts
+                    else:
+                        raise ValueError("Unrecognized value for --cond_dropout_curriculum_source")
+                    final_cond_dropout = args.cond_dropout if args.final_cond_dropout is None else args.final_cond_dropout
+                    this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
+                                                                       initial_value=args.cond_dropout,
+                                                                       final_value=final_cond_dropout,
+                                                                       alpha=args.cond_dropout_curriculum_alpha)
+                    if train_batch.random_instance.random() <= this_cond_dropout_p:
+                        full_batch['tokens'][i] = train_batch.cond_dropout_tokens
+                        for k in full_batch['captions'].keys():
+                            full_batch['captions'][k][i] = train_batch.cond_dropout_caption
 
                 remaining_batch = full_batch
                 while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
@@ -1291,7 +1322,7 @@ def main(args):
                     slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
                     actual_image_size = image_shape[2] * image_shape[3]
                     slice_size_scale_factor = slice_size_image_size_reference / actual_image_size
-                    slice_size = max(1, round(slice_size * slice_size_scale_factor))
+                    slice_size = max(1, math.floor(slice_size * slice_size_scale_factor))
 
                     # if True, divide the batch into 2 for loss+backward pass
                     # should only apply when doing multires when eg base res is 768 and curr res is 1024
@@ -1363,11 +1394,11 @@ def main(args):
                                                  args=args
                                                  )
                                 del target, model_pred
-                                loss_start_sample_index = loss_end_sample_index
 
                                 loss = loss.mean()
                                 ed_optimizer.backward(loss)
                                 seen_images_count += (loss_end_sample_index - loss_start_sample_index)
+                                loss_start_sample_index = loss_end_sample_index
 
                                 loss_step = loss.detach().item()
                                 del loss
@@ -1579,6 +1610,10 @@ if __name__ == "__main__":
     argparser.add_argument("--clip_grad_norm", type=float, default=None, help="Clip gradient norm (def: disabled) (ex: 1.5), useful if loss=nan?")
     argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
     argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
+    argparser.add_argument("--cond_dropout_curriculum_alpha", type=float, default=0, help="cond dropout curriculum alpha, from cond_dropout to final_cond_dropout, controlled by --cond_dropout_curriculum_source")
+    argparser.add_argument("--cond_dropout_curriculum_source", choices=['timestep', 'batch_size', 'batch_size_and_timestep', 'global_step'], default='timestep',
+                           help="source for cond dropout curriculum - timestep (high timestep (high noise)...low timestep), batch size (initial_batch_size...final_batch_size), or global_step")
+    argparser.add_argument("--final_cond_dropout", type=float, default=None, help="if doing cond dropout curriculum, the final cond dropout (timestep=0)")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
     argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
@@ -1594,6 +1629,7 @@ if __name__ == "__main__":
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--loss_type", type=str, default="mse_huber", help="type of loss, 'huber', 'mse', or 'mse_huber' for interpolated (def: mse_huber)", choices=["huber", "mse", "mse_huber"])
+    argparser.add_argument("--negative_loss_margin", type=float, default=1, help="margin for negative loss scale falloff")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])

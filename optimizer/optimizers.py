@@ -41,7 +41,7 @@ OPTIMIZER_TE_STATE_FILENAME = "optimizer_te.pt"
 OPTIMIZER_UNET_STATE_FILENAME = "optimizer_unet.pt"
 SCALER_STATE_FILENAME = 'scaler.pt'
 
-class EveryDreamOptimizer():
+class EveryDreamOptimizer:
     """
     Wrapper to manage optimizers
     resume_ckpt_path: path to resume checkpoint, will try to load state (.pt) files if they exist
@@ -127,12 +127,6 @@ class EveryDreamOptimizer():
     def _log_weight_normal(self, parameters: Generator, label: str, log_action=None):
         total_norm = self._get_norm(parameters, lambda p: p.data)
         log_action(total_norm, label)
-
-    def _calculate_normal(param, param_type):
-        if param_type(param) is not None:
-            return param_type(param).norm(2).item() ** 2
-        else:
-            return 0.0
 
     def _get_norm(self, parameters: Generator, param_type):
         total_norm = 0
@@ -409,6 +403,7 @@ class EveryDreamOptimizer():
         growth_rate=float("inf") # dadapt various, no idea what a sane default is
         safeguard_warmup = True # per recommendation from prodigy documentation
 
+        optimizer_name = None
         if local_optimizer_config is not None:
             betas = local_optimizer_config.get("betas", betas)
             epsilon = local_optimizer_config.get("epsilon", epsilon)

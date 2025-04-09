@@ -13,13 +13,17 @@ def nibble_batch(batch, take_count):
     current_batch_size = batch['image'].shape[0]
     non_runt_size = current_batch_size - runt_size
     assert non_runt_size > 0
-    if non_runt_size <= take_count:
-        return batch, None
 
-    nibble = _subdivide_batch_part(batch, 0, take_count)
+    nibble_size = min(non_runt_size, take_count)
+    nibble = _subdivide_batch_part(batch, 0, nibble_size)
     nibble['runt_size'] = 0
 
-    remainder = _subdivide_batch_part(batch, take_count, None)
+    remaining_size = non_runt_size - nibble_size
+    if remaining_size == 0:
+        remainder = None
+    else:
+        remainder = _subdivide_batch_part(batch, nibble_size, non_runt_size)
+        remainder['runt_size'] = 0
     return nibble, remainder
 
 
@@ -128,7 +132,8 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
     else:
         mask = torch.ones_like(target)
 
-    def compute_loss(model_pred, target, timesteps, loss_scale, reduction="none"):
+    def compute_loss(model_pred: torch.Tensor, target: torch.Tensor, timesteps: torch.LongTensor, loss_scale: torch.Tensor):
+        reduction = "none"
         loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction=reduction)
         loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float) * loss_scale
         loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
@@ -162,6 +167,13 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
             loss_mse = loss_mse * loss_scale.to(device)
             loss = loss_mse
             del loss_mse
+
+        if torch.any(loss_scale < 0):
+            distance_sq = torch.pow(model_pred.float() - target.float(), 2)
+            margin_sq = args.negative_loss_margin * args.negative_loss_margin
+            repulsion_loss = torch.max(torch.tensor(0), margin_sq - distance_sq)
+            negative_loss_mask = ((loss_scale < 0) * 1.0).to(loss.device)
+            loss = repulsion_loss * negative_loss_mask + loss * (1-negative_loss_mask)
         return loss
 
 
@@ -176,14 +188,18 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
         bsz = model_pred.shape[0]
         num_samples = [0] * bsz
         for i in range(bsz):
-            if (caption_str[i] is None or caption_str[i] == " "):
+            if (caption_str[i] is None
+                    or len(caption_str[i].strip()) == 0
+                    or loss_scale[i] < 0
+            ):
                 continue
 
             for j in range(bsz):
                 if (i == j  # skip self
                         or caption_str[j] is None
                         or len(caption_str[j].strip()) == 0  # skip missing or dropout
-                        or caption_str[i] == caption_str[j]  # skip equal captions
+                        or caption_str[i] == caption_str[j] # skip equal captions
+                        or loss_scale[j] < 0 # skip negative loss
                 ):
                     continue
                 delta_to_wrong = model_pred[j:j + 1] - model_pred[i:i + 1]
@@ -191,8 +207,7 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
                 l_negative = compute_loss(delta_to_wrong.float(),
                                       target_delta_to_wrong.float(),
                                       timesteps=timesteps[j:j + 1],
-                                      loss_scale=loss_scale[j:j + 1],
-                                      reduction='none')
+                                      loss_scale=loss_scale[j:j + 1])
                 # l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
                 negative_loss[i:i + 1] += l_negative
                 del delta_to_wrong
