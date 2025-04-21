@@ -146,9 +146,11 @@ class EveryDreamValidator:
         If this happens, the returned `list` contains the remaining items after the required items have been stolen.
         Otherwise, the returned `list` is identical to the passed-in `train_items`.
         """
+        # sort so we have a stable base point between runs
+        train_items = sorted(train_items, key=lambda ti: ti.pathname)
+
         with isolate_rng():
             random.seed(self.seed)
-
             auto_dataset, remaining_train_items = self._build_automatic_validation_dataset_if_required(train_items, tokenizer)
             # order is important - if we're removing images from train, this needs to happen before making
             # the overlapping dataloader
@@ -213,8 +215,7 @@ class EveryDreamValidator:
             for step, batch in enumerate(dataloader):
                 keys = list(batch["captions"].keys())
                 for key in keys:
-                    model_pred, target = get_model_prediction_and_target(image=batch["image"],
-                                                                         tokens=batch["tokens"][key])
+                    model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"][key])
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 

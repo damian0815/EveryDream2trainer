@@ -20,6 +20,8 @@ import math
 
 from tqdm.auto import tqdm
 
+from semaphore_files import check_semaphore_file_and_unlink, _INTERRUPT_SAMPLES_SEMAPHORE_FILE
+
 _RE_COMBINE_WHITESPACE = re.compile(r"\s+")
 
 
@@ -262,6 +264,10 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
         base_sample_index = index_offset
 
         for k, params in itertools.groupby(all_params, lambda x: get_critical_params(x)):
+            if check_semaphore_file_and_unlink(_INTERRUPT_SAMPLES_SEMAPHORE_FILE):
+                print("sample generation interrupted")
+                break
+
             params = list(params)
             p0: ImageGenerationParams = params[0]
 

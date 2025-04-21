@@ -21,8 +21,10 @@ from tqdm.auto import tqdm
 from compel import Compel
 import traceback
 
+from semaphore_files import check_semaphore_file_and_unlink
 from .sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
 
+_INTERRUPT_SAMPLES_SEMAPHORE_FILE = 'no_more_samples.semaphore'
 
 def clean_filename(filename):
     """
@@ -223,6 +225,10 @@ class SampleGenerator:
                                     text_encoder=pipe.text_encoder,
                                     use_penultimate_clip_layer=self.use_penultimate_clip_layer)
                     for batch in batches:
+                        if check_semaphore_file_and_unlink(_INTERRUPT_SAMPLES_SEMAPHORE_FILE):
+                            print("sample generation interrupted")
+                            return
+
                         prompts = [p.prompt for p in batch]
                         negative_prompts = [p.negative_prompt for p in batch]
                         seeds = [(p.seed if p.seed != -1 else random.randint(0, 2 ** 30))

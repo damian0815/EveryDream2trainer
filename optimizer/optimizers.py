@@ -22,6 +22,7 @@ from typing import Generator, Any
 
 import torch
 from diffusers.loaders import StableDiffusionLoraLoaderMixin
+from diffusers import UNet2DConditionModel
 from peft import LoraConfig
 
 from torch.cuda.amp import autocast, GradScaler
@@ -31,6 +32,7 @@ from colorama import Fore, Style
 import pprint
 
 from plugins.plugins import PluginRunner
+import re
 
 
 BETAS_DEFAULT = [0.9, 0.999]
@@ -59,6 +61,7 @@ class EveryDreamOptimizer:
         self.unet = unet # needed for weight norm logging, unet.parameters() has to be called again, Diffusers quirk
         self.text_encoder = text_encoder
         self.log_writer = log_writer
+        self.unet_freeze = args.freeze_unet_balanced
         self.te_config, self.base_config = self.get_final_optimizer_configs(args, optimizer_config)
         self.te_freeze_config = optimizer_config.get("text_encoder_freezing", {})
         print(f" Final unet optimizer config:")
@@ -76,7 +79,7 @@ class EveryDreamOptimizer:
             self.text_encoder_params, self.unet_params = self.setup_lora_training(args, text_encoder, unet)
         else:
             self.text_encoder_params = self._apply_text_encoder_freeze(text_encoder)
-            self.unet_params = unet.parameters()
+            self.unet_params = self._apply_unet_freeze(unet)
 
         if args.jacobian_descent:
             from torchjd.aggregation import UPGrad
@@ -547,7 +550,35 @@ class EveryDreamOptimizer:
         log_optimizer(label, optimizer, betas, epsilon, weight_decay, curr_lr)
         return optimizer
 
-    def _apply_text_encoder_freeze(self, text_encoder) -> chain[Any]:
+    def _apply_unet_freeze(self, unet: UNet2DConditionModel) -> chain[torch.nn.Parameter]:
+        if not self.unet_freeze:
+            return itertools.chain(unet.parameters())
+        def should_train(name: str) -> bool:
+            # Train Time Embeddings
+            if name.startswith("time_embedding."):
+                return True
+
+            # Train All Attention Layers (within down, mid, up blocks)
+            # This regex matches anything containing '.attentions.'
+            if re.search(r'\.attentions\.', name):
+                return True
+
+            # Train Final Output Layers
+            if name.startswith("conv_norm_out.") or name.startswith("conv_out."):
+                return True
+
+            # --- Everything else is frozen based on the Balanced Strategy ---
+            return False
+
+        print(' ❄️ applying unet "balanced" freeze')
+        for n, p in unet.named_parameters():
+            if not should_train(n):
+                p.requires_grad = False
+
+        return itertools.chain([p for n, p in unet.named_parameters() if should_train(n)])
+
+
+    def _apply_text_encoder_freeze(self, text_encoder) -> chain[torch.nn.Parameter]:
         num_layers = len(text_encoder.text_model.encoder.layers)
         unfreeze_embeddings = True
         unfreeze_last_n_layers = None

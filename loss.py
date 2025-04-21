@@ -1,6 +1,7 @@
 import logging
 import math
 import random
+from typing import Tuple
 
 import torch
 from torch.cuda.amp import autocast
@@ -111,7 +112,8 @@ def get_latents(image, vae, device, args):
         return latents
 
 
-def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, noise_scheduler,
+def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
+              caption_str, mask, timesteps, loss_scale, noise_scheduler,
               do_contrastive_learning,
               contrastive_learning_negative_loss_scale, args):
 
@@ -123,8 +125,11 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
         min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
         if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
             snr_weight = min_snr_gamma / (snr + 1)
+            # prevent extremely low weight at high timesteps
+            snr_weight += 0.0047
         else:
             snr_weight = min_snr_gamma / snr
+
         loss_scale = loss_scale * snr_weight.to(loss_scale.device)
 
     if mask is not None:
@@ -176,81 +181,137 @@ def _get_loss(model_pred, target, caption_str, mask, timesteps, loss_scale, nois
             loss = repulsion_loss * negative_loss_mask + loss * (1-negative_loss_mask)
         return loss
 
+    positive_loss = compute_loss(model_pred, target, timesteps, loss_scale)
+
+    if args.contrastive_learning_info_nce_sample_count > 0 and model_pred_wrong_mask.sum() > 0:
+        negative_losses = []
+        for i in range(args.contrastive_learning_info_nce_sample_count):
+            # positive_loss = MSE(v_pred_positive, v_target) (This is just L_simple)
+            # negative_loss_1 = MSE(v_pred_negative_1, v_target)
+            negative_losses.append(compute_loss(model_pred_wrong[i], target, timesteps, loss_scale))
+        negative_losses = torch.stack(negative_losses)
+        # InfoNCE (Noise Contrastive Estimation) Style
+        """
+        Calculate scores, often inversely related to error: 
+          score_positive = -error_positive / T 
+          score_negative_i = -error_negative_i / T (where T is a temperature hyperparameter).
+        Calculate the loss: 
+          L_contrastive = -log( exp(score_positive) / (exp(score_positive) + sum(exp(score_negative_i))) )
+            (This is the cross-entropy loss for classifying the positive correctly).
+        """
+        temperature = args.contrastive_learning_info_nce_temperature
+        score_positive = -positive_loss / temperature
+        scores_negative = -negative_losses / temperature
+        exp_positive = torch.exp(score_positive)
+        exps_negative = torch.exp(scores_negative)[model_pred_wrong_mask.unsqueeze(0)]
+        # if exps_negative is empty (because of the mask), contrastive_loss is torch.log(1) (== 0)
+        contrastive_loss = -torch.log(exp_positive / (exp_positive + torch.sum(exps_negative, dim=0)))
+        return (positive_loss + args.contrastive_learning_negative_loss_scale * contrastive_loss) * mask
 
     if not do_contrastive_learning:
-        return compute_loss(model_pred, target, timesteps, loss_scale) * mask
-    else:
-        positive_loss = compute_loss(model_pred, target, timesteps, loss_scale)
-        # Generate negative samples
-        # max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
-        #                                 dtype=positive_loss.dtype).to(positive_loss.device)
-        negative_loss = torch.zeros_like(positive_loss)
-        bsz = model_pred.shape[0]
-        num_samples = [0] * bsz
-        for i in range(bsz):
-            if (caption_str[i] is None
-                    or len(caption_str[i].strip()) == 0
-                    or loss_scale[i] < 0
+        return positive_loss * mask
+
+    # Generate negative samples
+    # max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
+    #                                 dtype=positive_loss.dtype).to(positive_loss.device)
+    negative_loss = torch.zeros_like(positive_loss)
+    bsz = model_pred.shape[0]
+    num_samples = [0] * bsz
+    for i in range(bsz):
+        if (caption_str[i] is None
+                or len(caption_str[i].strip()) == 0
+                or loss_scale[i] < 0
+        ):
+            continue
+
+        for j in range(bsz):
+            if (i == j  # skip self
+                    or caption_str[j] is None
+                    or len(caption_str[j].strip()) == 0  # skip missing or dropout
+                    or caption_str[i] == caption_str[j] # skip equal captions
+                    or loss_scale[j] < 0 # skip negative loss
             ):
                 continue
+            delta_to_wrong = model_pred[j:j + 1] - model_pred[i:i + 1]
+            target_delta_to_wrong = target[j:j + 1] - target[i:i + 1]
+            l_negative = compute_loss(delta_to_wrong.float(),
+                                  target_delta_to_wrong.float(),
+                                  timesteps=timesteps[j:j + 1],
+                                  loss_scale=loss_scale[j:j + 1])
+            # l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
+            negative_loss[i:i + 1] += l_negative
+            del delta_to_wrong
+            del target_delta_to_wrong
+            del l_negative
 
-            for j in range(bsz):
-                if (i == j  # skip self
-                        or caption_str[j] is None
-                        or len(caption_str[j].strip()) == 0  # skip missing or dropout
-                        or caption_str[i] == caption_str[j] # skip equal captions
-                        or loss_scale[j] < 0 # skip negative loss
-                ):
-                    continue
-                delta_to_wrong = model_pred[j:j + 1] - model_pred[i:i + 1]
-                target_delta_to_wrong = target[j:j + 1] - target[i:i + 1]
-                l_negative = compute_loss(delta_to_wrong.float(),
-                                      target_delta_to_wrong.float(),
-                                      timesteps=timesteps[j:j + 1],
-                                      loss_scale=loss_scale[j:j + 1])
-                # l_negative = F.mse_loss(delta_to_wrong.float(), target_delta_to_wrong.float(), reduction='none')
-                negative_loss[i:i + 1] += l_negative
-                del delta_to_wrong
-                del target_delta_to_wrong
-                del l_negative
+            num_samples[i] += 1
 
-                num_samples[i] += 1
+    # print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
 
-        # print(' - num contrastive samples', num_samples, ', negative loss', negative_loss.mean())
+    # Average over negative samples
+    num_samples_safe = torch.tensor(([1] * len(num_samples)
+                                     if args.contrastive_learning_no_average_negatives
+                                     else [max(1, x) for x in num_samples]
+                                     ), device=negative_loss.device)
 
-        # Average over negative samples
-        num_samples_safe = torch.tensor(([1] * len(num_samples)
-                                         if args.contrastive_learning_no_average_negatives
-                                         else [max(1, x) for x in num_samples]
-                                         ), device=negative_loss.device)
+    negative_loss_scale = contrastive_learning_negative_loss_scale / num_samples_safe
+    negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).to(device).expand_as(positive_loss)
+    if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
+        # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases
+        max_timestep = noise_scheduler.config.num_train_timesteps
+        negative_loss_timestep_start = args.contrastive_learning_delta_timestep_start
+        # linear bias with offset
+        early_timestep_bias = torch.maximum((timesteps - negative_loss_timestep_start)
+                                            / (max_timestep - negative_loss_timestep_start),
+                                            torch.tensor(0).to(device))
+        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss)
+        negative_loss_scale = negative_loss_scale * early_timestep_bias
 
-        negative_loss_scale = contrastive_learning_negative_loss_scale / num_samples_safe
-        negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).to(device).expand_as(positive_loss)
-        if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
-            # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases
-            max_timestep = noise_scheduler.config.num_train_timesteps
-            negative_loss_timestep_start = args.contrastive_learning_delta_timestep_start
-            # linear bias with offset
-            early_timestep_bias = torch.maximum((timesteps - negative_loss_timestep_start)
-                                                / (max_timestep - negative_loss_timestep_start),
-                                                torch.tensor(0).to(device))
-            early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss)
-            negative_loss_scale = negative_loss_scale * early_timestep_bias
+    loss = (positive_loss + negative_loss * negative_loss_scale) * mask
+    del positive_loss
+    del negative_loss
 
-        loss = (positive_loss + negative_loss * negative_loss_scale) * mask
-        del positive_loss
-        del negative_loss
+    return loss
 
-        return loss
+def _get_contrastive_v2_loss():
+    pass
 
-
-def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler, args):
+def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler,
+                                     args, skip_contrastive: bool=False
+                                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps,
                                                           args.latents_perturbation)
     with autocast(enabled=args.amp):
         # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-    return model_pred, target
+
+    model_pred_wrong_caption = None
+    model_pred_wrong_caption_mask = None
+
+    if not skip_contrastive and args.contrastive_learning_info_nce_sample_count > 0:
+        def rotate_dim0(x, c):
+            return torch.cat([x[-c:], x[:-c]])
+        model_pred_wrong_caption = []
+        model_pred_wrong_caption_mask = []
+        for i in range(min(args.contrastive_learning_info_nce_sample_count, encoder_hidden_states.shape[0]-1)):
+            # v_pred_positive = unet(z_t, t, c_positive).
+            # v_pred_negative_1 = unet(z_t, t, c_negative_1)
+            # v_pred_negative_2 = unet(z_t, t, c_negative_2)
+            with autocast(enabled=args.amp):
+                wrong_caption_i = rotate_dim0(encoder_hidden_states, i + 1)
+                model_pred_wrong_caption_i = unet(noisy_latents, timesteps, wrong_caption_i).sample
+                model_pred_wrong_caption.append(model_pred_wrong_caption_i)
+                del wrong_caption_i, model_pred_wrong_caption_i
+        if len(model_pred_wrong_caption) > 0:
+            model_pred_wrong_caption = torch.stack(model_pred_wrong_caption)
+            model_pred_wrong_caption_mask = torch.tensor([True] * encoder_hidden_states.shape[0],
+                                                              dtype=torch.bool, device=model_pred.device)
+        else:
+            model_pred_wrong_caption = torch.zeros_like(model_pred).unsqueeze(0)
+            model_pred_wrong_caption_mask = torch.tensor([False] * encoder_hidden_states.shape[0],
+                                                              dtype=torch.bool, device=model_pred.device)
+
+    return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask
 
 
 def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbation):
@@ -317,7 +378,7 @@ def pyramid_noise_like(x, discount=0.8):
     if w==1 or h==1: break # Lowest resolution is 1x1
   return noise/noise.std() # Scaled back to roughly unit variance
 
-def compute_snr(timesteps, noise_scheduler, max_sigma):
+def compute_snr(timesteps, noise_scheduler, max_sigma=22000):
     """
     Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
     """
