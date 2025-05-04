@@ -276,7 +276,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
 
             # reduce the batch size when images are larger
             size_factor = (p0.width * p0.height) / (768 * 768)
-            scaled_batch_size = max(batch_size, math.ceil(batch_size / size_factor))
+            scaled_batch_size = min(batch_size, math.ceil(batch_size / size_factor))
 
             params_batches = chunk_list(params, scaled_batch_size)
 

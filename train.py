@@ -1434,13 +1434,14 @@ def main(args):
                         loss_epoch.append(loss_step)
 
                         should_step_optimizer = effective_batch_images_count >= desired_effective_batch_size
-                        if should_step_optimizer or accumulated_loss_images_count >= max_backward_slice_size:
+                        if (should_step_optimizer and accumulated_loss_images_count > 0) or accumulated_loss_images_count >= max_backward_slice_size:
                             accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                             ed_optimizer.backward(accumulated_loss)
                             accumulated_loss = None
                             effective_backward_size = accumulated_loss_images_count
                             accumulated_loss_images_count = 0
                         if should_step_optimizer:
+                            #print(f'stepping optimizer - effective_batch_images_count {effective_batch_images_count}, accumulated_loss_images_count {accumulated_loss_images_count}')
                             effective_batch_size = effective_batch_images_count
                             ed_optimizer.step_optimizer(global_step)
                             effective_batch_images_count = 0
