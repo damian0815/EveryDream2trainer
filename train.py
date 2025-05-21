@@ -1144,6 +1144,7 @@ def main(args):
         needs_samples = False
         effective_batch_size = 0
         effective_backward_size = 0
+        effective_batch_total_elements = 0
         effective_batch_images_count = 0
         accumulated_loss_images_count = 0
         accumulated_loss = None
@@ -1425,17 +1426,19 @@ def main(args):
 
                         # eliminate the x/y dims so we can accumulate over a larger number of samples without
                         # worrying about size mismatch
-                        loss = loss.mean(dim=[2, 3])
-                        accumulated_loss = loss if accumulated_loss is None else torch.cat([accumulated_loss, loss])
+                        #loss = loss.mean(dim=[2, 3])
+                        effective_batch_total_elements += loss.numel()
+                        loss_sum = loss.sum()
+                        accumulated_loss = loss_sum if accumulated_loss is None else accumulated_loss + loss_sum
                         loss_step = loss.detach().mean().item()
-                        del loss
+                        del loss, loss_sum
                         steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
                         loss_log_step.append(loss_step)
                         loss_epoch.append(loss_step)
 
                         should_step_optimizer = effective_batch_images_count >= desired_effective_batch_size
                         if (should_step_optimizer and accumulated_loss_images_count > 0) or accumulated_loss_images_count >= max_backward_slice_size:
-                            accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
+                            #accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                             ed_optimizer.backward(accumulated_loss)
                             accumulated_loss = None
                             effective_backward_size = accumulated_loss_images_count
@@ -1443,8 +1446,9 @@ def main(args):
                         if should_step_optimizer:
                             #print(f'stepping optimizer - effective_batch_images_count {effective_batch_images_count}, accumulated_loss_images_count {accumulated_loss_images_count}')
                             effective_batch_size = effective_batch_images_count
-                            ed_optimizer.step_optimizer(global_step)
+                            ed_optimizer.step_optimizer(global_step, effective_batch_total_elements)
                             effective_batch_images_count = 0
+                            effective_batch_total_elements = 0
                             desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
 
                 ed_optimizer.step_schedulers(global_step)

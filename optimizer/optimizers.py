@@ -166,10 +166,20 @@ class EveryDreamOptimizer:
         else:
             loss_scaled_if_necessary.backward()
 
-    def step_optimizer(self, global_step):
+    def step_optimizer(self, global_step, total_elements=None):
         if self.scaler is not None:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
+
+        if total_elements is not None:
+            assert total_elements > 0
+            scaling_factor = 1.0 / total_elements
+            for param in self.unet_params:
+                if param.grad is not None:
+                    param.grad.data.mul_(scaling_factor)
+            for param in self.text_encoder_params:
+                if param.grad is not None:
+                    param.grad.data.mul_(scaling_factor)
 
         if self.clip_grad_norm is not None:
             if self.log_grad_norm:
