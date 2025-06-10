@@ -26,7 +26,7 @@ from diffusers import UNet2DConditionModel
 from peft import LoraConfig
 
 from torch.cuda.amp import autocast, GradScaler
-from diffusers.optimization import get_scheduler
+from diffusers.optimization import get_scheduler, get_polynomial_decay_schedule_with_warmup
 
 from colorama import Fore, Style
 import pprint
@@ -52,6 +52,8 @@ class EveryDreamOptimizer:
     unet: unet model parameters
     """
     def __init__(self, args, optimizer_config, text_encoder, unet, epoch_len, plugin_runner: PluginRunner, log_writer=None):
+        if optimizer_config is None:
+            raise ValueError("missing optimizer_config")
         if "doc" in optimizer_config:
             del optimizer_config["doc"]
         print(f"\n raw optimizer_config:")
@@ -73,6 +75,7 @@ class EveryDreamOptimizer:
         self.next_grad_accum_step = self.grad_accum
         self.clip_grad_norm = args.clip_grad_norm
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
+        self.use_grad_scaler = optimizer_config.get("use_grad_scaler", True)
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
         if args.lora:
@@ -108,7 +111,7 @@ class EveryDreamOptimizer:
         schedulers = self.create_lr_schedulers(args, optimizer_config)
         self.lr_schedulers.extend(schedulers)
 
-        if args.amp:
+        if args.amp and self.use_grad_scaler:
             self.scaler = GradScaler(
                 enabled=args.amp,
                 init_scale=args.init_grad_scale or 2**17.5,
@@ -313,12 +316,15 @@ class EveryDreamOptimizer:
         base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
         base_config["lr_warmup_steps"] = base_config.get("lr_warmup_steps", None) or args.lr_warmup_steps
         base_config["lr_decay_steps"] = base_config.get("lr_decay_steps", None) or args.lr_decay_steps
+        if "lr_advance_steps" not in base_config:
+            base_config["lr_advance_steps"] = 0
         base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
 
         te_config["lr"] = te_config.get("lr", None) or base_config["lr"]
         te_config["optimizer"] = te_config.get("optimizer", None) or base_config["optimizer"]
         te_config["lr_scheduler"] = te_config.get("lr_scheduler", None) or base_config["lr_scheduler"]
-        te_config["lr_warmup_steps"] = te_config.get("lr_warmup_steps", None) or  base_config["lr_warmup_steps"]
+        te_config["lr_warmup_steps"] = te_config.get("lr_warmup_steps", None) or base_config["lr_warmup_steps"]
+        te_config["lr_advance_steps"] = te_config.get("lr_advance_steps", None) or base_config["lr_advance_steps"]
         te_config["lr_decay_steps"] = te_config.get("lr_decay_steps", None) or base_config["lr_decay_steps"]
         te_config["weight_decay"] = te_config.get("weight_decay", None) or base_config["weight_decay"]
         te_config["betas"] = te_config.get("betas", None) or base_config["betas"]
@@ -339,16 +345,28 @@ class EveryDreamOptimizer:
                 num_warmup_steps=int(te_config.get("lr_warmup_steps", None) or unet_config.get("lr_warmup_steps",0)),
                 num_training_steps=int(te_config.get("lr_decay_steps", None) or unet_config.get("lr_decay_steps",1e9))
             )
-            ret_val.append(lr_scheduler)    
+            ret_val.append(lr_scheduler)
 
         if self.optimizer_unet is not None:
             unet_config = optimizer_config["base"]
-            lr_scheduler = get_scheduler(
-                unet_config["lr_scheduler"],
-                optimizer=self.optimizer_unet,
-                num_warmup_steps=int(unet_config["lr_warmup_steps"]),
-                num_training_steps=int(unet_config["lr_decay_steps"]),
-            )
+
+            if unet_config["lr_scheduler"] == "polynomial":
+                lr_scheduler = get_polynomial_decay_schedule_with_warmup(
+                    optimizer=self.optimizer_unet,
+                    lr_end=unet_config.get("lr_end", unet_config["lr"]/100.0),
+                    power=unet_config.get("power", 2),
+                    num_warmup_steps=int(unet_config["lr_warmup_steps"]),
+                    num_training_steps=int(unet_config["lr_decay_steps"]),
+                )
+            else:
+                lr_scheduler = get_scheduler(
+                    unet_config["lr_scheduler"],
+                    optimizer=self.optimizer_unet,
+                    num_warmup_steps=int(unet_config["lr_warmup_steps"]),
+                    num_training_steps=int(unet_config["lr_decay_steps"]),
+                )
+            for i in range(unet_config["lr_advance_steps"]):
+                lr_scheduler.step()
             ret_val.append(lr_scheduler)
         return ret_val
 

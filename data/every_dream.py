@@ -117,6 +117,7 @@ class EveryDreamBatch(Dataset):
 
         train_item = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
 
+
         std_dev = 0.5
         mean = 0.5
 
