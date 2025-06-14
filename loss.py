@@ -4,6 +4,7 @@ import random
 from typing import Tuple
 
 import torch
+from compel import Compel
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
@@ -87,20 +88,23 @@ def get_timestep_curriculum_range(progress_01,
     return int(min_t), int(max_t)
 
 
-def get_encoder_hidden_states(text_encoder, cuda_caption, clip_skip, embedding_perturbation):
-    encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
-
-    if clip_skip > 0:
-        encoder_hidden_states = text_encoder.text_model.final_layer_norm(
-            encoder_output.hidden_states[-clip_skip])
+def get_encoder_hidden_states(text_encoder, cuda_caption, clip_skip, embedding_perturbation,
+                              compel: Compel=None, caption_strings: list[str]=None):
+    if compel is not None:
+        encoder_hidden_states = compel(caption_strings)
     else:
-        encoder_hidden_states = encoder_output.last_hidden_state
+        encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
+        if clip_skip > 0:
+            encoder_hidden_states = text_encoder.text_model.final_layer_norm(
+                encoder_output.hidden_states[-clip_skip])
+        else:
+            encoder_hidden_states = encoder_output.last_hidden_state
 
     # https://arxiv.org/pdf/2405.20494
     perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
     perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
     encoder_hidden_states = encoder_hidden_states + perturbation_delta
-    return encoder_hidden_states, encoder_output.pooler_output
+    return encoder_hidden_states
 
 def get_latents(image, vae, device, args):
     with torch.no_grad():
@@ -314,11 +318,15 @@ def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, time
     return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask
 
 
-def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbation):
+def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbation,
+                           compel: Compel=None, caption_strings: list[str]=None):
     cuda_caption = tokens.to(text_encoder.device)
-    encoder_hidden_states, text_features = get_encoder_hidden_states(text_encoder, cuda_caption,
-                                                                     clip_skip=clip_skip,
-                                                                     embedding_perturbation=embedding_perturbation)
+    encoder_hidden_states = get_encoder_hidden_states(text_encoder,
+                                                      cuda_caption,
+                                                      clip_skip=clip_skip,
+                                                      embedding_perturbation=embedding_perturbation,
+                                                      compel=compel,
+                                                      caption_strings=caption_strings)
     del cuda_caption
     return encoder_hidden_states
 

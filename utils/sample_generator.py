@@ -221,9 +221,12 @@ class SampleGenerator:
                                             compatibility_test=sample_compatibility_test))
                     pbar = tqdm(total=len(batches), disable=disable_progress_bars, position=1, leave=False,
                                       desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
+                    if self.use_penultimate_clip_layer:
+                        print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
                     compel = Compel(tokenizer=pipe.tokenizer,
-                                    text_encoder=pipe.text_encoder,
-                                    use_penultimate_clip_layer=self.use_penultimate_clip_layer)
+                                    text_encoder=pipe.text_encoder
+                                    )#,
+                                    #use_penultimate_clip_layer=self.use_penultimate_clip_layer)
                     for batch in batches:
                         if check_semaphore_file_and_unlink(_INTERRUPT_SAMPLES_SEMAPHORE_FILE):
                             print("sample generation interrupted")

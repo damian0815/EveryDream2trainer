@@ -36,6 +36,9 @@ import itertools
 import torch
 import datetime
 import json
+
+from compel import Compel
+from compel.embeddings_provider import SplitLongTextMode
 from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel, DDIMScheduler, DDPMScheduler, \
@@ -738,6 +741,14 @@ def main(args):
         logging.error(" * Failed to load checkpoint *")
         raise
 
+    compel = None
+    if args.use_compel:
+        compel = Compel(tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        truncate_long_prompts=False,
+                        split_long_text_mode = SplitLongTextMode.SENTENCES,
+                        )
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         text_encoder.gradient_checkpointing_enable()
@@ -1104,16 +1115,19 @@ def main(args):
                            batch_share_noise=False)
         encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
                                                        clip_skip=args.clip_skip,
-                                                       embedding_perturbation=args.embedding_perturbation)
+                                                       embedding_perturbation=args.embedding_perturbation,
+                                                       compel=None)
 
         model_pred, target, _, _ = _get_model_prediction_and_target(latents,
-                                                                                encoder_hidden_states,
-                                                                                noise,
-                                                                                timesteps,
-                                                                                unet,
-                                                                                noise_scheduler,
-                                                                                args=args,
-                                                                                skip_contrastive=True)
+                                                                    encoder_hidden_states,
+                                                                    noise,
+                                                                    timesteps,
+                                                                    unet,
+                                                                    noise_scheduler,
+                                                                    args=args,
+                                                                    skip_contrastive=True)
+
+        del encoder_hidden_states
         return model_pred, target
 
     # Pre-train validation to establish a starting point on the loss graph
@@ -1149,7 +1163,6 @@ def main(args):
         accumulated_loss_images_count = 0
         accumulated_loss = None
         desired_effective_batch_size = choose_effective_batch_size(args, 0)
-        max_backward_slice_size = args.max_backward_slice_size or args.batch_size
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1188,6 +1201,9 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
+            forward_slice_size = args.forward_slice_size or args.batch_size
+            max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+
             for step, full_batch in enumerate(train_dataloader):
 
                 train_progress_01 = compute_train_process_01(epoch=epoch, step=step, steps_per_epoch=epoch_len,
@@ -1204,6 +1220,27 @@ def main(args):
                                                 ed_state=make_current_ed_state())
 
                 full_batch_size = full_batch["image"].shape[0]
+
+                image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
+                enable_vae_attention_slicing = False
+                if image_size > (1100)*(1100):
+                    if accumulated_loss_images_count > 1:
+                        print(f"emergency backward at accumulated_loss_images_count {accumulated_loss_images_count}")
+                        # todo: DRY
+                        ed_optimizer.backward(accumulated_loss)
+                        accumulated_loss = None
+                        effective_backward_size = accumulated_loss_images_count
+                        accumulated_loss_images_count = 0
+                        # reset slice sizes
+                        forward_slice_size = args.forward_slice_size or args.batch_size
+                        max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+                    enable_vae_attention_slicing = True
+                    forward_slice_size = min(forward_slice_size, 1)
+                    max_backward_slice_size = min(max_backward_slice_size, 2)
+
+                elif image_size > (850)*(850):
+                    forward_slice_size = min(forward_slice_size, 2)
+                    max_backward_slice_size = min(max_backward_slice_size, 6)
 
                 def lerp(x, in_min, in_max, out_min, out_max):
                     if (in_max - in_min) == 0:
@@ -1335,20 +1372,23 @@ def main(args):
                                            batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
                                            )
 
-                    slice_size = batch_size if args.forward_slice_size is None else args.forward_slice_size
-                    slice_size_image_size_reference = args.resolution[0] * args.resolution[0]
-                    actual_image_size = image_shape[2] * image_shape[3]
-                    slice_size_scale_factor = slice_size_image_size_reference / actual_image_size
-                    slice_size = max(1, math.floor(slice_size * slice_size_scale_factor))
-
                     runt_size = batch["runt_size"]
                     with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                         latents_slices = []
                         pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
-                        for slice_start, slice_end in get_slices(batch_size, slice_size, runt_size=runt_size):
-                            latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
-                            latents_slice = latents_slice[0].sample() * 0.18215
-                            latents_slices.append(latents_slice)
+                        for slice_start, slice_end in get_slices(batch_size, forward_slice_size, runt_size=runt_size):
+                            try:
+                                vae: AutoencoderKL
+                                if enable_vae_attention_slicing:
+                                    vae.enable_slicing()
+                                latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
+                                vae.disable_slicing()
+                                latents_slice = latents_slice[0].sample() * 0.18215
+                                latents_slices.append(latents_slice)
+                                del latents_slice
+                            except torch.cuda.OutOfMemoryError:
+                                print(f"OOM in vae.encode encoding slice size {forward_slice_size} from pixel values of shape {pixel_values.shape}, from {slice_start} to {slice_end} of {batch_size}. loss images accumulated: {accumulated_loss_images_count}")
+                                raise
                         del pixel_values
                         latents = torch.cat(latents_slices)
                         del latents_slices
@@ -1360,16 +1400,19 @@ def main(args):
                         with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
                             encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
                                                                        clip_skip=args.clip_skip,
-                                                                       embedding_perturbation=args.embedding_perturbation)
+                                                                       embedding_perturbation=args.embedding_perturbation,
+                                                                       compel=compel,
+                                                                       caption_strings=caption_str
+                                                                    )
 
                         model_pred_all = []
                         model_pred_wrong_all = []
                         model_pred_wrong_mask_all = []
                         target_all = []
 
-                        slices = list(get_slices(batch_size, slice_size, runt_size=runt_size))
+                        slices = list(get_slices(batch_size, forward_slice_size, runt_size=runt_size))
                         for slice_index, (slice_start, slice_end) in enumerate(slices):
-                            #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {slice_size}')
+                            #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                             latents_slice = latents[slice_start:slice_end]
                             encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
                             noise_slice = noise[slice_start:slice_end]
@@ -1443,6 +1486,10 @@ def main(args):
                             accumulated_loss = None
                             effective_backward_size = accumulated_loss_images_count
                             accumulated_loss_images_count = 0
+                            # reset slice sizes
+                            forward_slice_size = args.forward_slice_size or args.batch_size
+                            max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+
                         if should_step_optimizer:
                             #print(f'stepping optimizer - effective_batch_images_count {effective_batch_images_count}, accumulated_loss_images_count {accumulated_loss_images_count}')
                             effective_batch_size = effective_batch_images_count
@@ -1760,6 +1807,7 @@ if __name__ == "__main__":
     argparser.add_argument("--everything_contrastive_learning_curriculum_alpha", type=float, default=0, help="if >0, attenuate everything_contrastive_learning_p to 0 using this alpha as timestep approaches 0")
     argparser.add_argument("--caption_variants", type=str, nargs="*", default=None, help="If passed, use only these caption variants from json captions")
     argparser.add_argument("--all_caption_variants", action='store_true', help='if passed, use ALL caption variants every step')
+    argparser.add_argument("--use_compel", action='store_true', help='if passed, use Compel to process prompts with long-prompt support')
 
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
