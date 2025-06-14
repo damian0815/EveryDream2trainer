@@ -26,6 +26,7 @@ import gc
 import random
 import traceback
 import shutil
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import safetensors.torch
@@ -1153,16 +1154,33 @@ def main(args):
                                        text_encoder_ema=text_encoder_ema)
 
     epoch = None
-    try:        
-        plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
-        needs_samples = False
+
+    @dataclass
+    class TrainingVariables:
         effective_batch_size = 0
         effective_backward_size = 0
         effective_batch_total_elements = 0
         effective_batch_images_count = 0
         accumulated_loss_images_count = 0
         accumulated_loss = None
-        desired_effective_batch_size = choose_effective_batch_size(args, 0)
+        desired_effective_batch_size = None
+
+    def optimizer_backward(tv: TrainingVariables):
+        ed_optimizer.backward(tv.accumulated_loss)
+        tv.accumulated_loss = None
+        tv.effective_backward_size = tv.accumulated_loss_images_count
+        tv.accumulated_loss_images_count = 0
+        # reset slice sizes
+        tv.forward_slice_size = args.forward_slice_size or args.batch_size
+        tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+
+    tv = TrainingVariables()
+
+    try:        
+        plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
+
+        needs_samples = False
+        tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1201,8 +1219,8 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
-            forward_slice_size = args.forward_slice_size or args.batch_size
-            max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+            tv.forward_slice_size = args.forward_slice_size or args.batch_size
+            tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
 
             for step, full_batch in enumerate(train_dataloader):
 
@@ -1224,23 +1242,18 @@ def main(args):
                 image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
                 enable_vae_attention_slicing = False
                 if image_size > (1100)*(1100):
-                    if accumulated_loss_images_count > 1:
-                        print(f"emergency backward at accumulated_loss_images_count {accumulated_loss_images_count}")
+                    if tv.accumulated_loss_images_count > 1:
+                        print(f"emergency backward at accumulated_loss_images_count {tv.accumulated_loss_images_count}")
                         # todo: DRY
-                        ed_optimizer.backward(accumulated_loss)
-                        accumulated_loss = None
-                        effective_backward_size = accumulated_loss_images_count
-                        accumulated_loss_images_count = 0
-                        # reset slice sizes
-                        forward_slice_size = args.forward_slice_size or args.batch_size
-                        max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+                        optimizer_backward(tv)
+
                     enable_vae_attention_slicing = True
-                    forward_slice_size = min(forward_slice_size, 1)
-                    max_backward_slice_size = min(max_backward_slice_size, 2)
+                    tv.forward_slice_size = min(tv.forward_slice_size, 1)
+                    tv.max_backward_slice_size = min(tv.max_backward_slice_size, 2)
 
                 elif image_size > (850)*(850):
-                    forward_slice_size = min(forward_slice_size, 2)
-                    max_backward_slice_size = min(max_backward_slice_size, 6)
+                    tv.forward_slice_size = min(tv.forward_slice_size, 2)
+                    tv.max_backward_slice_size = min(tv.max_backward_slice_size, 6)
 
                 def lerp(x, in_min, in_max, out_min, out_max):
                     if (in_max - in_min) == 0:
@@ -1272,7 +1285,7 @@ def main(args):
                     min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
                 ) for tsr in timesteps_ranges]
 
-                if (desired_effective_batch_size > 1
+                if (tv.desired_effective_batch_size > 1
                         and args.everything_contrastive_learning_p > 0
                         and not full_batch["do_contrastive_learning"]
                 ):
@@ -1299,7 +1312,7 @@ def main(args):
                 if final_batch_size == initial_batch_size:
                     cdp_01_bs = 0
                 else:
-                    cdp_01_bs = min(1, max(0, (desired_effective_batch_size - initial_batch_size)
+                    cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
                                        / (final_batch_size - initial_batch_size)))
                 for i in range(timesteps.shape[0]):
                     cdp_01_ts = 1 - (timesteps[i].cpu().item() / 999)
@@ -1329,9 +1342,9 @@ def main(args):
                 remaining_batch = full_batch
                 while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
                     def get_nibble_size() -> int:
-                        assert desired_effective_batch_size - effective_batch_images_count > 0
-                        required_to_fill_batch = desired_effective_batch_size - effective_batch_images_count
-                        permitted_until_backward_step = max_backward_slice_size - accumulated_loss_images_count
+                        assert tv.desired_effective_batch_size - tv.effective_batch_images_count > 0
+                        required_to_fill_batch = tv.desired_effective_batch_size - tv.effective_batch_images_count
+                        permitted_until_backward_step = tv.max_backward_slice_size - tv.accumulated_loss_images_count
                         return max(1, min(required_to_fill_batch, permitted_until_backward_step))
 
                     batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size())
@@ -1376,7 +1389,7 @@ def main(args):
                     with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                         latents_slices = []
                         pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
-                        for slice_start, slice_end in get_slices(batch_size, forward_slice_size, runt_size=runt_size):
+                        for slice_start, slice_end in get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size):
                             try:
                                 vae: AutoencoderKL
                                 if enable_vae_attention_slicing:
@@ -1387,7 +1400,9 @@ def main(args):
                                 latents_slices.append(latents_slice)
                                 del latents_slice
                             except torch.cuda.OutOfMemoryError:
-                                print(f"OOM in vae.encode encoding slice size {forward_slice_size} from pixel values of shape {pixel_values.shape}, from {slice_start} to {slice_end} of {batch_size}. loss images accumulated: {accumulated_loss_images_count}")
+                                print(f"OOM in vae.encode encoding slice size {tv.forward_slice_size} from pixel values "
+                                      f"of shape {pixel_values.shape}, from {slice_start} to {slice_end} of {batch_size}. "
+                                      f"loss images accumulated: {tv.accumulated_loss_images_count}")
                                 raise
                         del pixel_values
                         latents = torch.cat(latents_slices)
@@ -1410,7 +1425,7 @@ def main(args):
                         model_pred_wrong_mask_all = []
                         target_all = []
 
-                        slices = list(get_slices(batch_size, forward_slice_size, runt_size=runt_size))
+                        slices = list(get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size))
                         for slice_index, (slice_start, slice_end) in enumerate(slices):
                             #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                             latents_slice = latents[slice_start:slice_end]
@@ -1459,8 +1474,8 @@ def main(args):
                                          )
                         del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
-                        accumulated_loss_images_count += nibble_size_actual
-                        effective_batch_images_count += nibble_size_actual
+                        tv.accumulated_loss_images_count += nibble_size_actual
+                        tv.effective_batch_images_count += nibble_size_actual
 
                         cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
                                                           for s in caption_str], device=loss.device, dtype=torch.bool)
@@ -1470,33 +1485,28 @@ def main(args):
                         # eliminate the x/y dims so we can accumulate over a larger number of samples without
                         # worrying about size mismatch
                         #loss = loss.mean(dim=[2, 3])
-                        effective_batch_total_elements += loss.numel()
+                        tv.effective_batch_total_elements += loss.numel()
                         loss_sum = loss.sum()
-                        accumulated_loss = loss_sum if accumulated_loss is None else accumulated_loss + loss_sum
+                        tv.accumulated_loss = loss_sum if tv.accumulated_loss is None else tv.accumulated_loss + loss_sum
                         loss_step = loss.detach().mean().item()
                         del loss, loss_sum
                         steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
                         loss_log_step.append(loss_step)
                         loss_epoch.append(loss_step)
 
-                        should_step_optimizer = effective_batch_images_count >= desired_effective_batch_size
-                        if (should_step_optimizer and accumulated_loss_images_count > 0) or accumulated_loss_images_count >= max_backward_slice_size:
+                        should_step_optimizer = tv.effective_batch_images_count >= tv.desired_effective_batch_size
+                        if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
+                                tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                             #accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
-                            ed_optimizer.backward(accumulated_loss)
-                            accumulated_loss = None
-                            effective_backward_size = accumulated_loss_images_count
-                            accumulated_loss_images_count = 0
-                            # reset slice sizes
-                            forward_slice_size = args.forward_slice_size or args.batch_size
-                            max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+                            optimizer_backward(tv)
 
                         if should_step_optimizer:
                             #print(f'stepping optimizer - effective_batch_images_count {effective_batch_images_count}, accumulated_loss_images_count {accumulated_loss_images_count}')
-                            effective_batch_size = effective_batch_images_count
-                            ed_optimizer.step_optimizer(global_step, effective_batch_total_elements)
-                            effective_batch_images_count = 0
-                            effective_batch_total_elements = 0
-                            desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                            tv.effective_batch_size = tv.effective_batch_images_count
+                            ed_optimizer.step_optimizer(global_step, tv.effective_batch_total_elements)
+                            tv.effective_batch_images_count = 0
+                            tv.effective_batch_total_elements = 0
+                            tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
 
                 ed_optimizer.step_schedulers(global_step)
 
@@ -1534,8 +1544,8 @@ def main(args):
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timesteps_ranges[0][0], global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timesteps_ranges[0][1], global_step=global_step)
-                    log_writer.add_scalar(tag="hyperparameter/effective batch size", scalar_value=effective_batch_size, global_step=global_step)
-                    log_writer.add_scalar(tag="hyperparameter/effective backward size", scalar_value=effective_backward_size, global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/effective batch size", scalar_value=tv.effective_batch_size, global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/effective backward size", scalar_value=tv.effective_backward_size, global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
                     avg = sum_img / len(images_per_sec_log_step)
@@ -1582,7 +1592,8 @@ def main(args):
                     last_epoch_saved_time = time.time()
                     logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
                     needs_save = True
-                if epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 0 and epoch < args.max_epochs and epoch >= args.save_ckpts_from_n_epochs:
+                if (epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 0 and
+                        epoch < args.max_epochs and epoch >= args.save_ckpts_from_n_epochs):
                     logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
                     needs_save = True
                 if needs_save:
