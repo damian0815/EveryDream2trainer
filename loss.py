@@ -1,12 +1,16 @@
 import logging
 import math
 import random
-from typing import Tuple
+from typing import Tuple, Callable
 
 import torch
 from compel import Compel
+from diffusers.training_utils import compute_loss_weighting_for_sd3
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
+
+from diffusers import SchedulerMixin, ConfigMixin
+
 
 #from train import pyramid_noise_like, compute_snr
 
@@ -124,6 +128,8 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
     device = model_pred.device
 
     if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
+        if args.train_sampler == 'flow-matching':
+            raise ValueError("can't use min-SNR with flow matching")
         snr = compute_snr(timesteps, noise_scheduler, max_sigma=22000)
         # kohya implementation
         min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
@@ -155,7 +161,6 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             loss_mse = loss_mse * loss_scale.to(device) * early_timestep_bias
             loss_huber = loss_huber * loss_scale.to(device) * (1.0 - early_timestep_bias)
             loss = loss_mse + loss_huber
-            del loss_mse
             del loss_huber
         elif args.loss_type == "huber_mse":
             early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
@@ -165,17 +170,29 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             loss_mse = loss_mse * loss_scale.to(device) * (1.0 - early_timestep_bias)
             loss_huber = loss_huber * loss_scale.to(device) * early_timestep_bias
             loss = loss_huber + loss_mse
-            del loss_mse
             del loss_huber
         elif args.loss_type == "huber":
             loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
             loss_huber = loss_huber * loss_scale.to(device)
             loss = loss_huber
             del loss_huber
+        elif args.loss_type.startswith('sd3-'):
+            # SD3 loss weight
+            sigmas = timesteps / noise_scheduler.config.num_train_timesteps
+            if args.loss_type == 'sd3-cosmap':
+                weighting_scheme = "cosmap"
+            elif args.loss_type == 'sd3-sigma_sqrt':
+                weighting_scheme = "sigma_sqrt"
+            else:
+                raise ValueError(f"unhandled loss type {args.loss_type}")
+            weights = compute_loss_weighting_for_sd3(weighting_scheme=weighting_scheme, sigmas=sigmas)
+            loss = loss_mse * weights.view(-1, 1, 1, 1).to(loss_mse.device) * loss_scale.to(device)
+            del weights, sigmas
         else:
-            loss_mse = loss_mse * loss_scale.to(device)
-            loss = loss_mse
-            del loss_mse
+            if args.loss_type != 'mse':
+                raise ValueError(f"Unrecognized --loss_type {args.loss_type}")
+            loss = loss_mse * loss_scale.to(device)
+        del loss_mse
 
         if torch.any(loss_scale < 0):
             distance_sq = torch.pow(model_pred.float() - target.float(), 2)
@@ -281,7 +298,8 @@ def _get_contrastive_v2_loss():
     pass
 
 def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler,
-                                     args, skip_contrastive: bool=False
+                                     args,
+                                     skip_contrastive: bool=False
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps,
                                                           args.latents_perturbation)
@@ -331,7 +349,7 @@ def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbati
     return encoder_hidden_states
 
 
-def _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps, latents_perturbation):
+def _get_noisy_latents_and_target(latents, noise, noise_scheduler: (SchedulerMixin, ConfigMixin), timesteps, latents_perturbation):
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
     if latents_perturbation > 0:
         noisy_latents += torch.randn_like(noisy_latents) * latents_perturbation
@@ -340,18 +358,25 @@ def _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps, la
         target = noise
     elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
         target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    elif noise_scheduler.config.prediction_type == "flow-matching":
+        target = noise - latents
     else:
         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
     return noisy_latents, target
 
 
-def _get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges):
-    timesteps = torch.cat([torch.randint(a, b, size=(1,), device=device)
-                           for a,b in timesteps_ranges])
+def _get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, is_flow_matching=False):
+    if is_flow_matching:
+        timesteps = torch.cat([a + torch.rand((1,), device=device) * (b-a)
+                               for a,b in timesteps_ranges])
+    else:
+        timesteps = torch.cat([torch.randint(a, b, size=(1,), device=device)
+                               for a,b in timesteps_ranges])
     if batch_share_timesteps:
         timesteps = timesteps[:1].repeat((batch_size,))
-    timesteps = timesteps.long()
+    if not is_flow_matching:
+        timesteps = timesteps.long()
     return timesteps
 
 

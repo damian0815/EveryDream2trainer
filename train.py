@@ -59,6 +59,7 @@ from data.data_loader import DataLoaderMultiAspect
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
+from flow_match_model import TrainFlowMatchScheduler
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
     _get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
     get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size, nibble_batch
@@ -95,6 +96,9 @@ def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_
         noise_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
                                                         trained_betas=trained_betas,
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
+    elif train_sampler.lower() == "flow-matching":
+        logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
+        noise_scheduler = TrainFlowMatchScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
         noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
@@ -721,16 +725,16 @@ def main(args):
                 release_memory(text_encoder_ema_on_wrong_device, text_encoder_ema_current_device)
 
         if args.enable_zero_terminal_snr:
+            if args.train_sampler == "flow-matching":
+                raise ValueError("can't use ZTSNR with flow matching")
             # Use zero terminal SNR
             from utils.unet_utils import enforce_zero_terminal_snr
             temp_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
             trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=None)
-            #noise_scheduler_ref = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=trained_betas)
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder,
                                                            trained_betas=trained_betas, rescale_betas_zero_snr=False#True
             )
-            noise_scheduler_base = get_training_noise_scheduler(args.train_sampler, model_root_folder, trained_betas=None)
         else:
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder)
@@ -930,7 +934,7 @@ def main(args):
                                        default_sample_steps=args.sample_steps,
                                        use_xformers=args.attn_type == "xformers",
                                        use_penultimate_clip_layer=(args.clip_skip >= 2),
-                                       guidance_rescale=0, # 0.7 if args.enable_zero_terminal_snr else 0
+                                       guidance_rescale=0.7 if args.enable_zero_terminal_snr else 0,
                                        is_ztsnr=args.enable_zero_terminal_snr
                                        )
 
@@ -1108,25 +1112,31 @@ def main(args):
         timesteps = _get_timesteps(batch_size=batch_size,
                                    batch_share_timesteps=False,
                                    device=unet.device,
-                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size)
+                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
+                                   is_flow_matching = noise_scheduler.config.prediction_type == 'flow-matching')
         latents = get_latents(image, vae, device=unet.device, args=args)
         noise = _get_noise(latents.shape, unet.device, image.dtype,
                            pyramid_noise_discount=args.pyramid_noise_discount,
                            zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                            batch_share_noise=False)
-        encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
-                                                       clip_skip=args.clip_skip,
-                                                       embedding_perturbation=args.embedding_perturbation,
-                                                       compel=None)
+        encoder_hidden_states = _encode_caption_tokens(
+            tokens,
+            text_encoder,
+            clip_skip=args.clip_skip,
+            embedding_perturbation=args.embedding_perturbation,
+            compel=None
+        )
 
-        model_pred, target, _, _ = _get_model_prediction_and_target(latents,
-                                                                    encoder_hidden_states,
-                                                                    noise,
-                                                                    timesteps,
-                                                                    unet,
-                                                                    noise_scheduler,
-                                                                    args=args,
-                                                                    skip_contrastive=True)
+        model_pred, target, _, _ = _get_model_prediction_and_target(
+            latents,
+            encoder_hidden_states,
+            noise,
+            timesteps,
+            unet,
+            noise_scheduler,
+            args=args,
+            skip_contrastive=True
+        )
 
         del encoder_hidden_states
         return model_pred, target
@@ -1157,22 +1167,30 @@ def main(args):
 
     @dataclass
     class TrainingVariables:
-        effective_batch_size = 0
+        last_effective_batch_size = 0
         effective_backward_size = 0
         effective_batch_total_elements = 0
-        effective_batch_images_count = 0
+        current_accumulated_backward_images_count = 0
         accumulated_loss_images_count = 0
         accumulated_loss = None
         desired_effective_batch_size = None
+        interleave_bs1_bsN = False
+        interleaved_bs1_count = None
+
 
     def optimizer_backward(tv: TrainingVariables):
-        ed_optimizer.backward(tv.accumulated_loss)
-        tv.accumulated_loss = None
-        tv.effective_backward_size = tv.accumulated_loss_images_count
-        tv.accumulated_loss_images_count = 0
-        # reset slice sizes
-        tv.forward_slice_size = args.forward_slice_size or args.batch_size
-        tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+        if tv.accumulated_loss_images_count == 0:
+            print("no accumulated loss images, not doing backward")
+        else:
+            ed_optimizer.backward(tv.accumulated_loss)
+            tv.accumulated_loss = None
+            tv.effective_backward_size = tv.accumulated_loss_images_count
+            tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
+            print(f"\nbackward on {tv.accumulated_loss_images_count} -> backward accumulated {tv.current_accumulated_backward_images_count}")
+            tv.accumulated_loss_images_count = 0
+            # reset slice sizes
+            tv.forward_slice_size = args.forward_slice_size or args.batch_size
+            tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
 
     tv = TrainingVariables()
 
@@ -1279,10 +1297,13 @@ def main(args):
                 timesteps_ranges = full_batch["timesteps_range"] or ([timestep_range] * full_batch_size)
 
                 # randomly expand
+                num_train_timesteps = noise_scheduler.config.num_train_timesteps
                 timesteps_ranges = [(
                     # maybe make 8 a CLI arg?
-                    min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
-                    min(1000, max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], 1000)))),
+                    min(num_train_timesteps,
+                        max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
+                    min(num_train_timesteps,
+                        max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], num_train_timesteps)))),
                 ) for tsr in timesteps_ranges]
 
                 if (tv.desired_effective_batch_size > 1
@@ -1300,11 +1321,14 @@ def main(args):
 
 
                 do_contrastive_learning = full_batch["do_contrastive_learning"]
-                timesteps: torch.LongTensor = _get_timesteps(batch_size=full_batch_size,
-                                           batch_share_timesteps=(
-                                                   do_contrastive_learning or args.batch_share_timesteps),
-                                           device=unet.device,
-                                           timesteps_ranges=timesteps_ranges)
+                timesteps: torch.LongTensor = _get_timesteps(
+                    batch_size=full_batch_size,
+                    batch_share_timesteps=(
+                    do_contrastive_learning or args.batch_share_timesteps),
+                    device=unet.device,
+                    timesteps_ranges=timesteps_ranges,
+                    is_flow_matching=noise_scheduler.config.prediction_type=='flow-matching'
+                )
 
                 # apply cond dropout
                 initial_batch_size = args.initial_batch_size or args.batch_size
@@ -1315,7 +1339,7 @@ def main(args):
                     cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
                                        / (final_batch_size - initial_batch_size)))
                 for i in range(timesteps.shape[0]):
-                    cdp_01_ts = 1 - (timesteps[i].cpu().item() / 999)
+                    cdp_01_ts = 1 - (timesteps[i].cpu().item() / noise_scheduler.config.num_train_timesteps)
                     if args.cond_dropout_curriculum_source == 'timestep':
                         cdp_01 = cdp_01_ts
                     elif args.cond_dropout_curriculum_source == 'batch_size':
@@ -1342,8 +1366,11 @@ def main(args):
                 remaining_batch = full_batch
                 while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
                     def get_nibble_size() -> int:
-                        assert tv.desired_effective_batch_size - tv.effective_batch_images_count > 0
-                        required_to_fill_batch = tv.desired_effective_batch_size - tv.effective_batch_images_count
+                        if tv.desired_effective_batch_size - tv.current_accumulated_backward_images_count <= 0:
+                            raise ValueError(f"get_nibble_size: no nibble left? desired effective batch size {tv.desired_effective_batch_size} - current accumulated backward images count {tv.current_accumulated_backward_images_count}")
+                        if tv.interleaved_bs1_count is not None:
+                            return 1
+                        required_to_fill_batch = tv.desired_effective_batch_size - tv.current_accumulated_backward_images_count
                         permitted_until_backward_step = tv.max_backward_slice_size - tv.accumulated_loss_images_count
                         return max(1, min(required_to_fill_batch, permitted_until_backward_step))
 
@@ -1361,9 +1388,9 @@ def main(args):
 
                     loss_scale = batch["loss_scale"]
                     assert loss_scale.shape[0] == batch["image"].shape[0]
-                    #if batch["runt_size"] > 0:
-                    #    runt_loss_scale = (batch["runt_size"] / args.batch_size) ** 1.5  # further discount runts by **1.5
-                    #    loss_scale = loss_scale * runt_loss_scale
+                    image_shape = batch["image"].shape
+                    reference_image_size = 512*512
+                    loss_scale = loss_scale.float() * (reference_image_size / image_size)
 
                     assert type(batch["captions"]) is dict
                     caption_variants = [c for c in list(sorted(batch["captions"].keys()))
@@ -1373,7 +1400,6 @@ def main(args):
                         caption_variants.append("default")
                     if not args.all_caption_variants:
                         caption_variants = [random.choice(caption_variants)]
-                    image_shape = batch["image"].shape
 
                     batch_size = image_shape[0]
 
@@ -1475,7 +1501,6 @@ def main(args):
                         del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
                         tv.accumulated_loss_images_count += nibble_size_actual
-                        tv.effective_batch_images_count += nibble_size_actual
 
                         cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
                                                           for s in caption_str], device=loss.device, dtype=torch.bool)
@@ -1487,6 +1512,7 @@ def main(args):
                         #loss = loss.mean(dim=[2, 3])
                         tv.effective_batch_total_elements += loss.numel()
                         loss_sum = loss.sum()
+
                         tv.accumulated_loss = loss_sum if tv.accumulated_loss is None else tv.accumulated_loss + loss_sum
                         loss_step = loss.detach().mean().item()
                         del loss, loss_sum
@@ -1494,19 +1520,39 @@ def main(args):
                         loss_log_step.append(loss_step)
                         loss_epoch.append(loss_step)
 
-                        should_step_optimizer = tv.effective_batch_images_count >= tv.desired_effective_batch_size
+                        should_step_optimizer = (
+                                (tv.current_accumulated_backward_images_count + tv.accumulated_loss_images_count)
+                                >= tv.desired_effective_batch_size
+                        ) or tv.interleaved_bs1_count is not None
                         if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                             #accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                             optimizer_backward(tv)
 
                         if should_step_optimizer:
-                            #print(f'stepping optimizer - effective_batch_images_count {effective_batch_images_count}, accumulated_loss_images_count {accumulated_loss_images_count}')
-                            tv.effective_batch_size = tv.effective_batch_images_count
-                            ed_optimizer.step_optimizer(global_step, tv.effective_batch_total_elements)
-                            tv.effective_batch_images_count = 0
-                            tv.effective_batch_total_elements = 0
-                            tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                            if tv.current_accumulated_backward_images_count == 0:
+                                print("Batch has 0 images, not stepping optimizer")
+                            else:
+                                print(f'\nstepping optimizer - current_accumulated_backward_images_count '
+                                      f'{tv.current_accumulated_backward_images_count}, '
+                                      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
+                                tv.last_effective_batch_size = tv.current_accumulated_backward_images_count
+                                ed_optimizer.step_optimizer(global_step, tv.effective_batch_total_elements)
+                                tv.current_accumulated_backward_images_count = 0
+                                tv.effective_batch_total_elements = 0
+
+                                # if we are interleaving BS1, increment counter
+                                if tv.interleaved_bs1_count is not None:
+                                    tv.interleaved_bs1_count += 1
+
+                                # if we are *not* interleaving BS1, or we've reached the end of interleaving BS1, then step and perhaps toggle interleave BS1
+                                if tv.interleaved_bs1_count is None or tv.interleaved_bs1_count >= max(1, tv.desired_effective_batch_size ** args.interleave_batch_size_1_alpha):
+                                    tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                                    if args.interleave_batch_size_1:
+                                        if tv.interleaved_bs1_count is None:
+                                            tv.interleaved_bs1_count = 0
+                                        else:
+                                            tv.interleaved_bs1_count = None
 
                 ed_optimizer.step_schedulers(global_step)
 
@@ -1544,7 +1590,7 @@ def main(args):
                     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timesteps_ranges[0][0], global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timesteps_ranges[0][1], global_step=global_step)
-                    log_writer.add_scalar(tag="hyperparameter/effective batch size", scalar_value=tv.effective_batch_size, global_step=global_step)
+                    log_writer.add_scalar(tag="hyperparameter/effective batch size", scalar_value=tv.last_effective_batch_size, global_step=global_step)
                     log_writer.add_scalar(tag="hyperparameter/effective backward size", scalar_value=tv.effective_backward_size, global_step=global_step)
 
                     sum_img = sum(images_per_sec_log_step)
@@ -1716,6 +1762,8 @@ if __name__ == "__main__":
     argparser.add_argument("--attn_type", type=str, default="sdp", help="Attention mechanismto use", choices=["xformers", "sdp", "slice"])
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
     argparser.add_argument("--batch_size_curriculum_alpha", type=float, default=0.5, help="curriculum alpha, default=0.5 (rapid (squared) falloff from initial)")
+    argparser.add_argument("--interleave_batch_size_1", action='store_true', help="If passed, toggle between batches of BS1 and batches of current_batch_size")
+    argparser.add_argument("--interleave_batch_size_1_alpha", type=float, default=0, help="How many BS1 batches to run when interleaving, as a factor of the current batch size (0=1 batch, 1=same as current batch size, 0.5=sqrt of current batch size etc)")
     argparser.add_argument("--initial_batch_size", type=int, default=None, help="initial batch size for curriculum")
     argparser.add_argument("--final_batch_size", type=int, default=None, help="final batch size for curriculum")
     argparser.add_argument("--ckpt_every_n_minutes", type=int, default=None, help="Save checkpoint every n minutes, def: 20")
@@ -1743,7 +1791,8 @@ if __name__ == "__main__":
     argparser.add_argument("--max_backward_slice_size", type=int, default=None, help="Max number of samples to accumulate graph before doing backward (NOT optimizer step)")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
-    argparser.add_argument("--loss_type", type=str, default="mse_huber", help="type of loss, 'huber', 'mse', or 'mse_huber' for interpolated (def: mse_huber)", choices=["huber", "mse", "mse_huber"])
+    argparser.add_argument("--loss_type", type=str, default="mse_huber",
+                           help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "v-mse"])
     argparser.add_argument("--negative_loss_margin", type=float, default=1, help="margin for negative loss scale falloff")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
@@ -1774,7 +1823,8 @@ if __name__ == "__main__":
     argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_initial_start", type=int, default=800, help="If using timestep_curriculum_alpha, the initial start timestep (default 800); will transition to --timestep_start")
     argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")
-    argparser.add_argument("--train_sampler", type=str, default="ddpm", help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim"])
+    argparser.add_argument("--train_sampler", type=str, default="ddpm",
+                           help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim", "flow-matching"])
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
     argparser.add_argument("--validation_config", default=None, help="Path to a JSON configuration file for the validator.  Default is no validation.")

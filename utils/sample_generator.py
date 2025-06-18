@@ -11,7 +11,8 @@ from PIL import Image, ImageDraw, ImageFont
 from colorama import Fore, Style
 from diffusers import (StableDiffusionPipeline, DDIMScheduler, DPMSolverMultistepScheduler, DDPMScheduler,
                        PNDMScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler, LMSDiscreteScheduler,
-                       KDPM2AncestralDiscreteScheduler, DPMSolverSDEScheduler, DPMSolverSinglestepScheduler)
+                       KDPM2AncestralDiscreteScheduler, DPMSolverSDEScheduler, DPMSolverSinglestepScheduler,
+                       FlowMatchEulerDiscreteScheduler)
 
 from torch import FloatTensor
 from torch.cuda.amp import autocast
@@ -365,11 +366,18 @@ class SampleGenerator:
         scheduler = self.scheduler
         if scheduler not in ['ddim', 'pndm', 'ddpm', 'lms', 'euler', 'euler_a', 'kdpm2', 'dpm++',
                              'dpm++_2s', 'dpm++_2m', 'dpm++_sde', 'dpm++_2m_sde',
-                             'dpm++_2s_k', 'dpm++_2m_k', 'dpm++_sde_k', 'dpm++_2m_sde_k']:
+                             'dpm++_2s_k', 'dpm++_2m_k', 'dpm++_sde_k', 'dpm++_2m_sde_k', 'flow-matching']:
             print(f"unsupported scheduler '{self.scheduler}', falling back to ddim")
             scheduler = 'ddim'
 
-        if scheduler == 'ddim':
+        if scheduler == 'flow-matching':
+            scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+            # hack for StableDiffusionPipeline support
+            scheduler.init_noise_sigma = 1
+            scheduler.scale_model_input = lambda x, t: x
+            return scheduler
+
+        elif scheduler == 'ddim':
             return DDIMScheduler.from_config(scheduler_config)
         elif scheduler == 'dpm++_2s':
             return DPMSolverSinglestepScheduler.from_config(scheduler_config, use_karras_sigmas=False)

@@ -17,14 +17,14 @@ ending_dot_p = 0.5
 replace_dots_with_commas_p = 0.3
 """
 
-shuffle_sentences_p = 0
-shuffle_phrases_within_sentences_p = 0
+shuffle_sentences_p = 0.02
+shuffle_phrases_within_sentences_p = 0.01
 keep_first_phrase_p = 1
-keep_first_sentence_p = 1
+keep_first_sentence_p = 0.98
 
 truncate_sentences_p = 0
 ending_dot_p = 0.5
-replace_dots_with_commas_p = 0
+replace_dots_with_commas_p = 0.02
 
 
 class CaptionMungerPlugin(BasePlugin):
