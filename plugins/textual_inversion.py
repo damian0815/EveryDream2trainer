@@ -2,11 +2,12 @@ import itertools
 import json
 import logging
 import os.path
+import random
 from typing import Optional, cast
 
 import torch
 from colorama import Fore
-from transformers import CLIPTextModel
+from transformers import CLIPTextModel, CLIPTokenizer
 
 from plugins.plugins import BasePlugin
 import torch.nn as nn
@@ -45,20 +46,24 @@ class TextualInversionPlugin(BasePlugin):
         self.this_batch_tokens = None
         self.training_token_ids = None
         self.original_text_embeddings = None
-        self.training_words = []
+        self.training_words: list[str] = []
+        self.training_words_to_tokens: dict[str, list[int]] = {}
         self.embedding_offsets_individual = None
-        self.text_encoder: Optional[CLIPTextModel] = None
+        self.text_encoder: CLIPTextModel = None
+        self.tokenizer: CLIPTokenizer = None
 
     @property
     def fallback_word(self):
-        return self.config.get('fallback_word', None)
+        fallback_word = self.config.get('fallback_word', self.training_words[0])
+        tokens = self.training_words_to_tokens[fallback_word]
+        return self.tokenizer.decode(tokens)
 
     def on_model_load(self, **kwargs):
         self.text_encoder = kwargs.get('text_encoder')
-        tokenizer = kwargs.get('tokenizer')
+        self.tokenizer = kwargs.get('tokenizer')
         optimizer_config: dict = kwargs.get('optimizer_config')
         def get_token_ids(t: str):
-            return tokenizer.convert_tokens_to_ids(tokenizer.tokenize(t))
+            return self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(t))
 
         # check for correctly configured text encoder training
         num_te_layers = len(self.text_encoder.text_model.encoder.layers)
@@ -90,12 +95,33 @@ class TextualInversionPlugin(BasePlugin):
         else:
             self.lerp_target_weights = None
 
-            self.training_words = [t['token'] for t in self.config['tokens']]
+            #text_model: CLIPTextModel = self.text_encoder.text_model
+            self.training_words = []
+            for token_config in self.config['tokens']:
+                # {"token": "*", "initializer": "corpse, abstract, group", "vector_length": 8}
+                training_word = token_config['token']
+
+                self.training_words.append(training_word)
+                if token_config.get('overwrite_existing', False):
+                    self.training_words_to_tokens[training_word] = get_token_ids(training_word)
+                else:
+                    vector_length = token_config.get('vector_length', 1)
+                    tokens_to_add = self.expand_tokens(training_word, vector_length)
+                    num_added = self.tokenizer.add_tokens(tokens_to_add)
+                    if num_added != len(tokens_to_add):
+                        raise RuntimeError("Wrong number of tokens added")
+                    self.text_encoder.resize_token_embeddings(len(self.text_encoder.get_input_embeddings().weight) + len(tokens_to_add))
+                    self.training_words_to_tokens[training_word] = [tid
+                                                                    for w in tokens_to_add
+                                                                    for tid in get_token_ids(w)]
+
+            print("after adding/updating tokens: input_embeddings has length", len(self.text_encoder.get_input_embeddings().weight))
+
             tokens_to_train = sorted(list(set([tid
-                                               for w in self.training_words
-                                               for tid in get_token_ids(w)])))
+                                               for tids in self.training_words_to_tokens.values()
+                                               for tid in tids])))
             logging.info(
-                f" * Text embedding unlocked tokens: {tokens_to_train} -> {tokenizer.convert_ids_to_tokens(tokens_to_train)}")
+                f" * Text embedding unlocked tokens: {tokens_to_train} -> {self.tokenizer.convert_ids_to_tokens(tokens_to_train)}")
             self.training_token_ids = torch.tensor(tokens_to_train, device=self.text_encoder.device, dtype=torch.int64)
 
             embeddings: nn.Embedding = self.text_encoder.get_input_embeddings()
@@ -103,16 +129,18 @@ class TextualInversionPlugin(BasePlugin):
                 stds = embeddings.weight.std(dim=0)
                 means = embeddings.weight.mean(dim=0)
                 for t in self.config['tokens']:
-                    tids_to_initialize = get_token_ids(t['token'])
+                    tids_to_initialize = self.training_words_to_tokens[t['token']]
                     # always calculate random weights, even if they're not used, to ensure persistent
                     # behaviour with same seed
                     random_weights = {tid: torch.normal(mean=means, std=stds)
                                       for tid in tids_to_initialize}
                     if t.get('initialize_random', False):
+                        print(f'initializing {tids_to_initialize} randomly')
                         for tid in tids_to_initialize:
                             embeddings.weight.data[tid] = random_weights[tid]
                     elif 'initializer' in t:
                         initializer = t['initializer']
+                        print(f'initializing {tids_to_initialize} from {initializer}')
                         initializer_tids = get_token_ids(initializer)
                         initializer_weights = [embeddings.weight[i] for i in initializer_tids]
                         for i, t in enumerate(tids_to_initialize):
@@ -131,6 +159,8 @@ class TextualInversionPlugin(BasePlugin):
             embeddings.embedding_offsets_individual = self.embedding_offsets_individual
             embeddings.register_forward_hook(_embedding_forward_individual_hook)
 
+    def expand_tokens(self, base_token_text, vector_length) -> list[str]:
+        return [f'{base_token_text}.{i}' for i in range(vector_length)]
 
     def add_parameters(self, text_encoder_parameters, unet_parameters):
         if self.lerp_target_weights is None:
@@ -163,6 +193,11 @@ class TextualInversionPlugin(BasePlugin):
                 self.embedding_offsets_individual.zero_()
 
     def transform_caption(self, caption:str):
+        if len(caption.strip()) == 0:
+            imagenet_caption = self.make_imagenet_caption()
+            #print('made caption:', imagenet_caption)
+            return imagenet_caption
+
         if (self.fallback_word is not None
                 and all(re.search('(^|[\W])'+word+'([\W]|$)', caption) is None
                     for word in self.training_words)
@@ -171,6 +206,41 @@ class TextualInversionPlugin(BasePlugin):
             return self.fallback_word + ' ' + caption
         else:
             return caption
+
+
+    def make_imagenet_caption(self):
+        imagenet_templates_small = [
+            "a photo of a {}",
+            "a rendering of a {}",
+            "a cropped photo of the {}",
+            "the photo of a {}",
+            "a photo of a clean {}",
+            "a photo of a dirty {}",
+            "a dark photo of the {}",
+            "a photo of my {}",
+            "a photo of the cool {}",
+            "a close-up photo of a {}",
+            "a bright photo of the {}",
+            "a cropped photo of a {}",
+            "a photo of the {}",
+            "a good photo of the {}",
+            "a photo of one {}",
+            "a close-up photo of the {}",
+            "a rendition of the {}",
+            "a photo of the clean {}",
+            "a rendition of a {}",
+            "a photo of a nice {}",
+            "a good photo of a {}",
+            "a photo of the nice {}",
+            "a photo of the small {}",
+            "a photo of the weird {}",
+            "a photo of the large {}",
+            "a photo of a cool {}",
+            "a photo of a small {}",
+        ]
+        return random.choice(imagenet_templates_small).replace('{}', self.fallback_word)
+
+
 
 def _embedding_forward_individual_hook(module, input_args, output):
     offset_weight = _apply_weight_offsets(module.training_token_ids, module, module.embedding_offsets_individual)

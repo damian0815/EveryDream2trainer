@@ -122,8 +122,9 @@ class ImageConfig:
             return ImageConfig(main_prompts=text, tags=[])
         else:
             split_caption = list(map(str.strip, text.split(",")))
+            main_prompt = ' ' if len(text.strip()) == 0 else split_caption[0]
             return ImageConfig(
-                main_prompts=split_caption[0],
+                main_prompts=main_prompt,
                 tags=map(Tag.parse, split_caption[1:])
                 )
 

@@ -156,7 +156,7 @@ class EveryDreamBatch(Dataset):
             caption_dict = {"default": example["caption"]}
 
         #for k in caption_dict.keys():
-        #    if self.random_instance.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
+        #    if self.randomizer.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
         #        caption_dict[k] = " "
 
         if self.random_instance.random() <= self.cond_dropout_noise_p:

@@ -22,6 +22,9 @@ import copy
 
 import random
 from typing import List, Dict
+from collections import Counter
+
+from tqdm.auto import tqdm
 
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 import PIL.Image
@@ -38,7 +41,10 @@ class DataLoaderMultiAspect():
     seed: random seed
     batch_size: number of images per batch
     """
-    def __init__(self, image_train_items: list[ImageTrainItem], seed=555, batch_size=1, grad_accum=1, chunk_shuffle_batch_size=None, batch_id_dropout_p=0):
+    def __init__(self, image_train_items: list[ImageTrainItem], seed=555,
+                 batch_size=1, grad_accum=1,
+                 chunk_shuffle_batch_size=None, batch_id_dropout_p=0,
+                 keep_same_sample_at_different_resolutions_together=False):
         self.seed = seed
         self.batch_size = batch_size
         self.grad_accum = grad_accum
@@ -48,6 +54,7 @@ class DataLoaderMultiAspect():
         self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
         self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
         self.batch_id_dropout_p = batch_id_dropout_p
+        self.keep_same_sample_at_different_resolutions_together = keep_same_sample_at_different_resolutions_together
         if self.expected_epoch_size != len(self.prepared_train_data):
             logging.info(f" * DLMA initialized with {len(image_train_items)} source images. After applying multipliers, each epoch will train on at least {self.expected_epoch_size} images.")
         else:
@@ -159,7 +166,7 @@ class DataLoaderMultiAspect():
                              for k,v in items_by_batch_id.items()} 
         # paranoia: verify that this hasn't fucked up the aspect ratio batching
         for items in items_by_batch_id.values():
-            batches = chunk(items, chunk_size=batch_size)
+            batches = chunk_list(items, chunk_size=batch_size)
             for batch in batches:
                 target_wh = batch[0].target_wh
                 assert all(target_wh == i.target_wh for i in batch[1:]), "mixed aspect ratios in a batch - this shouldn't happen"
@@ -171,6 +178,9 @@ class DataLoaderMultiAspect():
                                                                    grad_accum=grad_accum)
 
         items = chunked_shuffle(items, chunk_size=self.chunk_shuffle_batch_size, randomizer=randomizer)
+
+        if self.keep_same_sample_at_different_resolutions_together:
+            items = reorder_same_sample_different_resolution_adjacency(items, chunk_size=self.chunk_shuffle_batch_size, randomizer=randomizer)
 
         return items
 
@@ -220,18 +230,18 @@ class DataLoaderMultiAspect():
             self.ratings_summed.append(self.rating_overall_sum)
 
 
-def chunk(l: List, chunk_size) -> List:
+def chunk_list(l: List, chunk_size) -> List:
     num_chunks = int(math.ceil(float(len(l)) / chunk_size))
     return [l[i * chunk_size:(i + 1) * chunk_size] for i in range(num_chunks)]
 
-def unchunk(chunked_list: List):
+def unchunk_list(chunked_list: List):
     return [i for c in chunked_list for i in c]
 
 def collapse_buckets_by_batch_id(buckets: Dict) -> Dict:
     batch_ids = [k[0] for k in buckets.keys()]
     items_by_batch_id = {}
     for batch_id in batch_ids:
-        items_by_batch_id[batch_id] = unchunk([b for bucket_key,b in buckets.items() if bucket_key[0] == batch_id])
+        items_by_batch_id[batch_id] = unchunk_list([b for bucket_key,b in buckets.items() if bucket_key[0] == batch_id])
     return items_by_batch_id
 
 def flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id: Dict[str, List[ImageTrainItem]],
@@ -241,13 +251,13 @@ def flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id: Dict[str
     assert(all((len(v) % batch_size)==0 for v in items_by_batch_id.values()))
     # ensure we don't mix up aspect ratios by treating each chunk of batch_size images as
     # a single unit to pass to first_fit_decreasing()
-    filler_items = chunk(items_by_batch_id.get(DEFAULT_BATCH_ID, []), batch_size)
-    custom_batched_items = [chunk(v, batch_size) for k, v in items_by_batch_id.items() if k != DEFAULT_BATCH_ID]
+    filler_items = chunk_list(items_by_batch_id.get(DEFAULT_BATCH_ID, []), batch_size)
+    custom_batched_items = [chunk_list(v, batch_size) for k, v in items_by_batch_id.items() if k != DEFAULT_BATCH_ID]
     neighbourly_chunked_items = first_fit_decreasing(custom_batched_items,
                                                      batch_size=grad_accum,
                                                      filler_items=filler_items)
 
-    items: List[ImageTrainItem] = unchunk(neighbourly_chunked_items)
+    items: List[ImageTrainItem] = unchunk_list(neighbourly_chunked_items)
     return items
 
 def chunked_shuffle(l: List, chunk_size: int, randomizer: random.Random) -> List:
@@ -259,7 +269,7 @@ def chunked_shuffle(l: List, chunk_size: int, randomizer: random.Random) -> List
         return []
 
     # chunk by effective batch size
-    chunks = chunk(l, chunk_size)
+    chunks = chunk_list(l, chunk_size)
     # preserve last chunk as last if it is incomplete
     last_chunk = None
     if len(chunks[-1]) < chunk_size:
@@ -267,5 +277,121 @@ def chunked_shuffle(l: List, chunk_size: int, randomizer: random.Random) -> List
     randomizer.shuffle(chunks)
     if last_chunk is not None:
         chunks.append(last_chunk)
-    l = unchunk(chunks)
+    l = unchunk_list(chunks)
     return l
+
+
+def reorder_same_sample_different_resolution_adjacency(l: list[ImageTrainItem], chunk_size: int, randomizer: random.Random) -> list[ImageTrainItem]:
+
+    # chunk by effective batch size
+    chunks: list[list[ImageTrainItem]] = chunk_list(l, chunk_size)
+    unused_chunks = set(range(len(chunks)))
+
+    in_chunk = defaultdict(list)
+    for chunk_index, chunk in enumerate(chunks):
+        for item in chunk:
+            item: ImageTrainItem
+            in_chunk[item.pathname].append(chunk_index)
+    chunk_paths_sets: list[set[str]] = [
+        {item.pathname for item in chunk}
+        for chunk in chunks
+    ]
+    chunk_resolutions: list[int] = [
+        chunk[0].target_wh[0] * chunk[0].target_wh[1]
+        for chunk in chunks
+    ]
+
+    result_chunk_indices = [0]
+    unused_chunks.remove(0)
+
+    with tqdm(desc='finding resolution adjacency', total=len(chunks)) as pbar:
+        while unused_chunks:
+            pbar.update()
+            last_chunk_index = result_chunk_indices[-1]
+
+            last_paths = chunk_paths_sets[last_chunk_index]
+            last_resolution = chunk_resolutions[last_chunk_index]
+
+            candidates = sorted(
+                [u for u in unused_chunks if chunk_resolutions[u] != last_resolution],
+                key=lambda chunk_index: len(last_paths.intersection(chunk_paths_sets[chunk_index])),
+                reverse=True
+            )
+            if len(candidates) == 0:
+                # fallback
+                selection = unused_chunks.pop()
+            else:
+                selection = candidates[0]
+                unused_chunks.remove(selection)
+            result_chunk_indices.append(selection)
+
+    # reverse the list: we want the mismatched chunks first
+    result_chunks = [chunks[i] for i in reversed(result_chunk_indices)]
+    #print("before _shuffle_no_matches:")
+    #_print_path_match_sequences(result_chunks)
+    matches = _get_path_match_with_next_count(result_chunks)
+    counter = Counter(matches)
+    print("Number of batches with elements in common with next:", counter)
+
+    # now distribute the mismatched chunks amongst all the rest, so that they don't clump at the start/end
+    result_chunks = _shuffle_no_matches(result_chunks, randomizer=randomizer)
+    #print("after _shuffle_no_matches:")
+    #_print_path_match_sequences(result_chunks)
+
+    matches = _get_path_match_with_next_count(result_chunks)
+    counter = Counter(matches)
+    print("After shuffling:", counter)
+
+    return unchunk_list(result_chunks)
+
+def _shuffle_no_matches(chunks: list[list[ImageTrainItem]], randomizer: random.Random) -> list[list[ImageTrainItem]]:
+    """ shuffle chunks with no matches throughout the whole epoch,
+    so that we don't end up with a chunk of no-match at the start/end
+    """
+    path_match_with_next_count = _get_path_match_with_next_count(chunks)
+    no_matches_chunks = [
+        chunks[i] for i, count in enumerate(path_match_with_next_count)
+        if count == 0
+    ] + [chunks[-1]]
+    matches_chunks = [
+        chunks[i] for i, count in enumerate(path_match_with_next_count)
+        if count > 0
+    ]
+
+    for no_match_chunk in no_matches_chunks:
+        random_index = randomizer.randint(0, len(matches_chunks))
+        matches_chunks.insert(random_index, no_match_chunk)
+
+    return matches_chunks
+
+
+def _get_path_match_with_next_count(chunks: list[list[ImageTrainItem]]) -> list[int]:
+    path_match_with_next_count = [
+        len(
+            set([item.pathname for item in chunks[chunk_index]]).intersection(
+                set([item.pathname for item in chunks[chunk_index+1]])
+           )
+        )
+        for chunk_index in range(0, len(chunks)-1)
+    ]
+    return path_match_with_next_count
+
+def _print_path_match_sequences(chunks):
+    path_match_with_next_count = _get_path_match_with_next_count(chunks)
+
+    current_value, current_value_count = None, 0
+    for (i, chunk) in enumerate(chunks):
+        if i == len(chunks)-1:
+            break
+        path_match_count = path_match_with_next_count[i]
+        if current_value != path_match_count:
+            if current_value is not None:
+                print("sequence of ", current_value_count, "x", current_value)
+            current_value = path_match_count
+            current_value_count = 1
+        else:
+            current_value_count += 1
+    print("sequence of ", current_value_count, "x", current_value)
+
+
+
