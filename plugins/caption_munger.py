@@ -4,6 +4,8 @@ import random
 import threading
 import time
 
+from transformers import CLIPTokenizer
+
 from plugins.plugins import BasePlugin
 
 """
@@ -18,6 +20,7 @@ replace_dots_with_commas_p = 0.3
 """
 
 shuffle_sentences_p = 0.02
+too_long_caption_shuffle_sentences_p = 0.5
 shuffle_phrases_within_sentences_p = 0.01
 keep_first_phrase_p = 1
 keep_first_sentence_p = 0.98
@@ -26,8 +29,12 @@ truncate_sentences_p = 0
 ending_dot_p = 0.5
 replace_dots_with_commas_p = 0.02
 
-
 class CaptionMungerPlugin(BasePlugin):
+
+    tokenizer: CLIPTokenizer|None = None
+
+    def on_model_load(self, **kwargs):
+        self.tokenizer = kwargs['tokenizer']
 
     def transform_caption_parts(self, caption:str) -> str:
 
@@ -79,11 +86,17 @@ class CaptionMungerPlugin(BasePlugin):
                                       truncate_sentences_p=truncate_sentences_p)
             caption = "<<shufbreak>>".join(parts[:-1])
 
+        tokens = _get_tokens_full(caption, prefix, suffix, self.tokenizer)
+        if len(tokens) > 75:
+            actual_shuffle_sentences_p = too_long_caption_shuffle_sentences_p
+        else:
+            actual_shuffle_sentences_p = shuffle_sentences_p
+
         out_caption = handle_shufbreak(
             caption,
             keep_first_sentence_p=0 if len(prefix.strip()) > 0 else keep_first_sentence_p,
-            shuffle_sentences_p=shuffle_sentences_p,
-            truncate_sentences_p=truncate_sentences_p
+            shuffle_sentences_p=actual_shuffle_sentences_p,
+            truncate_sentences_p=truncate_sentences_p,
         )
 
         if replace_dots_with_commas_p > random.random():
@@ -108,6 +121,18 @@ class CaptionMungerPlugin(BasePlugin):
             return self.transform_caption(caption_in)
         return out_caption
 
+def _get_tokens_full(caption_with_shufbreaks, prefix, suffix, tokenizer: CLIPTokenizer) -> list[str]:
+    full_caption = ''
+
+    if len(prefix.strip()) > 0:
+        full_caption += prefix
+    full_caption += caption_with_shufbreaks.replace('<<shufbreak>>', '. ')
+    if len(suffix.strip()) > 0:
+        full_caption += suffix
+
+    return tokenizer.tokenize(full_caption)
+
+
 def partial_shuffle(l, factor=5):
     n = len(l)
     if n == 0:
@@ -127,11 +152,18 @@ def shuffle_on_doublebar(sentence: str) -> str:
     shuffled_sentence = ", ".join(phrases)
     return shuffled_sentence
 
-def handle_shufbreak(caption: str, keep_first_sentence_p, shuffle_sentences_p, truncate_sentences_p) -> str:
+def handle_shufbreak(caption: str,
+                     keep_first_sentence_p,
+                     shuffle_sentences_p,
+                     truncate_sentences_p) -> str:
     # split to sentences
     in_sentences = [s.strip() for s in caption.split("<<shufbreak>>")]
     # remove zero-length sentences (multiple . and trailing .)
     in_sentences = [s for s in in_sentences if len(s) > 0]
+    if len(in_sentences) == 0:
+        # empty string
+        return caption
+
     out_sentences = []
 
     # unused if not truncating

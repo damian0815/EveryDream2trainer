@@ -21,7 +21,7 @@ class InterruptiblePlugin(BasePlugin):
         # epoch length = 260 -> save every 2nd epoch
         self.every_n_epochs = 500 / epoch_length
         self.steps_to_save_this_epoch = self._get_save_step_indices(epoch, epoch_length)
-        print("every_n_epochs:", self.every_n_epochs, "-> steps to save:", self.steps_to_save_this_epoch)
+        print("\nInterruptible Plugin saving every_n_epochs:", self.every_n_epochs, "-> steps to save:", self.steps_to_save_this_epoch)
 
     def on_step_end(self, **kwargs):
         local_step = kwargs['local_step']

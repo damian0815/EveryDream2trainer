@@ -12,7 +12,10 @@ def same_barename(lhs, rhs):
     return barename(lhs) == barename(rhs)
     
 def is_image(file):
-    return ext(file) in {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif'}
+    return (
+        ext(file) in {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif'}
+        and not file.endswith(".mask.png")
+    )
 
 def read_text(file):
     try:
@@ -20,7 +23,11 @@ def read_text(file):
         for encoding in encodings:
             try:
                 with open(file, encoding=encoding) as f:
-                    return f.read()
+                    str = f.read()
+                    if len(str.strip()) > 0:
+                        return str
+                    else:
+                        return " "
             except UnicodeDecodeError:
                 continue
         raise UnicodeDecodeError(f'Could not decode file with any of the provided encodings: {encodings}')

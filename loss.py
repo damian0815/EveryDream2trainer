@@ -127,21 +127,6 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
 
     device = model_pred.device
 
-    if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
-        if args.train_sampler == 'flow-matching':
-            raise ValueError("can't use min-SNR with flow matching")
-        snr = compute_snr(timesteps, noise_scheduler, max_sigma=22000)
-        # kohya implementation
-        min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
-        if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-            snr_weight = min_snr_gamma / (snr + 1)
-            # prevent extremely low weight at high timesteps
-            snr_weight += 0.0047
-        else:
-            snr_weight = min_snr_gamma / snr
-
-        loss_scale = loss_scale * snr_weight.to(loss_scale.device)
-
     if mask is not None:
         mask = mask.repeat(1, target.shape[1], 1, 1).to(target.device)
     else:
@@ -200,17 +185,36 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             repulsion_loss = torch.max(torch.tensor(0), margin_sq - distance_sq)
             negative_loss_mask = ((loss_scale < 0) * 1.0).to(loss.device)
             loss = repulsion_loss * negative_loss_mask + loss * (1-negative_loss_mask)
+
+        if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
+            if args.train_sampler == 'flow-matching':
+                raise ValueError("can't use min-SNR with flow matching")
+            snr = compute_snr(timesteps, noise_scheduler, max_sigma=22000)
+            # kohya implementation
+            min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
+            if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
+                snr_weight = min_snr_gamma / (snr + 1)
+                # prevent extremely low weight at high timesteps
+                snr_weight += 0.0047
+            else:
+                snr_weight = min_snr_gamma / snr
+            snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
+
+            loss = loss * snr_weight.to(loss.device)
+
         return loss
 
-    positive_loss = compute_loss(model_pred, target, timesteps, loss_scale)
+    non_contrastive_loss = compute_loss(model_pred, target, timesteps, loss_scale)
+    if not do_contrastive_learning:
+        return non_contrastive_loss * mask
 
     if args.contrastive_learning_info_nce_sample_count > 0 and model_pred_wrong_mask.sum() > 0:
-        negative_losses = []
+        contrastive_negative_losses = []
         for i in range(args.contrastive_learning_info_nce_sample_count):
             # positive_loss = MSE(v_pred_positive, v_target) (This is just L_simple)
             # negative_loss_1 = MSE(v_pred_negative_1, v_target)
-            negative_losses.append(compute_loss(model_pred_wrong[i], target, timesteps, loss_scale))
-        negative_losses = torch.stack(negative_losses)
+            contrastive_negative_losses.append(compute_loss(model_pred_wrong[i], target, timesteps, loss_scale))
+        contrastive_negative_losses = torch.stack(contrastive_negative_losses)
         # InfoNCE (Noise Contrastive Estimation) Style
         """
         Calculate scores, often inversely related to error: 
@@ -221,21 +225,18 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             (This is the cross-entropy loss for classifying the positive correctly).
         """
         temperature = args.contrastive_learning_info_nce_temperature
-        score_positive = -positive_loss / temperature
-        scores_negative = -negative_losses / temperature
+        score_positive = -non_contrastive_loss / temperature
+        scores_negative = -contrastive_negative_losses / temperature
         exp_positive = torch.exp(score_positive)
         exps_negative = torch.exp(scores_negative)[model_pred_wrong_mask.unsqueeze(0)]
         # if exps_negative is empty (because of the mask), contrastive_loss is torch.log(1) (== 0)
         contrastive_loss = -torch.log(exp_positive / (exp_positive + torch.sum(exps_negative, dim=0)))
-        return (positive_loss + args.contrastive_learning_negative_loss_scale * contrastive_loss) * mask
-
-    if not do_contrastive_learning:
-        return positive_loss * mask
+        return (non_contrastive_loss + args.contrastive_learning_negative_loss_scale * contrastive_loss) * mask
 
     # Generate negative samples
     # max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
     #                                 dtype=positive_loss.dtype).to(positive_loss.device)
-    negative_loss = torch.zeros_like(positive_loss)
+    negative_loss = torch.zeros_like(non_contrastive_loss)
     bsz = model_pred.shape[0]
     num_samples = [0] * bsz
     for i in range(bsz):
@@ -276,7 +277,7 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
                                      ), device=negative_loss.device)
 
     negative_loss_scale = contrastive_learning_negative_loss_scale / num_samples_safe
-    negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).to(device).expand_as(positive_loss)
+    negative_loss_scale = negative_loss_scale.view(-1, 1, 1, 1).to(device).expand_as(non_contrastive_loss)
     if args.contrastive_learning_delta_loss_method and args.contrastive_learning_delta_timestep_start >= 0:
         # scale negative loss with timesteps, with a minimum cutoff. ie do more delta loss as noise level increases
         max_timestep = noise_scheduler.config.num_train_timesteps
@@ -285,11 +286,11 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
         early_timestep_bias = torch.maximum((timesteps - negative_loss_timestep_start)
                                             / (max_timestep - negative_loss_timestep_start),
                                             torch.tensor(0).to(device))
-        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(positive_loss)
+        early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(non_contrastive_loss)
         negative_loss_scale = negative_loss_scale * early_timestep_bias
 
-    loss = (positive_loss + negative_loss * negative_loss_scale) * mask
-    del positive_loss
+    loss = (non_contrastive_loss + negative_loss * negative_loss_scale) * mask
+    del non_contrastive_loss
     del negative_loss
 
     return loss

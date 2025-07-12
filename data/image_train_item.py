@@ -187,7 +187,7 @@ class ImageTrainItem:
 
     @property
     def pathname_mask(self):
-        return self.pathname + "_alpha"
+        return self.pathname + ".mask.png"
 
     def load_image(self) -> PIL.Image:
         try:
@@ -238,7 +238,7 @@ class ImageTrainItem:
             pass
         return False
 
-    def _get_random_crop_settings(self, image, crop_jitter=0.02):
+    def _get_random_jitter_amounts(self, image, crop_jitter=0.02):
         """
         randomly crops the image by a percentage of the image size on each of the four sides
         """
@@ -252,14 +252,15 @@ class ImageTrainItem:
 
         return left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels
 
-    def _percent_random_crop(self, image, crop_jitter=0.02, crop_settings=None):
+    def _apply_crop_jitter(self, image, crop_jitter=0.02, precomputed_jitter: tuple[int, int, int, int]=None):
         """
-        randomly crops the image by a percentage of the image size on each of the four sides
+        crops the image by a percentage of the image size on each of the four sides.
         """
         width, height = image.size
-        if crop_settings is None:
-            crop_settings = self._get_random_crop_settings(image, crop_jitter=crop_jitter)
-        left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = crop_settings
+        if precomputed_jitter is None:
+            left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = precomputed_jitter
+        else:
+            left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = self._get_random_jitter_amounts(image, crop_jitter=crop_jitter)
 
         # print(f"{left_crop_pixels}, {right_crop_pixels}, {top_crop_pixels}, {bottom_crop_pixels}, ")
 
@@ -334,10 +335,10 @@ class ImageTrainItem:
         img_jitter = max(img_jitter, 0.0)
         
         if img_jitter > 0.0:
-            crop_settings = self._get_random_crop_settings(image, img_jitter)
-            image = self._percent_random_crop(image, crop_settings=crop_settings)
+            jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
+            image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
             if mask is not None:
-                mask = self._percent_random_crop(image, crop_settings=crop_settings)
+                mask = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
 
         image = self._trim_to_aspect(image, self.target_wh)
         if mask is not None:

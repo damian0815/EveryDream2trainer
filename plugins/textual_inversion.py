@@ -48,15 +48,18 @@ class TextualInversionPlugin(BasePlugin):
         self.original_text_embeddings = None
         self.training_words: list[str] = []
         self.training_words_to_tokens: dict[str, list[int]] = {}
-        self.embedding_offsets_individual = None
+        self.embedding_offsets_individual: nn.Parameter = None
         self.text_encoder: CLIPTextModel = None
         self.tokenizer: CLIPTokenizer = None
+        self.log_folder: str = None
 
     @property
     def fallback_word(self):
         fallback_word = self.config.get('fallback_word', self.training_words[0])
         tokens = self.training_words_to_tokens[fallback_word]
         return self.tokenizer.decode(tokens)
+
+
 
     def on_model_load(self, **kwargs):
         self.text_encoder = kwargs.get('text_encoder')
@@ -107,10 +110,8 @@ class TextualInversionPlugin(BasePlugin):
                 else:
                     vector_length = token_config.get('vector_length', 1)
                     tokens_to_add = self.expand_tokens(training_word, vector_length)
-                    num_added = self.tokenizer.add_tokens(tokens_to_add)
-                    if num_added != len(tokens_to_add):
-                        raise RuntimeError("Wrong number of tokens added")
-                    self.text_encoder.resize_token_embeddings(len(self.text_encoder.get_input_embeddings().weight) + len(tokens_to_add))
+                    num_tokens_added = self.tokenizer.add_tokens(tokens_to_add)
+                    self.text_encoder.resize_token_embeddings(len(self.text_encoder.get_input_embeddings().weight) + num_tokens_added)
                     self.training_words_to_tokens[training_word] = [tid
                                                                     for w in tokens_to_add
                                                                     for tid in get_token_ids(w)]
@@ -159,6 +160,32 @@ class TextualInversionPlugin(BasePlugin):
             embeddings.embedding_offsets_individual = self.embedding_offsets_individual
             embeddings.register_forward_hook(_embedding_forward_individual_hook)
 
+    def on_model_save(self, **kwargs):
+        # ed_state = kwargs['ed_state']
+        save_path = kwargs['save_path']
+        te_path = os.path.join(save_path, 'text_embeddings')
+        self.save(te_path)
+
+    def save(self, save_path, suffix: str=''):
+        self.bounce_down_weights()
+        with torch.no_grad():
+            os.makedirs(save_path, exist_ok=True)
+            embeddings: nn.Embedding = self.text_encoder.get_input_embeddings()
+            offset_weights = _apply_weight_offsets(self.training_token_ids, embeddings, self.embedding_offsets_individual)
+            for word, tokens in self.training_words_to_tokens.items():
+                word: str
+                tokens: list[int]
+                embeddings_stack = offset_weights[tokens]
+
+                dict = {
+                    'string_to_token': {'*': 265},
+                    'string_to_param': {'*': embeddings_stack.detach().clone().cpu()},
+                    'name': word,
+                }
+                save_path = os.path.join(save_path, f'{word}{suffix}.pt')
+                torch.save(dict, save_path)
+
+
     def expand_tokens(self, base_token_text, vector_length) -> list[str]:
         return [f'{base_token_text}.{i}' for i in range(vector_length)]
 
@@ -182,15 +209,30 @@ class TextualInversionPlugin(BasePlugin):
     def on_epoch_end(self, **kwargs):
         if self.lerp_target_weights is None:
             if torch.count_nonzero(self.embedding_offsets_individual).item() == 0:
-                logging.warning(" * TextualInversionPlugin: warning: nothing has happened (possible misconfiguration?)")
-            with torch.no_grad():
-                # bounce offsets down into actual embeddings array and reset offsets
-                embeddings = self.text_encoder.get_input_embeddings()
-                offset_weights = _apply_weight_offsets(self.training_token_ids,
-                                                       original_embeddings=embeddings, # type: ignore
-                                                       embedding_offsets_individual=self.embedding_offsets_individual)
-                embeddings.weight.data = offset_weights.data
-                self.embedding_offsets_individual.zero_()
+                logging.warning(" * TextualInversionPlugin: warning: nothing has happened (possible misconfiguration? check batch size)")
+            self.bounce_down_weights()
+
+        te_path = os.path.join(self.log_folder, 'text_embeddings')
+        epoch = kwargs['epoch']
+        self.save(te_path, suffix=f'-ep{epoch:03}')
+
+    def on_training_start(self, **kwargs):
+        self.log_folder = kwargs['log_folder']
+
+    def on_training_end(self, **kwargs):
+        self.bounce_down_weights()
+
+
+    def bounce_down_weights(self):
+        #print("NOT doing bounce_down_weights")
+        with torch.no_grad():
+            # bounce offsets down into actual embeddings array and reset offsets
+            embeddings = self.text_encoder.get_input_embeddings()
+            offset_weights = _apply_weight_offsets(self.training_token_ids,
+                                                   original_embeddings=embeddings, # type: ignore
+                                                   embedding_offsets_individual=self.embedding_offsets_individual)
+            embeddings.weight.data = offset_weights.data
+            self.embedding_offsets_individual.data = torch.zeros_like(self.embedding_offsets_individual.data)
 
     def transform_caption(self, caption:str):
         if len(caption.strip()) == 0:
@@ -250,7 +292,11 @@ def _embedding_forward_individual_hook(module, input_args, output):
         input_args[0], offset_weight, module.padding_idx, module.max_norm,
         module.norm_type, module.scale_grad_by_freq, module.sparse)
 
-def _apply_weight_offsets(training_token_ids: torch.Tensor, original_embeddings: nn.Embedding, embedding_offsets_individual: torch.Tensor):
+def _apply_weight_offsets(
+        training_token_ids: torch.Tensor,
+        original_embeddings: nn.Embedding,
+        embedding_offsets_individual: torch.Tensor
+) -> torch.Tensor:
     index = training_token_ids
     offset_weight = original_embeddings.weight.index_add(
         0, index, embedding_offsets_individual

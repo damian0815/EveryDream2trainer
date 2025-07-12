@@ -123,6 +123,7 @@ class SampleGenerator:
         if not os.path.exists(f"{log_folder}/samples/"):
             os.makedirs(f"{log_folder}/samples/")
 
+
     def reload_config(self):
         try:
             config_file_extension = os.path.splitext(self.config_file_path)[1].lower()

@@ -306,6 +306,9 @@ class EveryDreamOptimizer:
             # set warmup to 2% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 3% of max epochs
             args.lr_warmup_steps = int(args.lr_decay_steps / 50)
 
+        if args.lr_advance_steps is None:
+            args.lr_advance_steps = 0
+
         if args.lr is not None:
             # override for legacy support reasons
             base_config["lr"] = args.lr
@@ -316,8 +319,7 @@ class EveryDreamOptimizer:
         base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
         base_config["lr_warmup_steps"] = base_config.get("lr_warmup_steps", None) or args.lr_warmup_steps
         base_config["lr_decay_steps"] = base_config.get("lr_decay_steps", None) or args.lr_decay_steps
-        if "lr_advance_steps" not in base_config:
-            base_config["lr_advance_steps"] = 0
+        base_config["lr_advance_steps"] = base_config.get("lr_advance_steps", None) or args.lr_advance_steps
         base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
 
         te_config["lr"] = te_config.get("lr", None) or base_config["lr"]

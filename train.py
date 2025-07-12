@@ -15,6 +15,7 @@ limitations under the License.
 """
 import contextlib
 import os
+import pickle
 import pprint
 import sys
 import math
@@ -26,6 +27,8 @@ import gc
 import random
 import traceback
 import shutil
+
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -847,9 +850,9 @@ def main(args):
                               )
 
     image_train_items = []
-    for resolution in args.resolution:
-        this_aspects = aspects.get_aspect_buckets(resolution)
-        image_train_items.extend(resolve_image_train_items(args, resolution, this_aspects))
+    for batch_resolution in args.resolution:
+        this_aspects = aspects.get_aspect_buckets(batch_resolution)
+        image_train_items.extend(resolve_image_train_items(args, batch_resolution, this_aspects))
 
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
@@ -881,7 +884,8 @@ def main(args):
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
         chunk_shuffle_batch_size=args.batch_size,
-        batch_id_dropout_p=args.batch_id_dropout_p
+        batch_id_dropout_p=args.batch_id_dropout_p,
+        keep_same_sample_at_different_resolutions_together=args.keep_same_sample_at_different_resolutions_together
     )
 
     train_batch = EveryDreamBatch(
@@ -897,7 +901,8 @@ def main(args):
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
         contrastive_learning_batch_ids=args.contrastive_learning_batch_ids,
         contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
-        cond_dropout_noise_p=args.cond_dropout_noise_p
+        cond_dropout_noise_p=args.cond_dropout_noise_p,
+        use_masks=args.use_masks
     )
 
     torch.cuda.benchmark = False
@@ -1014,6 +1019,7 @@ def main(args):
     loss_log_step = []
     loss_log_step_cd = []
     loss_log_step_non_cd = []
+    loss_per_timestep: dict[int, dict[int, tuple[float, int]]] = {resolution: {} for resolution in args.resolution}
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
@@ -1186,7 +1192,8 @@ def main(args):
             tv.accumulated_loss = None
             tv.effective_backward_size = tv.accumulated_loss_images_count
             tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
-            print(f"\nbackward on {tv.accumulated_loss_images_count} -> backward accumulated {tv.current_accumulated_backward_images_count}")
+            #print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
+            #      f"backward accumulated {tv.current_accumulated_backward_images_count}")
             tv.accumulated_loss_images_count = 0
             # reset slice sizes
             tv.forward_slice_size = args.forward_slice_size or args.batch_size
@@ -1391,6 +1398,7 @@ def main(args):
                     image_shape = batch["image"].shape
                     reference_image_size = 512*512
                     loss_scale = loss_scale.float() * (reference_image_size / image_size)
+                    batch_resolution = _get_best_match_resolution(args.resolution, image_size)
 
                     assert type(batch["captions"]) is dict
                     caption_variants = [c for c in list(sorted(batch["captions"].keys()))
@@ -1503,9 +1511,13 @@ def main(args):
                         tv.accumulated_loss_images_count += nibble_size_actual
 
                         cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
-                                                          for s in caption_str], device=loss.device, dtype=torch.bool)
+                                                          for s in caption_str[0:nibble_size_actual]], device=loss.device, dtype=torch.bool)
                         loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
                         loss_log_step_non_cd.append(loss[~cond_dropout_mask].mean().detach().item())
+                        for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
+                            used_timestep_detached = int(used_timestep.detach().item())
+                            current, count = loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
+                            loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
                         # eliminate the x/y dims so we can accumulate over a larger number of samples without
                         # worrying about size mismatch
@@ -1533,9 +1545,9 @@ def main(args):
                             if tv.current_accumulated_backward_images_count == 0:
                                 print("Batch has 0 images, not stepping optimizer")
                             else:
-                                print(f'\nstepping optimizer - current_accumulated_backward_images_count '
-                                      f'{tv.current_accumulated_backward_images_count}, '
-                                      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
+                                #print(f'\nstepping optimizer - current_accumulated_backward_images_count '
+                                #      f'{tv.current_accumulated_backward_images_count}, '
+                                #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
                                 tv.last_effective_batch_size = tv.current_accumulated_backward_images_count
                                 ed_optimizer.step_optimizer(global_step, tv.effective_batch_total_elements)
                                 tv.current_accumulated_backward_images_count = 0
@@ -1606,6 +1618,32 @@ def main(args):
                         log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)
                         logs["loss/log_step"] = loss_step
 
+
+                    # log histogram of loss vs timestep
+                    loss_sums_and_counts = {
+                        batch_resolution: [loss_per_timestep[batch_resolution].get(timestep, (0, 1))
+                                            for timestep in range(noise_scheduler.config.num_train_timesteps + 1)]
+                        for batch_resolution in args.resolution
+                    }
+                    loss_sums_and_counts = {
+                        batch_resolution: torch.tensor([
+                            loss_sum_this_step / count
+                            for loss_sum_this_step, count in data
+                        ])
+                        for batch_resolution, data in loss_sums_and_counts.items()
+                    }
+                    with open(os.path.join(log_folder, "loss_sums_and_counts_per_timestep.pt"), "wb") as f:
+                        torch.save(loss_sums_and_counts, f)
+
+                    #for batch_resolution in args.resolution:
+                    #    #image = _create_bar_chart_image(loss_per_timestep[batch_resolution])
+                    #    loss_sums_and_counts = [loss_per_timestep[batch_resolution].get(timestep, (0, 1))
+                    #                            for timestep in range(noise_scheduler.config.num_train_timesteps+1)]
+                    #    #log_writer.add_histogram(tag=f"loss/timesteps/{batch_resolution}", values=torch.tensor([
+                    #    #    loss_sum_this_step / count
+                    #    #    for loss_sum_this_step, count in loss_sums_and_counts
+                    #    #]), global_step=global_step)
+
                     loss_log_step_cd = [l for l in loss_log_step_cd if math.isfinite(l)]
                     if len(loss_log_step_cd) > 0:
                         loss_step_cd = sum(loss_log_step_cd) / len(loss_log_step_cd)
@@ -1617,6 +1655,18 @@ def main(args):
                         loss_step_non_cd = sum(loss_log_step_non_cd) / len(loss_log_step_non_cd)
                         log_writer.add_scalar(tag="loss/log_step non-CD", scalar_value=loss_step_non_cd, global_step=global_step)
                         logs["loss/log_step non-CD"] = loss_step_non_cd
+
+                    if args.log_named_parameters_magnitudes:
+                        def log_named_parameters(model, prefix):
+                            """Log L2 norms of parameter groups to help debug NaN issues."""
+                            for name, param in model.named_parameters():
+                                if param.grad is not None:
+                                    param_norm = torch.norm(param.data).item()
+                                    log_writer.add_scalar(tag=f"p-norm/{prefix}-{name}", scalar_value=param_norm, global_step=global_step)
+                        if not args.disable_unet_training:
+                            log_named_parameters(unet, "unet")
+                        if not args.disable_textenc_training:
+                            log_named_parameters(text_encoder, "textenc")
 
                     loss_log_step = []
                     loss_log_step_cd = []
@@ -1747,6 +1797,54 @@ def get_slices(batch_size, slice_size, runt_size):
             break
         yield slice_start, slice_end
 
+
+def _get_best_match_resolution(resolutions: list[int], image_size_pixels: int) -> int:
+    error = [image_size_pixels / (r*r) for r in resolutions]
+    best_resolution_index = min([i for i in range(len(resolutions))], key=lambda i: abs(math.log(error[i])))
+    return resolutions[best_resolution_index]
+
+
+def create_bar_chart_image(values, labels=None, title="Bar Chart"):
+    """
+    Create a bar chart and return it as a TensorFlow image tensor.
+    Use this if you want to handle the TensorBoard logging yourself.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x_pos = np.arange(len(values))
+
+    if labels is None:
+        labels = [f"Item {i + 1}" for i in range(len(values))]
+
+    bars = ax.bar(x_pos, values, alpha=0.8, color='steelblue')
+
+    ax.set_xlabel('Categories')
+    ax.set_ylabel('Values')
+    ax.set_title(title)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+
+    for bar, value in zip(bars, values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2., height + max(values) * 0.01,
+                f'{value:.2f}', ha='center', va='bottom')
+
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+
+    image = tf.image.decode_png(buf.getvalue(), channels=4)
+    image = tf.expand_dims(image, 0)
+
+    plt.close(fig)
+    buf.close()
+
+    return image
+
+
+
 if __name__ == "__main__":
     check_git()
     supported_resolutions = aspects.get_supported_resolutions()
@@ -1791,6 +1889,7 @@ if __name__ == "__main__":
     argparser.add_argument("--max_backward_slice_size", type=int, default=None, help="Max number of samples to accumulate graph before doing backward (NOT optimizer step)")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
+    argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
                            help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "v-mse"])
     argparser.add_argument("--negative_loss_margin", type=float, default=1, help="margin for negative loss scale falloff")
@@ -1798,6 +1897,7 @@ if __name__ == "__main__":
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
+    argparser.add_argument("--lr_advance_steps", type=int, default=None, help="Steps to advance the LR during training")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
     argparser.add_argument("--max_steps", type=int, default=None, help="Maximum number of steps to train for")
     argparser.add_argument("--auto_decay_steps_multiplier", type=float, default=1.1, help="Multiplier for calculating decay steps from epoch count")
@@ -1807,6 +1907,7 @@ if __name__ == "__main__":
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
     argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=supported_resolutions)
+    argparser.add_argument("--keep_same_sample_at_different_resolutions_together", action='store_true', help="if passed, re-order batches to put samples with the same path but different resolutions near to each other")
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
     argparser.add_argument("--run_name", type=str, required=False, default=None, help="Run name for wandb (child of project name), and comment for tensorboard, (def: None)")
     argparser.add_argument("--sample_prompts", type=str, default="sample_prompts.txt", help="Text file with prompts to generate test samples from, or JSON file with sample generator settings (default: sample_prompts.txt)")
@@ -1874,7 +1975,7 @@ if __name__ == "__main__":
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
 
     argparser.add_argument("--jacobian_descent", action='store_true', help="Do Jacobian Descent (see torchjd). Uses more VRAM.")
-    argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg_mask in the data folder and use as mask for the loss")
+    argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg.mask.png in the data folder and use as mask for the loss")
 
     argparser.add_argument("--lora", action='store_true', help="If passed, do LoRA training")
     argparser.add_argument("--lora_resume", type=str, default=None, help="resume from this lora (must be a huggingface format folder)")
@@ -1886,5 +1987,7 @@ if __name__ == "__main__":
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)
+
+    #torch.autograd.set_detect_anomaly(True)
 
     main(args)
