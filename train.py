@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import safetensors.torch
+import torchvision
 
 from colorama import Fore, Style
 import numpy as np
@@ -65,7 +66,7 @@ from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from flow_match_model import TrainFlowMatchScheduler
 from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
     _get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
-    get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size, nibble_batch
+    get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size, nibble_batch, vae_preview
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.huggingface_downloader import try_download_model_from_hf
@@ -548,8 +549,8 @@ def write_batch_schedule(log_folder: str, train_batch: EveryDreamBatch, epoch: i
     with open(f"{log_folder}/ep{epoch}_batch_schedule.txt", "w", encoding='utf-8') as f:
         for i in range(len(train_batch.image_train_items)):
             try:
-                item = train_batch.image_train_items[i]
-                f.write(f"step:{int(i / train_batch.batch_size):05}, wh:{item.target_wh}, r:{item.runt_size}, path:{item.pathname}\n")
+                item: ImageTrainItem = train_batch.image_train_items[i]
+                f.write(f"step:{int(i / train_batch.batch_size):05}, wh:{item.target_wh}, r:{item.runt_size}, path:{item.pathname} captions:{item.caption}\n")
             except Exception as e:
                 logging.error(f" * Error writing to batch schedule for file path: {item.pathname}")
 
@@ -1019,6 +1020,7 @@ def main(args):
     loss_log_step = []
     loss_log_step_cd = []
     loss_log_step_non_cd = []
+    loss_preview_image = None
     loss_per_timestep: dict[int, dict[int, tuple[float, int]]] = {resolution: {} for resolution in args.resolution}
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
@@ -1264,6 +1266,10 @@ def main(args):
 
                 full_batch_size = full_batch["image"].shape[0]
 
+                #for k in full_batch['captions'].keys():
+                #    if any(c is not None and len(c.strip()) == 0 for c in full_batch['captions'][k]):
+                #        print('a caption was already empty before cond dropout. paths:', full_batch['pathnames'], 'captions:', full_batch['captions'])
+
                 image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
                 enable_vae_attention_slicing = False
                 if image_size > (1100)*(1100):
@@ -1365,8 +1371,8 @@ def main(args):
                                                                        final_value=final_cond_dropout,
                                                                        alpha=args.cond_dropout_curriculum_alpha)
                     if train_batch.random_instance.random() <= this_cond_dropout_p:
-                        full_batch['tokens'][i] = train_batch.cond_dropout_tokens
                         for k in full_batch['captions'].keys():
+                            full_batch['tokens'][k][i] = train_batch.cond_dropout_tokens
                             full_batch['captions'][k][i] = train_batch.cond_dropout_caption
                         full_batch["loss_scale"][i] *= args.cond_dropout_loss_scale
 
@@ -1403,7 +1409,8 @@ def main(args):
                     assert type(batch["captions"]) is dict
                     caption_variants = [c for c in list(sorted(batch["captions"].keys()))
                                         if args.caption_variants is None
-                                        or c in args.caption_variants]
+                                        or c in args.caption_variants
+                                        and c != 'default']
                     if len(caption_variants) == 0:
                         caption_variants.append("default")
                     if not args.all_caption_variants:
@@ -1443,9 +1450,23 @@ def main(args):
                         del latents_slices
 
                     for caption_variant in caption_variants:
-                        tokens = batch["tokens"][caption_variant] if type(batch["tokens"]) is dict else batch["tokens"]
-                        caption_str = batch["captions"][caption_variant] if type(batch["tokens"]) is dict else batch["captions"]
+                        caption_str = []
+                        tokens = []
+                        for i in range(batch_size):
+                            this_caption_str = batch["captions"][caption_variant][i]
+                            this_tokens = batch["tokens"][caption_variant][i]
+                            if this_caption_str is None:
+                                # pick a random caption variant to replace it
+                                non_none_variant = train_batch.random_instance.choice([k for k, v in batch["captions"].items()
+                                                    if v[i] is not None])
+                                this_caption_str = batch["captions"][non_none_variant][i]
+                                this_tokens = batch["tokens"][non_none_variant][i]
+                            assert this_caption_str is not None
+                            assert this_tokens is not None
+                            caption_str.append(this_caption_str)
+                            tokens.append(this_tokens)
 
+                        tokens = torch.stack(tokens)
                         with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
                             encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
                                                                        clip_skip=args.clip_skip,
@@ -1522,10 +1543,12 @@ def main(args):
                         # eliminate the x/y dims so we can accumulate over a larger number of samples without
                         # worrying about size mismatch
                         #loss = loss.mean(dim=[2, 3])
-                        tv.effective_batch_total_elements += loss.numel()
+                        num_elements = loss.numel() if mask is None else mask.count_nonzero()
+                        tv.effective_batch_total_elements += num_elements
                         loss_sum = loss.sum()
 
                         tv.accumulated_loss = loss_sum if tv.accumulated_loss is None else tv.accumulated_loss + loss_sum
+                        loss_preview_image: torch.Tensor = loss.detach().clone().cpu()
                         loss_step = loss.detach().mean().item()
                         del loss, loss_sum
                         steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
@@ -1655,6 +1678,21 @@ def main(args):
                         loss_step_non_cd = sum(loss_log_step_non_cd) / len(loss_log_step_non_cd)
                         log_writer.add_scalar(tag="loss/log_step non-CD", scalar_value=loss_step_non_cd, global_step=global_step)
                         logs["loss/log_step non-CD"] = loss_step_non_cd
+
+                    if loss_preview_image is not None:
+                        loss_preview_image_rgb = torchvision.utils.make_grid(
+                            vae_preview((loss_preview_image / args.negative_loss_margin) * 2 - 1)
+                        )
+                        loss_preview_image = torchvision.utils.make_grid(
+                            torch.reshape(loss_preview_image, [
+                                loss_preview_image.shape[0]*loss_preview_image.shape[1], 1, loss_preview_image.shape[2], loss_preview_image.shape[3]
+                            ]),
+                            nrow=loss_preview_image.shape[0],
+                            normalize=True,
+                            value_range=(0, args.negative_loss_margin),
+                            scale_each=False)
+                        log_writer.add_image(tag="loss/last vis raw", img_tensor=loss_preview_image, global_step=global_step)
+                        log_writer.add_image(tag="loss/last vis rgb", img_tensor=loss_preview_image_rgb, global_step=global_step)
 
                     if args.log_named_parameters_magnitudes:
                         def log_named_parameters(model, prefix):
@@ -1892,7 +1930,7 @@ if __name__ == "__main__":
     argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
                            help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "v-mse"])
-    argparser.add_argument("--negative_loss_margin", type=float, default=1, help="margin for negative loss scale falloff")
+    argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])

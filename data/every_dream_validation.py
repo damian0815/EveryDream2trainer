@@ -215,7 +215,7 @@ class EveryDreamValidator:
             for step, batch in enumerate(dataloader):
                 keys = list(batch["captions"].keys())
                 for key in keys:
-                    model_pred, target = get_model_prediction_and_target(batch["image"], batch["tokens"][key])
+                    model_pred, target = get_model_prediction_and_target(batch["image"], torch.stack(batch["tokens"][key]))
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 

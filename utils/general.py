@@ -26,3 +26,4 @@ def sigterm_handler(signum, frame):
     else:
         # non-main threads (i.e. dataloader workers) should exit cleanly
         exit(0)
+

@@ -145,6 +145,10 @@ class SampleGenerator:
                 self.sample_requests = self._make_random_caption_sample_requests()
 
     def update_random_captions(self, possible_captions: list[str]|dict[str, str]):
+        possible_captions = [p for p in possible_captions
+                             if p is not None and len(p.strip())>0]
+        if len(possible_captions) == 0:
+            possible_captions = [' ']
         random_prompt_sample_requests = [r for r in self.sample_requests if r.wants_random_caption]
         for i, r in enumerate(random_prompt_sample_requests):
             r.prompt = possible_captions[i % len(possible_captions)]

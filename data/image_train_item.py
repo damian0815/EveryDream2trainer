@@ -201,7 +201,7 @@ class ImageTrainItem:
         if not os.path.exists(self.pathname_mask):
             return None
         try:
-            mask = PIL.Image.open(self.pathname_mask).convert('RGB')
+            mask = PIL.Image.open(self.pathname_mask).convert('L')
             mask = self._try_transpose(mask, print_error=False)
         except SyntaxError as e:
             pass
@@ -338,7 +338,7 @@ class ImageTrainItem:
             jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
             image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
             if mask is not None:
-                mask = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
+                mask = self._apply_crop_jitter(mask, precomputed_jitter=jitter_amounts)
 
         image = self._trim_to_aspect(image, self.target_wh)
         if mask is not None:

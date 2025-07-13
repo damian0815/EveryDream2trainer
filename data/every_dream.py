@@ -115,8 +115,8 @@ class EveryDreamBatch(Dataset):
     def __getitem__(self, i):
         example = {}
 
-        train_item = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
-
+        train_item: dict = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
+        example["pathname"] = train_item["pathname"]
 
         std_dev = 0.5
         mean = 0.5
@@ -155,6 +155,7 @@ class EveryDreamBatch(Dataset):
         else:
             caption_dict = {"default": example["caption"]}
 
+
         #for k in caption_dict.keys():
         #    if self.randomizer.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
         #        caption_dict[k] = " "
@@ -167,9 +168,11 @@ class EveryDreamBatch(Dataset):
                                   ).to(example["image"].device, dtype=example["image"].dtype)
             example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
 
-        example["caption"] = caption_dict
+
         try:
-            example["tokens"] = {k: torch.tensor(self.tokenizer(caption_dict[k] or '',
+            example["caption"] = {k: caption_dict.get(k, None) or caption_dict[self.random_instance.choice(caption_dict.keys())]
+                                  for k in caption_dict.keys()}
+            example["tokens"] = {k: torch.tensor(self.tokenizer(example["caption"][k],
                                                 truncation=True,
                                                 padding="max_length",
                                                 max_length=self.tokenizer.model_max_length,
@@ -216,6 +219,7 @@ class EveryDreamBatch(Dataset):
         example["batch_id"] = image_train_tmp.batch_id
         example["do_contrastive_learning"] = do_contrastive_learning
         example["timesteps_range"] = image_train_tmp.timesteps_range
+        example["pathname"] = image_train_tmp.pathname
 
         return example
 
@@ -293,22 +297,22 @@ def collate_fn(batch):
     """
     images = [example["image"] for example in batch]
     masks = [example["mask"] for example in batch]
+    pathnames = [example["pathname"] for example in batch]
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
 
     #captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     caption_variants = list(set(k
                             for b in batch
-                            for k in b["caption"].keys()
-                            if k is not "default"))
-    if len(caption_variants) == 0:
-        caption_variants = ["default"]
-    captions = {k: [example["caption"].get(k, example["caption"].get("default", None)) for example in batch]
-                for k in caption_variants}
-    assert all(c is not None for c in captions.values())
-    tokens = {k: torch.stack([example["tokens"].get(k, example["tokens"].get("default", None)) for example in batch])
-              for k in caption_variants}
-    assert all(t is not None for t in tokens.values())
+                            for k in b["caption"].keys()))
+    assert len(caption_variants) > 0
 
+    captions = {}
+    tokens = {}
+    for k in caption_variants:
+        captions[k] = [example["caption"].get(k, None)
+                       for example in batch]
+        tokens[k] = [example["tokens"].get(k, None)
+                     for example in batch]
 
     runt_size = batch[0]["runt_size"]
 
@@ -320,6 +324,8 @@ def collate_fn(batch):
                  else torch.ones([1, images[0].shape[1]//8, images[0].shape[2]//8], dtype=torch.float32).to(images.device)
                  for m in masks]
         masks = torch.stack(masks)
+        assert masks.min() >= 0
+        assert masks.max() <= 1
         masks = masks.to(memory_format=torch.contiguous_format).float()
     else:
         masks = None
@@ -338,6 +344,7 @@ def collate_fn(batch):
         "loss_scale": loss_scale,
         "do_contrastive_learning": do_contrastive_learning,
         "timesteps_range": timesteps_range,
+        "pathnames": pathnames,
     }
     del batch
     return ret

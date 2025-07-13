@@ -1,7 +1,7 @@
 import logging
 import math
 import random
-from typing import Tuple, Callable
+from typing import Tuple, Callable, Optional
 
 import torch
 from compel import Compel
@@ -194,10 +194,12 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
             if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
                 snr_weight = min_snr_gamma / (snr + 1)
-                # prevent extremely low weight at high timesteps
-                snr_weight += 0.0047
             else:
                 snr_weight = min_snr_gamma / snr
+
+            # prevent extremely low weight at high timesteps
+            snr_weight = snr_weight.clamp(min=0.1)
+
             snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
 
             loss = loss * snr_weight.to(loss.device)
@@ -446,3 +448,36 @@ def compute_snr(timesteps, noise_scheduler, max_sigma=22000):
     snr = (alpha / sigma) ** 2
     snr[snr < minimal_value] = minimal_value
     return snr
+
+def vae_preview(latents: torch.Tensor) -> torch.Tensor:
+
+    # adapted from https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/util/step_callback.py
+    SD1_5_LATENT_RGB_FACTORS = torch.tensor([
+        #    R        G        B
+        [0.3444, 0.1385, 0.0670],  # L1
+        [0.1247, 0.4027, 0.1494],  # L2
+        [-0.3192, 0.2513, 0.2103],  # L3
+        [-0.1307, -0.1874, -0.7445],  # L4
+    ])
+
+    def sample_to_lowres_estimated_image(
+            samples: torch.Tensor, latent_rgb_factors: torch.Tensor, smooth_matrix: Optional[torch.Tensor] = None
+    ):
+        if samples.dim() == 4:
+            samples = samples[0]
+        latent_image = samples.permute(1, 2, 0) @ latent_rgb_factors
+
+        if smooth_matrix is not None:
+            latent_image = latent_image.unsqueeze(0).permute(3, 0, 1, 2)
+            latent_image = torch.nn.functional.conv2d(latent_image, smooth_matrix.reshape((1, 1, 3, 3)), padding=1)
+            latent_image = latent_image.permute(1, 2, 3, 0).squeeze(0)
+
+        latents_ubyte = (
+            ((latent_image + 1) / 2).clamp(0, 1).mul(0xFF).byte()  # change scale from -1..1 to 0..1  # to 0..255
+        ).cpu()
+
+        return latents_ubyte
+
+    return torch.stack([sample_to_lowres_estimated_image(latents[i], SD1_5_LATENT_RGB_FACTORS).permute(2, 0, 1)
+                       for i in range(latents.shape[0])], dim=0)
+
