@@ -164,6 +164,16 @@ class EveryDreamTrainingState:
         self.unet_ema = unet_ema
         self.text_encoder_ema = text_encoder_ema
 
+@dataclass
+class TrainingModel:
+    noise_scheduler: any
+    text_encoder: any
+    text_encoder_ema: any
+    tokenizer: any
+    unet: any
+    unet_ema: any
+    vae: any
+
 def convert_diffusers_lora_to_civitai(diffusers_folder, civitai_path):
     broken = safetensors.torch.load_file(os.path.join(diffusers_folder, 'pytorch_lora_weights.safetensors'))
 
@@ -737,13 +747,24 @@ def main(args):
             trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler", trained_betas=None)
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder,
-                                                           trained_betas=trained_betas, rescale_betas_zero_snr=False#True
+                                                           trained_betas=trained_betas, trescale_betas_zero_snr=False#True
             )
         else:
             inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder)
 
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
+
+        # Construct TrainingModel instance after loading model components
+        model_being_trained = TrainingModel(
+            noise_scheduler=noise_scheduler,
+            text_encoder=text_encoder,
+            text_encoder_ema=None,
+            tokenizer=tokenizer,
+            unet=unet,
+            unet_ema=None,
+            vae=vae
+        )
 
     except Exception as e:
         traceback.print_exc()
@@ -752,20 +773,20 @@ def main(args):
 
     compel = None
     if args.use_compel:
-        compel = Compel(tokenizer=tokenizer,
-                        text_encoder=text_encoder,
+        compel = Compel(tokenizer=model_being_trained.tokenizer,
+                        text_encoder=model_being_trained.text_encoder,
                         truncate_long_prompts=False,
                         split_long_text_mode = SplitLongTextMode.SENTENCES,
                         )
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
-        text_encoder.gradient_checkpointing_enable()
+        model_being_trained.unet.enable_gradient_checkpointing()
+        model_being_trained.text_encoder.gradient_checkpointing_enable()
 
     if args.attn_type == "xformers":
         if (args.amp and is_sd1attn) or (not is_sd1attn):
             try:
-                unet.enable_xformers_memory_efficient_attention()
+                model_being_trained.unet.enable_xformers_memory_efficient_attention()
                 logging.info("Enabled xformers")
             except Exception as ex:
                 logging.warning("failed to load xformers, using default SDP attention instead")
@@ -773,16 +794,16 @@ def main(args):
         elif (args.disable_amp and is_sd1attn):
             logging.info("AMP is disabled but model is SD1.X, xformers is incompatible so using default attention")
     elif args.attn_type == "slice":
-        unet.set_attention_slice("auto")
+        model_being_trained.unet.set_attention_slice("auto")
     else:
         logging.info("* Using SDP attention *")
 
-    vae = vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
-    unet = unet.to(device, dtype=torch.float32)
+    model_being_trained.vae = model_being_trained.vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
+    model_being_trained.unet = model_being_trained.unet.to(device, dtype=torch.float32)
     if args.disable_textenc_training and args.amp:
-        text_encoder = text_encoder.to(device, dtype=torch.float16)
+        model_being_trained.text_encoder = model_being_trained.text_encoder.to(device, dtype=torch.float16)
     else:
-        text_encoder = text_encoder.to(device, dtype=torch.float32)
+        model_being_trained.text_encoder = model_being_trained.text_encoder.to(device, dtype=torch.float32)
 
 
     if use_ema_dacay_training:
@@ -791,22 +812,26 @@ def main(args):
 
             with torch.no_grad():
                 if args.ema_device == device:
-                    unet_ema = deepcopy(unet)
-                    text_encoder_ema = deepcopy(text_encoder)
+                    unet_ema = deepcopy(model_being_trained.unet)
+                    text_encoder_ema = deepcopy(model_being_trained.text_encoder)
                 else:
-                    unet_ema_first = deepcopy(unet)
-                    text_encoder_ema_first = deepcopy(text_encoder)
-                    unet_ema = unet_ema_first.to(ema_device, dtype=unet.dtype)
-                    text_encoder_ema = text_encoder_ema_first.to(ema_device, dtype=text_encoder.dtype)
+                    unet_ema_first = deepcopy(model_being_trained.unet)
+                    text_encoder_ema_first = deepcopy(model_being_trained.text_encoder)
+                    unet_ema = unet_ema_first.to(ema_device, dtype=model_being_trained.unet.dtype)
+                    text_encoder_ema = text_encoder_ema_first.to(ema_device, dtype=model_being_trained.text_encoder.dtype)
                     del unet_ema_first
                     del text_encoder_ema_first
         else:
             # Make sure correct types are used for models
-            unet_ema = unet_ema.to(ema_device, dtype=unet.dtype)
-            text_encoder_ema = text_encoder_ema.to(ema_device, dtype=text_encoder.dtype)
+            unet_ema = unet_ema.to(ema_device, dtype=model_being_trained.unet.dtype)
+            text_encoder_ema = text_encoder_ema.to(ema_device, dtype=model_being_trained.text_encoder.dtype)
     else:
         unet_ema = None
         text_encoder_ema = None
+
+    # Update model_being_trained with EMA models if available
+    model_being_trained.unet_ema = unet_ema
+    model_being_trained.text_encoder_ema = text_encoder_ema
 
     try:
         print()
@@ -877,7 +902,7 @@ def main(args):
         plugins = []
 
     plugin_runner = PluginRunner(plugins=plugins)
-    plugin_runner.run_on_model_load(unet=unet, text_encoder=text_encoder, tokenizer=tokenizer, optimizer_config=optimizer_config)
+    plugin_runner.run_on_model_load(unet=model_being_trained.unet, text_encoder=model_being_trained.text_encoder, tokenizer=model_being_trained.tokenizer, optimizer_config=optimizer_config)
 
     data_loader = DataLoaderMultiAspect(
         image_train_items=image_train_items,
@@ -893,7 +918,7 @@ def main(args):
         data_loader=data_loader,
         debug_level=1,
         conditional_dropout=args.cond_dropout,
-        tokenizer=tokenizer,
+        tokenizer=model_being_trained.tokenizer,
         seed = seed,
         shuffle_tags=args.shuffle_tags,
         keep_tags=args.keep_tags,
@@ -925,8 +950,8 @@ def main(args):
 
     ed_optimizer = EveryDreamOptimizer(args,
                                        optimizer_config,
-                                       text_encoder,
-                                       unet,
+                                       model_being_trained.text_encoder,
+                                       model_being_trained.unet,
                                        epoch_len,
                                        plugin_runner,
                                        log_writer)
@@ -993,12 +1018,12 @@ def main(args):
 
     train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size)
 
-    unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else unet.eval()
-    text_encoder.train() if not args.disable_textenc_training else text_encoder.eval()
+    model_being_trained.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model_being_trained.unet.eval()
+    model_being_trained.text_encoder.train() if not args.disable_textenc_training else model_being_trained.text_encoder.eval()
 
-    logging.info(f" unet device: {unet.device}, precision: {unet.dtype}, training: {unet.training}")
-    logging.info(f" text_encoder device: {text_encoder.device}, precision: {text_encoder.dtype}, training: {text_encoder.training}")
-    logging.info(f" vae device: {vae.device}, precision: {vae.dtype}, training: {vae.training}")
+    logging.info(f" unet device: {model_being_trained.unet.device}, precision: {model_being_trained.unet.dtype}, training: {model_being_trained.unet.training}")
+    logging.info(f" text_encoder device: {model_being_trained.text_encoder.device}, precision: {model_being_trained.text_encoder.dtype}, training: {model_being_trained.text_encoder.training}")
+    logging.info(f" vae device: {model_being_trained.vae.device}, precision: {model_being_trained.vae.dtype}, training: {model_being_trained.vae.training}")
     logging.info(f" scheduler: {noise_scheduler.__class__}")
 
     logging.info(f" {Fore.GREEN}Project name: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.project_name}{Style.RESET_ALL}")
@@ -1056,36 +1081,33 @@ def main(args):
                 extra_info: str = ""
 
                 if model_info["is_ema"]:
-                    current_unet, current_text_encoder = unet_ema, text_encoder_ema
+                    current_unet, current_text_encoder = model_being_trained.unet_ema, model_being_trained.text_encoder_ema
                     extra_info = "_ema"
                 else:
-                    current_unet, current_text_encoder = unet, text_encoder
+                    current_unet, current_text_encoder = model_being_trained.unet, model_being_trained.text_encoder
 
                 torch.cuda.empty_cache()
 
 
                 if model_info["swap_required"]:
                     with torch.no_grad():
-                        unet_unloaded = unet.to(ema_device)
-                        del unet
-                        text_encoder_unloaded = text_encoder.to(ema_device)
-                        del text_encoder
+                        unet_unloaded = model_being_trained.unet.to(ema_device)
+                        del model_being_trained.unet
+                        text_encoder_unloaded = model_being_trained.text_encoder.to(ema_device)
+                        del model_being_trained.text_encoder
 
-                        current_unet = unet_ema.to(device)
-                        del unet_ema
-                        current_text_encoder = text_encoder_ema.to(device)
-                        del text_encoder_ema
+                        current_unet = model_being_trained.unet_ema.to(device)
+                        del model_being_trained.unet_ema
+                        current_text_encoder = model_being_trained.text_encoder_ema.to(device)
+                        del model_being_trained.text_encoder_ema
                         gc.collect()
                         torch.cuda.empty_cache()
 
-
-
-                inference_pipe = sample_generator.create_inference_pipe(unet=current_unet,
-                                                                        text_encoder=current_text_encoder,
-                                                                        tokenizer=tokenizer,
-                                                                        vae=vae,
-                                                                        diffusers_scheduler_config=inference_scheduler.config
-                                                                        ).to(device)
+                # Pass model_being_trained instead of individual fields
+                inference_pipe = sample_generator.create_inference_pipe(
+                    model_being_trained=model_being_trained,
+                    diffusers_scheduler_config=inference_scheduler.config
+                ).to(device)
                 sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
                 # Cleanup
@@ -1093,14 +1115,14 @@ def main(args):
 
                 if model_info["swap_required"]:
                     with torch.no_grad():
-                        unet = unet_unloaded.to(device)
+                        model_being_trained.unet = unet_unloaded.to(device)
                         del unet_unloaded
-                        text_encoder = text_encoder_unloaded.to(device)
+                        model_being_trained.text_encoder = text_encoder_unloaded.to(device)
                         del text_encoder_unloaded
 
-                        unet_ema = current_unet.to(ema_device)
+                        model_being_trained.unet_ema = current_unet.to(ema_device)
                         del current_unet
-                        text_encoder_ema = current_text_encoder.to(ema_device)
+                        model_being_trained.text_encoder_ema = current_text_encoder.to(ema_device)
                         del current_text_encoder
 
                 gc.collect()
@@ -1119,17 +1141,17 @@ def main(args):
         batch_size = image.shape[0]
         timesteps = _get_timesteps(batch_size=batch_size,
                                    batch_share_timesteps=False,
-                                   device=unet.device,
+                                   device=model_being_trained.unet.device,
                                    timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                   is_flow_matching = noise_scheduler.config.prediction_type == 'flow-matching')
-        latents = get_latents(image, vae, device=unet.device, args=args)
-        noise = _get_noise(latents.shape, unet.device, image.dtype,
+                                   is_flow_matching = model_being_trained.noise_scheduler.config.prediction_type == 'flow-matching')
+        latents = get_latents(image, model_being_trained.vae, device=model_being_trained.unet.device, args=args)
+        noise = _get_noise(latents.shape, model_being_trained.unet.device, image.dtype,
                            pyramid_noise_discount=args.pyramid_noise_discount,
                            zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                            batch_share_noise=False)
         encoder_hidden_states = _encode_caption_tokens(
             tokens,
-            text_encoder,
+            model_being_trained.text_encoder,
             clip_skip=args.clip_skip,
             embedding_perturbation=args.embedding_perturbation,
             compel=None
@@ -1140,8 +1162,7 @@ def main(args):
             encoder_hidden_states,
             noise,
             timesteps,
-            unet,
-            noise_scheduler,
+            model_being_trained=model_being_trained,
             args=args,
             skip_contrastive=True
         )
@@ -1162,14 +1183,14 @@ def main(args):
     def make_current_ed_state() -> EveryDreamTrainingState:
         return EveryDreamTrainingState(optimizer=ed_optimizer,
                                        train_batch=train_batch,
-                                       unet=unet,
-                                       text_encoder=text_encoder,
-                                       tokenizer=tokenizer,
-                                       scheduler=noise_scheduler,
+                                       unet=model_being_trained.unet,
+                                       text_encoder=model_being_trained.text_encoder,
+                                       tokenizer=model_being_trained.tokenizer,
+                                       scheduler=model_being_trained.noise_scheduler,
                                        inference_scheduler=inference_scheduler,
-                                       vae=vae,
-                                       unet_ema=unet_ema,
-                                       text_encoder_ema=text_encoder_ema)
+                                       vae=model_being_trained.vae,
+                                       unet_ema=model_being_trained.unet_ema,
+                                       text_encoder_ema=model_being_trained.text_encoder_ema)
 
     epoch = None
 
@@ -1338,9 +1359,9 @@ def main(args):
                     batch_size=full_batch_size,
                     batch_share_timesteps=(
                     do_contrastive_learning or args.batch_share_timesteps),
-                    device=unet.device,
+                    device=model_being_trained.unet.device,
                     timesteps_ranges=timesteps_ranges,
-                    is_flow_matching=noise_scheduler.config.prediction_type=='flow-matching'
+                    is_flow_matching=model_being_trained.noise_scheduler.config.prediction_type=='flow-matching'
                 )
 
                 # apply cond dropout
@@ -1420,7 +1441,7 @@ def main(args):
 
                     with torch.no_grad():
                         noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
-                        noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
+                        noise = _get_noise(noise_shape, device=model_being_trained.unet.device, dtype=batch["image"].dtype,
                                            pyramid_noise_discount=args.pyramid_noise_discount,
                                            zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                            batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
@@ -1429,14 +1450,14 @@ def main(args):
                     runt_size = batch["runt_size"]
                     with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                         latents_slices = []
-                        pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
+                        pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(model_being_trained.unet.device)
                         for slice_start, slice_end in get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size):
                             try:
                                 vae: AutoencoderKL
                                 if enable_vae_attention_slicing:
-                                    vae.enable_slicing()
-                                latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
-                                vae.disable_slicing()
+                                    model_being_trained.vae.enable_slicing()
+                                latents_slice = model_being_trained.vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
+                                model_being_trained.vae.disable_slicing()
                                 latents_slice = latents_slice[0].sample() * 0.18215
                                 latents_slices.append(latents_slice)
                                 del latents_slice
@@ -1468,7 +1489,7 @@ def main(args):
 
                         tokens = torch.stack(tokens)
                         with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
-                            encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
+                            encoder_hidden_states = _encode_caption_tokens(tokens, model_being_trained.text_encoder,
                                                                        clip_skip=args.clip_skip,
                                                                        embedding_perturbation=args.embedding_perturbation,
                                                                        compel=compel,
@@ -1492,8 +1513,8 @@ def main(args):
                                 encoder_hidden_states=encoder_hidden_states_slice,
                                 noise=noise_slice,
                                 timesteps=timesteps_slice,
-                                unet=unet,
-                                noise_scheduler=noise_scheduler,
+                                unet=model_being_trained.unet,
+                                noise_scheduler=model_being_trained.noise_scheduler,
                                 args=args
                             )
                             model_pred_all.append(model_pred)
@@ -1522,7 +1543,7 @@ def main(args):
                                          mask=mask,
                                          timesteps=timesteps[0:nibble_size_actual],
                                          loss_scale=loss_scale[0:nibble_size_actual],
-                                         noise_scheduler=noise_scheduler,
+                                         noise_scheduler=model_being_trained.noise_scheduler,
                                          do_contrastive_learning=do_contrastive_learning,
                                          contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                          args=args
@@ -1599,10 +1620,10 @@ def main(args):
                         # debug_start_time = time.time() # Measure time
 
                         if args.disable_unet_training != True:
-                            update_ema(unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+                            update_ema(model_being_trained.unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
 
                         if args.disable_textenc_training != True:
-                            update_ema(text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+                            update_ema(model_being_trained.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
 
                         # debug_end_time = time.time() # Measure time
                         # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
@@ -1702,9 +1723,9 @@ def main(args):
                                     param_norm = torch.norm(param.data).item()
                                     log_writer.add_scalar(tag=f"p-norm/{prefix}-{name}", scalar_value=param_norm, global_step=global_step)
                         if not args.disable_unet_training:
-                            log_named_parameters(unet, "unet")
+                            log_named_parameters(model_being_trained.unet, "unet")
                         if not args.disable_textenc_training:
-                            log_named_parameters(text_encoder, "textenc")
+                            log_named_parameters(model_being_trained.text_encoder, "textenc")
 
                     loss_log_step = []
                     loss_log_step_cd = []

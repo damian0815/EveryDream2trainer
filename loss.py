@@ -300,15 +300,14 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
 def _get_contrastive_v2_loss():
     pass
 
-def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler,
-                                     args,
-                                     skip_contrastive: bool=False
+def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, model_being_trained: TrainingModel,
+                                     args=None, skip_contrastive: bool=False
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps,
+    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model_being_trained.noise_scheduler, timesteps,
                                                           args.latents_perturbation)
     with autocast(enabled=args.amp):
         # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        model_pred = model_being_trained.unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
     model_pred_wrong_caption = None
     model_pred_wrong_caption_mask = None
@@ -324,7 +323,7 @@ def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, time
             # v_pred_negative_2 = unet(z_t, t, c_negative_2)
             with autocast(enabled=args.amp):
                 wrong_caption_i = rotate_dim0(encoder_hidden_states, i + 1)
-                model_pred_wrong_caption_i = unet(noisy_latents, timesteps, wrong_caption_i).sample
+                model_pred_wrong_caption_i = model_being_trained.unet(noisy_latents, timesteps, wrong_caption_i).sample
                 model_pred_wrong_caption.append(model_pred_wrong_caption_i)
                 del wrong_caption_i, model_pred_wrong_caption_i
         if len(model_pred_wrong_caption) > 0:

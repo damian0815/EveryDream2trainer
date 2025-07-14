@@ -346,16 +346,16 @@ class SampleGenerator:
         del tfimage
 
     @torch.no_grad()
-    def create_inference_pipe(self, unet, text_encoder, tokenizer, vae, diffusers_scheduler_config: dict):
+    def create_inference_pipe(self, model_being_trained, diffusers_scheduler_config: dict=None, **kwargs):
         """
         creates a pipeline for SD inference
         """
         scheduler = self._create_scheduler(diffusers_scheduler_config)
         pipe = StableDiffusionPipeline(
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            unet=unet,
+            vae=model_being_trained.vae,
+            text_encoder=model_being_trained.text_encoder,
+            tokenizer=model_being_trained.tokenizer,
+            unet=model_being_trained.unet,
             scheduler=scheduler,
             safety_checker=None, # save vram
             requires_safety_checker=None, # avoid nag
