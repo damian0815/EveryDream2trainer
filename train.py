@@ -1181,22 +1181,42 @@ def main(args):
         current_accumulated_backward_images_count = 0
         accumulated_loss_images_count = 0
         accumulated_loss = None
+        accumulated_pathnames = []
+        accumulated_timesteps = []
         desired_effective_batch_size = None
         interleave_bs1_bsN = False
         interleaved_bs1_count = None
+        
+        def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], timesteps: list[int]):
+            self.accumulated_loss = (
+                loss
+                if self.accumulated_loss is None
+                else self.accumulated_loss + loss
+            )
+            self.accumulated_loss_images_count += len(timesteps)
+            self.accumulated_pathnames.extend(pathnames)
+            self.accumulated_timesteps.extend(timesteps)
+
+        def clear_accumulated_loss(self):
+            self.accumulated_loss = None
+            self.accumulated_loss_images_count = 0
+            self.accumulated_pathnames = []
+            self.accumulated_timesteps = []
 
 
     def optimizer_backward(tv: TrainingVariables):
         if tv.accumulated_loss_images_count == 0:
             print("no accumulated loss images, not doing backward")
         else:
-            ed_optimizer.backward(tv.accumulated_loss)
-            tv.accumulated_loss = None
-            tv.effective_backward_size = tv.accumulated_loss_images_count
-            tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
+            if tv.accumulated_loss.isnan().any():
+                logging.warn(f"NaN detected after processing {tv.accumulated_pathnames} @ {tv.accumulated_timesteps} - skipping")
+            else:
+                ed_optimizer.backward(tv.accumulated_loss)
+                tv.effective_backward_size = tv.accumulated_loss_images_count
+                tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
             #print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
             #      f"backward accumulated {tv.current_accumulated_backward_images_count}")
-            tv.accumulated_loss_images_count = 0
+            tv.clear_accumulated_loss()
             # reset slice sizes
             tv.forward_slice_size = args.forward_slice_size or args.batch_size
             tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
@@ -1529,8 +1549,6 @@ def main(args):
                                          )
                         del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
-                        tv.accumulated_loss_images_count += nibble_size_actual
-
                         cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
                                                           for s in caption_str[0:nibble_size_actual]], device=loss.device, dtype=torch.bool)
                         loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
@@ -1543,11 +1561,13 @@ def main(args):
                         # eliminate the x/y dims so we can accumulate over a larger number of samples without
                         # worrying about size mismatch
                         #loss = loss.mean(dim=[2, 3])
-                        num_elements = loss.numel() if mask is None else mask.count_nonzero()
+                        num_elements = loss.numel() if mask is None else max(1, mask.count_nonzero())
                         tv.effective_batch_total_elements += num_elements
                         loss_sum = loss.sum()
 
-                        tv.accumulated_loss = loss_sum if tv.accumulated_loss is None else tv.accumulated_loss + loss_sum
+                        tv.accumulate_loss(loss_sum,
+                                           pathnames=batch["pathnames"][0:nibble_size_actual],
+                                           timesteps=timesteps[0:nibble_size_actual].tolist())
                         loss_preview_image: torch.Tensor = loss.detach().clone().cpu()
                         loss_step = loss.detach().mean().item()
                         del loss, loss_sum
@@ -1698,9 +1718,9 @@ def main(args):
                         def log_named_parameters(model, prefix):
                             """Log L2 norms of parameter groups to help debug NaN issues."""
                             for name, param in model.named_parameters():
-                                if param.grad is not None:
-                                    param_norm = torch.norm(param.data).item()
-                                    log_writer.add_scalar(tag=f"p-norm/{prefix}-{name}", scalar_value=param_norm, global_step=global_step)
+                                if param.requires_grad:
+                                    param_mean = param.mean().item()
+                                    log_writer.add_scalar(tag=f"p-mean/{prefix}-{name}", scalar_value=param_mean, global_step=global_step)
                         if not args.disable_unet_training:
                             log_named_parameters(unet, "unet")
                         if not args.disable_textenc_training:
@@ -1977,6 +1997,7 @@ if __name__ == "__main__":
     argparser.add_argument("--match_zero_terminal_snr", action="store_true", default=None, help="use zero terminal SNR target as regular noise scheduler input")
     argparser.add_argument("--load_settings_every_epoch", action="store_true", default=None, help="Enable reloading of 'train.json' at start of every epoch.")
     argparser.add_argument("--min_snr_gamma", type=float, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
+    argparser.add_argument("--min_snr_alpha", type=float, default=1, help="Blending factor for min-SNR-gamma weighting. 1=use pure min SNR gamma weighting, 0.5=use a 50/50 blend of min SNR gamma and regular loss weighting (default: 1)")
     argparser.add_argument("--debug_invert_min_snr_gamma", action='store_true', help="invert the timestep/scale equation for min snr gamma")
     argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
     argparser.add_argument("--ema_strength_target", type=float, default=None, help="EMA decay target value in range (0,1). emarate will be calculated from equation: 'ema_decay_rate=ema_strength_target^(total_steps/ema_update_interval)'. Using this parameter will enable the ema feature and overide ema_decay_rate.")

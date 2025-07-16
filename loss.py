@@ -194,11 +194,12 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
             if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
                 snr_weight = min_snr_gamma / (snr + 1)
+                snr_weight += 0.0047
             else:
                 snr_weight = min_snr_gamma / snr
 
-            # prevent extremely low weight at high timesteps
-            snr_weight = snr_weight.clamp(min=0.1)
+            # blend snr with regular weight
+            snr_weight = (1 - args.min_snr_alpha) + (snr_weight * args.min_snr_alpha)
 
             snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
 
