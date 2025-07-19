@@ -65,9 +65,10 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from flow_match_model import TrainFlowMatchScheduler
-from loss import _get_noise, _get_timesteps, _get_model_prediction_and_target, \
-    _get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
-    get_exponential_scaled_value, subdivide_batch, choose_effective_batch_size, nibble_batch, vae_preview
+from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
+    get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
+    get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
+    get_multirank_stratified_random_timesteps
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.huggingface_downloader import try_download_model_from_hf
@@ -638,6 +639,10 @@ def main(args):
         device = 'cpu'
         gpu = None
 
+    # fix a weird issue with dataloader?
+    # https://github.com/pytorch/pytorch/issues/973#issuecomment-459398189
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
     #log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
 
     if not os.path.exists(log_folder):
@@ -670,6 +675,7 @@ def main(args):
             text_encoder = pipe.text_encoder
             vae = pipe.vae
             unet = pipe.unet
+            del pipe
         else:
             if args.lora_resume:
                 raise "Can't do lora_resume with downloaded models"
@@ -682,17 +688,6 @@ def main(args):
             vae = pipe.vae
             unet = pipe.unet
             del pipe
-
-        if args.teacher is not None:
-            if args.teacher_is_sdxl:
-                teacher_pipeline = StableDiffusionXLPipeline.from_pretrained(args.teacher, dtype=torch.float16)
-            else:
-                teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher, dtype=torch.float16)
-            teacher_pipeline.to(device)
-            del teacher_pipeline.vae
-        else:
-            teacher_pipeline = None
-
 
         if use_ema_dacay_training and args.ema_resume_model:
             print(f"Loading EMA model: {args.ema_resume_model}")
@@ -745,6 +740,17 @@ def main(args):
             noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder)
 
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
+
+        if args.teacher is not None:
+            logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
+            teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher)
+            if teacher_pipeline.scheduler.config.prediction_type != noise_scheduler.config.prediction_type:
+                raise ValueError("Teacher and training model must use same prediction_type")
+            teacher_unet = teacher_pipeline.unet.to(device=device, dtype=torch.float16)
+            teacher_unet.eval()
+            del teacher_pipeline
+        else:
+            teacher_unet = None
 
     except Exception as e:
         traceback.print_exc()
@@ -939,6 +945,7 @@ def main(args):
                                        config_file_path=args.sample_prompts,
                                        batch_size=max(1,args.batch_size//2),
                                        default_sample_steps=args.sample_steps,
+                                       default_sample_epochs=1,
                                        use_xformers=args.attn_type == "xformers",
                                        use_penultimate_clip_layer=(args.clip_skip >= 2),
                                        guidance_rescale=0.7 if args.enable_zero_terminal_snr else 0,
@@ -1033,12 +1040,7 @@ def main(args):
         nonlocal text_encoder_ema
 
         with isolate_rng():
-            prev_sample_steps = sample_generator.sample_steps
             sample_generator.reload_config()
-            if prev_sample_steps != sample_generator.sample_steps:
-                next_sample_step = math.ceil((global_step + 1) / sample_generator.sample_steps) * sample_generator.sample_steps
-                print(f" * SampleGenerator config changed, now generating images samples every " +
-                      f"{sample_generator.sample_steps} training steps (next={next_sample_step})")
             flattened_captions_dict = [v
                                        for _, l in batch["captions"].items()
                                        for v in l]
@@ -1118,16 +1120,16 @@ def main(args):
     def get_model_prediction_and_target_validation_wrapper(image, tokens
                                                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = image.shape[0]
-        timesteps = _get_timesteps(batch_size=batch_size,
-                                   batch_share_timesteps=False,
-                                   device=unet.device,
-                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                   is_flow_matching = noise_scheduler.config.prediction_type == 'flow-matching')
+        timesteps = get_timesteps(batch_size=batch_size,
+                                  batch_share_timesteps=False,
+                                  device=unet.device,
+                                  timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
+                                  continuous_float_timestamps=noise_scheduler.config.prediction_type == 'flow-matching')
         latents = get_latents(image, vae, device=unet.device, args=args)
-        noise = _get_noise(latents.shape, unet.device, image.dtype,
-                           pyramid_noise_discount=args.pyramid_noise_discount,
-                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
-                           batch_share_noise=False)
+        noise = get_noise(latents.shape, unet.device, image.dtype,
+                          pyramid_noise_discount=args.pyramid_noise_discount,
+                          zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                          batch_share_noise=False)
         encoder_hidden_states = _encode_caption_tokens(
             tokens,
             text_encoder,
@@ -1136,7 +1138,7 @@ def main(args):
             compel=None
         )
 
-        model_pred, target, _, _ = _get_model_prediction_and_target(
+        model_pred, target, _, _ = get_model_prediction_and_target(
             latents,
             encoder_hidden_states,
             noise,
@@ -1268,6 +1270,11 @@ def main(args):
                 arg_update_callback=update_arg
             )
 
+            sample_generator.on_epoch_start(
+                epoch=epoch,
+                global_step=global_step,
+                epoch_length=epoch_len
+            )
 
             loss_epoch = []
             epoch_start_time = time.time()
@@ -1371,14 +1378,19 @@ def main(args):
 
 
                     do_contrastive_learning = full_batch["do_contrastive_learning"]
-                    timesteps: torch.LongTensor = _get_timesteps(
-                        batch_size=full_batch_size,
-                        batch_share_timesteps=(
-                        do_contrastive_learning or args.batch_share_timesteps),
-                        device=unet.device,
-                        timesteps_ranges=timesteps_ranges,
-                        is_flow_matching=noise_scheduler.config.prediction_type=='flow-matching'
-                    )
+                    if args.timesteps_multirank_stratified:
+                        timesteps: torch.LongTensor = get_multirank_stratified_random_timesteps(
+                            batch_size=full_batch_size, device=unet.device
+                        )
+                    else:
+                        timesteps: torch.LongTensor = get_timesteps(
+                            batch_size=full_batch_size,
+                            batch_share_timesteps=(
+                            do_contrastive_learning or args.batch_share_timesteps),
+                            device=unet.device,
+                            timesteps_ranges=timesteps_ranges,
+                            continuous_float_timestamps=noise_scheduler.config.prediction_type == 'flow-matching'
+                        )
 
                     # apply cond dropout
                     initial_batch_size = args.initial_batch_size or args.batch_size
@@ -1457,11 +1469,11 @@ def main(args):
 
                         with torch.no_grad():
                             noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
-                            noise = _get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
-                                               pyramid_noise_discount=args.pyramid_noise_discount,
-                                               zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
-                                               batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
-                                               )
+                            noise = get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
+                                              pyramid_noise_discount=args.pyramid_noise_discount,
+                                              zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                                              batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
+                                              )
 
                         runt_size = batch["runt_size"]
                         with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
@@ -1528,14 +1540,19 @@ def main(args):
                                 encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
                                 timesteps_slice = timesteps[slice_start:slice_end]
-                                model_pred, target, model_pred_wrong, model_pred_wrong_mask = _get_model_prediction_and_target(
+                                if teacher_unet is not None and args.teacher_p > random.random():
+                                    use_teacher_unet = True
+                                else:
+                                    use_teacher_unet = False
+                                model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
                                     latents=latents_slice,
                                     encoder_hidden_states=encoder_hidden_states_slice,
                                     noise=noise_slice,
                                     timesteps=timesteps_slice,
                                     unet=unet,
                                     noise_scheduler=noise_scheduler,
-                                    args=args
+                                    args=args,
+                                    teacher_unet=teacher_unet if use_teacher_unet else None
                                 )
                                 model_pred_all.append(model_pred)
                                 model_pred_wrong_all.append(model_pred_wrong)
@@ -1555,19 +1572,19 @@ def main(args):
                             target = torch.cat(target_all)
                             del model_pred_all, model_pred_wrong_all, model_pred_wrong_mask_all, target_all
 
-                            loss = _get_loss(model_pred,
-                                             target,
-                                             model_pred_wrong=model_pred_wrong,
-                                             model_pred_wrong_mask=model_pred_wrong_mask,
-                                             caption_str=caption_str[0:nibble_size_actual],
-                                             mask=mask,
-                                             timesteps=timesteps[0:nibble_size_actual],
-                                             loss_scale=loss_scale[0:nibble_size_actual],
-                                             noise_scheduler=noise_scheduler,
-                                             do_contrastive_learning=do_contrastive_learning,
-                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
-                                             args=args
-                                             )
+                            loss = get_loss(model_pred,
+                                            target,
+                                            model_pred_wrong=model_pred_wrong,
+                                            model_pred_wrong_mask=model_pred_wrong_mask,
+                                            caption_str=caption_str[0:nibble_size_actual],
+                                            mask=mask,
+                                            timesteps=timesteps[0:nibble_size_actual],
+                                            loss_scale=loss_scale[0:nibble_size_actual],
+                                            noise_scheduler=noise_scheduler,
+                                            do_contrastive_learning=do_contrastive_learning,
+                                            contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
+                                            args=args
+                                            )
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
                             cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
@@ -1579,9 +1596,8 @@ def main(args):
                                 current, count = loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
                                 loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
-                            # eliminate the x/y dims so we can accumulate over a larger number of samples without
-                            # worrying about size mismatch
-                            loss_mean = loss.mean()
+                            #loss_mean = loss.mean() if mask is None else loss.sum()/mask.sum()
+                            loss_mean = loss.mean() 
                             tv.accumulate_loss(loss_mean * (nibble_size_actual/tv.desired_effective_batch_size),
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
@@ -1628,7 +1644,7 @@ def main(args):
 
                     ed_optimizer.step_schedulers(global_step)
 
-                    if (global_step + 1) % sample_generator.sample_steps == 0:
+                    if sample_generator.should_generate_samples(global_step, local_step=step):
                         needs_samples = True
 
                     if args.ema_decay_rate != None:
@@ -1850,9 +1866,10 @@ def main(args):
                    save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt, save_lora=args.lora,
                    plugin_runner=plugin_runner)
 
-        print("generating final samples")
-        _, batch = next(enumerate(train_dataloader))
-        generate_samples(global_step=global_step, batch=batch)
+        if not sample_generator.should_generate_samples(global_step=global_step-1, local_step=step):
+            print("generating final samples")
+            _, batch = next(enumerate(train_dataloader))
+            generate_samples(global_step=global_step, batch=batch)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
@@ -2007,6 +2024,7 @@ if __name__ == "__main__":
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
+    argparser.add_argument("--timesteps_multirank_stratified", action="store_true", default=False, help="use multirank stratified timesteps (recommended: disable min_snr_gamma")
     argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_initial_start", type=int, default=800, help="If using timestep_curriculum_alpha, the initial start timestep (default 800); will transition to --timestep_start")
     argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")
@@ -2038,8 +2056,7 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
-    argparser.add_argument("--teacher_is_sdxl", action='store_true', help="Pass if the --teacher is an SDXL model")
-    argparser.add_argument("--teacher_loss_scale", type=float, default=1, help="Loss scale factor for the teacher model (default=1)")
+    argparser.add_argument("--teacher_p", type=float, default=0.5, help="Probability of teacher model being used as target")
     argparser.add_argument("--contrastive_learning_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[])")
     argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=0.2, help="Scaling factor for contrastive learning negative loss")
     argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")

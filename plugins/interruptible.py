@@ -57,16 +57,19 @@ class InterruptiblePlugin(BasePlugin):
         self.previous_save_path = None
 
     def _get_save_step_indices(self, epoch, epoch_length_steps: int) -> list[int]:
-        if self.every_n_epochs >= 1:
-            if ((epoch+1) % round(self.every_n_epochs)) == 0:
-                # last step only
-                return [epoch_length_steps-1]
-            else:
-                return []
+        return get_save_step_indices(epoch, epoch_length_steps, every_n_epochs=self.every_n_epochs)
+
+def get_save_step_indices(epoch, epoch_length_steps, every_n_epochs: int) -> list[int]:
+    if every_n_epochs >= 1:
+        if ((epoch+1) % round(every_n_epochs)) == 0:
+            # last step only
+            return [epoch_length_steps-1]
         else:
-            # subdivide the epoch evenly, by rounding self.every_n_epochs to the nearest clean division of steps
-            num_divisions = max(1, min(epoch_length_steps, round(1/self.every_n_epochs)))
-            # validation happens after training:
-            # if an epoch has eg 100 steps and num_divisions is 2, then validation should occur after steps 49 and 99
-            validate_every_n_steps = epoch_length_steps / num_divisions
-            return [math.ceil((i+1)*validate_every_n_steps) - 1 for i in range(num_divisions)]
+            return []
+    else:
+        # subdivide the epoch evenly, by rounding self.every_n_epochs to the nearest clean division of steps
+        num_divisions = max(1, min(epoch_length_steps, round(1/every_n_epochs)))
+        # validation happens after training:
+        # if an epoch has eg 100 steps and num_divisions is 2, then validation should occur after steps 49 and 99
+        validate_every_n_steps = epoch_length_steps / num_divisions
+        return [math.ceil((i+1)*validate_every_n_steps) - 1 for i in range(num_divisions)]

@@ -1,7 +1,7 @@
 import logging
 import math
 import random
-from typing import Tuple, Callable, Optional
+from typing import Tuple, Optional
 
 import torch
 from compel import Compel
@@ -9,7 +9,9 @@ from diffusers.training_utils import compute_loss_weighting_for_sd3
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
-from diffusers import SchedulerMixin, ConfigMixin
+from scipy.stats import beta as sp_beta
+
+from diffusers import SchedulerMixin, ConfigMixin, UNet2DConditionModel
 
 
 #from train import pyramid_noise_like, compute_snr
@@ -120,10 +122,10 @@ def get_latents(image, vae, device, args):
         return latents
 
 
-def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
-              caption_str, mask, timesteps, loss_scale, noise_scheduler,
-              do_contrastive_learning,
-              contrastive_learning_negative_loss_scale, args):
+def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
+             caption_str, mask, timesteps, loss_scale, noise_scheduler,
+             do_contrastive_learning,
+             contrastive_learning_negative_loss_scale, args):
 
     device = model_pred.device
 
@@ -301,15 +303,22 @@ def _get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
 def _get_contrastive_v2_loss():
     pass
 
-def _get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler,
-                                     args,
-                                     skip_contrastive: bool=False
-                                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, noise_scheduler, timesteps,
-                                                          args.latents_perturbation)
+def get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, unet, noise_scheduler,
+                                    args,
+                                    skip_contrastive: bool=False,
+                                    teacher_unet: UNet2DConditionModel|None=None,
+                                    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # target might get overwritten below
+    noisy_latents = _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation=args.latents_perturbation)
     with autocast(enabled=args.amp):
         # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+    with torch.no_grad():
+        if teacher_unet is None:
+            target = _get_target(latents, noise, noise_scheduler, timesteps)
+        else:
+            target = teacher_unet(noisy_latents.half(), timesteps, encoder_hidden_states.half()).sample.float()
 
     model_pred_wrong_caption = None
     model_pred_wrong_caption_mask = None
@@ -353,11 +362,14 @@ def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbati
     return encoder_hidden_states
 
 
-def _get_noisy_latents_and_target(latents, noise, noise_scheduler: (SchedulerMixin, ConfigMixin), timesteps, latents_perturbation):
+def _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation):
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
     if latents_perturbation > 0:
         noisy_latents += torch.randn_like(noisy_latents) * latents_perturbation
+    return noisy_latents
 
+
+def _get_target(latents, noise, noise_scheduler, timesteps):
     if noise_scheduler.config.prediction_type == "epsilon":
         target = noise
     elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
@@ -366,12 +378,19 @@ def _get_noisy_latents_and_target(latents, noise, noise_scheduler: (SchedulerMix
         target = noise - latents
     else:
         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+    return target
+
+
+def _get_noisy_latents_and_target(latents, noise, noise_scheduler: (SchedulerMixin, ConfigMixin), timesteps, latents_perturbation):
+    noisy_latents = _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation)
+    target = _get_target(latents, noise, noise_scheduler, timesteps)
 
     return noisy_latents, target
 
 
-def _get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, is_flow_matching=False):
-    if is_flow_matching:
+def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, continuous_float_timestamps=False):
+    """ if continuous_float_timestamps is True, return float timestamps (continuous), otherwise return int timestamps (discrete) """
+    if continuous_float_timestamps:
         timesteps = torch.cat([a + torch.rand((1,), device=device) * (b-a)
                                for a,b in timesteps_ranges])
     else:
@@ -379,12 +398,12 @@ def _get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, 
                                for a,b in timesteps_ranges])
     if batch_share_timesteps:
         timesteps = timesteps[:1].repeat((batch_size,))
-    if not is_flow_matching:
+    if not continuous_float_timestamps:
         timesteps = timesteps.long()
     return timesteps
 
 
-def _get_noise(latents_shape, device, dtype, pyramid_noise_discount, zero_frequency_noise_ratio, batch_share_noise):
+def get_noise(latents_shape, device, dtype, pyramid_noise_discount, zero_frequency_noise_ratio, batch_share_noise):
     noise = torch.randn(latents_shape, dtype=dtype, device=device)
     if pyramid_noise_discount != None:
         if 0 < pyramid_noise_discount:
@@ -482,3 +501,17 @@ def vae_preview(latents: torch.Tensor) -> torch.Tensor:
     return torch.stack([sample_to_lowres_estimated_image(latents[i], SD1_5_LATENT_RGB_FACTORS).permute(2, 0, 1)
                        for i in range(latents.shape[0])], dim=0)
 
+
+# ref https://huggingface.co/jimmycarter/LibreFLUX
+# "Beta timestep scheduling and timestep stratification"
+def get_multirank_stratified_random_timesteps(batch_size, device, alpha=2.0, beta=1.6, continuous_float_timestamps=False):
+    indices = torch.arange(0, batch_size, dtype=torch.float64)
+    u = torch.rand(batch_size)
+    p = (indices + u) / batch_size
+    sigmas = torch.from_numpy(sp_beta.ppf(p.numpy(), a=alpha, b=beta)).to(device)
+
+    timestamps = (sigmas * 1000)
+    if continuous_float_timestamps:
+        return timestamps
+    else:
+        return timestamps.long().clamp(min=0, max=999)
