@@ -310,7 +310,7 @@ def setup_local_logger(args):
     """
     log_path = args.logdir
     os.makedirs(log_path, exist_ok=True)
-    
+
     datetimestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     log_folder = os.path.join(log_path, f"{args.project_name}-{datetimestamp}")
@@ -574,7 +574,7 @@ def log_args(log_writer, args, optimizer_config, log_folder, log_time):
     args_as_json = json.dumps(vars(args), indent=2)
     with open(os.path.join(log_folder, f"{args.project_name}-{log_time}_main.json"), "w") as f:
         f.write(args_as_json)
-        
+
     optimizer_config_as_json = json.dumps(optimizer_config, indent=2)
     with open(os.path.join(log_folder, f"{args.project_name}-{log_time}_opt.json"), "w") as f:
         f.write(optimizer_config_as_json)
@@ -741,7 +741,7 @@ def main(args):
 
         tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
 
-        if args.teacher is not None:
+        if args.teacher is not None and args.teacher_p > 0:
             logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
             teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher)
             if teacher_pipeline.scheduler.config.prediction_type != noise_scheduler.config.prediction_type:
@@ -1193,7 +1193,7 @@ def main(args):
         prev_accumulated_pathnames: list[str] = field(default_factory=list)
         prev_accumulated_captions: list[str] = field(default_factory=list)
         prev_accumulated_timesteps: list[str] = field(default_factory=list)
-        
+
         def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
 
             if loss.isnan().any():
@@ -1240,11 +1240,12 @@ def main(args):
 
     tv = TrainingVariables()
 
-    try:        
+    try:
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
 
         needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
+        remaining_timesteps = None
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1379,9 +1380,14 @@ def main(args):
 
                     do_contrastive_learning = full_batch["do_contrastive_learning"]
                     if args.timesteps_multirank_stratified:
-                        timesteps: torch.LongTensor = get_multirank_stratified_random_timesteps(
-                            batch_size=full_batch_size, device=unet.device
-                        )
+                        # the point of multirank stratified is to spread timesteps evenly across the batch.
+                        # so we need to do a dance here to make sure that we're actually spreading across the
+                        # desired_effective_batch_size - which will be "nibbled" below in chunks
+                        while remaining_timesteps is None or remaining_timesteps.shape[0] < max(full_batch_size, tv.desired_effective_batch_size):
+                            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size, device=unet.device, alpha=1.5, beta=2)
+                            remaining_timesteps = next_timesteps if remaining_timesteps is None else torch.cat([remaining_timesteps, next_timesteps])
+                        timesteps = remaining_timesteps[:full_batch_size]
+                        remaining_timesteps = remaining_timesteps[full_batch_size:]
                     else:
                         timesteps: torch.LongTensor = get_timesteps(
                             batch_size=full_batch_size,
@@ -1597,7 +1603,7 @@ def main(args):
                                 loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
                             #loss_mean = loss.mean() if mask is None else loss.sum()/mask.sum()
-                            loss_mean = loss.mean() 
+                            loss_mean = loss.mean()
                             tv.accumulate_loss(loss_mean * (nibble_size_actual/tv.desired_effective_batch_size),
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],

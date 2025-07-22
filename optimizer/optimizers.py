@@ -30,6 +30,9 @@ from diffusers.optimization import get_scheduler, get_polynomial_decay_schedule_
 from colorama import Fore, Style
 import pprint
 
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
+
 from plugins.plugins import PluginRunner
 import re
 
@@ -341,7 +344,7 @@ class EveryDreamOptimizer:
             unet_config = optimizer_config["base"]
 
             if unet_config["lr_scheduler"] == "polynomial":
-                lr_scheduler = get_polynomial_decay_schedule_with_warmup(
+                lr_scheduler = _get_polynomial_decay_schedule_with_warmup_adj(
                     optimizer=self.optimizer_unet,
                     lr_end=unet_config.get("lr_end", unet_config["lr"]/100.0),
                     power=unet_config.get("power", 2),
@@ -731,3 +734,59 @@ def _get_grad_norm(parameters) -> float:
             ),
             2.0,
         ).item()
+
+
+
+def _get_polynomial_decay_schedule_with_warmup_adj(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    lr_end: float = 1e-7,
+    power: float = 1.0,
+    last_epoch: int = -1,
+) -> LambdaLR:
+    """
+    Adapted from diffusers get_polynomial_decay_schedule_with_warmup to remove the restrictive check on strictly decreasing LR
+
+    Create a schedule with a learning rate that decreases as a polynomial decay from the initial lr set in the
+    optimizer to end lr defined by *lr_end*, after a warmup period during which it increases linearly from 0 to the
+    initial lr set in the optimizer.
+
+    Args:
+        optimizer ([`~torch.optim.Optimizer`]):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (`int`):
+            The total number of training steps.
+        lr_end (`float`, *optional*, defaults to 1e-7):
+            The end LR.
+        power (`float`, *optional*, defaults to 1.0):
+            Power factor.
+        last_epoch (`int`, *optional*, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Note: *power* defaults to 1.0 as in the fairseq implementation, which in turn is based on the original BERT
+    implementation at
+    https://github.com/google-research/bert/blob/f39e881b169b9d53bea03d2d341b31707a6c052b/optimization.py#L37
+
+    Return:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+
+    """
+
+    lr_init = optimizer.defaults["lr"]
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        elif current_step > num_training_steps:
+            return lr_end / lr_init  # as LambdaLR multiplies by lr_init
+        else:
+            lr_range = lr_init - lr_end
+            decay_steps = num_training_steps - num_warmup_steps
+            pct_remaining = 1 - (current_step - num_warmup_steps) / decay_steps
+            decay = lr_range * pct_remaining**power + lr_end
+            return decay / lr_init  # as LambdaLR multiplies by lr_init
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
