@@ -242,9 +242,9 @@ class EveryDreamOptimizer:
         """
         Saves the optimizer states to path
         """
-        self._save_optimizer(self.optimizer_te, os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME)) if self.optimizer_te is not None else None
-        self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)) if self.optimizer_unet is not None else None
-        self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME)) if self.scaler is not None else None
+        self._save_optimizer(self.optimizer_te, os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME), optimizer_type=self.te_config['optimizer']) if self.optimizer_te is not None else None
+        self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME), optimizer_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
+        self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME), 'scaler') if self.scaler is not None else None
 
     def load(self, ckpt_path: str):
         """
@@ -254,11 +254,11 @@ class EveryDreamOptimizer:
         unet_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)
         scaler_state_path = os.path.join(ckpt_path, SCALER_STATE_FILENAME)
         if os.path.exists(te_optimizer_state_path) and self.optimizer_te is not None:
-            self._load_optimizer(self.optimizer_te, te_optimizer_state_path)
+            self._load_optimizer(self.optimizer_te, te_optimizer_state_path, expected_type=self.te_config['optimizer']) if self.optimizer_te is not None else None
         if os.path.exists(unet_optimizer_state_path) and self.optimizer_unet is not None:
-            self._load_optimizer(self.optimizer_unet, unet_optimizer_state_path)
+            self._load_optimizer(self.optimizer_unet, unet_optimizer_state_path, expected_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
         if os.path.exists(scaler_state_path) and self.scaler is not None:
-            self._load_optimizer(self.scaler, scaler_state_path)
+            self._load_optimizer(self.scaler, scaler_state_path, expected_type='scaler')
 
     def create_optimizers(self, args, text_encoder_params, unet_params):
         """
@@ -388,21 +388,31 @@ class EveryDreamOptimizer:
             self.scaler.set_growth_interval(2000)
 
     @staticmethod
-    def _save_optimizer(optimizer, path: str):
+    def _save_optimizer(optimizer, path: str, optimizer_type: str):
         """
         Saves the optimizer state to specific path/filename
         """
-        torch.save(optimizer.state_dict(), path)
+        torch.save({
+            'optimizer_type': optimizer_type,
+            'state_dict': optimizer.state_dict()
+        }, path)
 
     @staticmethod
-    def _load_optimizer(optimizer: torch.optim.Optimizer, path: str):
+    def _load_optimizer(optimizer: torch.optim.Optimizer, path: str, expected_type: str=None):
         """
         Loads the optimizer state to an Optimizer object
         optimizer: torch.optim.Optimizer
         path: .pt file
         """
         try:
-            optimizer.load_state_dict(torch.load(path))
+            state_dict = torch.load(path)
+            if 'optimizer_type' in state_dict:
+                optimizer_type = state_dict['optimizer_type']
+                if expected_type is not None and optimizer_type != expected_type:
+                    logging.warning(f"{Fore.LIGHTYELLOW_EX}**Loaded optimizer type in {path} is {optimizer_type} but we expect {expected_type} - skipping optimizer load{Style.RESET_ALL}")
+                    return
+                state_dict = state_dict["state_dict"]
+            optimizer.load_state_dict(state_dict)
             logging.info(f" Loaded optimizer state from {path}")
         except Exception as e:
             logging.warning(f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}")

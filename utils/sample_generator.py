@@ -453,20 +453,20 @@ class SampleGenerator:
 
 
     def _recompute_sample_steps(self):
-        every_n_epochs = None
-        if self.sample_steps is None:
-            every_n_epochs = self.sample_epochs
-        elif self.sample_steps < 0:
-            every_n_epochs = -self.sample_steps / self.epoch_length
+        if self.sample_steps is not None and self.sample_steps < 0:
+            if self.epoch_length is None:
+                print("can't compute sample steps yet (no epoch length)")
+                return
+            else:
+                self.sample_epochs = -self.sample_steps / self.epoch_length
+                self.sample_steps = None
 
-        if every_n_epochs is None:
+        if self.sample_epochs is None:
             every_n_steps = self.sample_steps
             offset = self.epoch_start_global_step % every_n_steps
-            self.steps_to_generate_this_epoch = range(offset, self.epoch_length, every_n_steps)
+            self.steps_to_generate_this_epoch = list(range(offset, self.epoch_length, every_n_steps))
         else:
-            if every_n_epochs > 1:
-                every_n_epochs = round(every_n_epochs)
-            self.steps_to_generate_this_epoch = get_generate_step_indices(self.epoch, self.epoch_length, every_n_epochs=every_n_epochs)
+            self.steps_to_generate_this_epoch = get_generate_step_indices(self.epoch, self.epoch_length, every_n_epochs=self.sample_epochs)
 
 
     def should_generate_samples(self, global_step, local_step):

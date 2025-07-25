@@ -1317,7 +1317,7 @@ def main(args):
 
                     image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
                     enable_vae_attention_slicing = False
-                    if image_size > (1100)*(1100):
+                    if image_size > (1000)*(1000):
                         if tv.accumulated_loss_images_count > 1:
                             print(f"emergency backward at accumulated_loss_images_count {tv.accumulated_loss_images_count}")
                             # todo: DRY
@@ -1384,7 +1384,7 @@ def main(args):
                         # so we need to do a dance here to make sure that we're actually spreading across the
                         # desired_effective_batch_size - which will be "nibbled" below in chunks
                         while remaining_timesteps is None or remaining_timesteps.shape[0] < max(full_batch_size, tv.desired_effective_batch_size):
-                            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size, device=unet.device, alpha=1.5, beta=2)
+                            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size, device=unet.device, alpha=args.timesteps_multirank_stratified_alpha, beta=args.timesteps_multirank_stratified_beta)
                             remaining_timesteps = next_timesteps if remaining_timesteps is None else torch.cat([remaining_timesteps, next_timesteps])
                         timesteps = remaining_timesteps[:full_batch_size]
                         remaining_timesteps = remaining_timesteps[full_batch_size:]
@@ -1406,8 +1406,8 @@ def main(args):
                     else:
                         cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
                                            / (final_batch_size - initial_batch_size)))
-                    for i in range(timesteps.shape[0]):
-                        cdp_01_ts = 1 - (timesteps[i].cpu().item() / noise_scheduler.config.num_train_timesteps)
+                    for sample_index in range(timesteps.shape[0]):
+                        cdp_01_ts = 1 - (timesteps[sample_index].cpu().item() / noise_scheduler.config.num_train_timesteps)
                         if args.cond_dropout_curriculum_source == 'timestep':
                             cdp_01 = cdp_01_ts
                         elif args.cond_dropout_curriculum_source == 'batch_size':
@@ -1427,9 +1427,9 @@ def main(args):
                                                                            alpha=args.cond_dropout_curriculum_alpha)
                         if train_batch.random_instance.random() <= this_cond_dropout_p:
                             for k in full_batch['captions'].keys():
-                                full_batch['tokens'][k][i] = train_batch.cond_dropout_tokens
-                                full_batch['captions'][k][i] = train_batch.cond_dropout_caption
-                            full_batch["loss_scale"][i] *= args.cond_dropout_loss_scale
+                                full_batch['tokens'][k][sample_index] = train_batch.cond_dropout_tokens
+                                full_batch['captions'][k][sample_index] = train_batch.cond_dropout_caption
+                            full_batch["loss_scale"][sample_index] *= args.cond_dropout_loss_scale
 
                     remaining_batch = full_batch
                     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
@@ -1538,6 +1538,15 @@ def main(args):
                             model_pred_wrong_all = []
                             model_pred_wrong_mask_all = []
                             target_all = []
+                            if teacher_unet is None:
+                                teacher_mask = None
+                            else:
+                                teacher_mask = torch.rand((batch_size)).to(unet.device) < args.teacher_p
+
+                            cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
+                                                              for s in caption_str[0:batch_size]], device=unet.device, dtype=torch.bool)
+                            if teacher_mask is not None:
+                                teacher_mask *= ~cond_dropout_mask
 
                             slices = list(get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size))
                             for slice_index, (slice_start, slice_end) in enumerate(slices):
@@ -1546,10 +1555,11 @@ def main(args):
                                 encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
                                 timesteps_slice = timesteps[slice_start:slice_end]
-                                if teacher_unet is not None and args.teacher_p > random.random():
-                                    use_teacher_unet = True
+                                if teacher_mask is None:
+                                    teacher_mask_slice = None
                                 else:
-                                    use_teacher_unet = False
+                                    teacher_mask_slice = teacher_mask[slice_start:slice_end]
+
                                 model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
                                     latents=latents_slice,
                                     encoder_hidden_states=encoder_hidden_states_slice,
@@ -1558,7 +1568,8 @@ def main(args):
                                     unet=unet,
                                     noise_scheduler=noise_scheduler,
                                     args=args,
-                                    teacher_unet=teacher_unet if use_teacher_unet else None
+                                    teacher_unet=teacher_unet,
+                                    teacher_mask=teacher_mask_slice
                                 )
                                 model_pred_all.append(model_pred)
                                 model_pred_wrong_all.append(model_pred_wrong)
@@ -1589,12 +1600,10 @@ def main(args):
                                             noise_scheduler=noise_scheduler,
                                             do_contrastive_learning=do_contrastive_learning,
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
-                                            args=args
+                                            args=args,
                                             )
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
-                            cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
-                                                              for s in caption_str[0:nibble_size_actual]], device=loss.device, dtype=torch.bool)
                             loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
                             loss_log_step_non_cd.append(loss[~cond_dropout_mask].mean().detach().item())
                             for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
@@ -1602,15 +1611,15 @@ def main(args):
                                 current, count = loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
                                 loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
-                            #loss_mean = loss.mean() if mask is None else loss.sum()/mask.sum()
-                            loss_mean = loss.mean()
-                            tv.accumulate_loss(loss_mean * (nibble_size_actual/tv.desired_effective_batch_size),
+                            # take mean of all dimensions except B
+                            loss_sum = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
+                            tv.accumulate_loss(loss_sum,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
                                                timesteps=timesteps[0:nibble_size_actual].tolist())
                             loss_preview_image: torch.Tensor = loss.detach().clone().cpu()
                             loss_step = loss.detach().mean().item()
-                            del loss, loss_mean
+                            del loss, loss_sum
                             steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
                             loss_log_step.append(loss_step)
                             loss_epoch.append(loss_step)
@@ -2031,6 +2040,8 @@ if __name__ == "__main__":
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
     argparser.add_argument("--timesteps_multirank_stratified", action="store_true", default=False, help="use multirank stratified timesteps (recommended: disable min_snr_gamma")
+    argparser.add_argument("--timesteps_multirank_stratified_alpha", type=float, default=1.5, help="multirank stratified timesteps PPF alpha")
+    argparser.add_argument("--timesteps_multirank_stratified_beta", type=float, default=2, help="multirank stratified timesteps PPF beta")
     argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_initial_start", type=int, default=800, help="If using timestep_curriculum_alpha, the initial start timestep (default 800); will transition to --timestep_start")
     argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")

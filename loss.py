@@ -121,7 +121,6 @@ def get_latents(image, vae, device, args):
         latents = latents[0].sample() * 0.18215
         return latents
 
-
 def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
              caption_str, mask, timesteps, loss_scale, noise_scheduler,
              do_contrastive_learning,
@@ -140,7 +139,9 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
         loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float) * loss_scale
         loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
 
-        if args.loss_type == "mse_huber":
+
+        loss_type = args.loss_type
+        if loss_type == "mse_huber":
             early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
             early_timestep_bias = early_timestep_bias.float().to(device)
             early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
@@ -149,7 +150,7 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             loss_huber = loss_huber * loss_scale.to(device) * (1.0 - early_timestep_bias)
             loss = loss_mse + loss_huber
             del loss_huber
-        elif args.loss_type == "huber_mse":
+        elif loss_type == "huber_mse":
             early_timestep_bias = (timesteps / noise_scheduler.config.num_train_timesteps)
             early_timestep_bias = torch.tensor(early_timestep_bias, dtype=torch.float).to(device)
             early_timestep_bias = early_timestep_bias.view(-1, 1, 1, 1).expand_as(loss_mse)
@@ -158,12 +159,12 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             loss_huber = loss_huber * loss_scale.to(device) * early_timestep_bias
             loss = loss_huber + loss_mse
             del loss_huber
-        elif args.loss_type == "huber":
+        elif loss_type == "huber":
             loss_huber = F.huber_loss(model_pred.float(), target.float(), reduction=reduction, delta=1.0)
             loss_huber = loss_huber * loss_scale.to(device)
             loss = loss_huber
             del loss_huber
-        elif args.loss_type.startswith('sd3-'):
+        elif loss_type.startswith('sd3-'):
             # SD3 loss weight
             sigmas = timesteps / noise_scheduler.config.num_train_timesteps
             if args.loss_type == 'sd3-cosmap':
@@ -176,7 +177,7 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             loss = loss_mse * weights.view(-1, 1, 1, 1).to(loss_mse.device) * loss_scale.to(device)
             del weights, sigmas
         else:
-            if args.loss_type != 'mse':
+            if loss_type != 'mse':
                 raise ValueError(f"Unrecognized --loss_type {args.loss_type}")
             loss = loss_mse * loss_scale.to(device)
         del loss_mse
@@ -196,7 +197,7 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
             if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
                 snr_weight = min_snr_gamma / (snr + 1)
-                snr_weight += 0.0047
+                snr_weight += 0.047
             else:
                 snr_weight = min_snr_gamma / snr
 
@@ -307,6 +308,7 @@ def get_model_prediction_and_target(latents, encoder_hidden_states, noise, times
                                     args,
                                     skip_contrastive: bool=False,
                                     teacher_unet: UNet2DConditionModel|None=None,
+                                    teacher_mask: torch.Tensor|None=None
                                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # target might get overwritten below
     noisy_latents = _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation=args.latents_perturbation)
@@ -315,10 +317,13 @@ def get_model_prediction_and_target(latents, encoder_hidden_states, noise, times
         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
     with torch.no_grad():
-        if teacher_unet is None:
-            target = _get_target(latents, noise, noise_scheduler, timesteps)
-        else:
-            target = teacher_unet(noisy_latents.half(), timesteps, encoder_hidden_states.half()).sample.float()
+        target = _get_target(latents, noise, noise_scheduler, timesteps)
+        if teacher_unet is not None:
+            teacher_target = teacher_unet(noisy_latents.half(), timesteps, encoder_hidden_states.half()).sample.float()
+            target = (
+                teacher_target *  teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
+                +   target     * ~teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
+            )
 
     model_pred_wrong_caption = None
     model_pred_wrong_caption_mask = None
