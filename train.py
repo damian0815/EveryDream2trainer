@@ -194,7 +194,7 @@ def convert_diffusers_lora_to_civitai(diffusers_folder, civitai_path):
 
 @torch.no_grad()
 def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
-               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True, save_lora=False,
+               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True,
                plugin_runner: PluginRunner = None):
     """
     Save the model to disk
@@ -250,34 +250,6 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
 
             save_ckpt_file(diffusers_model_path, sd_ckpt_path_ema)
 
-    if save_lora:
-
-        if hasattr(ed_state.unet, 'peft_config'):
-            unet_lora_state_dict = convert_state_dict_to_diffusers(
-                get_peft_model_state_dict(ed_state.unet)
-            )
-        else:
-            unet_lora_state_dict = None
-        if hasattr(ed_state.text_encoder, 'peft_config'):
-            text_encoder_lora_state_dict = convert_state_dict_to_diffusers(
-                get_peft_model_state_dict(ed_state.text_encoder)
-            )
-        else:
-            text_encoder_lora_state_dict = None
-
-        print("saving diffusers LoRA to", save_path)
-        StableDiffusionPipeline.save_lora_weights(
-            save_directory=save_path,
-            unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=text_encoder_lora_state_dict,
-            safe_serialization=True,
-        )
-
-        civitai_path = save_path + "_civitai_format.safetensors"
-        print("saving civitai format LoRA to", civitai_path)
-        convert_diffusers_lora_to_civitai(save_path, civitai_path)
-
-
     else:
         pipeline = StableDiffusionPipeline(
             vae=ed_state.vae,
@@ -302,6 +274,34 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
         if save_optimizer_flag:
             logging.info(f" Saving optimizer state to {save_path}")
             ed_state.optimizer.save(save_path)
+
+
+@torch.no_grad()
+def save_model_lora(unet, text_encoder, save_path):
+    if hasattr(unet, "peft_config"):
+        unet_lora_state_dict = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(unet)
+        )
+    else:
+        unet_lora_state_dict = None
+    if hasattr(text_encoder, "peft_config"):
+        text_encoder_lora_state_dict = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(text_encoder)
+        )
+    else:
+        text_encoder_lora_state_dict = None
+
+    print("saving diffusers LoRA to", save_path)
+    StableDiffusionPipeline.save_lora_weights(
+        save_directory=save_path,
+        unet_lora_layers=unet_lora_state_dict,
+        text_encoder_lora_layers=text_encoder_lora_state_dict,
+        safe_serialization=True,
+    )
+
+    civitai_path = save_path + "_civitai_format.safetensors"
+    print("saving civitai format LoRA to", civitai_path)
+    convert_diffusers_lora_to_civitai(save_path, civitai_path)
 
 
 def setup_local_logger(args):
@@ -1794,8 +1794,11 @@ def main(args):
                         last_epoch_saved_time = time.time()
                         logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
                         needs_save = True
-                    if (epoch > 0 and epoch % args.save_every_n_epochs == 0 and step == 0 and
-                            epoch < args.max_epochs and epoch >= args.save_ckpts_from_n_epochs):
+                    def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
+                        return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
+                                epoch < args.max_epochs and epoch >= start_epoch)
+
+                    if is_first_step_of_save_epoch(args.save_every_n_epochs, start_epoch=args.save_ckpts_from_n_epochs):
                         logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
                         needs_save = True
                     if needs_save:
@@ -1804,8 +1807,11 @@ def main(args):
                                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
                                    save_full_precision=args.save_full_precision,
                                    save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
-                                   save_lora=args.lora,
                                    plugin_runner=plugin_runner)
+                    if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
+                        logging.info(f" Saving lora")
+                        save_path = make_save_path(epoch, global_step)
+                        save_model_lora(unet, text_encoder=text_encoder, save_path=save_path)
 
                     plugin_runner.run_on_step_end(epoch=epoch,
                                           global_step=global_step,
@@ -1878,8 +1884,10 @@ def main(args):
         save_path = make_save_path(epoch, global_step, prepend=("" if args.no_prepend_last else "last-"))
         save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt, save_lora=args.lora,
+                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
                    plugin_runner=plugin_runner)
+        if args.lora:
+            save_model_lora(unet=unet, text_encoder=text_encoder, save_path=save_path)
 
         if not sample_generator.should_generate_samples(global_step=global_step-1, local_step=step):
             print("generating final samples")
@@ -1897,7 +1905,7 @@ def main(args):
         #save_path = make_save_path(epoch, global_step, prepend="errored-")
         #save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
         #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt, save_lora=args.lora)
+        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
         #logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
         raise ex
 
@@ -2099,6 +2107,7 @@ if __name__ == "__main__":
     argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg.mask.png in the data folder and use as mask for the loss")
 
     argparser.add_argument("--lora", action='store_true', help="If passed, do LoRA training")
+    argparser.add_argument("--lora_save_every_n_epochs", type=int, default=1)
     argparser.add_argument("--lora_resume", type=str, default=None, help="resume from this lora (must be a huggingface format folder)")
     argparser.add_argument("--lora_rank", type=int, default=16)
     argparser.add_argument("--lora_alpha", type=int, default=8)

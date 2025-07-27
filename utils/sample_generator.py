@@ -455,7 +455,7 @@ class SampleGenerator:
     def _recompute_sample_steps(self):
         if self.sample_steps is not None and self.sample_steps < 0:
             if self.epoch_length is None:
-                print("can't compute sample steps yet (no epoch length)")
+                # can't compute sample steps yet (no epoch length)
                 return
             else:
                 self.sample_epochs = -self.sample_steps / self.epoch_length
