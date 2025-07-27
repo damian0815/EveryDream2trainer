@@ -3,7 +3,8 @@ import unittest
 import torch
 from diffusers import DDPMScheduler
 
-from train import compute_snr, get_training_noise_scheduler
+from train import compute_snr
+from model.training_model import get_training_noise_scheduler
 from utils.unet_utils import enforce_zero_terminal_snr
 
 

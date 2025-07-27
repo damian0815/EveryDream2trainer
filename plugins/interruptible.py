@@ -2,7 +2,7 @@ import math
 import os
 import shutil
 from plugins.plugins import BasePlugin
-from train import save_model
+from model.training_model import save_model
 
 EVERY_N_EPOCHS = 1 # how often to save. integers >= 1 save at the end of every nth epoch. floats < 1 subdivide the epoch evenly (eg 0.33 = 3 subdivisions)
 

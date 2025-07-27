@@ -304,19 +304,19 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
 def _get_contrastive_v2_loss():
     pass
 
-def get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, model_being_trained: TrainingModel,
+def get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, model: TrainingModel,
                                      args=None, skip_contrastive: bool=False,
                                      teacher_unet: UNet2DConditionModel|None=None,
                                      teacher_mask: torch.Tensor|None=None
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    noisy_latents, target = get_noisy_latents_and_target(latents, noise, model_being_trained.noise_scheduler, timesteps,
+    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps,
                                                           args.latents_perturbation)
     with autocast(enabled=args.amp):
         # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-        model_pred = model_being_trained.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        model_pred = model.unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
     with torch.no_grad():
-        target = _get_target(latents, noise, noise_scheduler, timesteps)
+        target = _get_target(latents, noise, model.noise_scheduler, timesteps)
         if teacher_unet is not None:
             teacher_target = teacher_unet(noisy_latents.half(), timesteps, encoder_hidden_states.half()).sample.float()
             target = (

@@ -37,6 +37,13 @@ def enforce_zero_terminal_snr(betas):
     betas = 1 - alphas
     return betas
 
+def check_for_sd1_attn(unet_cfg: dict) -> bool:
+    if unet_cfg["attention_head_dim"] == [8, 8, 8, 8]:
+        return True
+    if unet_cfg["attention_head_dim"] == 8:
+        return True
+    return False
+
 def get_attn_yaml(ckpt_path):
     """
     Analyze the checkpoint to determine the attention head type and yaml to use for inference
@@ -49,9 +56,6 @@ def get_attn_yaml(ckpt_path):
     with open(scheduler_cfg_path, "r") as f:
         scheduler_cfg = json.load(f)
 
-    is_sd1attn = unet_cfg["attention_head_dim"] == [8, 8, 8, 8]
-    is_sd1attn = unet_cfg["attention_head_dim"] == 8 or is_sd1attn
-
     if 'prediction_type' not in scheduler_cfg:
         logging.warn(f"Model has no prediction_type, assuming epsilon")
         prediction_type = "epsilon"
@@ -60,6 +64,7 @@ def get_attn_yaml(ckpt_path):
 
     logging.info(f" unet attention_head_dim: {unet_cfg['attention_head_dim']}")
 
+    is_sd1attn = check_for_sd1_attn(unet_cfg)
     yaml = ''
     if prediction_type in ["v_prediction","v-prediction"] and not is_sd1attn:
         yaml = "v2-inference-v.yaml"

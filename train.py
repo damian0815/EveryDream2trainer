@@ -16,7 +16,6 @@ limitations under the License.
 import contextlib
 import dataclasses
 import os
-import pickle
 import pprint
 import sys
 import math
@@ -27,18 +26,15 @@ import time
 import gc
 import random
 import traceback
-import shutil
-
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
 
-import safetensors.torch
+from dataclasses import dataclass, field
+from typing import Tuple
+
 import torchvision
 
 from colorama import Fore, Style
 import numpy as np
-import itertools
 import torch
 import datetime
 import json
@@ -47,12 +43,8 @@ from compel import Compel
 from compel.embeddings_provider import SplitLongTextMode
 from tqdm.auto import tqdm
 
-from diffusers import StableDiffusionPipeline, AutoencoderKL, UNet2DConditionModel, DDIMScheduler, DDPMScheduler, \
-    PNDMScheduler, StableDiffusionXLPipeline
-from diffusers.utils import convert_state_dict_to_diffusers
-from peft.utils import get_peft_model_state_dict
+from diffusers import StableDiffusionPipeline, AutoencoderKL
 #from diffusers.models import AttentionBlock
-from transformers import CLIPTextModel, CLIPTokenizer
 #from accelerate import Accelerator
 from accelerate.utils import set_seed
 
@@ -64,15 +56,14 @@ from data.data_loader import DataLoaderMultiAspect
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
-from flow_match_model import TrainFlowMatchScheduler
 from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
     get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
     get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
     get_multirank_stratified_random_timesteps
+from model.training_model import EveryDreamTrainingState, save_model, save_model_lora, find_last_checkpoint, load_model, \
+    get_use_ema_decay_training
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
-from utils.huggingface_downloader import try_download_model_from_hf
-from utils.convert_diff_to_ckpt import convert as converter
 from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
 from optimizer.optimizers import EveryDreamOptimizer
@@ -88,230 +79,6 @@ from plugins.plugins import PluginRunner
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
-
-def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_betas=None, rescale_betas_zero_snr=False):
-    noise_scheduler = None
-    if train_sampler.lower() == "pndm":
-        logging.info(f" * Using PNDM noise scheduler for training: {train_sampler}")
-        noise_scheduler = PNDMScheduler.from_pretrained(model_root_folder,
-                                                        subfolder="scheduler",
-                                                        trained_betas=trained_betas,
-                                                        rescale_betas_zero_snr=rescale_betas_zero_snr)
-    elif train_sampler.lower() == "ddim":
-        logging.info(f" * Using DDIM noise scheduler for training: {train_sampler}")
-        noise_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
-                                                        trained_betas=trained_betas,
-                                                        rescale_betas_zero_snr=rescale_betas_zero_snr)
-    elif train_sampler.lower() == "flow-matching":
-        logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        noise_scheduler = TrainFlowMatchScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
-    else:
-        logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
-        noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
-                                                        trained_betas=trained_betas,
-                                                        rescale_betas_zero_snr=rescale_betas_zero_snr)
-    return noise_scheduler
-
-def get_hf_ckpt_cache_path(ckpt_path):
-    return os.path.join("ckpt_cache", os.path.basename(ckpt_path))
-
-def convert_to_hf(ckpt_path):
-
-    hf_cache = get_hf_ckpt_cache_path(ckpt_path)
-    from utils.unet_utils import get_attn_yaml
-
-    if os.path.isfile(ckpt_path):
-        if not os.path.exists(hf_cache):
-            os.makedirs(hf_cache)
-            logging.info(f"Converting {ckpt_path} to Diffusers format")
-            try:
-                import utils.convert_original_stable_diffusion_to_diffusers as convert
-                convert.convert(ckpt_path, f"ckpt_cache/{ckpt_path}")
-            except:
-                logging.info("Please manually convert the checkpoint to Diffusers format (one time setup), see readme.")
-                exit()
-        else:
-            logging.info(f"Found cached checkpoint at {hf_cache}")
-
-        is_sd1attn, yaml = get_attn_yaml(hf_cache)
-        return hf_cache, is_sd1attn, yaml
-    elif os.path.isdir(hf_cache):
-        is_sd1attn, yaml = get_attn_yaml(hf_cache)
-        return hf_cache, is_sd1attn, yaml
-    else:
-        is_sd1attn, yaml = get_attn_yaml(ckpt_path)
-        return ckpt_path, is_sd1attn, yaml
-
-class EveryDreamTrainingState:
-    def __init__(self,
-                 optimizer: EveryDreamOptimizer,
-                 train_batch: EveryDreamBatch,
-                 unet: UNet2DConditionModel,
-                 text_encoder: CLIPTextModel,
-                 tokenizer: CLIPTokenizer,
-                 scheduler,
-                 inference_scheduler,
-                 vae: AutoencoderKL,
-                 unet_ema: Optional[UNet2DConditionModel],
-                 text_encoder_ema: Optional[CLIPTextModel]
-                 ):
-        self.optimizer = optimizer
-        self.train_batch = train_batch
-        self.unet = unet
-        self.text_encoder = text_encoder
-        self.tokenizer = tokenizer
-        self.scheduler = scheduler
-        self.inference_scheduler = inference_scheduler
-        self.vae = vae
-        self.unet_ema = unet_ema
-        self.text_encoder_ema = text_encoder_ema
-
-@dataclass
-class TrainingModel:
-    noise_scheduler: any
-    text_encoder: any
-    text_encoder_ema: any
-    tokenizer: any
-    unet: any
-    unet_ema: any
-    vae: any
-
-def convert_diffusers_lora_to_civitai(diffusers_folder, civitai_path):
-    broken = safetensors.torch.load_file(os.path.join(diffusers_folder, 'pytorch_lora_weights.safetensors'))
-
-    fixed = {}
-    for i, (orig_k, v) in enumerate(broken.items()):
-        k = orig_k
-        k = k.replace('text_encoder.', 'lora_te_')
-        k = k.replace('unet.', 'lora_unet_')
-        if '.lora' in k:
-            parts = k.split('.lora')
-            assert (len(parts) == 2)
-            pre = parts[0].replace('.', '_')
-            post = parts[1]
-            post = post.replace('_linear_layer.', '')
-            post = post.replace('.down.', 'down.')
-            post = post.replace('.up.', 'up.')
-            k = pre + '.lora_' + post
-            # if i > offset:
-            #    print(parts)
-            #    print(k)
-        #print(f'{orig_k} -> {k}')
-        fixed[k] = v
-
-    safetensors.torch.save_file(fixed, civitai_path)
-
-
-@torch.no_grad()
-def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
-               save_full_precision=False, save_optimizer_flag=False, save_ckpt=True,
-               plugin_runner: PluginRunner = None):
-    """
-    Save the model to disk
-    """
-
-    def save_ckpt_file(diffusers_model_path, sd_ckpt_path):
-        nonlocal save_ckpt_dir
-        nonlocal save_full_precision
-        nonlocal yaml_name
-
-        if save_ckpt_dir is not None:
-            sd_ckpt_full = os.path.join(save_ckpt_dir, sd_ckpt_path)
-        else:
-            sd_ckpt_full = os.path.join(os.curdir, sd_ckpt_path)
-            save_ckpt_dir = os.curdir
-
-        half = not save_full_precision
-
-        logging.info(f" * Saving SD model to {sd_ckpt_full}")
-        converter(model_path=diffusers_model_path, checkpoint_path=sd_ckpt_full, half=half)
-
-        if yaml_name and yaml_name != "v1-inference.yaml":
-            yaml_save_path = f"{os.path.join(save_ckpt_dir, os.path.basename(diffusers_model_path))}.yaml"
-            logging.info(f" * Saving yaml to {yaml_save_path}")
-            shutil.copyfile(yaml_name, yaml_save_path)
-
-
-    if global_step is None or global_step == 0:
-        logging.warning("  No model to save, something likely blew up on startup, not saving")
-        return
-
-    if plugin_runner is not None:
-        plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
-
-    if ed_state.unet_ema is not None or ed_state.text_encoder_ema is not None:
-        pipeline_ema = StableDiffusionPipeline(
-            vae=ed_state.vae,
-            text_encoder=ed_state.text_encoder_ema,
-            tokenizer=ed_state.tokenizer,
-            unet=ed_state.unet_ema,
-            scheduler=ed_state.inference_scheduler,
-            safety_checker=None, # save vram
-            requires_safety_checker=None, # avoid nag
-            feature_extractor=None, # must be none of no safety checker
-        )
-
-        diffusers_model_path = save_path + "_ema"
-        logging.info(f" * Saving diffusers EMA model to {diffusers_model_path}")
-        pipeline_ema.save_pretrained(diffusers_model_path)
-
-        if save_ckpt:
-            sd_ckpt_path_ema = f"{os.path.basename(save_path)}_ema.safetensors"
-
-            save_ckpt_file(diffusers_model_path, sd_ckpt_path_ema)
-
-    else:
-        pipeline = StableDiffusionPipeline(
-            vae=ed_state.vae,
-            text_encoder=ed_state.text_encoder,
-            tokenizer=ed_state.tokenizer,
-            unet=ed_state.unet,
-            scheduler=ed_state.inference_scheduler,
-            safety_checker=None,  # save vram
-            requires_safety_checker=None,  # avoid nag
-            feature_extractor=None,  # must be none of no safety checker
-        )
-
-
-        diffusers_model_path = save_path
-        logging.info(f" * Saving diffusers model to {diffusers_model_path}")
-        pipeline.save_pretrained(diffusers_model_path)
-
-        if save_ckpt:
-            sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
-            save_ckpt_file(diffusers_model_path, sd_ckpt_path)
-
-        if save_optimizer_flag:
-            logging.info(f" Saving optimizer state to {save_path}")
-            ed_state.optimizer.save(save_path)
-
-
-@torch.no_grad()
-def save_model_lora(unet, text_encoder, save_path):
-    if hasattr(unet, "peft_config"):
-        unet_lora_state_dict = convert_state_dict_to_diffusers(
-            get_peft_model_state_dict(unet)
-        )
-    else:
-        unet_lora_state_dict = None
-    if hasattr(text_encoder, "peft_config"):
-        text_encoder_lora_state_dict = convert_state_dict_to_diffusers(
-            get_peft_model_state_dict(text_encoder)
-        )
-    else:
-        text_encoder_lora_state_dict = None
-
-    print("saving diffusers LoRA to", save_path)
-    StableDiffusionPipeline.save_lora_weights(
-        save_directory=save_path,
-        unet_lora_layers=unet_lora_state_dict,
-        text_encoder_lora_layers=text_encoder_lora_state_dict,
-        safe_serialization=True,
-    )
-
-    civitai_path = save_path + "_civitai_format.safetensors"
-    print("saving civitai format LoRA to", civitai_path)
-    convert_diffusers_lora_to_civitai(save_path, civitai_path)
 
 
 def setup_local_logger(args):
@@ -384,34 +151,6 @@ def append_epoch_log(global_step: int, epoch_pbar, gpu, log_writer, **logs):
         if logs is not None:
             epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{global_step}")
 
-def find_last_checkpoint(logdir, is_ema=False):
-    """
-    Finds the last checkpoint in the logdir, recursively
-    """
-    last_ckpt = None
-    last_date = None
-
-    for root, dirs, files in os.walk(logdir):
-        for file in files:
-            if os.path.basename(file) == "model_index.json":
-
-                if is_ema and (not root.endswith("_ema")):
-                    continue
-                elif (not is_ema) and root.endswith("_ema"):
-                    continue
-
-                curr_date = os.path.getmtime(os.path.join(root,file))
-
-                if last_date is None or curr_date > last_date:
-                    last_date = curr_date
-                    last_ckpt = root
-
-    assert last_ckpt, f"Could not find last checkpoint in logdir: {logdir}"
-    assert "errored" not in last_ckpt, f"Found last checkpoint: {last_ckpt}, but it was errored, cancelling"
-
-    print(f"    {Fore.LIGHTCYAN_EX}Found last checkpoint: {last_ckpt}, resuming{Style.RESET_ALL}")
-
-    return last_ckpt
 
 def setup_args(args):
     """
@@ -590,18 +329,18 @@ def log_args(log_writer, args, optimizer_config, log_folder, log_time):
         f.write(optimizer_config_as_json)
 
 
-def update_ema(model, ema_model, decay, default_device, ema_device):
+def update_ema(model, ema_model, decay, default_device, ema_device: str):
     with torch.no_grad():
         original_model_on_proper_device = model
         need_to_delete_original = False
-        if ema_device != default_device:
+        if torch.device(ema_device) != torch.device(default_device):
             original_model_on_other_device = deepcopy(model)
             original_model_on_proper_device = original_model_on_other_device.to(ema_device, dtype=model.dtype)
             del original_model_on_other_device
             need_to_delete_original = True
 
-        params = dict(original_model_on_proper_device.named_parameters())
-        ema_params = dict(ema_model.named_parameters())
+        params: dict[str, torch.nn.Parameter] = dict(original_model_on_proper_device.named_parameters())
+        ema_params: dict[str, torch.nn.Parameter] = dict(ema_model.named_parameters())
 
         for name in ema_params:
             #ema_params[name].data.mul_(decay).add_(params[name].data, alpha=1 - decay)
@@ -658,103 +397,85 @@ def main(args):
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
 
-    def release_memory(model_to_delete, original_device):
-        del model_to_delete
-        gc.collect()
-
-        if 'cuda' in original_device.type:
-            torch.cuda.empty_cache()
-
-
-    use_ema_dacay_training = (args.ema_decay_rate != None) or (args.ema_strength_target != None)
-    ema_model_loaded_from_file = False
-
-    if use_ema_dacay_training:
-        ema_device = torch.device(args.ema_device)
-
-    optimizer_state_path = None
-
     try:
-        ema_model_loaded_from_file, is_sd1attn, model_being_trained, noise_scheduler, text_encoder, text_encoder_ema, tokenizer, unet, unet_ema, yaml = load_model(
-            args, ema_device, ema_model_loaded_from_file, release_memory, use_ema_dacay_training)
-
-        if args.teacher is not None and args.teacher_p > 0:
-            logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
-            teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher)
-            if teacher_pipeline.scheduler.config.prediction_type != noise_scheduler.config.prediction_type:
-                raise ValueError("Teacher and training model must use same prediction_type")
-            teacher_unet = teacher_pipeline.unet.to(device=device, dtype=torch.float16)
-            teacher_unet.eval()
-            del teacher_pipeline
-        else:
-            teacher_unet = None
-
+        model = load_model(args)
     except Exception as e:
         traceback.print_exc()
-        logging.error(" * Failed to load checkpoint *")
+        logging.error(f" * Failed to load checkpoint: {repr(e)} * ")
         raise
+
+    if args.teacher is not None and args.teacher_p > 0:
+        logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
+        teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher)
+        if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
+            raise ValueError("Teacher and training model must use same prediction_type")
+        teacher_unet = teacher_pipeline.unet.to(device=device, dtype=torch.float16)
+        teacher_unet.eval()
+        del teacher_pipeline
+    else:
+        teacher_unet = None
 
     compel = None
     if args.use_compel:
-        compel = Compel(tokenizer=model_being_trained.tokenizer,
-                        text_encoder=model_being_trained.text_encoder,
+        compel = Compel(tokenizer=model.tokenizer,
+                        text_encoder=model.text_encoder,
                         truncate_long_prompts=False,
                         split_long_text_mode = SplitLongTextMode.SENTENCES,
                         )
 
     if args.gradient_checkpointing:
-        model_being_trained.unet.enable_gradient_checkpointing()
-        model_being_trained.text_encoder.gradient_checkpointing_enable()
+        model.unet.enable_gradient_checkpointing()
+        model.text_encoder.gradient_checkpointing_enable()
 
     if args.attn_type == "xformers":
-        if (args.amp and is_sd1attn) or (not is_sd1attn):
+        if (args.amp and model.is_sd1attn) or (not model.is_sd1attn):
             try:
-                model_being_trained.unet.enable_xformers_memory_efficient_attention()
+                model.unet.enable_xformers_memory_efficient_attention()
                 logging.info("Enabled xformers")
             except Exception as ex:
                 logging.warning("failed to load xformers, using default SDP attention instead")
                 pass
-        elif (args.disable_amp and is_sd1attn):
+        elif (args.disable_amp and model.is_sd1attn):
             logging.info("AMP is disabled but model is SD1.X, xformers is incompatible so using default attention")
     elif args.attn_type == "slice":
-        model_being_trained.unet.set_attention_slice("auto")
+        model.unet.set_attention_slice("auto")
     else:
         logging.info("* Using SDP attention *")
 
-    model_being_trained.vae = model_being_trained.vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
-    model_being_trained.unet = model_being_trained.unet.to(device, dtype=torch.float32)
+    model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
+    model.unet = model.unet.to(device, dtype=torch.float32)
     if args.disable_textenc_training and args.amp:
-        model_being_trained.text_encoder = model_being_trained.text_encoder.to(device, dtype=torch.float16)
+        model.text_encoder = model.text_encoder.to(device, dtype=torch.float16)
     else:
-        model_being_trained.text_encoder = model_being_trained.text_encoder.to(device, dtype=torch.float32)
+        model.text_encoder = model.text_encoder.to(device, dtype=torch.float32)
 
 
-    if use_ema_dacay_training:
-        if not ema_model_loaded_from_file:
+    if get_use_ema_decay_training(args):
+        if model.unet_ema is None:
             logging.info(f"EMA decay enabled, creating EMA model.")
 
             with torch.no_grad():
                 if args.ema_device == device:
-                    unet_ema = deepcopy(model_being_trained.unet)
-                    text_encoder_ema = deepcopy(model_being_trained.text_encoder)
+                    unet_ema = deepcopy(model.unet)
+                    text_encoder_ema = deepcopy(model.text_encoder)
                 else:
-                    unet_ema_first = deepcopy(model_being_trained.unet)
-                    text_encoder_ema_first = deepcopy(model_being_trained.text_encoder)
-                    unet_ema = unet_ema_first.to(ema_device, dtype=model_being_trained.unet.dtype)
-                    text_encoder_ema = text_encoder_ema_first.to(ema_device, dtype=model_being_trained.text_encoder.dtype)
+                    unet_ema_first = deepcopy(model.unet)
+                    text_encoder_ema_first = deepcopy(model.text_encoder)
+                    unet_ema = unet_ema_first.to(args.ema_device, dtype=model.unet.dtype)
+                    text_encoder_ema = text_encoder_ema_first.to(args.ema_device, dtype=model.text_encoder.dtype)
                     del unet_ema_first
                     del text_encoder_ema_first
         else:
             # Make sure correct types are used for models
-            unet_ema = unet_ema.to(ema_device, dtype=model_being_trained.unet.dtype)
-            text_encoder_ema = text_encoder_ema.to(ema_device, dtype=model_being_trained.text_encoder.dtype)
+            unet_ema = model.unet_ema.to(args.ema_device, dtype=model.unet.dtype)
+            text_encoder_ema = model.text_encoder_ema.to(args.ema_device, dtype=model.text_encoder.dtype)
     else:
         unet_ema = None
         text_encoder_ema = None
 
-    # Update model_being_trained with EMA models if available
-    model_being_trained.unet_ema = unet_ema
-    model_being_trained.text_encoder_ema = text_encoder_ema
+    # Update model with EMA models if available
+    model.unet_ema = unet_ema
+    model.text_encoder_ema = text_encoder_ema
 
     try:
         print()
@@ -812,10 +533,10 @@ def main(args):
                                         approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
                                         )
         # the validation dataset may need to steal some items from image_train_items
-        image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=tokenizer)
+        image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=model.tokenizer)
 
     report_image_train_item_problems(log_folder, image_train_items, batch_size=args.batch_size,
-                                     check_load_all=args.test_images, tokenizer=tokenizer)
+                                     check_load_all=args.test_images, tokenizer=model.tokenizer)
 
     from plugins.plugins import load_plugin
     if args.plugins is not None:
@@ -825,7 +546,7 @@ def main(args):
         plugins = []
 
     plugin_runner = PluginRunner(plugins=plugins)
-    plugin_runner.run_on_model_load(unet=model_being_trained.unet, text_encoder=model_being_trained.text_encoder, tokenizer=model_being_trained.tokenizer, optimizer_config=optimizer_config)
+    plugin_runner.run_on_model_load(unet=model.unet, text_encoder=model.text_encoder, tokenizer=model.tokenizer, optimizer_config=optimizer_config)
 
     data_loader = DataLoaderMultiAspect(
         image_train_items=image_train_items,
@@ -841,7 +562,7 @@ def main(args):
         data_loader=data_loader,
         debug_level=1,
         conditional_dropout=args.cond_dropout,
-        tokenizer=model_being_trained.tokenizer,
+        tokenizer=model.tokenizer,
         seed = seed,
         shuffle_tags=args.shuffle_tags,
         keep_tags=args.keep_tags,
@@ -859,7 +580,7 @@ def main(args):
     epoch_len = math.ceil(len(train_batch) / args.batch_size)
 
 
-    if use_ema_dacay_training:
+    if get_use_ema_decay_training(args):
         args.ema_update_interval = args.ema_update_interval * args.grad_accum
         if args.ema_strength_target != None:
             total_number_of_steps: float = epoch_len * args.max_epochs
@@ -873,8 +594,8 @@ def main(args):
 
     ed_optimizer = EveryDreamOptimizer(args,
                                        optimizer_config,
-                                       model_being_trained.text_encoder,
-                                       model_being_trained.unet,
+                                       model.text_encoder,
+                                       model.unet,
                                        epoch_len,
                                        plugin_runner,
                                        log_writer)
@@ -922,7 +643,7 @@ def main(args):
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
                 time.sleep(2) # give opportunity to ctrl-C again to cancel save
                 save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
-                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
                            save_optimizer_flag=True, save_ckpt=not args.no_save_ckpt)
             exit(_SIGTERM_EXIT_CODE)
         else:
@@ -942,13 +663,13 @@ def main(args):
 
     train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size)
 
-    model_being_trained.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model_being_trained.unet.eval()
-    model_being_trained.text_encoder.train() if not args.disable_textenc_training else model_being_trained.text_encoder.eval()
+    model.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model.unet.eval()
+    model.text_encoder.train() if not args.disable_textenc_training else model.text_encoder.eval()
 
-    logging.info(f" unet device: {model_being_trained.unet.device}, precision: {model_being_trained.unet.dtype}, training: {model_being_trained.unet.training}")
-    logging.info(f" text_encoder device: {model_being_trained.text_encoder.device}, precision: {model_being_trained.text_encoder.dtype}, training: {model_being_trained.text_encoder.training}")
-    logging.info(f" vae device: {model_being_trained.vae.device}, precision: {model_being_trained.vae.dtype}, training: {model_being_trained.vae.training}")
-    logging.info(f" scheduler: {noise_scheduler.__class__}")
+    logging.info(f" unet device: {model.unet.device}, precision: {model.unet.dtype}, training: {model.unet.training}")
+    logging.info(f" text_encoder device: {model.text_encoder.device}, precision: {model.text_encoder.dtype}, training: {model.text_encoder.training}")
+    logging.info(f" vae device: {model.vae.device}, precision: {model.vae.dtype}, training: {model.vae.training}")
+    logging.info(f" scheduler: {model.noise_scheduler.__class__}")
 
     logging.info(f" {Fore.GREEN}Project name: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.project_name}{Style.RESET_ALL}")
     logging.info(f" {Fore.GREEN}grad_accum: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.grad_accum}{Style.RESET_ALL}"),
@@ -966,19 +687,21 @@ def main(args):
 
     append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
 
-    loss_log_step = []
-    loss_log_step_cd = []
-    loss_log_step_non_cd = []
-    loss_preview_image = None
-    loss_per_timestep: dict[int, dict[int, tuple[float, int]]] = {resolution: {} for resolution in args.resolution}
+
+    @dataclass
+    class LogData:
+        loss_log_step = []
+        loss_log_step_cd = []
+        loss_log_step_non_cd = []
+        loss_preview_image: torch.Tensor|None = None
+        loss_per_timestep: dict[int, dict[int, tuple[float, int]]] = dataclasses.field(
+            default_factory=lambda: defaultdict(dict))
+
+    log_data = LogData()
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
     def generate_samples(global_step: int, batch):
-        nonlocal unet
-        nonlocal text_encoder
-        nonlocal unet_ema
-        nonlocal text_encoder_ema
 
         with isolate_rng():
             sample_generator.reload_config()
@@ -993,39 +716,39 @@ def main(args):
                 models_info.append({"is_ema": False, "swap_required": False})
 
             if (args.ema_decay_rate is not None) and args.ema_sample_ema_model:
-                models_info.append({"is_ema": True, "swap_required": ema_device != device})
+                models_info.append({"is_ema": True, "swap_required": torch.device(args.ema_device) != device})
 
             for model_info in models_info:
 
                 extra_info: str = ""
 
                 if model_info["is_ema"]:
-                    current_unet, current_text_encoder = model_being_trained.unet_ema, model_being_trained.text_encoder_ema
+                    current_unet, current_text_encoder = model.unet_ema, model.text_encoder_ema
                     extra_info = "_ema"
                 else:
-                    current_unet, current_text_encoder = model_being_trained.unet, model_being_trained.text_encoder
+                    current_unet, current_text_encoder = model.unet, model.text_encoder
 
                 torch.cuda.empty_cache()
 
 
                 if model_info["swap_required"]:
                     with torch.no_grad():
-                        unet_unloaded = model_being_trained.unet.to(ema_device)
-                        del model_being_trained.unet
-                        text_encoder_unloaded = model_being_trained.text_encoder.to(ema_device)
-                        del model_being_trained.text_encoder
+                        unet_unloaded = model.unet.to(args.ema_device)
+                        del model.unet
+                        text_encoder_unloaded = model.text_encoder.to(args.ema_device)
+                        del model.text_encoder
 
-                        current_unet = model_being_trained.unet_ema.to(device)
-                        del model_being_trained.unet_ema
-                        current_text_encoder = model_being_trained.text_encoder_ema.to(device)
-                        del model_being_trained.text_encoder_ema
+                        current_unet = model.unet_ema.to(device)
+                        del model.unet_ema
+                        current_text_encoder = model.text_encoder_ema.to(device)
+                        del model.text_encoder_ema
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                # Pass model_being_trained instead of individual fields
+                # Pass model instead of individual fields
                 inference_pipe = sample_generator.create_inference_pipe(
-                    model_being_trained=model_being_trained,
-                    diffusers_scheduler_config=inference_scheduler.config
+                    model_being_trained=model,
+                    diffusers_scheduler_config=model.noise_scheduler.config
                 ).to(device)
                 sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
@@ -1034,14 +757,14 @@ def main(args):
 
                 if model_info["swap_required"]:
                     with torch.no_grad():
-                        model_being_trained.unet = unet_unloaded.to(device)
+                        model.unet = unet_unloaded.to(device)
                         del unet_unloaded
-                        model_being_trained.text_encoder = text_encoder_unloaded.to(device)
+                        model.text_encoder = text_encoder_unloaded.to(device)
                         del text_encoder_unloaded
 
-                        model_being_trained.unet_ema = current_unet.to(ema_device)
+                        model.unet_ema = current_unet.to(args.ema_device)
                         del current_unet
-                        model_being_trained.text_encoder_ema = current_text_encoder.to(ema_device)
+                        model.text_encoder_ema = current_text_encoder.to(args.ema_device)
                         del current_text_encoder
 
                 gc.collect()
@@ -1055,22 +778,22 @@ def main(args):
             basename += f"-gs{global_step:05}"
         return os.path.join(log_folder, "ckpts", basename)
 
-    def get_model_prediction_and_target_validation_wrapper(image, tokens
-                                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_model_prediction_and_target_validation_wrapper(image: torch.Tensor, tokens: torch.Tensor,
+                                                ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = image.shape[0]
         timesteps = get_timesteps(batch_size=batch_size,
                                   batch_share_timesteps=False,
-                                  device=model_being_trained.unet.device,
+                                  device=model.unet.device,
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                  continuous_float_timestamps=noise_scheduler.config.prediction_type == 'flow-matching')
-        latents = get_latents(image, model_being_trained.vae, device=model_being_trained.unet.device, args=args)
-        noise = get_noise(latents.shape, model_being_trained.unet.device, image.dtype,
+                                  continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching')
+        latents = get_latents(image, model.vae, device=model.unet.device, args=args)
+        noise = get_noise(latents.shape, model.unet.device, image.dtype,
                           pyramid_noise_discount=args.pyramid_noise_discount,
                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                           batch_share_noise=False)
         encoder_hidden_states = _encode_caption_tokens(
             tokens,
-            model_being_trained.text_encoder,
+            model.text_encoder,
             clip_skip=args.clip_skip,
             embedding_perturbation=args.embedding_perturbation,
             compel=None
@@ -1081,7 +804,7 @@ def main(args):
             encoder_hidden_states,
             noise,
             timesteps,
-            model_being_trained=model_being_trained,
+            model=model,
             args=args,
             skip_contrastive=True
         )
@@ -1102,15 +825,8 @@ def main(args):
     def make_current_ed_state() -> EveryDreamTrainingState:
         return EveryDreamTrainingState(optimizer=ed_optimizer,
                                        train_batch=train_batch,
-                                       unet=model_being_trained.unet,
-                                       text_encoder=model_being_trained.text_encoder,
-                                       tokenizer=model_being_trained.tokenizer,
-                                       scheduler=model_being_trained.noise_scheduler,
-                                       inference_scheduler=inference_scheduler,
-                                       vae=model_being_trained.vae,
-                                       unet_ema=model_being_trained.unet_ema,
-                                       text_encoder_ema=model_being_trained.text_encoder_ema)
-
+                                       model=model
+                                       )
     epoch = None
 
     @dataclass
@@ -1123,13 +839,13 @@ def main(args):
         accumulated_pathnames: list[str] = field(default_factory=list)
         accumulated_captions: list[str] = field(default_factory=list)
         accumulated_timesteps: list[int] = field(default_factory=list)
-        desired_effective_batch_size: int = None
+        desired_effective_batch_size: int|None = None
         interleave_bs1_bsN: bool = False
-        interleaved_bs1_count: int = None
+        interleaved_bs1_count: int|None = None
 
         prev_accumulated_pathnames: list[str] = field(default_factory=list)
         prev_accumulated_captions: list[str] = field(default_factory=list)
-        prev_accumulated_timesteps: list[str] = field(default_factory=list)
+        prev_accumulated_timesteps: list[int] = field(default_factory=list)
 
         def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
 
@@ -1138,7 +854,6 @@ def main(args):
                 logging.warning(f" - NaN detected (current accumulated {self.accumulated_pathnames} @ {self.accumulated_timesteps} ({self.accumulated_captions}) )")
                 logging.warning(f" - NaN detected (prev was {self.prev_accumulated_pathnames} @ {self.prev_accumulated_timesteps} ({self.prev_accumulated_captions}) )")
                 assert False
-                return
 
             self.accumulated_loss = (
                 loss
@@ -1292,7 +1007,7 @@ def main(args):
                     timesteps_ranges = full_batch["timesteps_range"] or ([timestep_range] * full_batch_size)
 
                     # randomly expand
-                    num_train_timesteps = noise_scheduler.config.num_train_timesteps
+                    num_train_timesteps = model.noise_scheduler.config.num_train_timesteps
                     timesteps_ranges = [(
                         # maybe make 8 a CLI arg?
                         min(num_train_timesteps,
@@ -1316,12 +1031,14 @@ def main(args):
 
 
                     do_contrastive_learning = full_batch["do_contrastive_learning"]
+                    timesteps: torch.Tensor
+
                     if args.timesteps_multirank_stratified:
                         # the point of multirank stratified is to spread timesteps evenly across the batch.
                         # so we need to do a dance here to make sure that we're actually spreading across the
                         # desired_effective_batch_size - which will be "nibbled" below in chunks
                         while remaining_timesteps is None or remaining_timesteps.shape[0] < max(full_batch_size, tv.desired_effective_batch_size):
-                            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size, device=unet.device, alpha=args.timesteps_multirank_stratified_alpha, beta=args.timesteps_multirank_stratified_beta)
+                            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size, device=model.unet.device, alpha=args.timesteps_multirank_stratified_alpha, beta=args.timesteps_multirank_stratified_beta)
                             remaining_timesteps = next_timesteps if remaining_timesteps is None else torch.cat([remaining_timesteps, next_timesteps])
                         timesteps = remaining_timesteps[:full_batch_size]
                         remaining_timesteps = remaining_timesteps[full_batch_size:]
@@ -1330,9 +1047,9 @@ def main(args):
                             batch_size=full_batch_size,
                             batch_share_timesteps=(
                             do_contrastive_learning or args.batch_share_timesteps),
-                            device=unet.device,
+                            device=model.device,
                             timesteps_ranges=timesteps_ranges,
-                            continuous_float_timestamps=noise_scheduler.config.prediction_type == 'flow-matching'
+                            continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching'
                         )
 
                     # apply cond dropout
@@ -1344,7 +1061,7 @@ def main(args):
                         cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
                                            / (final_batch_size - initial_batch_size)))
                     for sample_index in range(timesteps.shape[0]):
-                        cdp_01_ts = 1 - (timesteps[sample_index].cpu().item() / noise_scheduler.config.num_train_timesteps)
+                        cdp_01_ts = 1 - (timesteps[sample_index].cpu().item() / model.noise_scheduler.config.num_train_timesteps)
                         if args.cond_dropout_curriculum_source == 'timestep':
                             cdp_01 = cdp_01_ts
                         elif args.cond_dropout_curriculum_source == 'batch_size':
@@ -1368,6 +1085,7 @@ def main(args):
                                 full_batch['captions'][k][sample_index] = train_batch.cond_dropout_caption
                             full_batch["loss_scale"][sample_index] *= args.cond_dropout_loss_scale
 
+                    batch = None
                     remaining_batch = full_batch
                     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
                         def get_nibble_size() -> int:
@@ -1412,7 +1130,7 @@ def main(args):
 
                         with torch.no_grad():
                             noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
-                            noise = get_noise(noise_shape, device=unet.device, dtype=batch["image"].dtype,
+                            noise = get_noise(noise_shape, device=model.unet.device, dtype=batch["image"].dtype,
                                               pyramid_noise_discount=args.pyramid_noise_discount,
                                               zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                               batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
@@ -1421,7 +1139,7 @@ def main(args):
                         runt_size = batch["runt_size"]
                         with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                             latents_slices = []
-                            pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(unet.device)
+                            pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(model.unet.device)
                             for slice_start, slice_end in get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size):
                                 try:
                                     vae: AutoencoderKL
@@ -1464,7 +1182,7 @@ def main(args):
 
                             tokens = torch.stack(tokens)
                             with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
-                                encoder_hidden_states = _encode_caption_tokens(tokens, text_encoder,
+                                encoder_hidden_states = _encode_caption_tokens(tokens, model.text_encoder,
                                                                            clip_skip=args.clip_skip,
                                                                            embedding_perturbation=args.embedding_perturbation,
                                                                            compel=compel,
@@ -1478,10 +1196,10 @@ def main(args):
                             if teacher_unet is None:
                                 teacher_mask = None
                             else:
-                                teacher_mask = torch.rand((batch_size)).to(unet.device) < args.teacher_p
+                                teacher_mask = torch.rand((batch_size)).to(model.unet.device) < args.teacher_p
 
                             cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
-                                                              for s in caption_str[0:batch_size]], device=unet.device, dtype=torch.bool)
+                                                              for s in caption_str[0:batch_size]], device=model.unet.device, dtype=torch.bool)
                             if teacher_mask is not None:
                                 teacher_mask *= ~cond_dropout_mask
 
@@ -1502,8 +1220,7 @@ def main(args):
                                     encoder_hidden_states=encoder_hidden_states_slice,
                                     noise=noise_slice,
                                     timesteps=timesteps_slice,
-                                    unet=unet,
-                                    noise_scheduler=noise_scheduler,
+                                    model=model,
                                     args=args,
                                     teacher_unet=teacher_unet,
                                     teacher_mask=teacher_mask_slice
@@ -1534,19 +1251,19 @@ def main(args):
                                             mask=mask,
                                             timesteps=timesteps[0:nibble_size_actual],
                                             loss_scale=loss_scale[0:nibble_size_actual],
-                                            noise_scheduler=noise_scheduler,
+                                            noise_scheduler=model.noise_scheduler,
                                             do_contrastive_learning=do_contrastive_learning,
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
-                            loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
-                            loss_log_step_non_cd.append(loss[~cond_dropout_mask].mean().detach().item())
+                            log_data.loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
+                            log_data.loss_log_step_non_cd.append(loss[~cond_dropout_mask].mean().detach().item())
                             for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
                                 used_timestep_detached = int(used_timestep.detach().item())
-                                current, count = loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
-                                loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
+                                current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
+                                log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
                             # take mean of all dimensions except B
                             loss_sum = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
@@ -1554,11 +1271,11 @@ def main(args):
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
                                                timesteps=timesteps[0:nibble_size_actual].tolist())
-                            loss_preview_image: torch.Tensor = loss.detach().clone().cpu()
+                            log_data.loss_preview_image = loss.detach().clone().cpu()
                             loss_step = loss.detach().mean().item()
                             del loss, loss_sum
-                            steps_pbar.set_postfix({"loss/step": loss_step}, {"gs": global_step})
-                            loss_log_step.append(loss_step)
+                            steps_pbar.set_postfix({"loss/step": loss_step, "gs": global_step})
+                            log_data.loss_log_step.append(loss_step)
                             loss_epoch.append(loss_step)
 
                             should_step_optimizer = (
@@ -1604,10 +1321,10 @@ def main(args):
                             # debug_start_time = time.time() # Measure time
 
                             if args.disable_unet_training != True:
-                                update_ema(unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+                                update_ema(model.unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
 
                             if args.disable_textenc_training != True:
-                                update_ema(text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=ema_device)
+                                update_ema(model.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
 
                             # debug_end_time = time.time() # Measure time
                             # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
@@ -1641,16 +1358,16 @@ def main(args):
                         log_writer.add_scalar(tag="performance/images per second", scalar_value=avg, global_step=global_step)
 
                         logs = {"lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": images_per_sec}
-                        if len(loss_log_step) > 0:
-                            loss_step = sum(loss_log_step) / len(loss_log_step)
+                        if len(log_data.loss_log_step) > 0:
+                            loss_step = sum(log_data.loss_log_step) / len(log_data.loss_log_step)
                             log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)
                             logs["loss/log_step"] = loss_step
 
 
                         # log histogram of loss vs timestep
                         loss_sums_and_counts = {
-                            batch_resolution: [loss_per_timestep[batch_resolution].get(timestep, (0, 1))
-                                                for timestep in range(noise_scheduler.config.num_train_timesteps + 1)]
+                            batch_resolution: [log_data.loss_per_timestep[batch_resolution].get(timestep, (0, 1))
+                                                for timestep in range(model.noise_scheduler.config.num_train_timesteps + 1)]
                             for batch_resolution in args.resolution
                         }
                         loss_sums_and_counts = {
@@ -1672,31 +1389,31 @@ def main(args):
                         #    #    for loss_sum_this_step, count in loss_sums_and_counts
                         #    #]), global_step=global_step)
 
-                        loss_log_step_cd = [l for l in loss_log_step_cd if math.isfinite(l)]
+                        loss_log_step_cd = [l for l in log_data.loss_log_step_cd if math.isfinite(l)]
                         if len(loss_log_step_cd) > 0:
                             loss_step_cd = sum(loss_log_step_cd) / len(loss_log_step_cd)
                             log_writer.add_scalar(tag="loss/log_step CD", scalar_value=loss_step_cd, global_step=global_step)
                             logs["loss/log_step CD"] = loss_step_cd
 
-                        loss_log_step_non_cd = [l for l in loss_log_step_non_cd if math.isfinite(l)]
+                        loss_log_step_non_cd = [l for l in log_data.loss_log_step_non_cd if math.isfinite(l)]
                         if len(loss_log_step_non_cd) > 0:
                             loss_step_non_cd = sum(loss_log_step_non_cd) / len(loss_log_step_non_cd)
                             log_writer.add_scalar(tag="loss/log_step non-CD", scalar_value=loss_step_non_cd, global_step=global_step)
                             logs["loss/log_step non-CD"] = loss_step_non_cd
 
-                        if loss_preview_image is not None:
+                        if log_data.loss_preview_image is not None:
                             loss_preview_image_rgb = torchvision.utils.make_grid(
-                                vae_preview((loss_preview_image / args.negative_loss_margin) * 2 - 1)
+                                vae_preview((log_data.loss_preview_image / args.negative_loss_margin) * 2 - 1)
                             )
-                            loss_preview_image = torchvision.utils.make_grid(
-                                torch.reshape(loss_preview_image, [
-                                    loss_preview_image.shape[0]*loss_preview_image.shape[1], 1, loss_preview_image.shape[2], loss_preview_image.shape[3]
+                            log_data.loss_preview_image = torchvision.utils.make_grid(
+                                torch.reshape(log_data.loss_preview_image, [
+                                    log_data.loss_preview_image.shape[0]*log_data.loss_preview_image.shape[1], 1, log_data.loss_preview_image.shape[2], log_data.loss_preview_image.shape[3]
                                 ]),
-                                nrow=loss_preview_image.shape[0],
+                                nrow=log_data.loss_preview_image.shape[0],
                                 normalize=True,
                                 value_range=(0, args.negative_loss_margin),
                                 scale_each=False)
-                            log_writer.add_image(tag="loss/last vis raw", img_tensor=loss_preview_image, global_step=global_step)
+                            log_writer.add_image(tag="loss/last vis raw", img_tensor=log_data.loss_preview_image, global_step=global_step)
                             log_writer.add_image(tag="loss/last vis rgb", img_tensor=loss_preview_image_rgb, global_step=global_step)
 
                         if args.log_named_parameters_magnitudes:
@@ -1707,13 +1424,13 @@ def main(args):
                                         param_mean = param.mean().item()
                                         log_writer.add_scalar(tag=f"p-mean/{prefix}-{name}", scalar_value=param_mean, global_step=global_step)
                             if not args.disable_unet_training:
-                                log_named_parameters(unet, "unet")
+                                log_named_parameters(model.unet, "unet")
                             if not args.disable_textenc_training:
-                                log_named_parameters(text_encoder, "textenc")
+                                log_named_parameters(model.text_encoder, "textenc")
 
-                        loss_log_step = []
-                        loss_log_step_cd = []
-                        loss_log_step_non_cd = []
+                        log_data.loss_log_step = []
+                        log_data.loss_log_step_cd = []
+                        log_data.loss_log_step_non_cd = []
 
                         append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                         torch.cuda.empty_cache()
@@ -1748,7 +1465,7 @@ def main(args):
                     if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
                         logging.info(f" Saving lora")
                         save_path = make_save_path(epoch, global_step)
-                        save_model_lora(unet, text_encoder=text_encoder, save_path=save_path)
+                        save_model_lora(model=model, save_path=save_path)
 
                     plugin_runner.run_on_step_end(epoch=epoch,
                                           global_step=global_step,
@@ -1820,11 +1537,11 @@ def main(args):
 
         save_path = make_save_path(epoch, global_step, prepend=("" if args.no_prepend_last else "last-"))
         save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
-                   save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
+                   save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
                    save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
                    plugin_runner=plugin_runner)
         if args.lora:
-            save_model_lora(unet=unet, text_encoder=text_encoder, save_path=save_path)
+            save_model_lora(model=model, save_path=save_path)
 
         if not sample_generator.should_generate_samples(global_step=global_step-1, local_step=step):
             print("generating final samples")
@@ -1851,95 +1568,6 @@ def main(args):
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
 
 
-def load_model(args, ema_device, ema_model_loaded_from_file, release_memory, use_ema_dacay_training):
-    # check for a local file
-    hf_cache_path = get_hf_ckpt_cache_path(args.resume_ckpt)
-    if os.path.exists(hf_cache_path) or os.path.exists(args.resume_ckpt):
-        model_root_folder, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
-        pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_pretrained(args.resume_ckpt)
-        if args.lora_resume:
-            pipe.load_lora_weights(args.lora_resume)
-        text_encoder = pipe.text_encoder
-        vae = pipe.vae
-        unet = pipe.unet
-        del pipe
-    else:
-        if args.lora_resume:
-            raise "Can't do lora_resume with downloaded models"
-        # try to download from HF using resume_ckpt as a repo id
-        downloaded = try_download_model_from_hf(repo_id=args.resume_ckpt)
-        if downloaded is None:
-            raise ValueError(
-                f"No local file/folder for {args.resume_ckpt}, and no matching huggingface.co repo could be downloaded")
-        pipe, model_root_folder, is_sd1attn, yaml = downloaded
-        text_encoder = pipe.text_encoder
-        vae = pipe.vae
-        unet = pipe.unet
-        del pipe
-    if use_ema_dacay_training and args.ema_resume_model:
-        print(f"Loading EMA model: {args.ema_resume_model}")
-        ema_model_loaded_from_file = True
-        hf_cache_path = get_hf_ckpt_cache_path(args.ema_resume_model)
-
-        if os.path.exists(hf_cache_path) or os.path.exists(args.ema_resume_model):
-            ema_model_root_folder, ema_is_sd1attn, ema_yaml = convert_to_hf(args.resume_ckpt)
-            text_encoder_ema = CLIPTextModel.from_pretrained(ema_model_root_folder, subfolder="text_encoder")
-            unet_ema = UNet2DConditionModel.from_pretrained(ema_model_root_folder, subfolder="unet")
-
-        else:
-            # try to download from HF using ema_resume_model as a repo id
-            ema_downloaded = try_download_model_from_hf(repo_id=args.ema_resume_model)
-            if ema_downloaded is None:
-                raise ValueError(
-                    f"No local file/folder for ema_resume_model {args.ema_resume_model}, and no matching huggingface.co repo could be downloaded")
-            ema_pipe, ema_model_root_folder, ema_is_sd1attn, ema_yaml = ema_downloaded
-            text_encoder_ema = ema_pipe.text_encoder
-            unet_ema = ema_pipe.unet
-            del ema_pipe
-
-        # Make sure EMA model is on proper device, and memory released if moved
-        unet_ema_current_device = next(unet_ema.parameters()).device
-        if ema_device != unet_ema_current_device:
-            unet_ema_on_wrong_device = unet_ema
-            unet_ema = unet_ema.to(ema_device)
-            release_memory(unet_ema_on_wrong_device, unet_ema_current_device)
-
-        # Make sure EMA model is on proper device, and memory released if moved
-        text_encoder_ema_current_device = next(text_encoder_ema.parameters()).device
-        if ema_device != text_encoder_ema_current_device:
-            text_encoder_ema_on_wrong_device = text_encoder_ema
-            text_encoder_ema = text_encoder_ema.to(ema_device)
-            release_memory(text_encoder_ema_on_wrong_device, text_encoder_ema_current_device)
-    if args.enable_zero_terminal_snr:
-        if args.train_sampler == "flow-matching":
-            raise ValueError("can't use ZTSNR with flow matching")
-        # Use zero terminal SNR
-        from utils.unet_utils import enforce_zero_terminal_snr
-        temp_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
-        trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
-        inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
-                                                            trained_betas=None)
-        noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder,
-                                                       trained_betas=trained_betas, trescale_betas_zero_snr=False
-                                                       # True
-                                                       )
-    else:
-        inference_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
-        noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder)
-    tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
-    # Construct TrainingModel instance after loading model components
-    model_being_trained = TrainingModel(
-        noise_scheduler=noise_scheduler,
-        text_encoder=text_encoder,
-        text_encoder_ema=None,
-        tokenizer=tokenizer,
-        unet=unet,
-        unet_ema=None,
-        vae=vae
-    )
-    return ema_model_loaded_from_file, is_sd1attn, model_being_trained, noise_scheduler, text_encoder, text_encoder_ema, tokenizer, unet, unet_ema, yaml
-
-
 def get_slices(batch_size, slice_size, runt_size):
     num_slices = math.ceil(batch_size / slice_size)
     for slice_index in range(num_slices):
@@ -1954,47 +1582,6 @@ def _get_best_match_resolution(resolutions: list[int], image_size_pixels: int) -
     error = [image_size_pixels / (r*r) for r in resolutions]
     best_resolution_index = min([i for i in range(len(resolutions))], key=lambda i: abs(math.log(error[i])))
     return resolutions[best_resolution_index]
-
-
-def create_bar_chart_image(values, labels=None, title="Bar Chart"):
-    """
-    Create a bar chart and return it as a TensorFlow image tensor.
-    Use this if you want to handle the TensorBoard logging yourself.
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    x_pos = np.arange(len(values))
-
-    if labels is None:
-        labels = [f"Item {i + 1}" for i in range(len(values))]
-
-    bars = ax.bar(x_pos, values, alpha=0.8, color='steelblue')
-
-    ax.set_xlabel('Categories')
-    ax.set_ylabel('Values')
-    ax.set_title(title)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(labels, rotation=45, ha='right')
-
-    for bar, value in zip(bars, values):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2., height + max(values) * 0.01,
-                f'{value:.2f}', ha='center', va='bottom')
-
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-    buf.seek(0)
-
-    image = tf.image.decode_png(buf.getvalue(), channels=4)
-    image = tf.expand_dims(image, 0)
-
-    plt.close(fig)
-    buf.close()
-
-    return image
-
 
 
 if __name__ == "__main__":

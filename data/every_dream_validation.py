@@ -183,7 +183,7 @@ class EveryDreamValidator:
 
     def do_validation(self, global_step: int,
                       get_model_prediction_and_target_callable: Callable[
-                                         [Any, Any], tuple[torch.Tensor, torch.Tensor]]):
+                                         [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]):
         mean_loss_accumulator = 0
         for i, dataset in enumerate(self.validation_datasets):
             mean_loss = self._calculate_validation_loss(dataset.name,
@@ -202,7 +202,7 @@ class EveryDreamValidator:
                                        global_step=global_step)
 
     def _calculate_validation_loss(self, tag, dataloader, get_model_prediction_and_target: Callable[
-        [Any, Any], tuple[torch.Tensor, torch.Tensor]]) -> float:
+        [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]) -> float:
         with torch.no_grad(), isolate_rng():
             # ok to override seed here because we are in a `with isolate_rng():` block
             random.seed(self.seed)
