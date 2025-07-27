@@ -18,18 +18,20 @@ import logging
 import itertools
 import os
 from itertools import chain
-from typing import Generator, Any
+from typing import Generator
 
 import torch
-from diffusers.loaders import StableDiffusionLoraLoaderMixin
 from diffusers import UNet2DConditionModel
 from peft import LoraConfig
 
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 from diffusers.optimization import get_scheduler, get_polynomial_decay_schedule_with_warmup
 
 from colorama import Fore, Style
 import pprint
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
 
 from plugins.plugins import PluginRunner
 import re
@@ -56,7 +58,7 @@ class EveryDreamOptimizer:
             raise ValueError("missing optimizer_config")
         if "doc" in optimizer_config:
             del optimizer_config["doc"]
-        print(f"\n raw optimizer_config:")
+        print("\n raw optimizer_config:")
         pprint.pprint(optimizer_config)
         self.epoch_len = epoch_len
         self.max_epochs = args.max_epochs
@@ -66,9 +68,9 @@ class EveryDreamOptimizer:
         self.unet_freeze = args.freeze_unet_balanced
         self.te_config, self.base_config = self.get_final_optimizer_configs(args, optimizer_config)
         self.te_freeze_config = optimizer_config.get("text_encoder_freezing", {})
-        print(f" Final unet optimizer config:")
+        print(" Final unet optimizer config:")
         pprint.pprint(self.base_config)
-        print(f" Final text encoder optimizer config:")
+        print(" Final text encoder optimizer config:")
         pprint.pprint(self.te_config)
 
         self.grad_accum = args.grad_accum
@@ -93,6 +95,7 @@ class EveryDreamOptimizer:
             self.jacobian_aggregator = None
 
         self.text_encoder_params, self.unet_params = plugin_runner.run_add_parameters(self.text_encoder_params, self.unet_params)
+        self.unet_params = list(self.unet_params)
         self.text_encoder_params = list(self.text_encoder_params)
 
         #with torch.no_grad():
@@ -169,37 +172,23 @@ class EveryDreamOptimizer:
         else:
             loss_scaled_if_necessary.backward()
 
-    def step_optimizer(self, global_step, total_elements=None):
+    def step_optimizer(self, global_step):
         if self.scaler is not None:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
 
-        if total_elements is not None:
-            assert total_elements > 0
-            scaling_factor = 1.0 / total_elements
-            for param in self.unet_params:
-                if param.grad is not None:
-                    param.grad.data.mul_(scaling_factor)
-            for param in self.text_encoder_params:
-                if param.grad is not None:
-                    param.grad.data.mul_(scaling_factor)
+        if self.log_grad_norm:
+            with torch.no_grad():
+                self.log_writer.add_scalar("optimizer/unet_grad_norm_pre_clip", _get_grad_norm(self.unet.parameters()), global_step)
+                self.log_writer.add_scalar("optimizer/te_grad_norm_pre_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
 
-        if self.clip_grad_norm is not None:
+        if self.clip_grad_norm:
+            torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=self.clip_grad_norm)
+            torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder.parameters(), max_norm=self.clip_grad_norm)
             if self.log_grad_norm:
-                pre_clip_norm = torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=float('inf'))
-                self.log_writer.add_scalar("optimizer/unet_pre_clip_norm", pre_clip_norm, global_step)
-
-                pre_clip_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params,
-                                                               max_norm=float('inf'))
-                self.log_writer.add_scalar("optimizer/te_pre_clip_norm", pre_clip_norm, global_step)
-
-            unet_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(),
-                                                            max_norm=self.clip_grad_norm)
-            self.log_writer.add_scalar("optimizer/unet_grad_norm", unet_grad_norm, global_step)
-
-            te_grad_norm = torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder_params,
-                                                          max_norm=self.clip_grad_norm)
-            self.log_writer.add_scalar("optimizer/te_grad_norm", te_grad_norm, global_step)
+                with torch.no_grad():
+                    self.log_writer.add_scalar("optimizer/unet_grad_norm_post_clip", _get_grad_norm(self.unet.parameters()), global_step)
+                    self.log_writer.add_scalar("optimizer/te_grad_norm_post_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
 
         if self.scaler is None:
             for optimizer in self.optimizers:
@@ -210,14 +199,16 @@ class EveryDreamOptimizer:
             self.scaler.update()
 
         if self.log_grad_norm and self.log_writer:
-            log_info_unet_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
-            log_info_te_fn = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
-            with torch.no_grad():
-                self._log_gradient_normal(self.unet_params, "optimizer/unet_grad_norm", log_info_unet_fn)
-                self._log_gradient_normal(itertools.chain(self.text_encoder_params), "optimizer/te_grad_norm",
-                                          log_info_te_fn)
+            log_action = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
+            with (torch.no_grad()):
+                self._log_gradient_normal(self.unet.parameters(), "optimizer/unet_grad_norm", log_action)
+                self._log_gradient_normal(self.text_encoder.parameters(), "optimizer/te_grad_norm",
+                                          log_action)
+                self._log_weight_normal(self.unet.parameters(), "optimizer/unet_weight_norm", log_action)
+                self._log_weight_normal(self.text_encoder.parameters(), "optimizer/te_weight_norm", log_action)
 
         self._zero_grad(set_to_none=True)
+
 
     def step_schedulers(self, global_step):
         for scheduler in self.lr_schedulers:
@@ -251,9 +242,9 @@ class EveryDreamOptimizer:
         """
         Saves the optimizer states to path
         """
-        self._save_optimizer(self.optimizer_te, os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME)) if self.optimizer_te is not None else None
-        self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)) if self.optimizer_unet is not None else None
-        self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME)) if self.scaler is not None else None
+        self._save_optimizer(self.optimizer_te, os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME), optimizer_type=self.te_config['optimizer']) if self.optimizer_te is not None else None
+        self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME), optimizer_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
+        self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME), 'scaler') if self.scaler is not None else None
 
     def load(self, ckpt_path: str):
         """
@@ -263,11 +254,11 @@ class EveryDreamOptimizer:
         unet_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)
         scaler_state_path = os.path.join(ckpt_path, SCALER_STATE_FILENAME)
         if os.path.exists(te_optimizer_state_path) and self.optimizer_te is not None:
-            self._load_optimizer(self.optimizer_te, te_optimizer_state_path)
+            self._load_optimizer(self.optimizer_te, te_optimizer_state_path, expected_type=self.te_config['optimizer']) if self.optimizer_te is not None else None
         if os.path.exists(unet_optimizer_state_path) and self.optimizer_unet is not None:
-            self._load_optimizer(self.optimizer_unet, unet_optimizer_state_path)
+            self._load_optimizer(self.optimizer_unet, unet_optimizer_state_path, expected_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
         if os.path.exists(scaler_state_path) and self.scaler is not None:
-            self._load_optimizer(self.scaler, scaler_state_path)
+            self._load_optimizer(self.scaler, scaler_state_path, expected_type='scaler')
 
     def create_optimizers(self, args, text_encoder_params, unet_params):
         """
@@ -353,7 +344,7 @@ class EveryDreamOptimizer:
             unet_config = optimizer_config["base"]
 
             if unet_config["lr_scheduler"] == "polynomial":
-                lr_scheduler = get_polynomial_decay_schedule_with_warmup(
+                lr_scheduler = _get_polynomial_decay_schedule_with_warmup_adj(
                     optimizer=self.optimizer_unet,
                     lr_end=unet_config.get("lr_end", unet_config["lr"]/100.0),
                     power=unet_config.get("power", 2),
@@ -397,21 +388,31 @@ class EveryDreamOptimizer:
             self.scaler.set_growth_interval(2000)
 
     @staticmethod
-    def _save_optimizer(optimizer, path: str):
+    def _save_optimizer(optimizer, path: str, optimizer_type: str):
         """
         Saves the optimizer state to specific path/filename
         """
-        torch.save(optimizer.state_dict(), path)
+        torch.save({
+            'optimizer_type': optimizer_type,
+            'state_dict': optimizer.state_dict()
+        }, path)
 
     @staticmethod
-    def _load_optimizer(optimizer: torch.optim.Optimizer, path: str):
+    def _load_optimizer(optimizer: torch.optim.Optimizer, path: str, expected_type: str=None):
         """
         Loads the optimizer state to an Optimizer object
         optimizer: torch.optim.Optimizer
         path: .pt file
         """
         try:
-            optimizer.load_state_dict(torch.load(path))
+            state_dict = torch.load(path)
+            if 'optimizer_type' in state_dict:
+                optimizer_type = state_dict['optimizer_type']
+                if expected_type is not None and optimizer_type != expected_type:
+                    logging.warning(f"{Fore.LIGHTYELLOW_EX}**Loaded optimizer type in {path} is {optimizer_type} but we expect {expected_type} - skipping optimizer load{Style.RESET_ALL}")
+                    return
+                state_dict = state_dict["state_dict"]
+            optimizer.load_state_dict(state_dict)
             logging.info(f" Loaded optimizer state from {path}")
         except Exception as e:
             logging.warning(f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}")
@@ -725,3 +726,77 @@ def log_optimizer(label: str, optimizer: torch.optim.Optimizer, betas, epsilon, 
     logging.info(f"{Fore.CYAN} * {label} optimizer: {optimizer.__class__.__name__} {param_info} *{Style.RESET_ALL}")
     logging.info(f"{Fore.CYAN}    lr: {lr}, betas: {betas}, epsilon: {epsilon}, weight_decay: {weight_decay} *{Style.RESET_ALL}")
 
+
+def _get_grad_norm(parameters) -> float:
+    parameters = [
+        p for p in parameters if p.grad is not None and p.requires_grad
+    ]
+    if len(parameters) == 0:
+        return 0.0
+    else:
+        device = parameters[0].grad.device
+        return torch.norm(
+            torch.stack(
+                [
+                    torch.norm(p.grad.detach()).to(device)
+                    for p in parameters
+                ]
+            ),
+            2.0,
+        ).item()
+
+
+
+def _get_polynomial_decay_schedule_with_warmup_adj(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    lr_end: float = 1e-7,
+    power: float = 1.0,
+    last_epoch: int = -1,
+) -> LambdaLR:
+    """
+    Adapted from diffusers get_polynomial_decay_schedule_with_warmup to remove the restrictive check on strictly decreasing LR
+
+    Create a schedule with a learning rate that decreases as a polynomial decay from the initial lr set in the
+    optimizer to end lr defined by *lr_end*, after a warmup period during which it increases linearly from 0 to the
+    initial lr set in the optimizer.
+
+    Args:
+        optimizer ([`~torch.optim.Optimizer`]):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (`int`):
+            The total number of training steps.
+        lr_end (`float`, *optional*, defaults to 1e-7):
+            The end LR.
+        power (`float`, *optional*, defaults to 1.0):
+            Power factor.
+        last_epoch (`int`, *optional*, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Note: *power* defaults to 1.0 as in the fairseq implementation, which in turn is based on the original BERT
+    implementation at
+    https://github.com/google-research/bert/blob/f39e881b169b9d53bea03d2d341b31707a6c052b/optimization.py#L37
+
+    Return:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+
+    """
+
+    lr_init = optimizer.defaults["lr"]
+
+    def lr_lambda(current_step: int):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        elif current_step > num_training_steps:
+            return lr_end / lr_init  # as LambdaLR multiplies by lr_init
+        else:
+            lr_range = lr_init - lr_end
+            decay_steps = num_training_steps - num_warmup_steps
+            pct_remaining = 1 - (current_step - num_warmup_steps) / decay_steps
+            decay = lr_range * pct_remaining**power + lr_end
+            return decay / lr_init  # as LambdaLR multiplies by lr_init
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)

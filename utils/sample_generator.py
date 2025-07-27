@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os.path
 from dataclasses import dataclass
 import random
@@ -84,6 +85,11 @@ class SampleGenerator:
     num_inference_steps: int = 30
     random_captions = False
 
+    epoch = None
+    epoch_length = None
+    epoch_start_global_step = None
+    steps_to_generate_this_epoch = []
+
     sample_requests: [str]
     log_folder: str
     log_writer: SummaryWriter
@@ -97,7 +103,8 @@ class SampleGenerator:
                  config_file_path: str,
                  batch_size: int,
                  default_seed: int,
-                 default_sample_steps: int,
+                 default_sample_steps: int|None,
+                 default_sample_epochs: int|None,
                  use_xformers: bool,
                  use_penultimate_clip_layer: bool,
                  is_ztsnr: bool,
@@ -116,6 +123,7 @@ class SampleGenerator:
         self.default_resolution = default_resolution
         self.default_seed = default_seed
         self.sample_steps = default_sample_steps
+        self.sample_epochs = default_sample_epochs
 
         self.sample_requests = None
         self.reload_config()
@@ -184,6 +192,7 @@ class SampleGenerator:
             self.show_progress_bars = config.get('show_progress_bars', self.show_progress_bars)
             self.generate_pretrain_samples = config.get('generate_pretrain_samples', self.generate_pretrain_samples)
             self.sample_steps = config.get('generate_samples_every_n_steps', self.sample_steps)
+            self.sample_epochs = config.get('generate_samples_every_n_epochs', self.sample_epochs)
             self.sample_invokeai_info_dicts_json = config.get('invokeai_info_dicts_json', None)
             self.append_invokeai_info_dicts = config.get('append_invokeai_info_dicts', False)
             sample_requests_config = config.get('samples', None)
@@ -200,6 +209,8 @@ class SampleGenerator:
                                                       ) for p in sample_requests_config]
             if len(self.sample_requests) == 0:
                 self.sample_requests = self._make_random_caption_sample_requests()
+            self._recompute_sample_steps()
+
 
     @torch.no_grad()
     def generate_samples(self, pipe: StableDiffusionPipeline, global_step: int, extra_info: str = ""):
@@ -431,3 +442,50 @@ class SampleGenerator:
                                   image_save_cb=save_image,
                                   extra_cfgs=self.cfgs[1:],
                                   index_offset=index_offset)
+
+
+    def on_epoch_start(self, epoch: int, global_step: int, epoch_length: int):
+        self.epoch = epoch
+        self.epoch_length = epoch_length
+        self.epoch_start_global_step = global_step
+        self._recompute_sample_steps()
+        print(f"\nSample Generator generating every_n_steps {self.sample_steps} / every_n_epochs {self.sample_epochs} -> steps to generate:", self.steps_to_generate_this_epoch)
+
+
+    def _recompute_sample_steps(self):
+        if self.sample_steps is not None and self.sample_steps < 0:
+            if self.epoch_length is None:
+                # can't compute sample steps yet (no epoch length)
+                return
+            else:
+                self.sample_epochs = -self.sample_steps / self.epoch_length
+                self.sample_steps = None
+
+        if self.sample_epochs is None:
+            every_n_steps = self.sample_steps
+            offset = self.epoch_start_global_step % every_n_steps
+            self.steps_to_generate_this_epoch = list(range(offset, self.epoch_length, every_n_steps))
+        else:
+            self.steps_to_generate_this_epoch = get_generate_step_indices(self.epoch, self.epoch_length, every_n_epochs=self.sample_epochs)
+
+
+    def should_generate_samples(self, global_step, local_step):
+        if self.sample_steps is not None and self.sample_steps > 0:
+            return ((global_step + 1) % self.sample_steps) == 0
+        else:
+            return local_step in self.steps_to_generate_this_epoch
+
+
+def get_generate_step_indices(epoch, epoch_length_steps, every_n_epochs: float, offset: int=0) -> list[int]:
+    if every_n_epochs >= 1:
+        if ((epoch+1) % round(every_n_epochs)) == 0:
+            # last step only
+            return [offset + epoch_length_steps-1]
+        else:
+            return []
+    else:
+        # subdivide the epoch evenly, by rounding self.every_n_epochs to the nearest clean division of steps
+        num_divisions = max(1, min(epoch_length_steps, round(1/every_n_epochs)))
+        # if an epoch has eg 100 steps and num_divisions is 2, then validation should occur after steps 49 and 99
+        generate_every_n_steps = epoch_length_steps / num_divisions
+        return [offset + math.ceil((i+1)*generate_every_n_steps) - 1 for i in range(num_divisions)]

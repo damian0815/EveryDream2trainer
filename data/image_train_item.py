@@ -362,6 +362,9 @@ class ImageTrainItem:
         self.image = np.array(self.image).astype(np.uint8)
         if self.mask is not None:
             self.mask = np.array(self.mask.convert('L')).astype(np.float32) / 255
+            if np.count_nonzero(self.mask) == 0:
+                logging.warning(f"mask for {self.pathname} has no non-black pixels - setting to None")
+                self.mask = None
 
         return self
 
