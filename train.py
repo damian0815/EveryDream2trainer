@@ -26,12 +26,8 @@ import time
 import gc
 import random
 import traceback
-from collections import defaultdict
 
-from dataclasses import dataclass, field
 from typing import Tuple
-
-import torchvision
 
 from colorama import Fore, Style
 import numpy as np
@@ -56,12 +52,12 @@ from data.data_loader import DataLoaderMultiAspect
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
+from log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
 from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
     get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
-    get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
-    get_multirank_stratified_random_timesteps
+    get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, get_multirank_stratified_random_timesteps
 from model.training_model import EveryDreamTrainingState, save_model, save_model_lora, find_last_checkpoint, load_model, \
-    get_use_ema_decay_training
+    get_use_ema_decay_training, TrainingVariables, TrainingModel
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
@@ -130,26 +126,6 @@ def get_gpu_memory(nvsmi):
     gpu_used_mem = int(gpu_query['gpu'][0]['fb_memory_usage']['used'])
     gpu_total_mem = int(gpu_query['gpu'][0]['fb_memory_usage']['total'])
     return gpu_used_mem, gpu_total_mem
-
-def append_epoch_log(global_step: int, epoch_pbar, gpu, log_writer, **logs):
-    """
-    updates the vram usage for the epoch
-    """
-    if gpu is not None:
-        gpu_used_mem, gpu_total_mem = gpu.get_gpu_memory()
-        log_writer.add_scalar("performance/vram", gpu_used_mem, global_step)
-        epoch_mem_color = Style.RESET_ALL
-        if gpu_used_mem > 0.93 * gpu_total_mem:
-            epoch_mem_color = Fore.LIGHTRED_EX
-        elif gpu_used_mem > 0.85 * gpu_total_mem:
-            epoch_mem_color = Fore.LIGHTYELLOW_EX
-        elif gpu_used_mem > 0.7 * gpu_total_mem:
-            epoch_mem_color = Fore.LIGHTGREEN_EX
-        elif gpu_used_mem < 0.5 * gpu_total_mem:
-            epoch_mem_color = Fore.LIGHTBLUE_EX
-
-        if logs is not None:
-            epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{global_step}")
 
 
 def setup_args(args):
@@ -296,15 +272,6 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects) -> 
 
     return resolved_items
 
-def write_batch_schedule(log_folder: str, train_batch: EveryDreamBatch, epoch: int):
-    with open(f"{log_folder}/ep{epoch}_batch_schedule.txt", "w", encoding='utf-8') as f:
-        for i in range(len(train_batch.image_train_items)):
-            try:
-                item: ImageTrainItem = train_batch.image_train_items[i]
-                f.write(f"step:{int(i / train_batch.batch_size):05}, wh:{item.target_wh}, r:{item.runt_size}, path:{item.pathname} captions:{item.caption}\n")
-            except Exception as e:
-                logging.error(f" * Error writing to batch schedule for file path: {item.pathname}")
-
 
 def read_sample_prompts(sample_prompts_file_path: str):
     sample_prompts = []
@@ -312,21 +279,6 @@ def read_sample_prompts(sample_prompts_file_path: str):
         for line in f:
             sample_prompts.append(line.strip())
     return sample_prompts
-
-
-def log_args(log_writer, args, optimizer_config, log_folder, log_time):
-    arglog = "args:\n"
-    for arg, value in sorted(vars(args).items()):
-        arglog += f"{arg}={value}, "
-    log_writer.add_text("config", arglog)
-
-    args_as_json = json.dumps(vars(args), indent=2)
-    with open(os.path.join(log_folder, f"{args.project_name}-{log_time}_main.json"), "w") as f:
-        f.write(args_as_json)
-
-    optimizer_config_as_json = json.dumps(optimizer_config, indent=2)
-    with open(os.path.join(log_folder, f"{args.project_name}-{log_time}_opt.json"), "w") as f:
-        f.write(optimizer_config_as_json)
 
 
 def update_ema(model, ema_model, decay, default_device, ema_device: str):
@@ -348,6 +300,21 @@ def update_ema(model, ema_model, decay, default_device, ema_device: str):
 
         if need_to_delete_original:
             del(original_model_on_proper_device)
+
+
+def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables):
+    if tv.accumulated_loss_images_count == 0:
+        print("no accumulated loss images, not doing backward")
+    else:
+        optimizer.backward(tv.accumulated_loss)
+        tv.effective_backward_size = tv.accumulated_loss_images_count
+        tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
+        #print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
+        #      f"backward accumulated {tv.current_accumulated_backward_images_count}")
+        tv.clear_accumulated_loss()
+        # reset slice sizes
+        tv.forward_slice_size = args.forward_slice_size or args.batch_size
+        tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
 
 def load_train_json_from_file(args, report_load = False):
     try:
@@ -635,7 +602,7 @@ def main(args):
             global interrupted
             if not interrupted:
                 interrupted=True
-                global global_step
+                global_step = tv.global_step
                 interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step}")
                 print()
                 logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
@@ -680,22 +647,12 @@ def main(args):
     epoch_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Epochs{Style.RESET_ALL}")
     epoch_times = []
 
-    global global_step
-    global_step = 0
+    tv = TrainingVariables()
+    tv.global_step = 0
     training_start_time = time.time()
     last_epoch_saved_time = training_start_time
 
-    append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
-
-
-    @dataclass
-    class LogData:
-        loss_log_step = []
-        loss_log_step_cd = []
-        loss_log_step_non_cd = []
-        loss_preview_image: torch.Tensor|None = None
-        loss_per_timestep: dict[int, dict[int, tuple[float, int]]] = dataclasses.field(
-            default_factory=lambda: defaultdict(dict))
+    append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
 
     log_data = LogData()
 
@@ -829,69 +786,6 @@ def main(args):
                                        )
     epoch = None
 
-    @dataclass
-    class TrainingVariables:
-        last_effective_batch_size: int = 0
-        effective_backward_size: int = 0
-        current_accumulated_backward_images_count: int = 0
-        accumulated_loss_images_count: int = 0
-        accumulated_loss: torch.Tensor|None = None
-        accumulated_pathnames: list[str] = field(default_factory=list)
-        accumulated_captions: list[str] = field(default_factory=list)
-        accumulated_timesteps: list[int] = field(default_factory=list)
-        desired_effective_batch_size: int|None = None
-        interleave_bs1_bsN: bool = False
-        interleaved_bs1_count: int|None = None
-
-        prev_accumulated_pathnames: list[str] = field(default_factory=list)
-        prev_accumulated_captions: list[str] = field(default_factory=list)
-        prev_accumulated_timesteps: list[int] = field(default_factory=list)
-
-        def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
-
-            if loss.isnan().any():
-                logging.warning(f"NaN detected after processing {pathnames} @ {timesteps} ({captions} - skipping")
-                logging.warning(f" - NaN detected (current accumulated {self.accumulated_pathnames} @ {self.accumulated_timesteps} ({self.accumulated_captions}) )")
-                logging.warning(f" - NaN detected (prev was {self.prev_accumulated_pathnames} @ {self.prev_accumulated_timesteps} ({self.prev_accumulated_captions}) )")
-                assert False
-
-            self.accumulated_loss = (
-                loss
-                if self.accumulated_loss is None
-                else self.accumulated_loss + loss
-            )
-            self.accumulated_loss_images_count += len(timesteps)
-            self.accumulated_pathnames.extend(pathnames)
-            self.accumulated_captions.extend(captions)
-            self.accumulated_timesteps.extend(timesteps)
-
-        def clear_accumulated_loss(self):
-            self.accumulated_loss = None
-            self.accumulated_loss_images_count = 0
-            self.prev_accumulated_captions = self.accumulated_captions
-            self.prev_accumulated_pathnames = self.accumulated_pathnames
-            self.prev_accumulated_timesteps = self.accumulated_timesteps
-            self.accumulated_pathnames = []
-            self.accumulated_captions = []
-            self.accumulated_timesteps = []
-
-
-    def optimizer_backward(tv: TrainingVariables):
-        if tv.accumulated_loss_images_count == 0:
-            print("no accumulated loss images, not doing backward")
-        else:
-            ed_optimizer.backward(tv.accumulated_loss)
-            tv.effective_backward_size = tv.accumulated_loss_images_count
-            tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
-            #print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
-            #      f"backward accumulated {tv.current_accumulated_backward_images_count}")
-            tv.clear_accumulated_loss()
-            # reset slice sizes
-            tv.forward_slice_size = args.forward_slice_size or args.batch_size
-            tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
-
-    tv = TrainingVariables()
-
     try:
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
 
@@ -915,7 +809,7 @@ def main(args):
 
             plugin_runner.run_on_epoch_start(
                 epoch=epoch,
-                global_step=global_step,
+                global_step=tv.global_step,
                 epoch_length=epoch_len,
                 project_name=args.project_name,
                 log_folder=log_folder,
@@ -925,13 +819,11 @@ def main(args):
 
             sample_generator.on_epoch_start(
                 epoch=epoch,
-                global_step=global_step,
+                global_step=tv.global_step,
                 epoch_length=epoch_len
             )
 
-            loss_epoch = []
             epoch_start_time = time.time()
-            images_per_sec_log_step = []
 
             steps_pbar = tqdm(range(epoch_len), position=1, leave=False, dynamic_ncols=True)
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
@@ -944,6 +836,7 @@ def main(args):
             tv.forward_slice_size = args.forward_slice_size or args.batch_size
             tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
 
+            step = 0
             for step, full_batch in enumerate(train_dataloader):
 
                 try:
@@ -955,13 +848,11 @@ def main(args):
 
                     plugin_runner.run_on_step_start(epoch=epoch,
                                                     local_step=step,
-                                                    global_step=global_step,
+                                                    global_step=tv.global_step,
                                                     project_name=args.project_name,
                                                     log_folder=log_folder,
                                                     batch=full_batch,
                                                     ed_state=make_current_ed_state())
-
-                    full_batch_size = full_batch["image"].shape[0]
 
                     #for k in full_batch['captions'].keys():
                     #    if any(c is not None and len(c.strip()) == 0 for c in full_batch['captions'][k]):
@@ -972,8 +863,7 @@ def main(args):
                     if image_size > (1000)*(1000):
                         if tv.accumulated_loss_images_count > 1:
                             print(f"emergency backward at accumulated_loss_images_count {tv.accumulated_loss_images_count}")
-                            # todo: DRY
-                            optimizer_backward(tv)
+                            _optimizer_backward(ed_optimizer, tv)
 
                         enable_vae_attention_slicing = True
                         tv.forward_slice_size = min(tv.forward_slice_size, 1)
@@ -982,39 +872,6 @@ def main(args):
                     elif image_size > (850)*(850):
                         tv.forward_slice_size = min(tv.forward_slice_size, 2)
                         tv.max_backward_slice_size = min(tv.max_backward_slice_size, 6)
-
-                    def lerp(x, in_min, in_max, out_min, out_max):
-                        if (in_max - in_min) == 0:
-                            return in_min
-                        pct = (x - in_min) / (in_max - in_min)
-                        return out_min + pct * (out_max - out_min)
-
-                    if args.timestep_curriculum_alpha == 0:
-                        timestep_range = (args.timestep_start, args.timestep_end)
-                    else:
-                        t_min_initial = args.timestep_initial_start
-                        t_max_initial = args.timestep_initial_end
-                        t_min_final = args.timestep_start
-                        t_max_final = args.timestep_end
-                        timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
-                                                                       t_min_initial=t_min_initial,
-                                                                       t_max_initial=t_max_initial,
-                                                                       t_min_final=t_min_final,
-                                                                       t_max_final=t_max_final,
-                                                                       alpha=args.timestep_curriculum_alpha)
-                        # print('timestep range:', timestep_range)
-
-                    timesteps_ranges = full_batch["timesteps_range"] or ([timestep_range] * full_batch_size)
-
-                    # randomly expand
-                    num_train_timesteps = model.noise_scheduler.config.num_train_timesteps
-                    timesteps_ranges = [(
-                        # maybe make 8 a CLI arg?
-                        min(num_train_timesteps,
-                            max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
-                        min(num_train_timesteps,
-                            max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], num_train_timesteps)))),
-                    ) for tsr in timesteps_ranges]
 
                     if (tv.desired_effective_batch_size > 1
                             and args.everything_contrastive_learning_p > 0
@@ -1030,27 +887,7 @@ def main(args):
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
 
-                    do_contrastive_learning = full_batch["do_contrastive_learning"]
-                    timesteps: torch.Tensor
-
-                    if args.timesteps_multirank_stratified:
-                        # the point of multirank stratified is to spread timesteps evenly across the batch.
-                        # so we need to do a dance here to make sure that we're actually spreading across the
-                        # desired_effective_batch_size - which will be "nibbled" below in chunks
-                        while remaining_timesteps is None or remaining_timesteps.shape[0] < max(full_batch_size, tv.desired_effective_batch_size):
-                            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size, device=model.unet.device, alpha=args.timesteps_multirank_stratified_alpha, beta=args.timesteps_multirank_stratified_beta)
-                            remaining_timesteps = next_timesteps if remaining_timesteps is None else torch.cat([remaining_timesteps, next_timesteps])
-                        timesteps = remaining_timesteps[:full_batch_size]
-                        remaining_timesteps = remaining_timesteps[full_batch_size:]
-                    else:
-                        timesteps: torch.LongTensor = get_timesteps(
-                            batch_size=full_batch_size,
-                            batch_share_timesteps=(
-                            do_contrastive_learning or args.batch_share_timesteps),
-                            device=model.device,
-                            timesteps_ranges=timesteps_ranges,
-                            continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching'
-                        )
+                    timesteps = _get_step_timesteps(full_batch, model, tv, args)
 
                     # apply cond dropout
                     initial_batch_size = args.initial_batch_size or args.batch_size
@@ -1133,7 +970,7 @@ def main(args):
                             noise = get_noise(noise_shape, device=model.unet.device, dtype=batch["image"].dtype,
                                               pyramid_noise_discount=args.pyramid_noise_discount,
                                               zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
-                                              batch_share_noise=(do_contrastive_learning or args.batch_share_noise)
+                                              batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise)
                                               )
 
                         runt_size = batch["runt_size"]
@@ -1252,7 +1089,7 @@ def main(args):
                                             timesteps=timesteps[0:nibble_size_actual],
                                             loss_scale=loss_scale[0:nibble_size_actual],
                                             noise_scheduler=model.noise_scheduler,
-                                            do_contrastive_learning=do_contrastive_learning,
+                                            do_contrastive_learning=full_batch["do_contrastive_learning"],
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
@@ -1274,9 +1111,9 @@ def main(args):
                             log_data.loss_preview_image = loss.detach().clone().cpu()
                             loss_step = loss.detach().mean().item()
                             del loss, loss_sum
-                            steps_pbar.set_postfix({"loss/step": loss_step, "gs": global_step})
+                            steps_pbar.set_postfix({"loss/step": loss_step, "gs": tv.global_step})
                             log_data.loss_log_step.append(loss_step)
-                            loss_epoch.append(loss_step)
+                            log_data.loss_epoch.append(loss_step)
 
                             should_step_optimizer = (
                                     (tv.current_accumulated_backward_images_count + tv.accumulated_loss_images_count)
@@ -1285,7 +1122,7 @@ def main(args):
                             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                                     tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                                 #accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
-                                optimizer_backward(tv)
+                                _optimizer_backward(ed_optimizer, tv)
 
                             if should_step_optimizer:
                                 if tv.current_accumulated_backward_images_count == 0:
@@ -1295,7 +1132,7 @@ def main(args):
                                     #      f'{tv.current_accumulated_backward_images_count}, '
                                     #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
                                     tv.last_effective_batch_size = tv.current_accumulated_backward_images_count
-                                    ed_optimizer.step_optimizer(global_step)
+                                    ed_optimizer.step_optimizer(tv.global_step)
                                     tv.current_accumulated_backward_images_count = 0
 
                                     # if we are interleaving BS1, increment counter
@@ -1311,13 +1148,13 @@ def main(args):
                                             else:
                                                 tv.interleaved_bs1_count = None
 
-                    ed_optimizer.step_schedulers(global_step)
+                    ed_optimizer.step_schedulers(tv.global_step)
 
-                    if sample_generator.should_generate_samples(global_step, local_step=step):
+                    if sample_generator.should_generate_samples(tv.global_step, local_step=step):
                         needs_samples = True
 
                     if args.ema_decay_rate != None:
-                        if ((global_step + 1) % args.ema_update_interval) == 0:
+                        if ((tv.global_step + 1) % args.ema_update_interval) == 0:
                             # debug_start_time = time.time() # Measure time
 
                             if args.disable_unet_training != True:
@@ -1331,144 +1168,57 @@ def main(args):
                             # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
                     if needs_samples or check_semaphore_file_and_unlink(_WANT_SAMPLES_SEMAPHORE_FILE):
-                        generate_samples(global_step=global_step, batch=full_batch)
+                        generate_samples(global_step=tv.global_step, batch=full_batch)
                         needs_samples = False
 
                     steps_pbar.update(1)
 
                     images_per_sec = args.batch_size / (time.time() - step_start_time)
-                    images_per_sec_log_step.append(images_per_sec)
+                    log_data.images_per_sec_log_step.append(images_per_sec)
 
-                    if (global_step + 1) % args.log_step == 0:
-                        lr_unet = ed_optimizer.get_unet_lr()
-                        lr_textenc = ed_optimizer.get_textenc_lr()
+                    if (tv.global_step + 1) % args.log_step == 0:
+                        logs = do_log_step(args, ed_optimizer, log_data, log_folder,
+                                           log_writer, model, tv)
 
-                        log_writer.add_scalar(tag="hyperparameter/lr unet", scalar_value=lr_unet, global_step=global_step)
-                        log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
-                        log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=timesteps_ranges[0][0], global_step=global_step)
-                        log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=timesteps_ranges[0][1], global_step=global_step)
-                        log_writer.add_scalar(tag="hyperparameter/effective batch size", scalar_value=tv.last_effective_batch_size, global_step=global_step)
-                        log_writer.add_scalar(tag="hyperparameter/effective backward size", scalar_value=tv.effective_backward_size, global_step=global_step)
+                        append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer,
+                                         **logs)
 
-                        sum_img = sum(images_per_sec_log_step)
-                        avg = sum_img / len(images_per_sec_log_step)
-                        images_per_sec_log_step = []
-                        if args.amp:
-                            log_writer.add_scalar(tag="hyperparameter/grad scale", scalar_value=ed_optimizer.get_scale(), global_step=global_step)
-                        log_writer.add_scalar(tag="performance/images per second", scalar_value=avg, global_step=global_step)
-
-                        logs = {"lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": images_per_sec}
-                        if len(log_data.loss_log_step) > 0:
-                            loss_step = sum(log_data.loss_log_step) / len(log_data.loss_log_step)
-                            log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)
-                            logs["loss/log_step"] = loss_step
-
-
-                        # log histogram of loss vs timestep
-                        loss_sums_and_counts = {
-                            batch_resolution: [log_data.loss_per_timestep[batch_resolution].get(timestep, (0, 1))
-                                                for timestep in range(model.noise_scheduler.config.num_train_timesteps + 1)]
-                            for batch_resolution in args.resolution
-                        }
-                        loss_sums_and_counts = {
-                            batch_resolution: torch.tensor([
-                                loss_sum_this_step / count
-                                for loss_sum_this_step, count in data
-                            ])
-                            for batch_resolution, data in loss_sums_and_counts.items()
-                        }
-                        with open(os.path.join(log_folder, "loss_sums_and_counts_per_timestep.pt"), "wb") as f:
-                            torch.save(loss_sums_and_counts, f)
-
-                        #for batch_resolution in args.resolution:
-                        #    #image = _create_bar_chart_image(loss_per_timestep[batch_resolution])
-                        #    loss_sums_and_counts = [loss_per_timestep[batch_resolution].get(timestep, (0, 1))
-                        #                            for timestep in range(noise_scheduler.config.num_train_timesteps+1)]
-                        #    #log_writer.add_histogram(tag=f"loss/timesteps/{batch_resolution}", values=torch.tensor([
-                        #    #    loss_sum_this_step / count
-                        #    #    for loss_sum_this_step, count in loss_sums_and_counts
-                        #    #]), global_step=global_step)
-
-                        loss_log_step_cd = [l for l in log_data.loss_log_step_cd if math.isfinite(l)]
-                        if len(loss_log_step_cd) > 0:
-                            loss_step_cd = sum(loss_log_step_cd) / len(loss_log_step_cd)
-                            log_writer.add_scalar(tag="loss/log_step CD", scalar_value=loss_step_cd, global_step=global_step)
-                            logs["loss/log_step CD"] = loss_step_cd
-
-                        loss_log_step_non_cd = [l for l in log_data.loss_log_step_non_cd if math.isfinite(l)]
-                        if len(loss_log_step_non_cd) > 0:
-                            loss_step_non_cd = sum(loss_log_step_non_cd) / len(loss_log_step_non_cd)
-                            log_writer.add_scalar(tag="loss/log_step non-CD", scalar_value=loss_step_non_cd, global_step=global_step)
-                            logs["loss/log_step non-CD"] = loss_step_non_cd
-
-                        if log_data.loss_preview_image is not None:
-                            loss_preview_image_rgb = torchvision.utils.make_grid(
-                                vae_preview((log_data.loss_preview_image / args.negative_loss_margin) * 2 - 1)
-                            )
-                            log_data.loss_preview_image = torchvision.utils.make_grid(
-                                torch.reshape(log_data.loss_preview_image, [
-                                    log_data.loss_preview_image.shape[0]*log_data.loss_preview_image.shape[1], 1, log_data.loss_preview_image.shape[2], log_data.loss_preview_image.shape[3]
-                                ]),
-                                nrow=log_data.loss_preview_image.shape[0],
-                                normalize=True,
-                                value_range=(0, args.negative_loss_margin),
-                                scale_each=False)
-                            log_writer.add_image(tag="loss/last vis raw", img_tensor=log_data.loss_preview_image, global_step=global_step)
-                            log_writer.add_image(tag="loss/last vis rgb", img_tensor=loss_preview_image_rgb, global_step=global_step)
-
-                        if args.log_named_parameters_magnitudes:
-                            def log_named_parameters(model, prefix):
-                                """Log L2 norms of parameter groups to help debug NaN issues."""
-                                for name, param in model.named_parameters():
-                                    if param.requires_grad:
-                                        param_mean = param.mean().item()
-                                        log_writer.add_scalar(tag=f"p-mean/{prefix}-{name}", scalar_value=param_mean, global_step=global_step)
-                            if not args.disable_unet_training:
-                                log_named_parameters(model.unet, "unet")
-                            if not args.disable_textenc_training:
-                                log_named_parameters(model.text_encoder, "textenc")
-
-                        log_data.loss_log_step = []
-                        log_data.loss_log_step_cd = []
-                        log_data.loss_log_step_non_cd = []
-
-                        append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                         torch.cuda.empty_cache()
 
                     if validator and (
                             step in validation_steps
                             or check_semaphore_file_and_unlink(_WANT_VALIDATION_SEMAPHORE_FILE)
                     ):
-                        validator.do_validation(global_step, get_model_prediction_and_target_validation_wrapper)
+                        validator.do_validation(tv.global_step, get_model_prediction_and_target_validation_wrapper)
 
                     min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 
                     needs_save = False
                     if args.ckpt_every_n_minutes is not None and (min_since_last_ckpt > args.ckpt_every_n_minutes):
                         last_epoch_saved_time = time.time()
-                        logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {global_step}")
+                        logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {tv.global_step}")
                         needs_save = True
                     def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
                         return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
                                 epoch < args.max_epochs and epoch >= start_epoch)
 
                     if is_first_step_of_save_epoch(args.save_every_n_epochs, start_epoch=args.save_ckpts_from_n_epochs):
-                        logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {global_step}")
+                        logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
                         needs_save = True
                     if needs_save:
-                        save_path = make_save_path(epoch, global_step)
-                        save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
+                        save_path = make_save_path(epoch, tv.global_step)
+                        save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
                                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
                                    save_full_precision=args.save_full_precision,
                                    save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
                                    plugin_runner=plugin_runner)
                     if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
                         logging.info(f" Saving lora")
-                        save_path = make_save_path(epoch, global_step)
+                        save_path = make_save_path(epoch, tv.global_step)
                         save_model_lora(model=model, save_path=save_path)
 
                     plugin_runner.run_on_step_end(epoch=epoch,
-                                          global_step=global_step,
+                                          global_step=tv.global_step,
                                           local_step=step,
                                           project_name=args.project_name,
                                           log_folder=log_folder,
@@ -1477,15 +1227,15 @@ def main(args):
                                           ed_state=make_current_ed_state())
 
                     if (epoch == args.max_epochs-1
-                            and ed_optimizer.will_do_grad_accum_step(step, global_step)
+                            and ed_optimizer.will_do_grad_accum_step(step, tv.global_step)
                             and epoch_len-step < args.grad_accum
                     ):
                         print(f"only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
                         break
 
-                    global_step += 1
+                    tv.global_step += 1
 
-                    if args.max_steps is not None and global_step >= args.max_steps:
+                    if args.max_steps is not None and tv.global_step >= args.max_steps:
                         print(f"max_steps reached, stopping")
                         break
 
@@ -1496,7 +1246,7 @@ def main(args):
                         current_batch = batch
                     except NameError:
                         current_batch = None
-                    logging.error(f"step {global_step} failed. full_batch: {full_batch}, current batch: {current_batch}, training values: {dataclasses.asdict(tv)}")
+                    logging.error(f"step {tv.global_step} failed. full_batch: {full_batch}, current batch: {current_batch}, training values: {dataclasses.asdict(tv)}")
                     raise
 
 
@@ -1505,11 +1255,11 @@ def main(args):
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
             epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
             log_writer.add_scalar(
-                "performance/minutes per epoch", elapsed_epoch_time, global_step
+                "performance/minutes per epoch", elapsed_epoch_time, tv.global_step
             )
 
             plugin_runner.run_on_epoch_end(epoch=epoch,
-                                           global_step=global_step,
+                                           global_step=tv.global_step,
                                            project_name=args.project_name,
                                            log_folder=log_folder,
                                            data_root=args.data_root,
@@ -1519,13 +1269,13 @@ def main(args):
             if epoch < args.max_epochs - 1:
                 train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
 
-            if len(loss_epoch) > 0:
-                loss_epoch = sum(loss_epoch) / len(loss_epoch)
-                log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_epoch, global_step=global_step)
+            if len(log_data.loss_epoch) > 0:
+                loss_epoch = sum(log_data.loss_epoch) / len(log_data.loss_epoch)
+                log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_epoch, global_step=tv.global_step)
 
             gc.collect()
 
-            if args.max_steps is not None and global_step >= args.max_steps:
+            if args.max_steps is not None and tv.global_step >= args.max_steps:
                 break
 
             # end of epoch
@@ -1535,22 +1285,22 @@ def main(args):
 
         plugin_runner.run_on_training_end()
 
-        save_path = make_save_path(epoch, global_step, prepend=("" if args.no_prepend_last else "last-"))
-        save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
+        save_path = make_save_path(epoch, tv.global_step, prepend=("" if args.no_prepend_last else "last-"))
+        save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
                    save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
                    plugin_runner=plugin_runner)
         if args.lora:
             save_model_lora(model=model, save_path=save_path)
 
-        if not sample_generator.should_generate_samples(global_step=global_step-1, local_step=step):
+        if not sample_generator.should_generate_samples(global_step=tv.global_step-1, local_step=step):
             print("generating final samples")
             _, batch = next(enumerate(train_dataloader))
-            generate_samples(global_step=global_step, batch=batch)
+            generate_samples(global_step=tv.global_step, batch=batch)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")
-        logging.info(f"Total training time took {total_elapsed_time/60:.2f} minutes, total steps: {global_step}")
+        logging.info(f"Total training time took {total_elapsed_time/60:.2f} minutes, total steps: {tv.global_step}")
         logging.info(f"Average epoch time: {np.mean([t['time'] for t in epoch_times]):.2f} minutes")
 
     except Exception as ex:
@@ -1566,6 +1316,72 @@ def main(args):
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
     logging.info(f"{Fore.LIGHTWHITE_EX} **** Finished training ****{Style.RESET_ALL}")
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
+
+
+def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: TrainingModel, tv: TrainingVariables, args):
+    full_batch_size = full_batch["image"].shape[0]
+    if args.timesteps_multirank_stratified:
+        # the point of multirank stratified is to spread timesteps evenly across the batch.
+        # so we need to do a dance here to make sure that we're actually spreading across the
+        # desired_effective_batch_size - which will be "nibbled" below in chunks
+        while tv.remaining_timesteps is None or tv.remaining_timesteps.shape[0] < max(full_batch_size,
+                                                                                tv.desired_effective_batch_size):
+            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size,
+                                                                       device=model.unet.device,
+                                                                       alpha=args.timesteps_multirank_stratified_alpha,
+                                                                       beta=args.timesteps_multirank_stratified_beta)
+            tv.remaining_timesteps = next_timesteps if tv.remaining_timesteps is None else torch.cat(
+                [tv.remaining_timesteps, next_timesteps])
+        timesteps: torch.Tensor = tv.remaining_timesteps[:full_batch_size]
+        tv.remaining_timesteps = tv.remaining_timesteps[full_batch_size:]
+        return timesteps
+    else:
+        if full_batch["timesteps_range"] is not None:
+            timesteps_ranges_base = full_batch["timesteps_range"]
+        else:
+            if args.timestep_curriculum_alpha == 0:
+                timestep_range = (args.timestep_start, args.timestep_end)
+            else:
+                t_min_initial = args.timestep_initial_start
+                t_max_initial = args.timestep_initial_end
+                t_min_final = args.timestep_start
+                t_max_final = args.timestep_end
+                timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
+                                                               t_min_initial=t_min_initial,
+                                                               t_max_initial=t_max_initial,
+                                                               t_min_final=t_min_final,
+                                                               t_max_final=t_max_final,
+                                                               alpha=args.timestep_curriculum_alpha)
+                # print('timestep range:', timestep_range)
+            timesteps_ranges_base = [timestep_range] * full_batch_size
+
+        # randomly expand
+        num_train_timesteps = model.noise_scheduler.config.num_train_timesteps
+
+        def lerp(x, in_min, in_max, out_min, out_max):
+            if (in_max - in_min) == 0:
+                return in_min
+            pct = (x - in_min) / (in_max - in_min)
+            return out_min + pct * (out_max - out_min)
+
+        timesteps_ranges_expanded = [(
+            # maybe make 8 a CLI arg?
+            min(num_train_timesteps,
+                max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
+            min(num_train_timesteps,
+                max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], num_train_timesteps)))),
+        ) for tsr in timesteps_ranges_base]
+
+        do_contrastive_learning = full_batch["do_contrastive_learning"]
+        timesteps: torch.LongTensor = get_timesteps(
+            batch_size=full_batch_size,
+            batch_share_timesteps=(
+                    do_contrastive_learning or args.batch_share_timesteps),
+            device=model.device,
+            timesteps_ranges=timesteps_ranges_expanded,
+            continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching'
+        )
+        return timesteps
 
 
 def get_slices(batch_size, slice_size, runt_size):

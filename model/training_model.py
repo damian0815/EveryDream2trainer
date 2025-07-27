@@ -2,7 +2,7 @@ import gc
 import logging
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import safetensors.torch
 import torch
@@ -75,6 +75,58 @@ def convert_to_hf(ckpt_path):
     else:
         is_sd1attn, yaml = get_attn_yaml(ckpt_path)
         return ckpt_path, is_sd1attn, yaml
+
+
+@dataclass
+class TrainingVariables:
+
+    global_step: int = None
+
+    last_effective_batch_size: int = 0
+    effective_backward_size: int = 0
+    current_accumulated_backward_images_count: int = 0
+    accumulated_loss_images_count: int = 0
+    accumulated_loss: torch.Tensor|None = None
+    accumulated_pathnames: list[str] = field(default_factory=list)
+    accumulated_captions: list[str] = field(default_factory=list)
+    accumulated_timesteps: list[int] = field(default_factory=list)
+    desired_effective_batch_size: int|None = None
+    interleave_bs1_bsN: bool = False
+    interleaved_bs1_count: int|None = None
+
+    timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
+
+    prev_accumulated_pathnames: list[str] = field(default_factory=list)
+    prev_accumulated_captions: list[str] = field(default_factory=list)
+    prev_accumulated_timesteps: list[int] = field(default_factory=list)
+
+    def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
+
+        if loss.isnan().any():
+            logging.warning(f"NaN detected after processing {pathnames} @ {timesteps} ({captions} - skipping")
+            logging.warning(f" - NaN detected (current accumulated {self.accumulated_pathnames} @ {self.accumulated_timesteps} ({self.accumulated_captions}) )")
+            logging.warning(f" - NaN detected (prev was {self.prev_accumulated_pathnames} @ {self.prev_accumulated_timesteps} ({self.prev_accumulated_captions}) )")
+            assert False
+
+        self.accumulated_loss = (
+            loss
+            if self.accumulated_loss is None
+            else self.accumulated_loss + loss
+        )
+        self.accumulated_loss_images_count += len(timesteps)
+        self.accumulated_pathnames.extend(pathnames)
+        self.accumulated_captions.extend(captions)
+        self.accumulated_timesteps.extend(timesteps)
+
+    def clear_accumulated_loss(self):
+        self.accumulated_loss = None
+        self.accumulated_loss_images_count = 0
+        self.prev_accumulated_captions = self.accumulated_captions
+        self.prev_accumulated_pathnames = self.accumulated_pathnames
+        self.prev_accumulated_timesteps = self.accumulated_timesteps
+        self.accumulated_pathnames = []
+        self.accumulated_captions = []
+        self.accumulated_timesteps = []
 
 
 @dataclass
