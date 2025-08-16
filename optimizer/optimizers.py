@@ -18,7 +18,7 @@ import logging
 import itertools
 import os
 from itertools import chain
-from typing import Generator
+from typing import List, Tuple, Generator
 
 import torch
 from diffusers import UNet2DConditionModel
@@ -418,7 +418,7 @@ class EveryDreamOptimizer:
             logging.warning(f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}")
             pass
 
-    def _create_optimizer(self, label, args, local_optimizer_config, parameters):
+    def _create_optimizer(self, label, args, local_optimizer_config, parameters: List[Tuple[str, torch.nn.Parameter]]):
         #l = [parameters]
         betas = BETAS_DEFAULT
         epsilon = EPSILON_DEFAULT
@@ -458,41 +458,59 @@ class EveryDreamOptimizer:
             curr_lr = default_lr
             logging.warning(f"No LR setting found, defaulting to {default_lr}")
 
+        param_groups = []
+        attention_weight_decay = local_optimizer_config.get("weight_decay_attn_qk", None)
+        if attention_weight_decay is None:
+            param_groups = [{
+                "params": [p for n, p in parameters],
+                "weight_decay": weight_decay,
+            }]
+        else:
+            regular_group, attention_group = _extract_attention_parameter_group(parameters)
+            logging.info(f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}")
+            param_groups = [
+                {
+                    "params": [p for n, p in regular_group],
+                    "betas": (betas[0], betas[1]),
+                    "weight_decay": weight_decay,
+                    "lr": curr_lr,
+                    "name": "regular",
+                },
+                {
+                    "params": [p for n, p in attention_group],
+                    "betas": (betas[0], betas[1]),
+                    "weight_decay": attention_weight_decay,
+                    "lr": curr_lr,
+                    "name": "attention_high_decay",
+                },
+            ]
+
         if optimizer_name:
             optimizer_name = optimizer_name.lower()
 
             if optimizer_name == "lion":
                 from lion_pytorch import Lion
                 opt_class = Lion
-                optimizer = opt_class(
-                    itertools.chain(parameters),
-                    lr=curr_lr,
-                    betas=(betas[0], betas[1]),
-                    weight_decay=weight_decay,
-                )
+                optimizer = opt_class(param_groups)
             elif optimizer_name == "lion8bit":
                 from bitsandbytes.optim import Lion8bit
                 opt_class = Lion8bit
-                optimizer = opt_class(
-                    itertools.chain(parameters),
-                    lr=curr_lr,
-                    betas=(betas[0], betas[1]),
-                    weight_decay=weight_decay,
-                    percentile_clipping=100,
-                    min_8bit_size=4096,
-                )
+                for g in param_groups:
+                    g.update({"percentile_clipping": 100,
+                              "min_8bit_size": 4096})
+                optimizer = opt_class(param_groups)
+
             elif optimizer_name == "prodigy":
                 from prodigyopt import Prodigy
                 opt_class = Prodigy
-                optimizer = opt_class(
-                    itertools.chain(parameters),
-                    lr=curr_lr,
-                    weight_decay=weight_decay,
-                    use_bias_correction=use_bias_correction,
-                    growth_rate=growth_rate,
-                    d0=d0,
-                    safeguard_warmup=safeguard_warmup
-                )
+                for g in param_groups:
+                    g.update({
+                        "use_bias_correction": use_bias_correction,
+                        "growth_rate": growth_rate,
+                        "d0": d0,
+                        "safeguard_warmup": safeguard_warmup
+                    })
+                optimizer = opt_class(param_group)
             elif optimizer_name == "adamw":
                 opt_class = torch.optim.AdamW
             if "dowg" in optimizer_name:
@@ -514,76 +532,69 @@ class EveryDreamOptimizer:
 
                 if optimizer_name == "dadapt_adam":
                     opt_class = dadaptation.DAdaptAdam
-                    optimizer = opt_class(
-                        itertools.chain(parameters),
-                        lr=curr_lr,
-                        betas=(betas[0], betas[1]),
-                        weight_decay=weight_decay,
-                        eps=epsilon, #unused for lion
-                        d0=d0,
-                        log_every=args.log_step,
-                        growth_rate=growth_rate,
-                        decouple=decouple,
-                    )
+                    for g in param_groups:
+                        g.update({
+                            "eps": epsilon, # unused for dadapt_adam
+                            "d0": d0,
+                            "log_every": args.log_step,
+                            "growth_rate": growth_rate,
+                            "decouple": decouple,
+                        })
+                    optimizer = opt_class(param_groups)
                 elif optimizer_name == "dadapt_adan":
                     opt_class = dadaptation.DAdaptAdan
-                    optimizer = opt_class(
-                        itertools.chain(parameters),
-                        lr=curr_lr,
-                        betas=(betas[0], betas[1]),
-                        no_prox=no_prox,
-                        weight_decay=weight_decay,
-                        eps=epsilon,
-                        d0=d0,
-                        log_every=args.log_step,
-                        growth_rate=growth_rate,
-                    )
+                    for g in param_groups:
+                        g.update({
+                            "no_prox": no_prox,
+                            "eps": epsilon,
+                            "d0": d0,
+                            "log_every": args.log_step,
+                            "growth_rate": growth_rate,
+                        })
+                    optimizer = opt_class(param_groups)
                 elif optimizer_name == "dadapt_lion":
                     opt_class = dadaptation.DAdaptLion
-                    optimizer = opt_class(
-                        itertools.chain(parameters),
-                        lr=curr_lr,
-                        betas=(betas[0], betas[1]),
-                        weight_decay=weight_decay,
-                        d0=d0,
-                        log_every=args.log_step,
-                    )
+                    for g in param_groups:
+                        g.update({
+                            "eps": epsilon,
+                            "d0": d0,
+                            "log_every": args.log_step,
+                        })
+                    optimizer = opt_class(param_groups)
                 elif optimizer_name == "dadapt_sgd":
                     opt_class = dadaptation.DAdaptSGD
-                    optimizer = opt_class(
-                        itertools.chain(parameters),
-                        lr=curr_lr,
-                        momentum=momentum,
-                        weight_decay=weight_decay,
-                        d0=d0,
-                        log_every=args.log_step,
-                        growth_rate=growth_rate,
-                    )
+                    for g in param_groups:
+                        g.update({
+                            "momentum": momentum,
+                            "d0": d0,
+                            "log_every": args.log_step,
+                            "growth_rate": growth_rate,
+                        })
+                    optimizer = opt_class(param_groups)
             elif optimizer_name == "adacoor":
                 from optimizer.adacoor import AdaCoor
 
                 opt_class = AdaCoor
-                optimizer = opt_class(
-                    itertools.chain(parameters),
-                    eps=epsilon
-                )
+                for g in param_groups:
+                    g.update({
+                        "eps": epsilon,
+                    })
+                optimizer = opt_class(param_groups)
 
         if not optimizer:
-            optimizer = opt_class(
-                itertools.chain(parameters),
-                lr=curr_lr,
-                betas=(betas[0], betas[1]),
-                eps=epsilon,
-                weight_decay=weight_decay,
-                amsgrad=False,
-            )
+            for g in param_groups:
+                g.update({
+                    "eps": epsilon,
+                    "amsgrad": False,
+                })
+            optimizer = opt_class(param_groups)
 
         log_optimizer(label, optimizer, betas, epsilon, weight_decay, curr_lr)
         return optimizer
 
     def _apply_unet_freeze(self, unet: UNet2DConditionModel) -> chain[torch.nn.Parameter]:
         if not self.unet_freeze:
-            return itertools.chain(unet.parameters())
+            return itertools.chain(unet.named_parameters())
         def should_train(name: str) -> bool:
             # Train Time Embeddings
             if name.startswith("time_embedding."):
@@ -606,7 +617,7 @@ class EveryDreamOptimizer:
             if not should_train(n):
                 p.requires_grad = False
 
-        return itertools.chain([p for n, p in unet.named_parameters() if should_train(n)])
+        return itertools.chain([p for p in unet.named_parameters() if should_train(p[0])])
 
 
     def _apply_text_encoder_freeze(self, text_encoder) -> chain[torch.nn.Parameter]:
@@ -644,20 +655,20 @@ class EveryDreamOptimizer:
         parameters = itertools.chain([])
 
         if unfreeze_embeddings:
-            parameters = itertools.chain(parameters, text_encoder.text_model.embeddings.parameters())
+            parameters = itertools.chain(parameters, text_encoder.text_model.embeddings.named_parameters())
         else:
             print(" ❄️ freezing embeddings")
             #for p in text_encoder.text_model.embeddings.parameters():
             #    p.requires_grad = False
 
         if unfreeze_last_n_layers >= num_layers:
-            parameters = itertools.chain(parameters, text_encoder.text_model.encoder.layers.parameters())
+            parameters = itertools.chain(parameters, text_encoder.text_model.encoder.layers.named_parameters())
         else:
             # freeze the specified CLIP text encoder layers
             layers = text_encoder.text_model.encoder.layers
             first_layer_to_unfreeze = num_layers - unfreeze_last_n_layers
             print(f" ❄️ freezing text encoder layers 1-{first_layer_to_unfreeze} out of {num_layers} layers total")
-            parameters = itertools.chain(parameters, layers[first_layer_to_unfreeze:].parameters())
+            parameters = itertools.chain(parameters, layers[first_layer_to_unfreeze:].named_parameters())
             for l in layers[:first_layer_to_unfreeze]:
                 for p in l.parameters():
                     p.requires_grad = False
@@ -692,7 +703,7 @@ class EveryDreamOptimizer:
                     target_modules=target_modules
                 )
                 text_encoder.add_adapter(text_lora_config)
-            text_encoder_params = list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
+            text_encoder_params = list(filter(lambda p: p[1].requires_grad, text_encoder.named_parameters()))
 
         if args.disable_unet_training:
             unet_params = []
@@ -705,7 +716,7 @@ class EveryDreamOptimizer:
                     target_modules=["to_k", "to_q", "to_v", "to_out.0"],
                 )
                 unet.add_adapter(unet_lora_config)
-            unet_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
+            unet_params = list(filter(lambda p: p[1].requires_grad, unet.named_parameters()))
 
         return text_encoder_params, unet_params
 
@@ -800,3 +811,21 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
             return decay / lr_init  # as LambdaLR multiplies by lr_init
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def _extract_attention_parameter_group(parameters: list[tuple[str, torch.nn.Parameter]]) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    """
+    Extracts the attention parameters from the given parameters list.
+    Returns a tuple of two lists: regular parameters and attention parameters.
+    """
+    regular_group = []
+    attention_group = []
+
+    for name, param in parameters:
+        name = name.lower()
+        if ("attn" in name or "attention" in name) and any(qk in name for qk in ["to_q", "to_k", "query", "key"]):
+            attention_group.append((name, param))
+        else:
+            regular_group.append((name, param))
+
+    return regular_group, attention_group

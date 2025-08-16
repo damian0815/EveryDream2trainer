@@ -1,3 +1,5 @@
+import traceback
+
 import yaml
 import json
 
@@ -77,6 +79,8 @@ class ImageConfig:
 
     @classmethod
     def from_dict(cls, data: dict):
+        if dict is None:
+            raise ValueError("Cannot parse ImageConfig from None")
         # Parse standard yaml tag file (with options)
         parsed_cfg = ImageConfig(
             main_prompts=safe_set(data.get("main_prompt")), 
@@ -130,17 +134,22 @@ class ImageConfig:
 
     @classmethod    
     def from_file(cls, file: str):
-        match ext(file):
-            case '.jpg' | '.jpeg' | '.png' | '.bmp' | '.webp' | '.jfif':
-                return ImageConfig(image=file)
-            case ".json":
-                return ImageConfig.from_dict(json.load(read_text(file)))
-            case ".yaml" | ".yml":
-                return ImageConfig.from_dict(yaml.safe_load(read_text(file)))
-            case ".txt" | ".caption":
-                return ImageConfig.from_caption_text(read_text(file))
-            case _:
-                return logging.warning(" *** Unrecognized config extension {ext}")
+        try:
+            match ext(file):
+                case '.jpg' | '.jpeg' | '.png' | '.bmp' | '.webp' | '.jfif':
+                    return ImageConfig(image=file)
+                case ".json":
+                    return ImageConfig.from_dict(json.load(read_text(file)))
+                case ".yaml" | ".yml":
+                    return ImageConfig.from_dict(yaml.safe_load(read_text(file)))
+                case ".txt" | ".caption":
+                    return ImageConfig.from_caption_text(read_text(file))
+                case _:
+                    logging.warning(" *** Unrecognized config extension {ext}")
+                    return None
+        except Exception as e:
+            traceback.print_exc()
+            raise RuntimeError(f" *** Error parsing prompt/config file (is it empty?): {file}: {repr(e)}")
 
     @classmethod
     def parse(cls, input):

@@ -55,7 +55,9 @@ from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
 from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
     get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
-    get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, get_multirank_stratified_random_timesteps
+    get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
+    get_multirank_stratified_random_timesteps
+from optimizer.attention_activation_control import ActivationLogger
 from model.training_model import EveryDreamTrainingState, save_model, save_model_lora, find_last_checkpoint, load_model, \
     get_use_ema_decay_training, TrainingVariables, TrainingModel
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
