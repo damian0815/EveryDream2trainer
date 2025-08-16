@@ -15,6 +15,7 @@ from data.image_train_item import ImageTrainItem
 from loss import vae_preview
 from model.training_model import TrainingModel, TrainingVariables
 
+from optimizer.attention_activation_control import ActivationLogger
 
 @dataclasses.dataclass
 class LogData:
@@ -29,7 +30,9 @@ class LogData:
     images_per_sec = []
     images_per_sec_log_step = []
 
-def do_log_step(args, ed_optimizer, log_data, log_folder, log_writer, model: TrainingModel, tv: TrainingVariables):
+    attention_activation_logger: ActivationLogger = None
+
+def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, model: TrainingModel, tv: TrainingVariables):
     global_step = tv.global_step
     lr_unet = ed_optimizer.get_unet_lr()
     lr_textenc = ed_optimizer.get_textenc_lr()
@@ -119,6 +122,10 @@ def do_log_step(args, ed_optimizer, log_data, log_folder, log_writer, model: Tra
     log_data.loss_log_step = []
     log_data.loss_log_step_cd = []
     log_data.loss_log_step_non_cd = []
+
+    # log activations every 4th logging action
+    if log_data.attention_activation_logger and (global_step + 1) % (args.log_step * 4) == 0:
+        log_data.attention_activation_logger.log_to_tensorboard(global_step=global_step)
 
     return logs
 

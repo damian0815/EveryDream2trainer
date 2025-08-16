@@ -77,6 +77,8 @@ def convert_to_hf(ckpt_path):
         return ckpt_path, is_sd1attn, yaml
 
 
+
+
 @dataclass
 class TrainingVariables:
 

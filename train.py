@@ -657,6 +657,7 @@ def main(args):
     append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
 
     log_data = LogData()
+    log_data.attention_activation_logger = ActivationLogger(model=model.unet, writer=log_writer)
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
