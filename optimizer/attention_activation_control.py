@@ -8,10 +8,8 @@ import re
 class ActivationLogger:
     """Simple hook-based activation magnitude logger for UNet attention layers"""
 
-    def __init__(self, model, writer: SummaryWriter, log_every=100):
+    def __init__(self, model, writer: SummaryWriter):
         self.writer = writer
-        self.log_every = log_every
-        self.step = 0
         self.hooks = []
         self.activations = defaultdict(list)
 
@@ -42,22 +40,21 @@ class ActivationLogger:
 
             self.activations[name].append((mean, min, max))
 
-    def log_to_tensorboard(self):
+    def log_to_tensorboard(self, global_step):
         """Log accumulated activations to tensorboard"""
-        if self.step % self.log_every == 0 and self.activations:
+        if self.activations:
             for name, mags in self.activations.items():
                 if mags:
                     for index, label in enumerate(['mean', 'min', 'max']):
                         values = [mag[index] for mag in mags]
                         avg = sum(values) / len(mags)
                         self.writer.add_scalar(
-                            f"activations/{label}_{name}_magnitude", avg, self.step
+                            f"activations-{label}/{name}", avg, global_step=global_step
                         )
 
             # Clear accumulated activations
             self.activations.clear()
 
-        self.step += 1
 
     def cleanup(self):
         """Remove all hooks"""

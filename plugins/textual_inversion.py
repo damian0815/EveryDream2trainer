@@ -192,7 +192,7 @@ class TextualInversionPlugin(BasePlugin):
     def add_parameters(self, text_encoder_parameters, unet_parameters):
         if self.lerp_target_weights is None:
             text_encoder_parameters = itertools.chain(text_encoder_parameters,
-                    [self.embedding_offsets_individual])
+                    [('te_offset', self.embedding_offsets_individual)])
         return text_encoder_parameters, unet_parameters
 
     def on_step_end(self, **kwargs):

@@ -1780,7 +1780,9 @@ def main(args):
                         loss_log_step_cd = []
                         loss_log_step_non_cd = []
 
-                        attention_activation_logger.log_to_tensorboard()
+                        # log activations every 4th logging action
+                        if (global_step+1) % (args.log_step*4) == 0:
+                            attention_activation_logger.log_to_tensorboard(global_step=global_step)
 
                         append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                         torch.cuda.empty_cache()
