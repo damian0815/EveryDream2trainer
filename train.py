@@ -69,6 +69,7 @@ from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
     get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
     get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
     get_multirank_stratified_random_timesteps
+from optimizer.attention_activation_control import ActivationLogger
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.huggingface_downloader import try_download_model_from_hf
@@ -1239,6 +1240,7 @@ def main(args):
             tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
 
     tv = TrainingVariables()
+    attention_activation_logger = ActivationLogger(unet, log_writer)
 
     try:
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
@@ -1777,6 +1779,8 @@ def main(args):
                         loss_log_step = []
                         loss_log_step_cd = []
                         loss_log_step_non_cd = []
+
+                        attention_activation_logger.log_to_tensorboard()
 
                         append_epoch_log(global_step=global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer, **logs)
                         torch.cuda.empty_cache()
