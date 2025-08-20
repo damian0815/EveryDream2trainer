@@ -7,14 +7,25 @@ from dataclasses import dataclass, field
 import safetensors.torch
 import torch
 from colorama import Fore, Style
-from diffusers import PNDMScheduler, DDIMScheduler, DDPMScheduler, SchedulerMixin, ConfigMixin, UNet2DConditionModel, \
-    AutoencoderKL, StableDiffusionPipeline
+from diffusers import (
+    PNDMScheduler,
+    DDIMScheduler,
+    DDPMScheduler,
+    SchedulerMixin,
+    ConfigMixin,
+    UNet2DConditionModel,
+    AutoencoderKL,
+    StableDiffusionPipeline,
+    StableDiffusionXLPipeline,
+    AutoModel,
+)
 from diffusers.utils import convert_state_dict_to_diffusers
 from transformers import CLIPTextModel, CLIPTokenizer
 from peft.utils import get_peft_model_state_dict
 
 from data.every_dream import EveryDreamBatch
 from flow_match_model import TrainFlowMatchScheduler
+from notebooks.flow_matching import encoder_hidden_states
 from optimizer.optimizers import EveryDreamOptimizer
 from plugins.plugins import PluginRunner
 from utils.convert_diff_to_ckpt import convert as converter
@@ -22,24 +33,23 @@ from utils.huggingface_downloader import try_download_model_from_hf
 from utils.unet_utils import check_for_sd1_attn
 
 
-def get_training_noise_scheduler(train_sampler: str, model_root_folder, trained_betas=None, rescale_betas_zero_snr=False):
+def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=None, rescale_betas_zero_snr=False):
     if train_sampler.lower() == "pndm":
         logging.info(f" * Using PNDM noise scheduler for training: {train_sampler}")
-        noise_scheduler = PNDMScheduler.from_pretrained(model_root_folder,
-                                                        subfolder="scheduler",
+        noise_scheduler = PNDMScheduler.from_config(scheduler.config,
                                                         trained_betas=trained_betas,
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "ddim":
         logging.info(f" * Using DDIM noise scheduler for training: {train_sampler}")
-        noise_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
+        noise_scheduler = DDIMScheduler.from_config(scheduler.config,
                                                         trained_betas=trained_betas,
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "flow-matching":
         logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        noise_scheduler = TrainFlowMatchScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
+        noise_scheduler = TrainFlowMatchScheduler.from_config(scheduler.config)
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
-        noise_scheduler = DDPMScheduler.from_pretrained(model_root_folder, subfolder="scheduler",
+        noise_scheduler = DDPMScheduler.from_config(scheduler.config,
                                                         trained_betas=trained_betas,
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     return noise_scheduler
@@ -75,8 +85,6 @@ def convert_to_hf(ckpt_path):
     else:
         is_sd1attn, yaml = get_attn_yaml(ckpt_path)
         return ckpt_path, is_sd1attn, yaml
-
-
 
 
 @dataclass
@@ -131,8 +139,14 @@ class TrainingVariables:
         self.accumulated_timesteps = []
 
 
+
+
 @dataclass
 class TrainingModel:
+
+    @property
+    def is_sdxl(self):
+        return self.text_encoder_2 is not None
 
     @property
     def is_sd1attn(self):
@@ -144,13 +158,51 @@ class TrainingModel:
 
     noise_scheduler: SchedulerMixin|ConfigMixin
     text_encoder: CLIPTextModel
-    text_encoder_ema: torch.nn.Module|None
+    text_encoder_2: CLIPTextModel|None
     tokenizer: CLIPTokenizer
+    tokenizer_2: CLIPTokenizer|None
     unet: UNet2DConditionModel
-    unet_ema: UNet2DConditionModel|None
     vae: AutoencoderKL
 
     yaml: str|None
+
+
+@dataclass
+class Conditioning:
+    text_encoder_hidden_states: torch.Tensor
+
+    text_encoder_2_pooled_embeds: torch.Tensor|None
+    add_time_ids: torch.Tensor|None
+
+    @property
+    def added_cond_kwargs(self) -> dict:
+        return {"text_embeds": self.text_encoder_2_pooled_embeds, "time_ids": self.add_time_ids}
+
+    @staticmethod
+    def sd12_conditioning(text_encoder_hidden_states: torch.Tensor):
+        return Conditioning(text_encoder_hidden_states=text_encoder_hidden_states)
+
+    @staticmethod
+    def sdxl_conditioning(text_encoder_hidden_states: torch.Tensor,
+                          text_encoder_2_pooled_embeds: torch.Tensor,
+                          original_size: torch.Tensor,
+                          crops_coords_top_left: torch.Tensor,
+                          target_size: torch.Tensor,
+                          model: TrainingModel):
+
+        add_time_ids = _get_add_time_ids(
+            unet=model.unet,
+            original_size=original_size,
+            crops_coords_top_left=crops_coords_top_left,
+            target_size=target_size,
+            dtype=text_encoder_hidden_states.dtype,
+            text_encoder_projection_dim=model.text_encoder_2.config.projection_dim
+        )
+
+        return Conditioning(text_encoder_hidden_states=text_encoder_hidden_states,
+                            text_encoder_2_pooled_embeds=text_encoder_2_pooled_embeds,
+                            add_time_ids=add_time_ids)
+
 
 
 @dataclass
@@ -223,27 +275,18 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if plugin_runner is not None:
         plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
 
-    if ed_state.model.unet_ema is not None or ed_state.model.text_encoder_ema is not None:
-        pipeline_ema = StableDiffusionPipeline(
+    if ed_state.model.is_sdxl:
+        pipeline = StableDiffusionXLPipeline(
             vae=ed_state.model.vae,
-            text_encoder=ed_state.model.text_encoder_ema,
+            text_encoder=ed_state.model.text_encoder,
+            text_encoder_2=ed_state.model.text_encoder_2,
             tokenizer=ed_state.model.tokenizer,
-            unet=ed_state.model.unet_ema,
+            tokenizer_2=ed_state.model.tokenizer_2,
+            unet=ed_state.model.unet,
             scheduler=ed_state.model.noise_scheduler,
-            safety_checker=None, # save vram
-            requires_safety_checker=None, # avoid nag
-            feature_extractor=None, # must be none of no safety checker
+            feature_extractor=None,  # must be none of no safety checker
+            add_watermarker=None
         )
-
-        diffusers_model_path = save_path + "_ema"
-        logging.info(f" * Saving diffusers EMA model to {diffusers_model_path}")
-        pipeline_ema.save_pretrained(diffusers_model_path)
-
-        if save_ckpt:
-            sd_ckpt_path_ema = f"{os.path.basename(save_path)}_ema.safetensors"
-
-            save_ckpt_file(diffusers_model_path, sd_ckpt_path_ema)
-
     else:
         pipeline = StableDiffusionPipeline(
             vae=ed_state.model.vae,
@@ -256,18 +299,17 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
             feature_extractor=None,  # must be none of no safety checker
         )
 
+    diffusers_model_path = save_path
+    logging.info(f" * Saving diffusers model to {diffusers_model_path}")
+    pipeline.save_pretrained(diffusers_model_path)
 
-        diffusers_model_path = save_path
-        logging.info(f" * Saving diffusers model to {diffusers_model_path}")
-        pipeline.save_pretrained(diffusers_model_path)
+    if save_ckpt:
+        sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
+        save_ckpt_file(diffusers_model_path, sd_ckpt_path)
 
-        if save_ckpt:
-            sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
-            save_ckpt_file(diffusers_model_path, sd_ckpt_path)
-
-        if save_optimizer_flag:
-            logging.info(f" Saving optimizer state to {save_path}")
-            ed_state.optimizer.save(save_path)
+    if save_optimizer_flag:
+        logging.info(f" Saving optimizer state to {save_path}")
+        ed_state.optimizer.save(save_path)
 
 
 @torch.no_grad()
@@ -309,11 +351,6 @@ def find_last_checkpoint(logdir, is_ema=False):
         for file in files:
             if os.path.basename(file) == "model_index.json":
 
-                if is_ema and (not root.endswith("_ema")):
-                    continue
-                elif (not is_ema) and root.endswith("_ema"):
-                    continue
-
                 curr_date = os.path.getmtime(os.path.join(root,file))
 
                 if last_date is None or curr_date > last_date:
@@ -328,6 +365,12 @@ def find_last_checkpoint(logdir, is_ema=False):
     return last_ckpt
 
 
+def _check_pipe(pipe):
+    if type(pipe) is StableDiffusionXLPipeline:
+        if pipe.unet.config.time_cond_proj_dim is not None:
+            logging.warning("** Pipeline config specifies time_cond_proj_dim but this will be ignored")
+
+
 def load_model(args) -> TrainingModel:
     use_ema_dacay_training = get_use_ema_decay_training(args)
 
@@ -336,10 +379,19 @@ def load_model(args) -> TrainingModel:
     hf_cache_path = get_hf_ckpt_cache_path(args.resume_ckpt)
     if os.path.exists(hf_cache_path) or os.path.exists(args.resume_ckpt):
         model_root_folder, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
-        pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_pretrained(args.resume_ckpt)
+        pipe: StableDiffusionPipeline|StableDiffusionXLPipeline = AutoModel.from_pretrained(args.resume_ckpt)
+        _check_pipe(pipe)
         if args.lora_resume:
             pipe.load_lora_weights(args.lora_resume)
+        scheduler = pipe.scheduler
         text_encoder = pipe.text_encoder
+        tokenizer = pipe.tokenizer
+        if hasattr(pipe, 'text_encoder_2'):
+            text_encoder_2 = pipe.text_encoder_2
+            tokenizer_2 = pipe.tokenizer_2
+        else:
+            text_encoder_2 = None
+            tokenizer_2 = None
         vae = pipe.vae
         unet = pipe.unet
         del pipe
@@ -352,52 +404,20 @@ def load_model(args) -> TrainingModel:
             raise ValueError(
                 f"No local file/folder for {args.resume_ckpt}, and no matching huggingface.co repo could be downloaded")
         pipe, model_root_folder, is_sd1attn, yaml = downloaded
+        _check_pipe(pipe)
+        scheduler = pipe.scheduler
         text_encoder = pipe.text_encoder
+        tokenizer = pipe.tokenizer
+        if hasattr(pipe, 'text_encoder_2'):
+            text_encoder_2 = pipe.text_encoder_2
+            tokenizer_2 = pipe.tokenizer_2
+        else:
+            text_encoder_2 = None
+            tokenizer_2 = None
         vae = pipe.vae
         unet = pipe.unet
         del pipe
 
-    text_encoder_ema = None
-    unet_ema = None
-    if use_ema_dacay_training and args.ema_resume_model:
-        print(f"Loading EMA model: {args.ema_resume_model}")
-        hf_cache_path = get_hf_ckpt_cache_path(args.ema_resume_model)
-
-        if os.path.exists(hf_cache_path) or os.path.exists(args.ema_resume_model):
-            ema_model_root_folder, ema_is_sd1attn, ema_yaml = convert_to_hf(args.resume_ckpt)
-            text_encoder_ema = CLIPTextModel.from_pretrained(ema_model_root_folder, subfolder="text_encoder")
-            unet_ema = UNet2DConditionModel.from_pretrained(ema_model_root_folder, subfolder="unet")
-        else:
-            # try to download from HF using ema_resume_model as a repo id
-            ema_downloaded = try_download_model_from_hf(repo_id=args.ema_resume_model)
-            if ema_downloaded is None:
-                raise ValueError(
-                    f"No local file/folder for ema_resume_model {args.ema_resume_model}, and no matching huggingface.co repo could be downloaded")
-            ema_pipe, ema_model_root_folder, ema_is_sd1attn, ema_yaml = ema_downloaded
-            text_encoder_ema = ema_pipe.text_encoder
-            unet_ema = ema_pipe.unet
-            del ema_pipe
-
-        # Make sure EMA model is on proper device, and memory released if moved
-        def release_memory(model_to_delete, original_device):
-            del model_to_delete
-            gc.collect()
-
-            if 'cuda' in original_device.type:
-                torch.cuda.empty_cache()
-        unet_ema_current_device = next(unet_ema.parameters()).device
-        ema_device = torch.device(args.ema_device)
-        if ema_device != unet_ema_current_device:
-            unet_ema_on_wrong_device = unet_ema
-            unet_ema = unet_ema.to(ema_device)
-            release_memory(unet_ema_on_wrong_device, unet_ema_current_device)
-
-        # Make sure EMA model is on proper device, and memory released if moved
-        text_encoder_ema_current_device = next(text_encoder_ema.parameters()).device
-        if ema_device != text_encoder_ema_current_device:
-            text_encoder_ema_on_wrong_device = text_encoder_ema
-            text_encoder_ema = text_encoder_ema.to(ema_device)
-            release_memory(text_encoder_ema_on_wrong_device, text_encoder_ema_current_device)
     if args.enable_zero_terminal_snr:
         if args.train_sampler == "flow-matching":
             raise ValueError("can't use ZTSNR with flow matching")
@@ -410,16 +430,15 @@ def load_model(args) -> TrainingModel:
                                                        # True
                                                        )
     else:
-        noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder)
-    tokenizer = CLIPTokenizer.from_pretrained(model_root_folder, subfolder="tokenizer", use_fast=False)
+        noise_scheduler = get_training_noise_scheduler(scheduler, args.train_sampler)
     # Construct TrainingModel instance after loading model components
     model_being_trained = TrainingModel(
         noise_scheduler=noise_scheduler,
         text_encoder=text_encoder,
-        text_encoder_ema=text_encoder_ema,
+        text_encoder_2=text_encoder_2,
         tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
         unet=unet,
-        unet_ema=unet_ema,
         vae=vae,
         yaml=yaml
     )
@@ -429,3 +448,23 @@ def load_model(args) -> TrainingModel:
 def get_use_ema_decay_training(args):
     use_ema_dacay_training = (args.ema_decay_rate != None) or (args.ema_strength_target != None)
     return use_ema_dacay_training
+
+
+# from SDXLPipeline
+def _get_add_time_ids(
+        unet, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
+    ):
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+
+        passed_add_embed_dim = (
+            unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+        )
+        expected_add_embed_dim = unet.add_embedding.linear_1.in_features
+
+        if expected_add_embed_dim != passed_add_embed_dim:
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+            )
+
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        return add_time_ids

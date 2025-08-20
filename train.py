@@ -40,8 +40,8 @@ from compel.embeddings_provider import SplitLongTextMode
 from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL
-#from diffusers.models import AttentionBlock
-#from accelerate import Accelerator
+# from diffusers.models import AttentionBlock
+# from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 import wandb
@@ -58,8 +58,17 @@ from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
     get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
     get_multirank_stratified_random_timesteps
 from optimizer.attention_activation_control import ActivationLogger
-from model.training_model import EveryDreamTrainingState, save_model, save_model_lora, find_last_checkpoint, load_model, \
-    get_use_ema_decay_training, TrainingVariables, TrainingModel
+from model.training_model import (
+    EveryDreamTrainingState,
+    save_model,
+    save_model_lora,
+    find_last_checkpoint,
+    load_model,
+    get_use_ema_decay_training,
+    TrainingVariables,
+    TrainingModel,
+    Conditioning,
+)
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
@@ -190,6 +199,9 @@ def setup_args(args):
         args.rated_dataset_target_dropout_percent = min(max(args.rated_dataset_target_dropout_percent, 0), 100)
 
         logging.info(logging.info(f"{Fore.CYAN} * Activating rated images learning with a target rate of {args.rated_dataset_target_dropout_percent}% {Style.RESET_ALL}"))
+
+    if type(args.resolution) is not list:
+        args.resolution = [args.resolution]
 
     return args
 
@@ -353,15 +365,18 @@ def main(args):
         gpu = GPU(device)
         torch.backends.cudnn.benchmark = True
     else:
-        logging.warning("*** Running on CPU. This is for testing loading/config parsing code only.")
-        device = 'cpu'
+        if torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            logging.warning("*** Running on CPU. This is for testing loading/config parsing code only.")
+            device = 'cpu'
         gpu = None
 
     # fix a weird issue with dataloader?
     # https://github.com/pytorch/pytorch/issues/973#issuecomment-459398189
     torch.multiprocessing.set_sharing_strategy("file_system")
 
-    #log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
+    # log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
 
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
@@ -395,6 +410,8 @@ def main(args):
     if args.gradient_checkpointing:
         model.unet.enable_gradient_checkpointing()
         model.text_encoder.gradient_checkpointing_enable()
+        if model.text_encoder_2:
+            model.text_encoder_2.gradient_checkpointing_enable()
 
     if args.attn_type == "xformers":
         if (args.amp and model.is_sd1attn) or (not model.is_sd1attn):
@@ -411,13 +428,18 @@ def main(args):
     else:
         logging.info("* Using SDP attention *")
 
-    model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else torch.float32)
-    model.unet = model.unet.to(device, dtype=torch.float32)
+    train_dtype = torch.float16 if device=='mps' else torch.float32
+
+    model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else train_dtype)
+    model.unet = model.unet.to(device, dtype=train_dtype)
     if args.disable_textenc_training and args.amp:
         model.text_encoder = model.text_encoder.to(device, dtype=torch.float16)
+        if model.text_encoder_2:
+            model.text_encoder_2 = model.text_encoder_2.to(device, dtype=torch.float16)
     else:
-        model.text_encoder = model.text_encoder.to(device, dtype=torch.float32)
-
+        model.text_encoder = model.text_encoder.to(device, dtype=train_dtype)
+        if model.text_encoder_2:
+            model.text_encoder_2 = model.text_encoder_2.to(device, dtype=train_dtype)
 
     if get_use_ema_decay_training(args):
         if model.unet_ema is None:
@@ -449,10 +471,10 @@ def main(args):
     try:
         print()
         # currently broken on most systems?
-        #unet = torch.compile(unet, mode="max-autotune")
-        #text_encoder = torch.compile(text_encoder, mode="max-autotune")
-        #vae = torch.compile(vae, mode="max-autotune")
-        #logging.info("Successfully compiled models")
+        # unet = torch.compile(unet, mode="max-autotune")
+        # text_encoder = torch.compile(text_encoder, mode="max-autotune")
+        # vae = torch.compile(vae, mode="max-autotune")
+        # logging.info("Successfully compiled models")
     except Exception as ex:
         logging.warning(f"Failed to compile model, continuing anyway, ex: {ex}")
         pass
@@ -547,7 +569,6 @@ def main(args):
     torch.cuda.benchmark = False
 
     epoch_len = math.ceil(len(train_batch) / args.batch_size)
-
 
     if get_use_ema_decay_training(args):
         args.ema_update_interval = args.ema_update_interval * args.grad_accum
@@ -670,65 +691,21 @@ def main(args):
                                        for v in l]
             sample_generator.update_random_captions(flattened_captions_dict)
 
-            models_info = []
+            extra_info: str = ""
+            torch.cuda.empty_cache()
 
-            if (args.ema_decay_rate is None) or args.ema_sample_nonema_model:
-                models_info.append({"is_ema": False, "swap_required": False})
+            # Pass model instead of individual fields
+            inference_pipe = sample_generator.create_inference_pipe(
+                model_being_trained=model,
+                diffusers_scheduler_config=model.noise_scheduler.config
+            ).to(device)
+            sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
-            if (args.ema_decay_rate is not None) and args.ema_sample_ema_model:
-                models_info.append({"is_ema": True, "swap_required": torch.device(args.ema_device) != device})
+            # Cleanup
+            del inference_pipe
 
-            for model_info in models_info:
-
-                extra_info: str = ""
-
-                if model_info["is_ema"]:
-                    current_unet, current_text_encoder = model.unet_ema, model.text_encoder_ema
-                    extra_info = "_ema"
-                else:
-                    current_unet, current_text_encoder = model.unet, model.text_encoder
-
-                torch.cuda.empty_cache()
-
-
-                if model_info["swap_required"]:
-                    with torch.no_grad():
-                        unet_unloaded = model.unet.to(args.ema_device)
-                        del model.unet
-                        text_encoder_unloaded = model.text_encoder.to(args.ema_device)
-                        del model.text_encoder
-
-                        current_unet = model.unet_ema.to(device)
-                        del model.unet_ema
-                        current_text_encoder = model.text_encoder_ema.to(device)
-                        del model.text_encoder_ema
-                        gc.collect()
-                        torch.cuda.empty_cache()
-
-                # Pass model instead of individual fields
-                inference_pipe = sample_generator.create_inference_pipe(
-                    model_being_trained=model,
-                    diffusers_scheduler_config=model.noise_scheduler.config
-                ).to(device)
-                sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
-
-                # Cleanup
-                del inference_pipe
-
-                if model_info["swap_required"]:
-                    with torch.no_grad():
-                        model.unet = unet_unloaded.to(device)
-                        del unet_unloaded
-                        model.text_encoder = text_encoder_unloaded.to(device)
-                        del text_encoder_unloaded
-
-                        model.unet_ema = current_unet.to(args.ema_device)
-                        del current_unet
-                        model.text_encoder_ema = current_text_encoder.to(args.ema_device)
-                        del current_text_encoder
-
-                gc.collect()
-                torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def make_save_path(epoch, global_step, prepend=""):
         basename = f"{prepend}{args.project_name}"
@@ -857,7 +834,7 @@ def main(args):
                                                     batch=full_batch,
                                                     ed_state=make_current_ed_state())
 
-                    #for k in full_batch['captions'].keys():
+                    # for k in full_batch['captions'].keys():
                     #    if any(c is not None and len(c.strip()) == 0 for c in full_batch['captions'][k]):
                     #        print('a caption was already empty before cond dropout. paths:', full_batch['pathnames'], 'captions:', full_batch['captions'])
 
@@ -888,7 +865,6 @@ def main(args):
                         else:
                             everything_contrastive_learning_p = args.everything_contrastive_learning_p
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
-
 
                     timesteps = _get_step_timesteps(full_batch, model, tv, args)
 
@@ -947,13 +923,13 @@ def main(args):
                                                                        initial_value=args.contrastive_learning_negative_loss_scale,
                                                                        final_value=0,
                                                                        alpha=args.contrastive_learning_curriculum_alpha)
-                            #print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
+                            # print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
 
                         loss_scale = batch["loss_scale"]
                         assert loss_scale.shape[0] == batch["image"].shape[0]
                         image_shape = batch["image"].shape
                         reference_image_size = 512*512
-                        #loss_scale = loss_scale.float() * (reference_image_size / image_size)
+                        # loss_scale = loss_scale.float() * (reference_image_size / image_size)
                         batch_resolution = _get_best_match_resolution(args.resolution, image_size)
 
                         assert type(batch["captions"]) is dict
@@ -1004,30 +980,56 @@ def main(args):
                             del latents_slices
 
                         for caption_variant in caption_variants:
+
+                            # todo: move to Conditioning
+                            # todo: -----
                             caption_str = []
                             tokens = []
+                            tokens_2 = []
                             for i in range(batch_size):
                                 this_caption_str = batch["captions"][caption_variant][i]
-                                this_tokens = batch["tokens"][caption_variant][i]
-                                if this_caption_str is None:
+                                if this_caption_str is not None:
+                                    tokens_variant = caption_variant
+                                else:
                                     # pick a random caption variant to replace it
-                                    non_none_variant = train_batch.random_instance.choice([k for k, v in batch["captions"].items()
+                                    tokens_variant = train_batch.random_instance.choice([k for k, v in batch["captions"].items()
                                                         if v[i] is not None])
-                                    this_caption_str = batch["captions"][non_none_variant][i]
-                                    this_tokens = batch["tokens"][non_none_variant][i]
+                                    this_caption_str = batch["captions"][tokens_variant][i]
+
+                                this_tokens = batch["tokens"][tokens_variant][i]
+
                                 assert this_caption_str is not None
-                                assert this_tokens is not None
                                 caption_str.append(this_caption_str)
+
+                                assert this_tokens is not None
                                 tokens.append(this_tokens)
+
+                                if model.is_sdxl:
+                                    this_tokens_2 = batch["tokens_2"][tokens_variant][i]
+                                    assert this_tokens_2 is not None
+                                    tokens_2.append(this_tokens_2)
 
                             tokens = torch.stack(tokens)
                             with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
-                                encoder_hidden_states = _encode_caption_tokens(tokens, model.text_encoder,
-                                                                           clip_skip=args.clip_skip,
-                                                                           embedding_perturbation=args.embedding_perturbation,
-                                                                           compel=compel,
-                                                                           caption_strings=caption_str
-                                                                        )
+                                encoder_hidden_states = _encode_caption_tokens(
+                                    tokens,
+                                    model.text_encoder,
+                                    clip_skip=args.clip_skip,
+                                    embedding_perturbation=args.embedding_perturbation,
+                                    compel=compel,
+                                    is_sdxl=model.is_sdxl,
+                                    caption_strings=caption_str,
+                                )
+                                if model.is_sdxl:
+                                    encoder_2_pooled_embeds = _encode_caption_tokens(tokens_2, model.text_encoder_2,
+                                                                                     clip_skip=args.clip_skip,
+                                                                                     embedding_perturbation=args.embeddiing_perturbation,
+                                                                                     compel=compel,
+                                                                                     caption_strings=caption_str,
+                                                                                     is_sdxl=model.is_sdxl,
+                                                                                     pooled_only=True)
+                            # todo: -----
+                            # todo: move to conditioning (end)
 
                             model_pred_all = []
                             model_pred_wrong_all = []
@@ -1045,7 +1047,7 @@ def main(args):
 
                             slices = list(get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size))
                             for slice_index, (slice_start, slice_end) in enumerate(slices):
-                                #print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
+                                # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                                 latents_slice = latents[slice_start:slice_end]
                                 encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
@@ -1055,9 +1057,27 @@ def main(args):
                                 else:
                                     teacher_mask_slice = teacher_mask[slice_start:slice_end]
 
+                                if model.is_sdxl:
+                                    encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
+                                    original_size_slice = original_size[slice_start:slice_end]
+                                    crop_coords_top_left_slice = crops_coords_top_left[slice_start:slice_end]
+                                    target_size_slice = target_size[slice_start:slice_end]
+                                    conditioning = Conditioning.sdxl_conditioning(
+                                        text_encoder_hidden_states=encoder_hidden_states_slice,
+                                        text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
+                                        original_size=original_size_slice,
+                                        crops_coords_top_left=crop_coords_top_left_slice,
+                                        target_size=target_size_slice,
+                                        model=model
+                                    )
+                                else:
+                                    conditioning = Conditioning.sd12_conditioning(
+                                        text_encoder_hidden_states=encoder_hidden_states_slice
+                                    )
+
                                 model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
                                     latents=latents_slice,
-                                    encoder_hidden_states=encoder_hidden_states_slice,
+                                    conditioning=conditioning,
                                     noise=noise_slice,
                                     timesteps=timesteps_slice,
                                     model=model,
@@ -1124,14 +1144,14 @@ def main(args):
                             ) or tv.interleaved_bs1_count is not None
                             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                                     tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
-                                #accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
+                                # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                                 _optimizer_backward(ed_optimizer, tv)
 
                             if should_step_optimizer:
                                 if tv.current_accumulated_backward_images_count == 0:
                                     print("Batch has 0 images, not stepping optimizer")
                                 else:
-                                    #print(f'\nstepping optimizer - current_accumulated_backward_images_count '
+                                    # print(f'\nstepping optimizer - current_accumulated_backward_images_count '
                                     #      f'{tv.current_accumulated_backward_images_count}, '
                                     #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
                                     tv.last_effective_batch_size = tv.current_accumulated_backward_images_count
@@ -1252,7 +1272,6 @@ def main(args):
                     logging.error(f"step {tv.global_step} failed. full_batch: {full_batch}, current batch: {current_batch}, training values: {dataclasses.asdict(tv)}")
                     raise
 
-
             steps_pbar.close()
 
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
@@ -1309,11 +1328,11 @@ def main(args):
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
         logging.error(f"{Fore.LIGHTYELLOW_EX}NOT attempting to save model{Style.RESET_ALL}")
-        #save_path = make_save_path(epoch, global_step, prepend="errored-")
-        #save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
+        # save_path = make_save_path(epoch, global_step, prepend="errored-")
+        # save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
         #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
         #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
-        #logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
+        # logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
         raise ex
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")

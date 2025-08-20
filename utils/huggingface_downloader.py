@@ -3,12 +3,12 @@ import os
 from typing import Optional, Tuple
 
 import huggingface_hub
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, AutoModel, StableDiffusionXLPipeline
 
 from utils.unet_utils import get_attn_yaml
 
 
-def try_download_model_from_hf(repo_id: str) -> Tuple[StableDiffusionPipeline, str, bool, str] | None:
+def try_download_model_from_hf(repo_id: str) -> Tuple[StableDiffusionPipeline|StableDiffusionXLPipeline, str|None, bool, str|None] | None:
     """
     Attempts to download files from the following subfolders under the given repo id:
     "text_encoder", "vae", "unet", "scheduler", "tokenizer".
@@ -27,10 +27,14 @@ def try_download_model_from_hf(repo_id: str) -> Tuple[StableDiffusionPipeline, s
     if model_info is None:
         return None
 
+    if model_info.config['diffusers']['_class_name'] == 'StableDiffusionXLPipeline':
+        pipe = StableDiffusionXLPipeline.from_pretrained(repo_id)
+        return pipe, None, False, None
+
     # load it to download it
     #pipe, cache_folder = StableDiffusionPipeline.from_pretrained(repo_id, return_cached_folder=True)
-    cache_folder = StableDiffusionPipeline.download(repo_id)
-    pipe = StableDiffusionPipeline.from_pretrained(repo_id)
+    cache_folder = AutoModel.download(repo_id)
+    pipe = AutoModel.from_pretrained(repo_id)
 
     is_sd1_attn, yaml_path = get_attn_yaml(cache_folder)
     print(f"* HuggingFace Downloaded model from {repo_id} to {cache_folder}.")

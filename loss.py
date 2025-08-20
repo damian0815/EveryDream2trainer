@@ -13,8 +13,11 @@ from scipy.stats import beta as sp_beta
 
 from diffusers import SchedulerMixin, ConfigMixin, UNet2DConditionModel
 
+from model.training_model import TrainingModel, Conditioning
+from notebooks.flow_matching import encoder_hidden_states
 
-#from train import pyramid_noise_like, compute_snr
+
+# from train import pyramid_noise_like, compute_snr
 
 def nibble_batch(batch, take_count):
     runt_size = batch['runt_size']
@@ -94,28 +97,11 @@ def get_timestep_curriculum_range(progress_01,
     return int(min_t), int(max_t)
 
 
-def get_encoder_hidden_states(text_encoder, cuda_caption, clip_skip, embedding_perturbation,
-                              compel: Compel=None, caption_strings: list[str]=None):
-    if compel is not None:
-        encoder_hidden_states = compel(caption_strings)
-    else:
-        encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
-        if clip_skip > 0:
-            encoder_hidden_states = text_encoder.text_model.final_layer_norm(
-                encoder_output.hidden_states[-clip_skip])
-        else:
-            encoder_hidden_states = encoder_output.last_hidden_state
-
-    # https://arxiv.org/pdf/2405.20494
-    perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
-    perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
-    encoder_hidden_states = encoder_hidden_states + perturbation_delta
-    return encoder_hidden_states
 
 def get_latents(image, vae, device, args):
     with torch.no_grad():
         with autocast(enabled=args.amp):
-            pixel_values = image.to(memory_format=torch.contiguous_format).to(device)
+            pixel_values = image.to(memory_format=torch.contiguous_format).to(device, dtype=vae.dtype)
             latents = vae.encode(pixel_values, return_dict=False)
         del pixel_values
         latents = latents[0].sample() * 0.18215
@@ -304,7 +290,8 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
 def _get_contrastive_v2_loss():
     pass
 
-def get_model_prediction_and_target(latents, encoder_hidden_states, noise, timesteps, model: TrainingModel,
+def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: torch.Tensor,
+                                    timesteps: torch.Tensor, model: TrainingModel,
                                      args=None, skip_contrastive: bool=False,
                                      teacher_unet: UNet2DConditionModel|None=None,
                                      teacher_mask: torch.Tensor|None=None
@@ -312,13 +299,21 @@ def get_model_prediction_and_target(latents, encoder_hidden_states, noise, times
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps,
                                                           args.latents_perturbation)
     with autocast(enabled=args.amp):
-        # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-        model_pred = model.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        if model.is_sdxl:
+            model_pred = model.unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=conditioning.text_encoder_hidden_states,
+                    added_cond_kwargs=conditioning.added_cond_kwargs
+            )
+        else:
+            # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
+            model_pred = model.unet(noisy_latents, timesteps, conditioning.text_encoder_hidden_states).sample
 
     with torch.no_grad():
         target = _get_target(latents, noise, model.noise_scheduler, timesteps)
         if teacher_unet is not None:
-            teacher_target = teacher_unet(noisy_latents.half(), timesteps, encoder_hidden_states.half()).sample.float()
+            teacher_target = teacher_unet(noisy_latents.half(), timesteps, conditioning.encoder_hidden_states.half()).sample.float()
             target = (
                 teacher_target *  teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
                 +   target     * ~teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
@@ -354,14 +349,27 @@ def get_model_prediction_and_target(latents, encoder_hidden_states, noise, times
 
 
 def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbation,
-                           compel: Compel=None, caption_strings: list[str]=None):
+                           compel: Compel=None, caption_strings: list[str]=None, is_sdxl=False, pooled_only=False):
     cuda_caption = tokens.to(text_encoder.device)
-    encoder_hidden_states = get_encoder_hidden_states(text_encoder,
-                                                      cuda_caption,
-                                                      clip_skip=clip_skip,
-                                                      embedding_perturbation=embedding_perturbation,
-                                                      compel=compel,
-                                                      caption_strings=caption_strings)
+    if compel is not None:
+        if pooled_only:
+            raise ValueError("cannot use Compel + SDXL")
+        encoder_hidden_states = compel(caption_strings)
+    else:
+        encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
+        if pooled_only:
+            return encoder_output[0]
+
+        layer_offset = 1 if is_sdxl else 2
+        encoder_hidden_states = encoder_output.hidden_states[-(clip_skip + layer_offset)]
+        if not is_sdxl:
+            encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states)
+        return encoder_hidden_states
+
+    # https://arxiv.org/pdf/2405.20494
+    perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
+    perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
+    encoder_hidden_states = encoder_hidden_states + perturbation_delta
     del cuda_caption
     return encoder_hidden_states
 

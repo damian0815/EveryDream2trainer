@@ -674,7 +674,7 @@ class EveryDreamOptimizer:
                     p.requires_grad = False
 
         if unfreeze_final_layer_norm:
-            parameters = itertools.chain(parameters, text_encoder.text_model.final_layer_norm.parameters())
+            parameters = itertools.chain(parameters, text_encoder.text_model.final_layer_norm.named_parameters())
         else:
             print(" ❄️ freezing final layer norm")
             for p in text_encoder.text_model.final_layer_norm.parameters():
