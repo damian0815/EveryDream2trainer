@@ -19,6 +19,7 @@ from data.data_loader import DataLoaderMultiAspect
 from data import resolver
 from data import aspects
 from data.image_train_item import ImageTrainItem
+from model.training_model import Conditioning, get_text_conditioning, TrainingModel
 from plugins.plugins import PluginRunner
 from utils.isolate_rng import isolate_rng
 
@@ -122,7 +123,6 @@ class EveryDreamValidator:
             print(f'validating every {every_n_epochs} ({every_n_steps} steps at epoch length {approx_epoch_length})')
             self.config['every_n_epochs'] = every_n_epochs
 
-
     @property
     def batch_size(self):
         return self.config['batch_size']
@@ -134,12 +134,12 @@ class EveryDreamValidator:
     @property
     def seed(self):
         return self.config['seed']
-    
+
     @property
     def use_relative_loss(self):
         return self.config['use_relative_loss']
 
-    def prepare_validation_splits(self, train_items: list[ImageTrainItem], tokenizer: Any) -> list[ImageTrainItem]:
+    def prepare_validation_splits(self, train_items: list[ImageTrainItem], model: TrainingModel) -> list[ImageTrainItem]:
         """
         Build the validation splits as requested by the config passed at init.
         This may steal some items from `train_items`.
@@ -151,17 +151,17 @@ class EveryDreamValidator:
 
         with isolate_rng():
             random.seed(self.seed)
-            auto_dataset, remaining_train_items = self._build_automatic_validation_dataset_if_required(train_items, tokenizer)
+            auto_dataset, remaining_train_items = self._build_automatic_validation_dataset_if_required(train_items, model=model)
             # order is important - if we're removing images from train, this needs to happen before making
             # the overlapping dataloader
             train_overlapping_dataset = self._build_train_stabilizer_dataloader_if_required(
-                remaining_train_items, tokenizer)
+                remaining_train_items, model)
 
             if auto_dataset is not None:
                 self.validation_datasets.append(auto_dataset)
             if train_overlapping_dataset is not None:
                 self.validation_datasets.append(train_overlapping_dataset)
-            manual_splits = self._build_manual_validation_datasets(tokenizer)
+            manual_splits = self._build_manual_validation_datasets(model)
             self.validation_datasets.extend(manual_splits)
 
             return remaining_train_items
@@ -181,14 +181,14 @@ class EveryDreamValidator:
             validate_every_n_steps = epoch_length_steps / num_divisions
             return [math.ceil((i+1)*validate_every_n_steps) - 1 for i in range(num_divisions)]
 
-    def do_validation(self, global_step: int,
+    def do_validation(self, model: TrainingModel, global_step: int,
                       get_model_prediction_and_target_callable: Callable[
-                                         [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]):
+                                         [torch.Tensor, Conditioning], tuple[torch.Tensor, torch.Tensor]]):
         mean_loss_accumulator = 0
         for i, dataset in enumerate(self.validation_datasets):
-            mean_loss = self._calculate_validation_loss(dataset.name,
-                                                        dataset.dataloader,
-                                                        get_model_prediction_and_target_callable)
+            mean_loss = self._calculate_validation_loss(model, logging_tag=dataset.name,
+                                                        dataloader=dataset.dataloader,
+                                                        get_model_prediction_and_target=get_model_prediction_and_target_callable)
             mean_loss_accumulator += mean_loss
             self.log_writer.add_scalar(tag=f"loss/{dataset.name}",
                                        scalar_value=mean_loss,
@@ -201,8 +201,8 @@ class EveryDreamValidator:
                                        scalar_value=total_mean_loss,
                                        global_step=global_step)
 
-    def _calculate_validation_loss(self, tag, dataloader, get_model_prediction_and_target: Callable[
-        [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]) -> float:
+    def _calculate_validation_loss(self, model, logging_tag, dataloader, get_model_prediction_and_target: Callable[
+        [torch.Tensor, Conditioning], tuple[torch.Tensor, torch.Tensor]]) -> float:
         with torch.no_grad(), isolate_rng():
             # ok to override seed here because we are in a `with isolate_rng():` block
             random.seed(self.seed)
@@ -210,12 +210,30 @@ class EveryDreamValidator:
 
             loss_validation_epoch = []
             steps_pbar = tqdm(range(len(dataloader)), position=1, leave=False)
-            steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({tag}){Style.RESET_ALL}")
+            steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({logging_tag}){Style.RESET_ALL}")
 
             for step, batch in enumerate(dataloader):
                 keys = list(batch["captions"].keys())
                 for key in keys:
-                    model_pred, target = get_model_prediction_and_target(batch["image"], torch.stack(batch["tokens"][key]))
+
+                    caption_str = batch["captions"][key]
+                    tokens = torch.stack(batch["tokens"][key])
+                    if model.is_sdxl:
+                        tokens_2 = torch.stack(batch["tokens_2"][key])
+
+                    encoder_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                        tokens, tokens_2, caption_str, model, args=None
+                    )
+                    if model.is_sdxl:
+                        add_time_ids = batch["add_time_ids"]
+                        conditioning = Conditioning.sdxl_conditioning(text_encoder_hidden_states=encoder_hidden_states,
+                                                                      text_encoder_2_pooled_embeds=encoder_2_pooled_embeds,
+                                                                      add_time_ids=add_time_ids
+                                                                      )
+                    else:
+                        conditioning = Conditioning.sd12_conditioning(text_encoder_hidden_states=encoder_hidden_states)
+
+                    model_pred, target = get_model_prediction_and_target(batch["image"], conditioning)
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -230,8 +248,7 @@ class EveryDreamValidator:
         loss_validation_local = sum(loss_validation_epoch) / len(loss_validation_epoch)
         return loss_validation_local
 
-
-    def _build_automatic_validation_dataset_if_required(self, image_train_items: list[ImageTrainItem], tokenizer) \
+    def _build_automatic_validation_dataset_if_required(self, image_train_items: list[ImageTrainItem], model: TrainingModel) \
             -> tuple[Optional[ValidationDataset], list[ImageTrainItem]]:
         val_split_mode = self.config['val_split_mode'] if self.config['validate_training'] else None
         if val_split_mode is None or val_split_mode == 'none' or val_split_mode == 'manual':
@@ -242,23 +259,23 @@ class EveryDreamValidator:
             val_items, remaining_train_items = get_random_split(image_train_items, auto_split_proportion, batch_size=self.batch_size)
             val_items = list(disable_multiplier_and_flip(val_items))
             logging.info(f" * Removed {len(val_items)} images from the training set to use for validation")
-            val_ed_batch = self._build_ed_batch(val_items, tokenizer=tokenizer, name='val')
+            val_ed_batch = self._build_ed_batch(val_items, model=model, name='val')
             val_dataloader = build_torch_dataloader(val_ed_batch, batch_size=self.batch_size)
             return ValidationDataset(name='val', dataloader=val_dataloader), remaining_train_items
         else:
             raise ValueError(f"Unrecognized validation split mode '{val_split_mode}'")
 
-    def _build_manual_validation_datasets(self, tokenizer) -> list[ValidationDataset]:
+    def _build_manual_validation_datasets(self, model: TrainingModel) -> list[ValidationDataset]:
         datasets = []
         for name, root in self.config.get('extra_manual_datasets', {}).items():
             items = self._load_manual_val_split(root)
             logging.info(f" * Loaded {len(items)} validation images for validation set '{name}' from {root}")
-            ed_batch = self._build_ed_batch(items, tokenizer=tokenizer, name=name)
+            ed_batch = self._build_ed_batch(items, model=model, name=name)
             dataloader = build_torch_dataloader(ed_batch, batch_size=self.batch_size)
             datasets.append(ValidationDataset(name=name, dataloader=dataloader))
         return datasets
 
-    def _build_train_stabilizer_dataloader_if_required(self, image_train_items: list[ImageTrainItem], tokenizer) \
+    def _build_train_stabilizer_dataloader_if_required(self, image_train_items: list[ImageTrainItem], model) \
             -> Optional[ValidationDataset]:
         stabilize_training_loss = self.config['stabilize_training_loss']
         if not stabilize_training_loss:
@@ -267,7 +284,7 @@ class EveryDreamValidator:
         stabilize_split_proportion = self.config['stabilize_split_proportion']
         stabilize_items, _ = get_random_split(image_train_items, stabilize_split_proportion, batch_size=self.batch_size)
         stabilize_items = list(disable_multiplier_and_flip(stabilize_items))
-        stabilize_ed_batch = self._build_ed_batch(stabilize_items, tokenizer=tokenizer, name='stabilize-train')
+        stabilize_ed_batch = self._build_ed_batch(stabilize_items, model=model, name='stabilize-train')
         stabilize_dataloader = build_torch_dataloader(stabilize_ed_batch, batch_size=self.batch_size)
         return ValidationDataset(name='stabilize-train', dataloader=stabilize_dataloader, val_loss_window_size=None)
 
@@ -282,7 +299,7 @@ class EveryDreamValidator:
         random.shuffle(val_items)
         return val_items
 
-    def _build_ed_batch(self, items: list[ImageTrainItem], tokenizer, name='val'):
+    def _build_ed_batch(self, items: list[ImageTrainItem], model: TrainingModel, name='val'):
         batch_size = self.batch_size
         seed = self.seed
         data_loader = DataLoaderMultiAspect(
@@ -296,7 +313,8 @@ class EveryDreamValidator:
             data_loader=data_loader,
             debug_level=1,
             conditional_dropout=0,
-            tokenizer=tokenizer,
+            tokenizer=model.tokenizer,
+            tokenizer_2=model.tokenizer_2,
             seed=seed,
             name=name,
             crop_jitter=0,

@@ -54,7 +54,7 @@ from data.every_dream_validation import EveryDreamValidator
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
 from loss import get_noise, get_timesteps, get_model_prediction_and_target, \
-    get_loss, get_latents, _encode_caption_tokens, get_timestep_curriculum_range, compute_train_process_01, \
+    get_loss, get_latents, get_timestep_curriculum_range, compute_train_process_01, \
     get_exponential_scaled_value, choose_effective_batch_size, nibble_batch, vae_preview, \
     get_multirank_stratified_random_timesteps
 from optimizer.attention_activation_control import ActivationLogger
@@ -68,6 +68,7 @@ from model.training_model import (
     TrainingVariables,
     TrainingModel,
     Conditioning,
+    get_text_conditioning,
 )
 from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
     _WANT_VALIDATION_SEMAPHORE_FILE
@@ -206,7 +207,7 @@ def setup_args(args):
     return args
 
 
-def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem], batch_size, check_load_all=False, tokenizer=None) -> None:
+def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem], batch_size, check_load_all=False, model: TrainingModel=None) -> None:
     undersized_items = [item for item in items if item.is_undersized]
     if len(undersized_items) > 0:
         underized_log_path = os.path.join(log_folder, "undersized_images.txt")
@@ -220,7 +221,9 @@ def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem
 
     if check_load_all:
         data_loader = DataLoaderMultiAspect(items)
-        ed_batch = EveryDreamBatch(data_loader, tokenizer=tokenizer)
+        ed_batch = EveryDreamBatch(data_loader,
+                                   tokenizer=model.tokenizer,
+                                   tokenizer_2=model.tokenizer_2)
         error_count = 0
         print("checking we can load all images...")
         for i in tqdm(items):
@@ -524,10 +527,10 @@ def main(args):
                                         approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
                                         )
         # the validation dataset may need to steal some items from image_train_items
-        image_train_items = validator.prepare_validation_splits(image_train_items, tokenizer=model.tokenizer)
+        image_train_items = validator.prepare_validation_splits(image_train_items, model=model)
 
     report_image_train_item_problems(log_folder, image_train_items, batch_size=args.batch_size,
-                                     check_load_all=args.test_images, tokenizer=model.tokenizer)
+                                     check_load_all=args.test_images, model=model)
 
     from plugins.plugins import load_plugin
     if args.plugins is not None:
@@ -554,6 +557,7 @@ def main(args):
         debug_level=1,
         conditional_dropout=args.cond_dropout,
         tokenizer=model.tokenizer,
+        tokenizer_2=model.tokenizer_2,
         seed = seed,
         shuffle_tags=args.shuffle_tags,
         keep_tags=args.keep_tags,
@@ -563,7 +567,7 @@ def main(args):
         contrastive_learning_batch_ids=args.contrastive_learning_batch_ids,
         contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
         cond_dropout_noise_p=args.cond_dropout_noise_p,
-        use_masks=args.use_masks
+        use_masks=args.use_masks,
     )
 
     torch.cuda.benchmark = False
@@ -715,7 +719,7 @@ def main(args):
             basename += f"-gs{global_step:05}"
         return os.path.join(log_folder, "ckpts", basename)
 
-    def get_model_prediction_and_target_validation_wrapper(image: torch.Tensor, tokens: torch.Tensor,
+    def get_model_prediction_and_target_validation_wrapper(image: torch.Tensor, conditioning: Conditioning
                                                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = image.shape[0]
         timesteps = get_timesteps(batch_size=batch_size,
@@ -728,17 +732,10 @@ def main(args):
                           pyramid_noise_discount=args.pyramid_noise_discount,
                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                           batch_share_noise=False)
-        encoder_hidden_states = _encode_caption_tokens(
-            tokens,
-            model.text_encoder,
-            clip_skip=args.clip_skip,
-            embedding_perturbation=args.embedding_perturbation,
-            compel=None
-        )
 
         model_pred, target, _, _ = get_model_prediction_and_target(
             latents,
-            encoder_hidden_states,
+            conditioning,
             noise,
             timesteps,
             model=model,
@@ -751,7 +748,8 @@ def main(args):
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
-        validator.do_validation(global_step=0,
+        validator.do_validation(model=model,
+                                global_step=0,
                                 get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper)
 
     # the sample generator might be configured to generate samples before step 0
@@ -866,7 +864,7 @@ def main(args):
                             everything_contrastive_learning_p = args.everything_contrastive_learning_p
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
-                    timesteps = _get_step_timesteps(full_batch, model, tv, args)
+                    timesteps = _get_step_timesteps(full_batch, train_progress_01, model, tv, args)
 
                     # apply cond dropout
                     initial_batch_size = args.initial_batch_size or args.batch_size
@@ -962,7 +960,7 @@ def main(args):
                                     if enable_vae_attention_slicing:
                                         vae.enable_slicing()
                                     try:
-                                        latents_slice = vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
+                                        latents_slice = model.vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
                                     except Exception as e:
                                         logging.error(f"vae.encode failed for batch {batch['pathnames']} slice [{slice_start}:{slice_end}] @resolution {batch_resolution}. pixel_values shape is {pixel_values.shape}")
                                         raise
@@ -981,55 +979,57 @@ def main(args):
 
                         for caption_variant in caption_variants:
 
-                            # todo: move to Conditioning
-                            # todo: -----
-                            caption_str = []
-                            tokens = []
-                            tokens_2 = []
-                            for i in range(batch_size):
-                                this_caption_str = batch["captions"][caption_variant][i]
-                                if this_caption_str is not None:
-                                    tokens_variant = caption_variant
-                                else:
-                                    # pick a random caption variant to replace it
-                                    tokens_variant = train_batch.random_instance.choice([k for k, v in batch["captions"].items()
-                                                        if v[i] is not None])
-                                    this_caption_str = batch["captions"][tokens_variant][i]
+                            with (
+                                torch.no_grad()
+                                if args.disable_textenc_training
+                                else contextlib.nullcontext()
+                            ):
+                                # todo move this logic to the dataloader
+                                caption_str = []
+                                tokens = []
+                                tokens_2 = []
+                                batch_size = batch["image"].shape[0]
+                                add_time_ids = batch["add_time_ids"] if "add_time_ids" in batch else None
+                                for i in range(batch_size):
+                                    this_caption_str = batch["captions"][
+                                        caption_variant
+                                    ][i]
+                                    if this_caption_str is not None:
+                                        tokens_variant = caption_variant
+                                    else:
+                                        # pick a random caption variant to replace it
+                                        tokens_variant = train_batch.random_instance.choice(
+                                            [
+                                                k
+                                                for k, v in batch["captions"].items()
+                                                if v[i] is not None
+                                            ]
+                                        )
+                                        this_caption_str = batch["captions"][
+                                            tokens_variant
+                                        ][i]
 
-                                this_tokens = batch["tokens"][tokens_variant][i]
+                                    this_tokens = batch["tokens"][tokens_variant][i]
 
-                                assert this_caption_str is not None
-                                caption_str.append(this_caption_str)
+                                    assert this_caption_str is not None
+                                    caption_str.append(this_caption_str)
 
-                                assert this_tokens is not None
-                                tokens.append(this_tokens)
+                                    assert this_tokens is not None
+                                    tokens.append(this_tokens)
 
+                                    if model.is_sdxl:
+                                        this_tokens_2 = batch["tokens_2"][
+                                            tokens_variant
+                                        ][i]
+                                        assert this_tokens_2 is not None
+                                        tokens_2.append(this_tokens_2)
+
+                                tokens = torch.stack(tokens)
                                 if model.is_sdxl:
-                                    this_tokens_2 = batch["tokens_2"][tokens_variant][i]
-                                    assert this_tokens_2 is not None
-                                    tokens_2.append(this_tokens_2)
-
-                            tokens = torch.stack(tokens)
-                            with torch.no_grad() if args.disable_textenc_training else contextlib.nullcontext():
-                                encoder_hidden_states = _encode_caption_tokens(
-                                    tokens,
-                                    model.text_encoder,
-                                    clip_skip=args.clip_skip,
-                                    embedding_perturbation=args.embedding_perturbation,
-                                    compel=compel,
-                                    is_sdxl=model.is_sdxl,
-                                    caption_strings=caption_str,
+                                    tokens_2 = torch.stack(tokens_2)
+                                encoder_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                                    tokens, tokens_2, caption_str, model, args
                                 )
-                                if model.is_sdxl:
-                                    encoder_2_pooled_embeds = _encode_caption_tokens(tokens_2, model.text_encoder_2,
-                                                                                     clip_skip=args.clip_skip,
-                                                                                     embedding_perturbation=args.embeddiing_perturbation,
-                                                                                     compel=compel,
-                                                                                     caption_strings=caption_str,
-                                                                                     is_sdxl=model.is_sdxl,
-                                                                                     pooled_only=True)
-                            # todo: -----
-                            # todo: move to conditioning (end)
 
                             model_pred_all = []
                             model_pred_wrong_all = []
@@ -1059,16 +1059,11 @@ def main(args):
 
                                 if model.is_sdxl:
                                     encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
-                                    original_size_slice = original_size[slice_start:slice_end]
-                                    crop_coords_top_left_slice = crops_coords_top_left[slice_start:slice_end]
-                                    target_size_slice = target_size[slice_start:slice_end]
+                                    add_time_ids_slice = add_time_ids[slice_start:slice_end]
                                     conditioning = Conditioning.sdxl_conditioning(
                                         text_encoder_hidden_states=encoder_hidden_states_slice,
                                         text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
-                                        original_size=original_size_slice,
-                                        crops_coords_top_left=crop_coords_top_left_slice,
-                                        target_size=target_size_slice,
-                                        model=model
+                                        add_time_ids = add_time_ids_slice
                                     )
                                 else:
                                     conditioning = Conditioning.sd12_conditioning(
@@ -1212,7 +1207,9 @@ def main(args):
                             step in validation_steps
                             or check_semaphore_file_and_unlink(_WANT_VALIDATION_SEMAPHORE_FILE)
                     ):
-                        validator.do_validation(tv.global_step, get_model_prediction_and_target_validation_wrapper)
+                        validator.do_validation(model=model,
+                                                global_step=tv.global_step,
+                                                get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper)
 
                     min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 

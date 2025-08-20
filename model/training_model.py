@@ -1,12 +1,17 @@
+import contextlib
 import gc
 import logging
+import math
 import os
 import shutil
+from argparse import Namespace
 from dataclasses import dataclass, field
+import random
 
 import safetensors.torch
 import torch
 from colorama import Fore, Style
+from compel import Compel, ReturnedEmbeddingsType, SplitLongTextMode
 from diffusers import (
     PNDMScheduler,
     DDIMScheduler,
@@ -23,9 +28,7 @@ from diffusers.utils import convert_state_dict_to_diffusers
 from transformers import CLIPTextModel, CLIPTokenizer
 from peft.utils import get_peft_model_state_dict
 
-from data.every_dream import EveryDreamBatch
 from flow_match_model import TrainFlowMatchScheduler
-from notebooks.flow_matching import encoder_hidden_states
 from optimizer.optimizers import EveryDreamOptimizer
 from plugins.plugins import PluginRunner
 from utils.convert_diff_to_ckpt import convert as converter
@@ -139,8 +142,6 @@ class TrainingVariables:
         self.accumulated_timesteps = []
 
 
-
-
 @dataclass
 class TrainingModel:
 
@@ -164,15 +165,15 @@ class TrainingModel:
     unet: UNet2DConditionModel
     vae: AutoencoderKL
 
+    compel: Compel|None
     yaml: str|None
-
 
 @dataclass
 class Conditioning:
     text_encoder_hidden_states: torch.Tensor
 
-    text_encoder_2_pooled_embeds: torch.Tensor|None
-    add_time_ids: torch.Tensor|None
+    text_encoder_2_pooled_embeds: torch.Tensor|None = None
+    add_time_ids: torch.Tensor|None = None
 
     @property
     def added_cond_kwargs(self) -> dict:
@@ -185,31 +186,76 @@ class Conditioning:
     @staticmethod
     def sdxl_conditioning(text_encoder_hidden_states: torch.Tensor,
                           text_encoder_2_pooled_embeds: torch.Tensor,
-                          original_size: torch.Tensor,
-                          crops_coords_top_left: torch.Tensor,
-                          target_size: torch.Tensor,
-                          model: TrainingModel):
-
-        add_time_ids = _get_add_time_ids(
-            unet=model.unet,
-            original_size=original_size,
-            crops_coords_top_left=crops_coords_top_left,
-            target_size=target_size,
-            dtype=text_encoder_hidden_states.dtype,
-            text_encoder_projection_dim=model.text_encoder_2.config.projection_dim
-        )
+                          add_time_ids: torch.Tensor):
 
         return Conditioning(text_encoder_hidden_states=text_encoder_hidden_states,
                             text_encoder_2_pooled_embeds=text_encoder_2_pooled_embeds,
                             add_time_ids=add_time_ids)
 
 
+def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor|None]:
+    # todo: move to Conditioning
+    # todo: -----
+    if model.compel:
+        print("Compel is setup but not being used (not implemented)")
+    encoder_hidden_states = _encode_caption_tokens(
+        tokens,
+        model.text_encoder,
+        clip_skip=args.clip_skip if args else 0,
+        embedding_perturbation=args.embedding_perturbation if args else False,
+        compel=model.compel,
+        is_sdxl=model.is_sdxl,
+        caption_strings=caption_str,
+    )
+    if model.is_sdxl:
+        encoder_2_pooled_embeds = _encode_caption_tokens(
+            tokens_2,
+            model.text_encoder_2,
+            clip_skip=args.clip_skip if args else 0,
+            embedding_perturbation=args.embeddiing_perturbation if args else False,
+            compel=model.compel,
+            caption_strings=caption_str,
+            is_sdxl=model.is_sdxl,
+            pooled_only=True,
+        )
+    else:
+        encoder_2_pooled_embeds = None
+    # todo: -----
+    # todo: move to conditioning (end)
+    return encoder_hidden_states, encoder_2_pooled_embeds
+
+
+def _encode_caption_tokens(tokens, text_encoder, clip_skip: int, embedding_perturbation: bool,
+                           compel: Compel=None, caption_strings: list[str]=None, is_sdxl=False, pooled_only=False):
+    cuda_caption = tokens.to(text_encoder.device)
+    if compel is not None:
+        if pooled_only:
+            raise ValueError("cannot use Compel + SDXL")
+        encoder_hidden_states = compel(caption_strings)
+    else:
+        encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
+        if pooled_only:
+            return encoder_output[0]
+
+        layer_offset = 1 if is_sdxl else 2
+        encoder_hidden_states = encoder_output.hidden_states[-(clip_skip + layer_offset)]
+        if not is_sdxl:
+            encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states)
+        return encoder_hidden_states
+
+    # https://arxiv.org/pdf/2405.20494
+    perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
+    perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
+    encoder_hidden_states = encoder_hidden_states + perturbation_delta
+    del cuda_caption
+    return encoder_hidden_states
+
 
 @dataclass
 class EveryDreamTrainingState:
     model: TrainingModel
     optimizer: EveryDreamOptimizer
-    train_batch: EveryDreamBatch
+    train_batch: 'EveryDreamBatch'
 
 
 def convert_diffusers_lora_to_civitai(diffusers_folder, civitai_path):
@@ -386,14 +432,23 @@ def load_model(args) -> TrainingModel:
         scheduler = pipe.scheduler
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer
+        unet = pipe.unet
         if hasattr(pipe, 'text_encoder_2'):
+            # sdxl
             text_encoder_2 = pipe.text_encoder_2
             tokenizer_2 = pipe.tokenizer_2
+            # check assumptions for _get_add_time_ids
+            # this is to avoid having to pass these config values manually to eg dataloader classes
+            if unet.config.addition_time_embed_dim != 256:
+                raise ValueError("unet addition_time_embed_dim differs from assumed hard-coded value in _get_add_time_ids")
+            if text_encoder_2.config.projection_dim != 1280:
+                raise ValueError("text_encoder_2 projection_dim differs from assumed hard-coded value in _get_add_time_ids")
+            if unet.add_embedding.linear_1.in_features != 2816:
+                raise ValueError("unet add_embedding input dim differs from assumed hard-coded value in _get_add_time_ids")
         else:
             text_encoder_2 = None
             tokenizer_2 = None
         vae = pipe.vae
-        unet = pipe.unet
         del pipe
     else:
         if args.lora_resume:
@@ -431,6 +486,19 @@ def load_model(args) -> TrainingModel:
                                                        )
     else:
         noise_scheduler = get_training_noise_scheduler(scheduler, args.train_sampler)
+
+    compel = None
+    if args.use_compel:
+        tokenizer_list = tokenizer if tokenizer_2 is None else [tokenizer, tokenizer_2]
+        text_encoder_list = text_encoder if text_encoder_2 is None else [text_encoder, text_encoder_2]
+        return_type = ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED if text_encoder_2 else ReturnedEmbeddingsType.LAST_HIDDEN_STATES_NORMALIZED
+        compel = Compel(tokenizer=tokenizer_list,
+                        text_encoder=text_encoder_list,
+                        truncate_long_prompts=False,
+                        requires_pooled=True,
+                        returned_embeddings_type=return_type,
+                        split_long_text_mode=SplitLongTextMode.SENTENCES,
+                        )
     # Construct TrainingModel instance after loading model components
     model_being_trained = TrainingModel(
         noise_scheduler=noise_scheduler,
@@ -440,7 +508,8 @@ def load_model(args) -> TrainingModel:
         tokenizer_2=tokenizer_2,
         unet=unet,
         vae=vae,
-        yaml=yaml
+        yaml=yaml,
+        compel=compel
     )
     return model_being_trained
 
@@ -448,23 +517,3 @@ def load_model(args) -> TrainingModel:
 def get_use_ema_decay_training(args):
     use_ema_dacay_training = (args.ema_decay_rate != None) or (args.ema_strength_target != None)
     return use_ema_dacay_training
-
-
-# from SDXLPipeline
-def _get_add_time_ids(
-        unet, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
-    ):
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-
-        passed_add_embed_dim = (
-            unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
-        )
-        expected_add_embed_dim = unet.add_embedding.linear_1.in_features
-
-        if expected_add_embed_dim != passed_add_embed_dim:
-            raise ValueError(
-                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
-            )
-
-        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
-        return add_time_ids

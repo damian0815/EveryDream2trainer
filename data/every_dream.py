@@ -46,6 +46,7 @@ class EveryDreamBatch(Dataset):
                  crop_jitter=0.02,
                  seed=555,
                  tokenizer=None,
+                 tokenizer_2=None,
                  shuffle_tags=False,
                  keep_tags=0,
                  plugin_runner:PluginRunner=None,
@@ -55,7 +56,7 @@ class EveryDreamBatch(Dataset):
                  contrastive_learning_batch_ids=None,
                  use_masks=False,
                  contrastive_learning_dropout_p=0,
-                 cond_dropout_noise_p=0
+                 cond_dropout_noise_p=0,
                  ):
 
         if tokenizer is None:
@@ -72,6 +73,7 @@ class EveryDreamBatch(Dataset):
         self.crop_jitter = crop_jitter
         self.unloaded_to_idx = 0
         self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
         self.max_token_length = self.tokenizer.model_max_length
         self.shuffle_tags = shuffle_tags
         self.keep_tags = keep_tags
@@ -98,6 +100,9 @@ class EveryDreamBatch(Dataset):
                                         max_length=self.tokenizer.model_max_length,
                                         ).input_ids)
 
+    @property
+    def is_sdxl(self):
+        return self.tokenizer_2 is not None
 
     def shuffle(self, epoch_n: int, max_epochs: int):
         self.seed += 1
@@ -155,19 +160,17 @@ class EveryDreamBatch(Dataset):
         else:
             caption_dict = {"default": example["caption"]}
 
-
-        #for k in caption_dict.keys():
+        # for k in caption_dict.keys():
         #    if self.randomizer.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
         #        caption_dict[k] = " "
 
         if self.random_instance.random() <= self.cond_dropout_noise_p:
-            #example["image"] = torch.randn_like(example["image"])
+            # example["image"] = torch.randn_like(example["image"])
             perlin_shape = example["image"].shape[1:]
             perlin3 = torch.stack([rand_perlin_2d_octaves(perlin_shape, (1, 1), 7)
                                    for _ in range(3)]
                                   ).to(example["image"].device, dtype=example["image"].dtype)
             example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
-
 
         try:
             example["caption"] = {k: caption_dict.get(k, None) or caption_dict[self.random_instance.choice(caption_dict.keys())]
@@ -178,11 +181,22 @@ class EveryDreamBatch(Dataset):
                                                 max_length=self.tokenizer.model_max_length,
                                               ).input_ids)
                                  for k in caption_dict.keys()}
+            if self.is_sdxl:
+                example["tokens_2"] = {k: torch.tensor(self.tokenizer_2(example["caption"][k],
+                                                    truncation=True,
+                                                    padding="max_length",
+                                                    max_length=self.tokenizer_2.model_max_length,
+                                                  ).input_ids)
+                                     for k in caption_dict.keys()}
         except ValueError as e:
             traceback.print_exc()
             print('caption_dict:', caption_dict)
             print('train_item:', train_item)
             raise
+
+        if self.is_sdxl:
+            example["add_time_ids"] = train_item["add_time_ids"]
+
 
         example["runt_size"] = train_item["runt_size"]
 
@@ -221,11 +235,18 @@ class EveryDreamBatch(Dataset):
         example["timesteps_range"] = image_train_tmp.timesteps_range
         example["pathname"] = image_train_tmp.pathname
 
+        if self.is_sdxl:
+            example["add_time_ids"] = _get_add_time_ids(
+                original_size = (image_train_item.image_size[1], image_train_item.image_size[0]),
+                target_size = (image_train_item.target_wh[1], image_train_item.target_wh[0]),
+                crops_coords_top_left = (0, 0),
+                dtype=torch.float32
+            )
+
         return example
 
     def __update_image_train_items(self, dropout_fraction: float):
         self.image_train_items = self.data_loader.get_shuffled_image_buckets(dropout_fraction)
-
 
 
 class DataLoaderWithFixedBuffer(torch.utils.data.DataLoader):
@@ -255,6 +276,9 @@ class DataLoaderWithFixedBuffer(torch.utils.data.DataLoader):
 
         captions = [example["caption"] for example in batch]
         tokens = [example["tokens"] for example in batch]
+        tokens_2 = ([example["tokens_2"] for example in batch]\
+                     if "tokens_2" in batch[0]
+                     else None)
         runt_size = batch[0]["runt_size"]
 
         images = torch.stack(images)
@@ -266,6 +290,9 @@ class DataLoaderWithFixedBuffer(torch.utils.data.DataLoader):
             "captions": captions,
             "runt_size": runt_size,
         }
+        if tokens_2 is not None:
+            ret["tokens_2"] = torch.stack(tuple(tokens_2))
+
         del batch
         return ret
 
@@ -300,7 +327,7 @@ def collate_fn(batch):
     pathnames = [example["pathname"] for example in batch]
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
 
-    #captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
+    # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     caption_variants = list(set(k
                             for b in batch
                             for k in b["caption"].keys()))
@@ -308,11 +335,20 @@ def collate_fn(batch):
 
     captions = {}
     tokens = {}
+    tokens_2 = {}
     for k in caption_variants:
         captions[k] = [example["caption"].get(k, None)
                        for example in batch]
         tokens[k] = [example["tokens"].get(k, None)
                      for example in batch]
+        if "tokens_2" in batch[0]:
+            tokens_2[k] = [example["tokens_2"].get(k, None)
+                            for example in batch]
+
+    if "add_time_ids" in batch[0]:
+        add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
+    else:
+        add_time_ids = None
 
     runt_size = batch[0]["runt_size"]
 
@@ -346,7 +382,31 @@ def collate_fn(batch):
         "timesteps_range": timesteps_range,
         "pathnames": pathnames,
     }
+    if tokens_2:
+        ret["tokens_2"] = tokens_2
+        ret["add_time_ids"] = add_time_ids
     del batch
     return ret
 
 
+
+# from SDXLPipeline
+def _get_add_time_ids(
+        original_size, crops_coords_top_left, target_size, dtype
+    ):
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+
+        passed_add_embed_dim = (
+            256 #unet.config.addition_time_embed_dim
+             * len(add_time_ids)
+             + 1280 #text_encoder_projection_dim
+        )
+        expected_add_embed_dim = 2816 #unet.add_embedding.linear_1.in_features
+
+        if expected_add_embed_dim != passed_add_embed_dim:
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+            )
+
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        return add_time_ids

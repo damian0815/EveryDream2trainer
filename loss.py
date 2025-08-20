@@ -14,7 +14,6 @@ from scipy.stats import beta as sp_beta
 from diffusers import SchedulerMixin, ConfigMixin, UNet2DConditionModel
 
 from model.training_model import TrainingModel, Conditioning
-from notebooks.flow_matching import encoder_hidden_states
 
 
 # from train import pyramid_noise_like, compute_snr
@@ -346,32 +345,6 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                                                               dtype=torch.bool, device=model_pred.device)
 
     return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask
-
-
-def _encode_caption_tokens(tokens, text_encoder, clip_skip, embedding_perturbation,
-                           compel: Compel=None, caption_strings: list[str]=None, is_sdxl=False, pooled_only=False):
-    cuda_caption = tokens.to(text_encoder.device)
-    if compel is not None:
-        if pooled_only:
-            raise ValueError("cannot use Compel + SDXL")
-        encoder_hidden_states = compel(caption_strings)
-    else:
-        encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
-        if pooled_only:
-            return encoder_output[0]
-
-        layer_offset = 1 if is_sdxl else 2
-        encoder_hidden_states = encoder_output.hidden_states[-(clip_skip + layer_offset)]
-        if not is_sdxl:
-            encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states)
-        return encoder_hidden_states
-
-    # https://arxiv.org/pdf/2405.20494
-    perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
-    perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
-    encoder_hidden_states = encoder_hidden_states + perturbation_delta
-    del cuda_caption
-    return encoder_hidden_states
 
 
 def _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation):
