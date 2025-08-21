@@ -302,17 +302,17 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
             model_pred = model.unet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=conditioning.text_encoder_hidden_states,
+                    encoder_hidden_states=conditioning.prompt_embeds,
                     added_cond_kwargs=conditioning.added_cond_kwargs
-            )
+            ).sample
         else:
             # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-            model_pred = model.unet(noisy_latents, timesteps, conditioning.text_encoder_hidden_states).sample
+            model_pred = model.unet(noisy_latents, timesteps, conditioning.prompt_embeds).sample
 
     with torch.no_grad():
         target = _get_target(latents, noise, model.noise_scheduler, timesteps)
         if teacher_unet is not None:
-            teacher_target = teacher_unet(noisy_latents.half(), timesteps, conditioning.encoder_hidden_states.half()).sample.float()
+            teacher_target = teacher_unet(noisy_latents.half(), timesteps, conditioning.prompt_embeds.half()).sample.float()
             target = (
                 teacher_target *  teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
                 +   target     * ~teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)

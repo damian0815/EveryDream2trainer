@@ -1027,7 +1027,7 @@ def main(args):
                                 tokens = torch.stack(tokens)
                                 if model.is_sdxl:
                                     tokens_2 = torch.stack(tokens_2)
-                                encoder_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                                encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
                                     tokens, tokens_2, caption_str, model, args
                                 )
 
@@ -1050,6 +1050,7 @@ def main(args):
                                 # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                                 latents_slice = latents[slice_start:slice_end]
                                 encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+                                encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
                                 timesteps_slice = timesteps[slice_start:slice_end]
                                 if teacher_mask is None:
@@ -1062,6 +1063,7 @@ def main(args):
                                     add_time_ids_slice = add_time_ids[slice_start:slice_end]
                                     conditioning = Conditioning.sdxl_conditioning(
                                         text_encoder_hidden_states=encoder_hidden_states_slice,
+                                        text_encoder_2_hidden_states=encoder_2_hidden_states_slice,
                                         text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
                                         add_time_ids = add_time_ids_slice
                                     )
