@@ -425,7 +425,10 @@ def load_model(args) -> TrainingModel:
     hf_cache_path = get_hf_ckpt_cache_path(args.resume_ckpt)
     if os.path.exists(hf_cache_path) or os.path.exists(args.resume_ckpt):
         model_root_folder, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
-        pipe: StableDiffusionPipeline|StableDiffusionXLPipeline = AutoModel.from_pretrained(args.resume_ckpt)
+        if os.path.exists(os.path.join(model_root_folder, 'text_encoder_2')):
+            pipe = StableDiffusionXLPipeline.from_pretrained(model_root_folder)
+        else:
+            pipe = StableDiffusionPipeline.from_pretrained(model_root_folder)
         _check_pipe(pipe)
         if args.lora_resume:
             pipe.load_lora_weights(args.lora_resume)
