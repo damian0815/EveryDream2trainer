@@ -461,10 +461,15 @@ class EveryDreamOptimizer:
         param_groups = []
         attention_weight_decay = local_optimizer_config.get("weight_decay_attn_qk", None)
         if attention_weight_decay is None:
-            param_groups = [{
-                "params": [p for n, p in parameters],
-                "weight_decay": weight_decay,
-            }]
+            param_groups = [
+                {
+                    "params": [p for n, p in parameters],
+                    "betas": (betas[0], betas[1]),
+                    "weight_decay": weight_decay,
+                    "lr": curr_lr,
+                    "name": "attention_high_decay",
+                }
+            ]
         else:
             regular_group, attention_group = _extract_attention_parameter_group(parameters)
             logging.info(f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}")
