@@ -458,9 +458,9 @@ def load_model(args) -> TrainingModel:
     if os.path.exists(hf_cache_path) or os.path.exists(args.resume_ckpt):
         model_root_folder, is_sd1attn, yaml = convert_to_hf(args.resume_ckpt)
         if os.path.exists(os.path.join(model_root_folder, 'text_encoder_2')):
-            pipe = StableDiffusionXLPipeline.from_pretrained(model_root_folder)
+            pipe = StableDiffusionXLPipeline.from_pretrained(model_root_folder, variant=args.resume_ckpt_variant)
         else:
-            pipe = StableDiffusionPipeline.from_pretrained(model_root_folder)
+            pipe = StableDiffusionPipeline.from_pretrained(model_root_folder, variant=args.resume_ckpt_variant)
         _check_pipe(pipe)
         if args.lora_resume:
             pipe.load_lora_weights(args.lora_resume)
@@ -489,7 +489,7 @@ def load_model(args) -> TrainingModel:
         if args.lora_resume:
             raise "Can't do lora_resume with downloaded models"
         # try to download from HF using resume_ckpt as a repo id
-        downloaded = try_download_model_from_hf(repo_id=args.resume_ckpt)
+        downloaded = try_download_model_from_hf(repo_id=args.resume_ckpt, variant=args.resume_ckpt_variant)
         if downloaded is None:
             raise ValueError(
                 f"No local file/folder for {args.resume_ckpt}, and no matching huggingface.co repo could be downloaded")

@@ -1500,6 +1500,7 @@ if __name__ == "__main__":
     argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=supported_resolutions)
     argparser.add_argument("--keep_same_sample_at_different_resolutions_together", action='store_true', help="if passed, re-order batches to put samples with the same path but different resolutions near to each other")
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
+    argparser.add_argument("--resume_ckpt_variant", type=str, required=False, default=None, help="For Hugging Face repo resume_ckpts, the variant (eg fp16) - required for some models")
     argparser.add_argument("--run_name", type=str, required=False, default=None, help="Run name for wandb (child of project name), and comment for tensorboard, (def: None)")
     argparser.add_argument("--sample_prompts", type=str, default="sample_prompts.txt", help="Text file with prompts to generate test samples from, or JSON file with sample generator settings (default: sample_prompts.txt)")
     argparser.add_argument("--sample_steps", type=int, default=250, help="Number of steps between samples (def: 250)")

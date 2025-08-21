@@ -8,7 +8,7 @@ from diffusers import StableDiffusionPipeline, AutoModel, StableDiffusionXLPipel
 from utils.unet_utils import get_attn_yaml
 
 
-def try_download_model_from_hf(repo_id: str) -> Tuple[StableDiffusionPipeline|StableDiffusionXLPipeline, str|None, bool, str|None] | None:
+def try_download_model_from_hf(repo_id: str, variant: str|None=None) -> Tuple[StableDiffusionPipeline|StableDiffusionXLPipeline, str|None, bool, str|None] | None:
     """
     Attempts to download files from the following subfolders under the given repo id:
     "text_encoder", "vae", "unet", "scheduler", "tokenizer".
@@ -28,7 +28,7 @@ def try_download_model_from_hf(repo_id: str) -> Tuple[StableDiffusionPipeline|St
         return None
 
     if model_info.config['diffusers']['_class_name'] == 'StableDiffusionXLPipeline':
-        pipe = StableDiffusionXLPipeline.from_pretrained(repo_id)
+        pipe = StableDiffusionXLPipeline.from_pretrained(repo_id, variant=variant)
         return pipe, None, False, None
 
     # load it to download it
