@@ -170,30 +170,43 @@ class TrainingModel:
 
 @dataclass
 class Conditioning:
-    text_encoder_hidden_states: torch.Tensor
+    _text_encoder_hidden_states: torch.Tensor
+    _text_encoder_2_hidden_states: torch.Tensor|None
 
-    text_encoder_2_pooled_embeds: torch.Tensor|None = None
-    add_time_ids: torch.Tensor|None = None
+    _text_encoder_2_pooled_embeds: torch.Tensor|None
+    _add_time_ids: torch.Tensor|None
+
+    @property
+    def prompt_embeds(self) -> torch.Tensor:
+        if self._text_encoder_2_hidden_states is None:
+            return self._text_encoder_hidden_states
+        else:
+            return torch.cat([self._text_encoder_hidden_states, self._text_encoder_2_hidden_states])
 
     @property
     def added_cond_kwargs(self) -> dict:
-        return {"text_embeds": self.text_encoder_2_pooled_embeds, "time_ids": self.add_time_ids}
+        return {"text_embeds": self._text_encoder_2_pooled_embeds, "time_ids": self._add_time_ids}
 
     @staticmethod
     def sd12_conditioning(text_encoder_hidden_states: torch.Tensor):
-        return Conditioning(text_encoder_hidden_states=text_encoder_hidden_states)
+        return Conditioning(_text_encoder_hidden_states=text_encoder_hidden_states,
+                            _text_encoder_2_hidden_states=None,
+                            _text_encoder_2_pooled_embeds=None,
+                            _add_time_ids=None)
 
     @staticmethod
     def sdxl_conditioning(text_encoder_hidden_states: torch.Tensor,
+                          text_encoder_2_hidden_states: torch.Tensor,
                           text_encoder_2_pooled_embeds: torch.Tensor,
                           add_time_ids: torch.Tensor):
 
-        return Conditioning(text_encoder_hidden_states=text_encoder_hidden_states,
-                            text_encoder_2_pooled_embeds=text_encoder_2_pooled_embeds,
-                            add_time_ids=add_time_ids)
+        return Conditioning(_text_encoder_hidden_states=text_encoder_hidden_states,
+                            _text_encoder_2_hidden_states=text_encoder_2_hidden_states,
+                            _text_encoder_2_pooled_embeds=text_encoder_2_pooled_embeds,
+                            _add_time_ids=add_time_ids)
 
 
-def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor|None]:
+def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
     # todo: move to Conditioning
     # todo: -----
     if model.compel:
@@ -208,7 +221,9 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
         caption_strings=caption_str,
     )
     if model.is_sdxl:
-        encoder_2_pooled_embeds = _encode_caption_tokens(
+        # note: to support a "style" prompt we'd need to collect/encode a "tokens_3" (style prompt tokens)
+        # so we don't support that for now
+        encoder_2_hidden_states, encoder_2_pooled_embeds = _encode_caption_tokens(
             tokens_2,
             model.text_encoder_2,
             clip_skip=args.clip_skip if args else 0,
@@ -216,30 +231,33 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
             compel=model.compel,
             caption_strings=caption_str,
             is_sdxl=model.is_sdxl,
-            pooled_only=True,
+            return_pooled = True
         )
     else:
+        encoder_2_hidden_states = None
         encoder_2_pooled_embeds = None
     # todo: -----
     # todo: move to conditioning (end)
-    return encoder_hidden_states, encoder_2_pooled_embeds
+    return encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds
 
 
 def _encode_caption_tokens(tokens, text_encoder, clip_skip: int, embedding_perturbation: bool,
-                           compel: Compel=None, caption_strings: list[str]=None, is_sdxl=False, pooled_only=False):
+                           compel: Compel=None, caption_strings: list[str]=None, is_sdxl=False, return_pooled=False):
     cuda_caption = tokens.to(text_encoder.device)
     if compel is not None:
-        if pooled_only:
-            raise ValueError("cannot use Compel + SDXL")
+        if return_pooled:
+            raise ValueError("Compel + SDXL not implemented yet")
         encoder_hidden_states = compel(caption_strings)
     else:
         encoder_output = text_encoder(cuda_caption, output_hidden_states=True)
-        if pooled_only:
-            return encoder_output[0]
 
-        layer_offset = 1 if is_sdxl else 2
-        encoder_hidden_states = encoder_output.hidden_states[-(clip_skip + layer_offset)]
+        # for SDXL we use the penultimate layer (+ clip skip)
+        # for SD1 we use the last layer (+ clip skip)
+        # for SD2 we use the "penultimate" layer (which diffusers/HF have already dropped for us so it's the last layer)
+        layer_backwards_offset = 2 if is_sdxl else 1
+        encoder_hidden_states = encoder_output.hidden_states[-(clip_skip + layer_backwards_offset)]
         if not is_sdxl:
+            # for SD1 and SD2 we need to normalize the hidden states
             encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states)
         return encoder_hidden_states
 
