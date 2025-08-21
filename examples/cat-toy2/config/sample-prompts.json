@@ -1,0 +1,30 @@
+{
+  "batch_size": 2,
+  "seed": 555,
+  "cfgs": [7, 4],
+  "scheduler": "ddim",
+  "num_inference_steps": 30,
+  "show_progress_bars": true,
+  "samples": [
+    {
+      "prompt": "a cat-toy2 on a wooden desk"
+    },
+    {
+      "prompt": "a cat-toy2 on a sofa"
+    },
+    {
+      "prompt": "a cat-toy2 riding a bicycle"
+    },
+    {
+      "prompt": "a cat-toy2 in a cafe in new york city"
+    },
+    {
+      "random_caption": true,
+      "size": [384, 640]
+    },
+    {
+      "random_caption": true,
+      "size": [640, 384]
+    }
+  ]
+}
