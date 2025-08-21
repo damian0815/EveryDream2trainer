@@ -31,7 +31,7 @@ from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm.auto import tqdm
-from compel import Compel
+from compel import Compel, ReturnedEmbeddingsType
 import traceback
 
 from model.training_model import TrainingModel
@@ -126,7 +126,8 @@ class SampleGenerator:
         self.batch_size = batch_size
         self.config_file_path = config_file_path
         self.use_xformers = use_xformers
-        self.show_progress_bars = False
+        self.use_compel = True
+        self.show_progress_bars = True
         self.generate_pretrain_samples = False
         self.use_penultimate_clip_layer = use_penultimate_clip_layer
         self.guidance_rescale = guidance_rescale
@@ -137,6 +138,8 @@ class SampleGenerator:
         self.sample_steps = default_sample_steps
         self.sample_epochs = default_sample_epochs
 
+        self.sample_invokeai_info_dicts_json = None
+        self.sample_invokeai_info_dicts = None
         self.sample_requests = None
         self.reload_config()
         print(f" * SampleGenerator initialized with {len(self.sample_requests)} prompts, generating samples every {self.sample_steps} training steps, using scheduler '{self.scheduler}' with {self.num_inference_steps} inference steps")
@@ -229,8 +232,6 @@ class SampleGenerator:
         """
         generates samples at different cfg scales and saves them to disk
         """
-        disable_progress_bars = not self.show_progress_bars
-
         try:
             font = ImageFont.truetype(font="arial.ttf", size=20)
         except:
@@ -248,14 +249,17 @@ class SampleGenerator:
                         return a.size == b.size
                     batches = list(chunk_list(self.sample_requests, self.batch_size,
                                             compatibility_test=sample_compatibility_test))
-                    pbar = tqdm(total=len(batches), disable=disable_progress_bars, position=1, leave=False,
+                    pbar = tqdm(total=len(batches), disable=not self.show_progress_bars, position=1, leave=False,
                                       desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
-                    compel = Compel(tokenizer=pipe.tokenizer,
-                                    text_encoder=pipe.text_encoder
-                                    )#,
-                                    #use_penultimate_clip_layer=self.use_penultimate_clip_layer)
+                    if type(pipe) is StableDiffusionXLPipeline:
+                        compel = compel = Compel(tokenizer=[pipe.tokenizer, pipe.tokenizer_2] , text_encoder=[pipe.text_encoder, pipe.text_encoder_2], returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED, requires_pooled=[False, True])
+                    else:
+                        compel = Compel(tokenizer=pipe.tokenizer,
+                                        text_encoder=pipe.text_encoder
+                                        )#,
+                                        #use_penultimate_clip_layer=self.use_penultimate_clip_layer)
                     for batch in batches:
                         if check_semaphore_file_and_unlink(_INTERRUPT_SAMPLES_SEMAPHORE_FILE):
                             print("sample generation interrupted")
@@ -271,12 +275,21 @@ class SampleGenerator:
 
                         batch_images = []
                         for cfg in self.cfgs:
-                            pipe.set_progress_bar_config(disable=disable_progress_bars, position=2, leave=False,
+                            pipe.set_progress_bar_config(disable=not self.show_progress_bars, position=2, leave=False,
                                                          desc=f"{Fore.LIGHTYELLOW_EX}CFG scale {cfg}{Style.RESET_ALL}")
-                            prompt_embeds = compel(prompts)
-                            negative_prompt_embeds = compel(negative_prompts)
+                            if type(pipe) is StableDiffusionXLPipeline:
+                                prompt_embeds, pooled_prompt_embeds = compel(prompts)
+                                negative_prompt_embeds, negative_pooled_prompt_embeds = compel(negative_prompts)
+                            else:
+                                prompt_embeds = compel(prompts)
+                                pooled_prompt_embeds = None
+                                negative_pooled_prompt_embeds = compel(negative_prompts)
+                                negative_pooled_prompt_embeds = None
+
                             images = pipe(prompt_embeds=prompt_embeds,
+                                          pooled_prompt_embeds=pooled_prompt_embeds,
                                           negative_prompt_embeds=negative_prompt_embeds,
+                                          negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
                                           num_inference_steps=self.num_inference_steps,
                                           num_images_per_prompt=1,
                                           guidance_scale=cfg,
@@ -383,9 +396,6 @@ class SampleGenerator:
                 tokenizer_2=model_being_trained.tokenizer_2,
                 unet=model_being_trained.unet,
                 scheduler=scheduler,
-                safety_checker=None,  # save vram
-                requires_safety_checker=None,  # avoid nag
-                feature_extractor=None,  # must be None if no safety checker
             )
         else:
             pipe = StableDiffusionPipeline(

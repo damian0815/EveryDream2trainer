@@ -601,7 +601,7 @@ def main(args):
                                        config_file_path=args.sample_prompts,
                                        batch_size=max(1,args.batch_size//2),
                                        default_sample_steps=args.sample_steps,
-                                       default_sample_epochs=1,
+                                       default_sample_epochs=None,
                                        use_xformers=args.attn_type == "xformers",
                                        use_penultimate_clip_layer=(args.clip_skip >= 2),
                                        guidance_rescale=0.7 if args.enable_zero_terminal_snr else 0,
@@ -732,7 +732,10 @@ def main(args):
                                   device=model.unet.device,
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
                                   continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching')
+        model.load_vae_to_device(device)
         latents = get_latents(image, model.vae, device=model.unet.device, args=args)
+        if args.offload_vae:
+            model.load_vae_to_device('cpu')
         noise = get_noise(latents.shape, model.unet.device, image.dtype,
                           pyramid_noise_discount=args.pyramid_noise_discount,
                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
@@ -958,6 +961,7 @@ def main(args):
                         runt_size = batch["runt_size"]
                         with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                             latents_slices = []
+                            model.vae.to(device)
                             pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(model.unet.device)
                             for slice_start, slice_end in get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size):
                                 try:
@@ -979,6 +983,8 @@ def main(args):
                                     raise
                             del pixel_values
                             latents = torch.cat(latents_slices)
+                            if args.offload_vae:
+                                model.load_vae_to_device('cpu')
                             del latents_slices
 
                         for caption_variant in caption_variants:
@@ -1031,9 +1037,12 @@ def main(args):
                                 tokens = torch.stack(tokens)
                                 if model.is_sdxl:
                                     tokens_2 = torch.stack(tokens_2)
+                                model.load_textenc_to_device(device)
                                 encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
                                     tokens, tokens_2, caption_str, model, args
                                 )
+                                if args.offload_text_encoder:
+                                    model.load_textenc_to_device('cpu')
 
                             model_pred_all = []
                             model_pred_wrong_all = []
@@ -1075,6 +1084,8 @@ def main(args):
                                     conditioning = Conditioning.sd12_conditioning(
                                         text_encoder_hidden_states=encoder_hidden_states_slice
                                     )
+
+
 
                                 model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
                                     latents=latents_slice,
@@ -1568,6 +1579,8 @@ if __name__ == "__main__":
 
     argparser.add_argument("--test_images", action="store_true", help="check all images by trying to load them")
 
+    argparser.add_argument("--offload_vae", action="store_true", help="If passed, offload VAE to CPU when not in use, saves VRAM but is slower")
+    argparser.add_argument("--offload_text_encoder", action="store_true", help="If passed, offload text encoder(s) to CPU when not in use, saves VRAM but is slower")
     argparser.add_argument("--no_save_on_error", action="store_true", help="If passed, do not save model on error/ctrl-c")
 
     # load CLI args to overwrite existing config args

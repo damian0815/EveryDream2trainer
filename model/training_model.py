@@ -168,6 +168,14 @@ class TrainingModel:
     compel: Compel|None
     yaml: str|None
 
+    def load_vae_to_device(self, device):
+        self.vae.to(device)
+
+    def load_textenc_to_device(self, device):
+        self.text_encoder.to(device)
+        self.text_encoder_2.to(device)
+
+
 @dataclass
 class Conditioning:
     _text_encoder_hidden_states: torch.Tensor

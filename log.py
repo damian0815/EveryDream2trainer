@@ -38,17 +38,17 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
     lr_textenc = ed_optimizer.get_textenc_lr()
     log_writer.add_scalar(tag="hyperparameter/lr unet", scalar_value=lr_unet, global_step=global_step)
     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
-    log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=tv.timesteps_ranges[0][0],
-                          global_step=global_step)
-    log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=tv.timesteps_ranges[0][1],
-                          global_step=global_step)
+    if tv.timesteps_ranges:
+        log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=tv.timesteps_ranges[0][0],
+                              global_step=global_step)
+        log_writer.add_scalar(tag="hyperparameter/timestep end", scalar_value=tv.timesteps_ranges[0][1],
+                              global_step=global_step)
     log_writer.add_scalar(tag="hyperparameter/effective batch size", scalar_value=tv.last_effective_batch_size,
                           global_step=global_step)
     log_writer.add_scalar(tag="hyperparameter/effective backward size", scalar_value=tv.effective_backward_size,
                           global_step=global_step)
     sum_img = sum(log_data.images_per_sec_log_step)
     avg = sum_img / len(log_data.images_per_sec_log_step)
-    images_per_sec_log_step = []
     if args.amp:
         log_writer.add_scalar(tag="hyperparameter/grad scale", scalar_value=ed_optimizer.get_scale(),
                               global_step=global_step)
