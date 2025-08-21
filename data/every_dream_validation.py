@@ -221,12 +221,13 @@ class EveryDreamValidator:
                     if model.is_sdxl:
                         tokens_2 = torch.stack(batch["tokens_2"][key])
 
-                    encoder_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                    encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
                         tokens, tokens_2, caption_str, model, args=None
                     )
                     if model.is_sdxl:
-                        add_time_ids = batch["add_time_ids"]
+                        add_time_ids = batch["add_time_ids"].to(encoder_hidden_states.device)
                         conditioning = Conditioning.sdxl_conditioning(text_encoder_hidden_states=encoder_hidden_states,
+                                                                      text_encoder_2_hidden_states=encoder_2_hidden_states,
                                                                       text_encoder_2_pooled_embeds=encoder_2_pooled_embeds,
                                                                       add_time_ids=add_time_ids
                                                                       )

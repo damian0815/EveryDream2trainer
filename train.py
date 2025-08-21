@@ -632,13 +632,16 @@ def main(args):
                 global_step = tv.global_step
                 interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step}")
                 print()
-                logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
-                logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
-                logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
-                time.sleep(2) # give opportunity to ctrl-C again to cancel save
-                save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
-                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
-                           save_optimizer_flag=True, save_ckpt=not args.no_save_ckpt)
+                if args.no_save_on_error:
+                   logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, but NOT saving because --no_save_on_error was passed{Style.RESET_ALL}")
+                else:
+                    logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
+                    logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, attempting to save model to {interrupted_checkpoint_path}{Style.RESET_ALL}")
+                    logging.error(f"{Fore.LIGHTRED_EX} ************************************************************************{Style.RESET_ALL}")
+                    time.sleep(2) # give opportunity to ctrl-C again to cancel save
+                    save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
+                               save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
+                               save_optimizer_flag=True, save_ckpt=not args.no_save_ckpt)
             exit(_SIGTERM_EXIT_CODE)
         else:
             # non-main threads (i.e. dataloader workers) should exit cleanly
@@ -659,6 +662,8 @@ def main(args):
 
     model.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model.unet.eval()
     model.text_encoder.train() if not args.disable_textenc_training else model.text_encoder.eval()
+    if model.is_sdxl:
+        model.text_encoder_2.train() if not args.disable_textenc_training else model.text_encoder_2.eval()
 
     logging.info(f" unet device: {model.unet.device}, precision: {model.unet.dtype}, training: {model.unet.training}")
     logging.info(f" text_encoder device: {model.text_encoder.device}, precision: {model.text_encoder.dtype}, training: {model.text_encoder.training}")
@@ -956,15 +961,14 @@ def main(args):
                             pixel_values = batch["image"].to(memory_format=torch.contiguous_format).to(model.unet.device)
                             for slice_start, slice_end in get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size):
                                 try:
-                                    vae: AutoencoderKL
                                     if enable_vae_attention_slicing:
-                                        vae.enable_slicing()
+                                        model.vae.enable_slicing()
                                     try:
                                         latents_slice = model.vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
                                     except Exception as e:
                                         logging.error(f"vae.encode failed for batch {batch['pathnames']} slice [{slice_start}:{slice_end}] @resolution {batch_resolution}. pixel_values shape is {pixel_values.shape}")
                                         raise
-                                    vae.disable_slicing()
+                                    model.vae.disable_slicing()
                                     latents_slice = latents_slice[0].sample() * 0.18215
                                     latents_slices.append(latents_slice)
                                     del latents_slice
@@ -989,7 +993,7 @@ def main(args):
                                 tokens = []
                                 tokens_2 = []
                                 batch_size = batch["image"].shape[0]
-                                add_time_ids = batch["add_time_ids"] if "add_time_ids" in batch else None
+                                add_time_ids = batch["add_time_ids"].to(model.unet.device) if "add_time_ids" in batch else None
                                 for i in range(batch_size):
                                     this_caption_str = batch["captions"][
                                         caption_variant
@@ -1564,6 +1568,7 @@ if __name__ == "__main__":
 
     argparser.add_argument("--test_images", action="store_true", help="check all images by trying to load them")
 
+    argparser.add_argument("--no_save_on_error", action="store_true", help="If passed, do not save model on error/ctrl-c")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

@@ -10,10 +10,21 @@ import PIL
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from colorama import Fore, Style
-from diffusers import (StableDiffusionPipeline, DDIMScheduler, DPMSolverMultistepScheduler, DDPMScheduler,
-                       PNDMScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler, LMSDiscreteScheduler,
-                       KDPM2AncestralDiscreteScheduler, DPMSolverSDEScheduler, DPMSolverSinglestepScheduler,
-                       FlowMatchEulerDiscreteScheduler)
+from diffusers import (
+    StableDiffusionPipeline,
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    DDPMScheduler,
+    PNDMScheduler,
+    EulerDiscreteScheduler,
+    EulerAncestralDiscreteScheduler,
+    LMSDiscreteScheduler,
+    KDPM2AncestralDiscreteScheduler,
+    DPMSolverSDEScheduler,
+    DPMSolverSinglestepScheduler,
+    FlowMatchEulerDiscreteScheduler,
+    StableDiffusionXLPipeline,
+)
 
 from torch import FloatTensor
 from torch.cuda.amp import autocast
@@ -23,6 +34,7 @@ from tqdm.auto import tqdm
 from compel import Compel
 import traceback
 
+from model.training_model import TrainingModel
 from semaphore_files import check_semaphore_file_and_unlink
 from .sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
 
@@ -357,21 +369,35 @@ class SampleGenerator:
         del tfimage
 
     @torch.no_grad()
-    def create_inference_pipe(self, model_being_trained, diffusers_scheduler_config: dict=None, **kwargs):
+    def create_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config: dict=None, **kwargs) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
         """
         creates a pipeline for SD inference
         """
         scheduler = self._create_scheduler(diffusers_scheduler_config)
-        pipe = StableDiffusionPipeline(
-            vae=model_being_trained.vae,
-            text_encoder=model_being_trained.text_encoder,
-            tokenizer=model_being_trained.tokenizer,
-            unet=model_being_trained.unet,
-            scheduler=scheduler,
-            safety_checker=None, # save vram
-            requires_safety_checker=None, # avoid nag
-            feature_extractor=None, # must be None if no safety checker
-        )
+        if model_being_trained.is_sdxl:
+            pipe = StableDiffusionXLPipeline(
+                vae=model_being_trained.vae,
+                text_encoder=model_being_trained.text_encoder,
+                text_encoder_2=model_being_trained.text_encoder_2,
+                tokenizer=model_being_trained.tokenizer,
+                tokenizer_2=model_being_trained.tokenizer_2,
+                unet=model_being_trained.unet,
+                scheduler=scheduler,
+                safety_checker=None,  # save vram
+                requires_safety_checker=None,  # avoid nag
+                feature_extractor=None,  # must be None if no safety checker
+            )
+        else:
+            pipe = StableDiffusionPipeline(
+                vae=model_being_trained.vae,
+                text_encoder=model_being_trained.text_encoder,
+                tokenizer=model_being_trained.tokenizer,
+                unet=model_being_trained.unet,
+                scheduler=scheduler,
+                safety_checker=None, # save vram
+                requires_safety_checker=None, # avoid nag
+                feature_extractor=None, # must be None if no safety checker
+            )
         if self.use_xformers:
             pipe.enable_xformers_memory_efficient_attention()
         return pipe

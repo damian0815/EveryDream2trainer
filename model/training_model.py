@@ -178,10 +178,11 @@ class Conditioning:
 
     @property
     def prompt_embeds(self) -> torch.Tensor:
-        if self._text_encoder_2_hidden_states is None:
-            return self._text_encoder_hidden_states
+        if self._text_encoder_2_hidden_states is not None:
+            # sdxl: both text encoders fused together
+            return torch.cat([self._text_encoder_hidden_states, self._text_encoder_2_hidden_states], dim=-1)
         else:
-            return torch.cat([self._text_encoder_hidden_states, self._text_encoder_2_hidden_states])
+            return self._text_encoder_hidden_states
 
     @property
     def added_cond_kwargs(self) -> dict:
@@ -227,7 +228,7 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
             tokens_2,
             model.text_encoder_2,
             clip_skip=args.clip_skip if args else 0,
-            embedding_perturbation=args.embeddiing_perturbation if args else False,
+            embedding_perturbation=args.embedding_perturbation if args else False,
             compel=model.compel,
             caption_strings=caption_str,
             is_sdxl=model.is_sdxl,
@@ -241,7 +242,7 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
     return encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds
 
 
-def _encode_caption_tokens(tokens, text_encoder, clip_skip: int, embedding_perturbation: bool,
+def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, embedding_perturbation: bool,
                            compel: Compel=None, caption_strings: list[str]=None, is_sdxl=False, return_pooled=False):
     cuda_caption = tokens.to(text_encoder.device)
     if compel is not None:
@@ -259,7 +260,12 @@ def _encode_caption_tokens(tokens, text_encoder, clip_skip: int, embedding_pertu
         if not is_sdxl:
             # for SD1 and SD2 we need to normalize the hidden states
             encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states)
-        return encoder_hidden_states
+
+        if return_pooled:
+            pooler_output = encoder_output[0]
+            return encoder_hidden_states, pooler_output
+        else:
+            return encoder_hidden_states
 
     # https://arxiv.org/pdf/2405.20494
     perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
