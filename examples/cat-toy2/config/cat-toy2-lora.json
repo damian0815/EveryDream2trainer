@@ -24,7 +24,7 @@
   "max_epochs": 40,
   "notebook": false,
   "project_name": "sdxl-cat-toy2",
-  "resolution": 512,
+  "resolution": 1024,
   "resume_ckpt": "RunDiffusion/Juggernaut-XL-v9",
   "resume_ckpt_variant": "fp16",
   "sample_prompts": "examples/cat-toy2/config/sample-prompts.json",

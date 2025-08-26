@@ -107,6 +107,10 @@ class TrainingVariables:
     interleave_bs1_bsN: bool = False
     interleaved_bs1_count: int|None = None
 
+    cond_dropouts: list[float] = field(default_factory=list)
+
+    remaining_timesteps: torch.Tensor|None = None
+
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
 
     prev_accumulated_pathnames: list[str] = field(default_factory=list)
@@ -173,7 +177,8 @@ class TrainingModel:
 
     def load_textenc_to_device(self, device):
         self.text_encoder.to(device)
-        self.text_encoder_2.to(device)
+        if self.text_encoder_2:
+            self.text_encoder_2.to(device)
 
 
 @dataclass
@@ -515,7 +520,7 @@ def load_model(args) -> TrainingModel:
         from utils.unet_utils import enforce_zero_terminal_snr
         temp_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
         trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
-        noise_scheduler = get_training_noise_scheduler(args.train_sampler, model_root_folder,
+        noise_scheduler = get_training_noise_scheduler(temp_scheduler, args.train_sampler,
                                                        trained_betas=trained_betas, rescale_betas_zero_snr=False
                                                        # True
                                                        )

@@ -254,7 +254,10 @@ class SampleGenerator:
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
                     if type(pipe) is StableDiffusionXLPipeline:
-                        compel = compel = Compel(tokenizer=[pipe.tokenizer, pipe.tokenizer_2] , text_encoder=[pipe.text_encoder, pipe.text_encoder_2], returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED, requires_pooled=[False, True])
+                        compel = Compel(tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
+                            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+                            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+                            requires_pooled=[False, True])
                     else:
                         compel = Compel(tokenizer=pipe.tokenizer,
                                         text_encoder=pipe.text_encoder
@@ -283,7 +286,7 @@ class SampleGenerator:
                             else:
                                 prompt_embeds = compel(prompts)
                                 pooled_prompt_embeds = None
-                                negative_pooled_prompt_embeds = compel(negative_prompts)
+                                negative_prompt_embeds = compel(negative_prompts)
                                 negative_pooled_prompt_embeds = None
 
                             images = pipe(prompt_embeds=prompt_embeds,

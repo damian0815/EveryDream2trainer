@@ -220,6 +220,8 @@ class EveryDreamValidator:
                     tokens = torch.stack(batch["tokens"][key])
                     if model.is_sdxl:
                         tokens_2 = torch.stack(batch["tokens_2"][key])
+                    else:
+                        tokens_2 = None
 
                     encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
                         tokens, tokens_2, caption_str, model, args=None
@@ -238,7 +240,7 @@ class EveryDreamValidator:
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                    del target, model_pred
+                    del target, model_pred, conditioning
                     loss_step = loss.detach().item()
                     loss_validation_epoch.append(loss_step)
 

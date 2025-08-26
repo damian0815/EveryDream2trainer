@@ -90,6 +90,14 @@ ASPECTS_1024 = [[1024,1024],   # 1048576 1:1
     [2048,512],[512,2048], # 1048576 4:1
 ]
 
+ASPECTS_1024_SDXL = [
+    [1024,1024],   # 1048576 1:1
+    [1152, 896], [896, 1152],  # 1032192 1.286:1
+    [1216, 832], [832, 1216],  # 1011712 1.462:1
+    [1344, 768], [768, 1344],  # 1032192 1.75:1
+    [1536, 640], [640, 1536],  # 1024000 2.5:1
+]
+
 ASPECTS_960 = [[960,960],     # 921600 1:1
     #[1024,896],[896,1024], # 917504 1.143:1
     [1088,832],[832,1088], # 905216 1.308:1
@@ -206,7 +214,7 @@ ASPECTS_256 = [[256,256],  # 65536 1:1
     [512,128],[128,512],   # 65536 4:1
 ]
 
-def get_aspect_buckets(resolution, square_only=False, reduced_buckets=False):
+def get_aspect_buckets(resolution, square_only=False, reduced_buckets=False, is_sdxl=False):
     if resolution < 256:
         raise ValueError("Resolution must be at least 512")
     try: 
@@ -246,6 +254,9 @@ def __get_all_aspects():
             ASPECTS_1280,
             ASPECTS_1536,
            ]
+
+def __get_all_aspects_sdxl():
+    return ASPECTS_1024_SDXL
 
 
 def get_rational_aspect_ratio(bucket_wh: Tuple[int, int]) -> Tuple[int]:

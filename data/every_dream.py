@@ -218,7 +218,7 @@ class EveryDreamBatch(Dataset):
         crop_jitter = (0.0
                        if image_train_item.runt_size > 0 # and do_contrastive_learning
                        else self.crop_jitter)
-        image_train_tmp = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=self.use_masks)
+        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=self.use_masks, return_crop_info=True)
 
         example["image"] = image_train_tmp.image.copy() # hack for now to avoid memory leak
         example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy() # hack for now to avoid memory leak
@@ -237,9 +237,9 @@ class EveryDreamBatch(Dataset):
 
         if self.is_sdxl:
             example["add_time_ids"] = _get_add_time_ids(
-                original_size = (image_train_item.image_size[1], image_train_item.image_size[0]),
+                original_size = (uncropped_h, uncropped_w),
                 target_size = (image_train_item.target_wh[1], image_train_item.target_wh[0]),
-                crops_coords_top_left = (0, 0),
+                crops_coords_top_left = (crop_tl_y, crop_tl_x),
                 dtype=torch.float32
             )
 
@@ -276,7 +276,7 @@ class DataLoaderWithFixedBuffer(torch.utils.data.DataLoader):
 
         captions = [example["caption"] for example in batch]
         tokens = [example["tokens"] for example in batch]
-        tokens_2 = ([example["tokens_2"] for example in batch]\
+        tokens_2 = ([example["tokens_2"] for example in batch]
                      if "tokens_2" in batch[0]
                      else None)
         runt_size = batch[0]["runt_size"]

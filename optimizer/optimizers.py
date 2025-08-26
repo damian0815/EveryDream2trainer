@@ -454,6 +454,12 @@ class EveryDreamOptimizer:
                 curr_lr = args.lr
                 logging.info(f"Overriding LR from optimizer config with main config/cli LR setting: {curr_lr}")
 
+        if optimizer_name is None or optimizer_name == "adamw8bit":
+            if not self.use_grad_scaler:
+                logging.warning(
+                    f"{Fore.YELLOW}** Using AdamW8bit without grad scaler is not recommended, consider enabling amp mode.{Style.RESET_ALL}"
+                )
+
         if curr_lr is None:
             curr_lr = default_lr
             logging.warning(f"No LR setting found, defaulting to {default_lr}")

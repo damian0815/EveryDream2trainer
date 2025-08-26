@@ -52,6 +52,13 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
     if args.amp:
         log_writer.add_scalar(tag="hyperparameter/grad scale", scalar_value=ed_optimizer.get_scale(),
                               global_step=global_step)
+    if tv.cond_dropouts:
+        log_writer.add_scalar(
+            tag="hyperparameter/cond dropout",
+            scalar_value=sum(tv.cond_dropouts)/len(tv.cond_dropouts),
+            global_step=global_step,
+        )
+        tv.cond_dropouts = []
     log_writer.add_scalar(tag="performance/images per second", scalar_value=avg, global_step=global_step)
     logs = {"lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": log_data.images_per_sec}
     if len(log_data.loss_log_step) > 0:

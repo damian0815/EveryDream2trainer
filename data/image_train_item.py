@@ -180,6 +180,7 @@ class ImageTrainItem:
             self.image = image
             self.image_size = image.size
             #self.target_size = None
+        self.mask = None
 
         self.is_undersized = False
         self.error = None
@@ -269,9 +270,9 @@ class ImageTrainItem:
         top = top_crop_pixels
         bottom = height - bottom_crop_pixels
 
-        crop_size = image.crop((left, top, right, bottom))
+        cropped = image.crop((left, top, right, bottom))
 
-        return crop_size
+        return cropped
     
     def _debug_save_image(self, image, folder=""):
         base_name = os.path.basename(self.pathname)
@@ -288,7 +289,7 @@ class ImageTrainItem:
             print(f"error for debug saving image of {self.pathname}: {e}")
             pass
 
-    def _trim_to_aspect(self, image, target_wh):
+    def _trim_to_aspect(self, image, target_wh) -> tuple[PIL.Image, tuple[int, int]]:
         try:
             width, height = image.size
             target_aspect = target_wh[0] / target_wh[1] # 0.60
@@ -304,6 +305,7 @@ class ImageTrainItem:
                 r = width - overwidth + l
                 #print(f"\n_trim_to_aspect actual ar: {image_aspect}, target ar:{target_aspect:.2f}, {image.size}, cropping with box: {l}, 0, {r}, {height}, {self.pathname}")
                 image = image.crop((l, 0, r, height))
+                return image, (l, 0)
             elif target_aspect > image_aspect:
                 target_height = int(width / target_aspect)
                 overheight = height - target_height
@@ -314,13 +316,17 @@ class ImageTrainItem:
                 b = height - overheight + t
                 #print(f"\n_trim_to_aspect actual ar: {image_aspect}, target ar:{target_aspect:.2f}, {image.size}, cropping with box: 0, {t}, {width}, {b}, {self.pathname}")
                 image = image.crop((0, t, width, b))
-                
+                return image, (0, t)
+            else:
+                return image, (0, 0)
+
         except Exception as e:
             logging.error(f"fatal error trimming image {self.pathname}: {e}")
             raise e
-        return image
 
-    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False) -> 'ImageTrainItem':
+    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, return_crop_info=False
+                ) -> typing.Union['ImageTrainItem',
+                                  tuple['ImageTrainItem', tuple[int, int, int, int]]]:
         image = self.load_image()
         mask = self.load_mask() if load_mask else None
 
@@ -339,10 +345,15 @@ class ImageTrainItem:
             image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
             if mask is not None:
                 mask = self._apply_crop_jitter(mask, precomputed_jitter=jitter_amounts)
+        else:
+            jitter_amounts = (0, 0, 0, 0)
+        crop_topleft = (jitter_amounts[0], jitter_amounts[2])
 
-        image = self._trim_to_aspect(image, self.target_wh)
+        uncropped_width, uncropped_height = image.size
+        image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh)
         if mask is not None:
-            mask = self._trim_to_aspect(mask, self.target_wh)
+            mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh)
+        crop_topleft = (crop_topleft[0] + trim_crop_offset[0], crop_topleft[1] + trim_crop_offset[1])
 
         image = image.resize(self.target_wh)
         if mask:
@@ -366,7 +377,10 @@ class ImageTrainItem:
                 logging.warning(f"mask for {self.pathname} has no non-black pixels - setting to None")
                 self.mask = None
 
-        return self
+        if return_crop_info:
+            return self, (crop_topleft[0], crop_topleft[1], uncropped_width, uncropped_height)
+        else:
+            return self
 
     def __compute_target_width_height(self):
         self.target_wh = None

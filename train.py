@@ -515,7 +515,10 @@ def main(args):
 
     image_train_items = []
     for batch_resolution in args.resolution:
-        this_aspects = aspects.get_aspect_buckets(batch_resolution)
+        this_aspects = aspects.get_aspect_buckets(batch_resolution,
+                                                  #square_only=model.is_sdxl,
+                                                  #reduced_buckets=model.is_sdxl
+                                                  )
         image_train_items.extend(resolve_image_train_items(args, batch_resolution, this_aspects))
 
     validator = None
@@ -687,7 +690,8 @@ def main(args):
     append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
 
     log_data = LogData()
-    log_data.attention_activation_logger = ActivationLogger(model=model.unet, writer=log_writer)
+    if args.log_attention_activations:
+        log_data.attention_activation_logger = ActivationLogger(model=model.unet, writer=log_writer)
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
@@ -751,7 +755,6 @@ def main(args):
             skip_contrastive=True
         )
 
-        del encoder_hidden_states
         return model_pred, target
 
     # Pre-train validation to establish a starting point on the loss graph
@@ -777,7 +780,7 @@ def main(args):
 
         needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
-        remaining_timesteps = None
+        tv.remaining_timesteps = None
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -901,10 +904,13 @@ def main(args):
                                                                            initial_value=args.cond_dropout,
                                                                            final_value=final_cond_dropout,
                                                                            alpha=args.cond_dropout_curriculum_alpha)
+                        tv.cond_dropouts.append(this_cond_dropout_p)
                         if train_batch.random_instance.random() <= this_cond_dropout_p:
-                            for k in full_batch['captions'].keys():
-                                full_batch['tokens'][k][sample_index] = train_batch.cond_dropout_tokens
-                                full_batch['captions'][k][sample_index] = train_batch.cond_dropout_caption
+                            for k in full_batch["captions"].keys():
+                                full_batch["tokens"][k][sample_index] = train_batch.cond_dropout_tokens
+                                if model.is_sdxl:
+                                    full_batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens
+                                full_batch["captions"][k][sample_index] = train_batch.cond_dropout_caption
                             full_batch["loss_scale"][sample_index] *= args.cond_dropout_loss_scale
 
                     batch = None
@@ -1063,7 +1069,6 @@ def main(args):
                                 # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                                 latents_slice = latents[slice_start:slice_end]
                                 encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
-                                encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
                                 timesteps_slice = timesteps[slice_start:slice_end]
                                 if teacher_mask is None:
@@ -1072,6 +1077,7 @@ def main(args):
                                     teacher_mask_slice = teacher_mask[slice_start:slice_end]
 
                                 if model.is_sdxl:
+                                    encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
                                     encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
                                     add_time_ids_slice = add_time_ids[slice_start:slice_end]
                                     conditioning = Conditioning.sdxl_conditioning(
@@ -1080,12 +1086,12 @@ def main(args):
                                         text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
                                         add_time_ids = add_time_ids_slice
                                     )
+                                    del encoder_2_hidden_states_slice, encoder_2_pooled_embeds_slice, add_time_ids_slice
                                 else:
                                     conditioning = Conditioning.sd12_conditioning(
                                         text_encoder_hidden_states=encoder_hidden_states_slice
                                     )
-
-
+                                del encoder_hidden_states_slice
 
                                 model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
                                     latents=latents_slice,
@@ -1101,6 +1107,8 @@ def main(args):
                                 model_pred_wrong_all.append(model_pred_wrong)
                                 model_pred_wrong_mask_all.append(model_pred_wrong_mask)
                                 target_all.append(target)
+
+                                del conditioning
 
                             nibble_size_actual = min(slice_end, batch_size - runt_size)
                             mask = None if batch["mask"] is None else batch["mask"][0:nibble_size_actual]
@@ -1438,7 +1446,6 @@ def _get_best_match_resolution(resolutions: list[int], image_size_pixels: int) -
 
 if __name__ == "__main__":
     check_git()
-    supported_resolutions = aspects.get_supported_resolutions()
     argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
     argparser.add_argument("--config", type=str, required=False, default=None, help="JSON config file to load options from")
     args, argv = argparser.parse_known_args()
@@ -1481,6 +1488,7 @@ if __name__ == "__main__":
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")
+    argparser.add_argument('--log_attention_activations', action='store_true', help='If passed, magnitudes of attention activation modules in the unet')
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
                            help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "v-mse"])
     argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
@@ -1497,7 +1505,7 @@ if __name__ == "__main__":
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
-    argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=supported_resolutions)
+    argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=aspects.get_supported_resolutions())
     argparser.add_argument("--keep_same_sample_at_different_resolutions_together", action='store_true', help="if passed, re-order batches to put samples with the same path but different resolutions near to each other")
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
     argparser.add_argument("--resume_ckpt_variant", type=str, required=False, default=None, help="For Hugging Face repo resume_ckpts, the variant (eg fp16) - required for some models")

@@ -9,10 +9,10 @@ import torch
 from diffusers import (
     DDIMScheduler, DDPMScheduler, DPMSolverMultistepScheduler, DPMSolverSDEScheduler,
     EulerAncestralDiscreteScheduler, PNDMScheduler, LMSDiscreteScheduler,
-    KDPM2AncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverSinglestepScheduler
+    KDPM2AncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverSinglestepScheduler, StableDiffusionXLPipeline
 )
 from diffusers import StableDiffusionPipeline
-from compel import Compel
+from compel import Compel, ReturnedEmbeddingsType
 from PIL import Image, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import hashlib
@@ -234,7 +234,9 @@ def create_scheduler(name, scheduler_config: dict):
         raise ValueError(f"unknown scheduler '{scheduler}'")
 
 
-def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, model_type: str,
+def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline,
+                              model_name: str,
+                              model_type: str,
                               all_params: list[ImageGenerationParams],
                               batch_size: int,
                               image_save_cb,
@@ -247,7 +249,14 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
     extra_cfgs = extra_cfgs or []
     all_params = sorted(all_params, key=lambda x: get_critical_params(x))
 
-    compel = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
+    if type(pipe) is StableDiffusionXLPipeline:
+        compel = Compel(tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
+                        text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+                        returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+                        requires_pooled=[False, True])
+    else:
+        compel = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
+
     model_node_data = {'name': model_name, "base": model_type, "type": "main"}
 
     try:
@@ -286,8 +295,14 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
                 negative_prompts = [p.negative_prompt for p in batch]
                 pipe.set_progress_bar_config(leave=False, desc=f"{len(prompts)} gens")
 
-                prompt_embeds = compel(prompts)
-                negative_prompt_embeds = compel(negative_prompts)
+                if type(pipe) is StableDiffusionXLPipeline:
+                    prompt_embeds, pooled_prompt_embeds = compel(prompts)
+                    negative_prompt_embeds, negative_pooled_prompt_embeds = compel(negative_prompts)
+                else:
+                    prompt_embeds = compel(prompts)
+                    pooled_prompt_embeds = None
+                    negative_prompt_embeds = compel(negative_prompts)
+                    negative_pooled_prompt_embeds = None
 
                 # pad long prompts
                 prompt_embeds_padded = []
@@ -299,14 +314,18 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline, model_name: str, mo
                         print('padded to shape', padded[0].shape)
                     prompt_embeds_padded.append(padded[0])
                     negative_prompt_embeds_padded.append(padded[1])
+                prompt_embeds_padded = torch.cat(prompt_embeds_padded)
+                negative_prompt_embeds_padded = torch.cat(negative_prompt_embeds_padded)
 
                 batch_images = []
 
                 cfgs = [p0.cfg] + extra_cfgs
                 for cfg in cfgs:
                     generator = [torch.Generator(device=generator_device).manual_seed(p.seed) for p in batch]
-                    images = pipe(prompt_embeds=torch.cat(prompt_embeds_padded),
-                                  negative_prompt_embeds=torch.cat(negative_prompt_embeds_padded),
+                    images = pipe(prompt_embeds=prompt_embeds_padded,
+                                  pooled_prompt_embeds=pooled_prompt_embeds,
+                                  negative_prompt_embeds=negative_prompt_embeds_padded,
+                                  negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
                                   generator=generator,
                                   width=p0.width,
                                   height=p0.height,
