@@ -1,10 +1,12 @@
 {
   "batch_size": 2,
   "seed": 555,
-  "cfgs": [7, 4],
+  "cfgs": [4, 2, 1],
   "scheduler": "ddim",
   "num_inference_steps": 30,
   "show_progress_bars": true,
+  "generate_samples_every_n_steps": null,
+  "generate_samples_every_n_epochs": 10,
   "samples": [
     {
       "prompt": "a cat-toy2 on a wooden desk"
@@ -20,11 +22,15 @@
     },
     {
       "random_caption": true,
-      "size": [384, 640]
+      "size": [1024, 1024]
     },
     {
       "random_caption": true,
-      "size": [640, 384]
+      "size": [768, 1344]
+    },
+    {
+      "random_caption": true,
+      "size": [1344, 768]
     }
   ]
 }

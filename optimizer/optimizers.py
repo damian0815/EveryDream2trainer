@@ -53,7 +53,7 @@ class EveryDreamOptimizer:
     text_encoder: text encoder model parameters
     unet: unet model parameters
     """
-    def __init__(self, args, optimizer_config, text_encoder, unet, epoch_len, plugin_runner: PluginRunner, log_writer=None):
+    def __init__(self, args, optimizer_config, model: 'TrainingModel', epoch_len, plugin_runner: PluginRunner, log_writer=None):
         if optimizer_config is None:
             raise ValueError("missing optimizer_config")
         if "doc" in optimizer_config:
@@ -62,8 +62,9 @@ class EveryDreamOptimizer:
         pprint.pprint(optimizer_config)
         self.epoch_len = epoch_len
         self.max_epochs = args.max_epochs
-        self.unet = unet # needed for weight norm logging, unet.parameters() has to be called again, Diffusers quirk
-        self.text_encoder = text_encoder
+        self.unet = model.unet # needed for weight norm logging, unet.parameters() has to be called again, Diffusers quirk
+        self.text_encoder = model.text_encoder
+        self.text_encoder_2 = model.text_encoder_2
         self.log_writer = log_writer
         self.unet_freeze = args.freeze_unet_balanced
         self.te_config, self.base_config = self.get_final_optimizer_configs(args, optimizer_config)
@@ -81,10 +82,13 @@ class EveryDreamOptimizer:
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
         if args.lora:
-            self.text_encoder_params, self.unet_params = self.setup_lora_training(args, text_encoder, unet)
+            self.text_encoder_params, self.unet_params = self.setup_lora_training(args, model)
         else:
-            self.text_encoder_params = self._apply_text_encoder_freeze(text_encoder)
-            self.unet_params = self._apply_unet_freeze(unet)
+            self.text_encoder_params = itertools.chain([
+                self._apply_text_encoder_freeze(model.text_encoder),
+                self._apply_text_encoder_freeze(model.text_encoder_2)
+            ])
+            self.unet_params = self._apply_unet_freeze(model.unet)
 
         if args.jacobian_descent:
             from torchjd.aggregation import UPGrad
@@ -181,14 +185,23 @@ class EveryDreamOptimizer:
             with torch.no_grad():
                 self.log_writer.add_scalar("optimizer/unet_grad_norm_pre_clip", _get_grad_norm(self.unet.parameters()), global_step)
                 self.log_writer.add_scalar("optimizer/te_grad_norm_pre_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
+                if self.text_encoder_2 is not None:
+                    self.log_writer.add_scalar("optimizer/te2_grad_norm_pre_clip", _get_grad_norm(self.text_encoder_2.parameters()),global_step,)
 
         if self.clip_grad_norm:
             torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=self.clip_grad_norm)
             torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder.parameters(), max_norm=self.clip_grad_norm)
+            if self.text_encoder_2 is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    parameters=self.text_encoder_2.parameters(),
+                    max_norm=self.clip_grad_norm,
+                )
             if self.log_grad_norm:
                 with torch.no_grad():
                     self.log_writer.add_scalar("optimizer/unet_grad_norm_post_clip", _get_grad_norm(self.unet.parameters()), global_step)
                     self.log_writer.add_scalar("optimizer/te_grad_norm_post_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
+                    if self.text_encoder_2 is not None:
+                        self.log_writer.add_scalar("optimizer/te2_grad_norm_post_clip", _get_grad_norm(self.text_encoder_2.parameters()), global_step)
 
         if self.scaler is None:
             for optimizer in self.optimizers:
@@ -206,6 +219,13 @@ class EveryDreamOptimizer:
                                           log_action)
                 self._log_weight_normal(self.unet.parameters(), "optimizer/unet_weight_norm", log_action)
                 self._log_weight_normal(self.text_encoder.parameters(), "optimizer/te_weight_norm", log_action)
+                if self.text_encoder_2 is not None:
+                    self._log_gradient_normal(
+                        self.text_encoder_2.parameters(),
+                        "optimizer/te2_grad_norm",
+                        log_action,
+                    )
+                    self._log_weight_normal(self.text_encoder_2.parameters(), "optimizer/te2_weight_norm", log_action)
 
         self._zero_grad(set_to_none=True)
 
@@ -357,6 +377,7 @@ class EveryDreamOptimizer:
                     optimizer=self.optimizer_unet,
                     num_warmup_steps=int(unet_config["lr_warmup_steps"]),
                     num_training_steps=int(unet_config["lr_decay_steps"]),
+                    num_cycles=3
                 )
             for i in range(unet_config["lr_advance_steps"]):
                 lr_scheduler.step()
@@ -693,28 +714,26 @@ class EveryDreamOptimizer:
 
         return parameters
 
-    def setup_lora_training(self, args, text_encoder, unet):
+    def setup_lora_training(self, args, model: 'TrainingModel'):
 
         if args.disable_textenc_training:
             text_encoder_params = []
         else:
             if not args.lora_resume:
-                suffixes = ["q_proj", "k_proj", "v_proj", "out_proj"]
-                target_modules = [k for k, _ in text_encoder.named_modules() if any(suffix in k for suffix in suffixes)]
-                unfreeze_last_n_layers = self.te_freeze_config.get("unfreeze_last_n_layers", None)
-                if unfreeze_last_n_layers is not None:
-                    layer_count = len(text_encoder.text_model.encoder.layers)
-                    last_n_layers = range(layer_count-unfreeze_last_n_layers, layer_count+1)
-                    target_modules = [k for k in target_modules if any(f'.layers.{l}' in k for l in last_n_layers)]
-                print("lora freezing means we put lora on: ", target_modules)
+                if self.te_freeze_config.get("unfreeze_last_n_layers", None) is not None:
+                    raise ValueError("Freezing not supported with LoRA training")
                 text_lora_config = LoraConfig(
                     r=args.lora_rank,
                     lora_alpha=args.lora_alpha,
                     init_lora_weights="gaussian",
-                    target_modules=target_modules
+                    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]
                 )
-                text_encoder.add_adapter(text_lora_config)
-            text_encoder_params = list(filter(lambda p: p[1].requires_grad, text_encoder.named_parameters()))
+                model.text_encoder.add_adapter(text_lora_config)
+                if model.text_encoder_2 is not None:
+                    model.text_encoder_2.add_adapter(text_lora_config)
+            text_encoder_params = list(filter(lambda p: p[1].requires_grad, model.text_encoder.named_parameters()))
+            if model.text_encoder_2 is not None:
+                text_encoder_params += list(filter(lambda p: p[1].requires_grad, model.text_encoder_2.named_parameters()))
 
         if args.disable_unet_training:
             unet_params = []
@@ -726,8 +745,8 @@ class EveryDreamOptimizer:
                     init_lora_weights="gaussian",
                     target_modules=["to_k", "to_q", "to_v", "to_out.0"],
                 )
-                unet.add_adapter(unet_lora_config)
-            unet_params = list(filter(lambda p: p[1].requires_grad, unet.named_parameters()))
+                model.unet.add_adapter(unet_lora_config)
+            unet_params = list(filter(lambda p: p[1].requires_grad, model.unet.named_parameters()))
 
         return text_encoder_params, unet_params
 

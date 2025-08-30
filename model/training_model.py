@@ -22,7 +22,6 @@ from diffusers import (
     AutoencoderKL,
     StableDiffusionPipeline,
     StableDiffusionXLPipeline,
-    AutoModel,
 )
 from diffusers.utils import convert_state_dict_to_diffusers
 from transformers import CLIPTextModel, CLIPTokenizer

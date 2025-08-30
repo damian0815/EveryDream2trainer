@@ -88,7 +88,6 @@ from plugins.plugins import PluginRunner
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
 
-
 def setup_local_logger(args):
     """
     configures logger with file and console logging, logs args, and returns the datestamp
@@ -516,8 +515,7 @@ def main(args):
     image_train_items = []
     for batch_resolution in args.resolution:
         this_aspects = aspects.get_aspect_buckets(batch_resolution,
-                                                  #square_only=model.is_sdxl,
-                                                  #reduced_buckets=model.is_sdxl
+                                                  square_only=model.is_sdxl,
                                                   )
         image_train_items.extend(resolve_image_train_items(args, batch_resolution, this_aspects))
 
@@ -591,8 +589,7 @@ def main(args):
 
     ed_optimizer = EveryDreamOptimizer(args,
                                        optimizer_config,
-                                       model.text_encoder,
-                                       model.unet,
+                                       model,
                                        epoch_len,
                                        plugin_runner,
                                        log_writer)
@@ -670,6 +667,8 @@ def main(args):
 
     logging.info(f" unet device: {model.unet.device}, precision: {model.unet.dtype}, training: {model.unet.training}")
     logging.info(f" text_encoder device: {model.text_encoder.device}, precision: {model.text_encoder.dtype}, training: {model.text_encoder.training}")
+    if model.is_sdxl:
+        logging.info(f" text_encoder_2 device: {model.text_encoder_2.device}, precision: {model.text_encoder_2.dtype}, training: {model.text_encoder_2.training}")
     logging.info(f" vae device: {model.vae.device}, precision: {model.vae.dtype}, training: {model.vae.training}")
     logging.info(f" scheduler: {model.noise_scheduler.__class__}")
 
@@ -1329,11 +1328,14 @@ def main(args):
 
         plugin_runner.run_on_training_end()
 
-        save_path = make_save_path(epoch, tv.global_step, prepend=("" if args.no_prepend_last else "last-"))
-        save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
-                   save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
-                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
-                   plugin_runner=plugin_runner)
+        save_path = make_save_path(
+            epoch, tv.global_step, prepend=("" if args.no_prepend_last else "last-")
+        )
+        if not args.lora:
+            save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
+                       save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
+                       save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                       plugin_runner=plugin_runner)
         if args.lora:
             save_model_lora(model=model, save_path=save_path)
 
