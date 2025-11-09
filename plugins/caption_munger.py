@@ -56,7 +56,9 @@ class CaptionMungerPlugin(BasePlugin):
         except Exception as e:
             logging.error(f"unable to load json from {captions_json}: {e}")
             raise
-        transformed_json = {k: (self.transform_caption(v) if (v and len(v.strip())>0) else None)
+        transformed_json = {k.lower(): (self.transform_caption(v)
+                                          if (v and len(v.strip())>0)
+                                          else None)
                 for k, v in d.items()}
         #print(f"transformed caption from '{d}' to '{transformed_json}'")
         return transformed_json

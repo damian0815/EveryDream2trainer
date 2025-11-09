@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import bisect
+import json
 import logging
 from collections import defaultdict
 
@@ -120,6 +121,13 @@ class DataLoaderMultiAspect():
         grad_accum = self.grad_accum
 
         def add_image_to_appropriate_bucket(image: ImageTrainItem, batch_id_override: str=None):
+            #if all(image.caption)
+            caption = image.caption.get_caption()
+            if caption.startswith("<<json>>"):
+                caption_data = json.loads(caption.replace("<<json>>", ""))
+                if all(v is None or len(v) == 0 for v in caption_data.values()):
+                    print("Empty JSON caption detected, skipping image:", image.pathname)
+                    return
             bucket_key = (image.batch_id if batch_id_override is None else batch_id_override,
                           image.target_wh[0],
                           image.target_wh[1])

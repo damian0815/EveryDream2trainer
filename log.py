@@ -59,6 +59,11 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
             global_step=global_step,
         )
         tv.cond_dropouts = []
+    log_writer.add_scalar(
+        tag="hyperparameter/cond dropout actual",
+        scalar_value=tv.cond_dropout_count / (tv.cond_dropout_count + tv.non_cond_dropout_count),
+        global_step=global_step
+    )
     log_writer.add_scalar(tag="performance/images per second", scalar_value=avg, global_step=global_step)
     logs = {"lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": log_data.images_per_sec}
     if len(log_data.loss_log_step) > 0:
@@ -100,19 +105,9 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         logs["loss/log_step non-CD"] = loss_step_non_cd
     if log_data.loss_preview_image is not None:
         loss_preview_image_rgb = torchvision.utils.make_grid(
-            vae_preview((log_data.loss_preview_image / args.negative_loss_margin) * 2 - 1)
+            vae_preview(log_data.loss_preview_image)
         )
-        log_data.loss_preview_image = torchvision.utils.make_grid(
-            torch.reshape(log_data.loss_preview_image, [
-                log_data.loss_preview_image.shape[0] * log_data.loss_preview_image.shape[1], 1,
-                log_data.loss_preview_image.shape[2], log_data.loss_preview_image.shape[3]
-            ]),
-            nrow=log_data.loss_preview_image.shape[0],
-            normalize=True,
-            value_range=(0, args.negative_loss_margin),
-            scale_each=False)
-        log_writer.add_image(tag="loss/last vis raw", img_tensor=log_data.loss_preview_image, global_step=global_step)
-        log_writer.add_image(tag="loss/last vis rgb", img_tensor=loss_preview_image_rgb, global_step=global_step)
+        log_writer.add_image(tag="loss/last model_pred and target", img_tensor=loss_preview_image_rgb, global_step=global_step)
     if args.log_named_parameters_magnitudes:
         def log_named_parameters(model, prefix):
             """Log L2 norms of parameter groups to help debug NaN issues."""

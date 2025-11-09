@@ -96,8 +96,8 @@ class TrainingVariables:
 
     last_effective_batch_size: int = 0
     effective_backward_size: int = 0
-    current_accumulated_backward_images_count: int = 0
-    accumulated_loss_images_count: int = 0
+    current_accumulated_backward_images_count: int = 0 # images that have been backward()ed but not yet optimizer.stepped
+    accumulated_loss_images_count: int = 0 # images that are in the current loss (not yet backward()ed)
     accumulated_loss: torch.Tensor|None = None
     accumulated_pathnames: list[str] = field(default_factory=list)
     accumulated_captions: list[str] = field(default_factory=list)
@@ -107,6 +107,8 @@ class TrainingVariables:
     interleaved_bs1_count: int|None = None
 
     cond_dropouts: list[float] = field(default_factory=list)
+    cond_dropout_count = 0
+    non_cond_dropout_count = 0
 
     remaining_timesteps: torch.Tensor|None = None
 
@@ -294,11 +296,11 @@ class EveryDreamTrainingState:
     train_batch: 'EveryDreamBatch'
 
 
-def convert_diffusers_lora_to_civitai(diffusers_folder, civitai_path):
-    broken = safetensors.torch.load_file(os.path.join(diffusers_folder, 'pytorch_lora_weights.safetensors'))
+def convert_diffusers_lora_to_single_file(diffusers_format, civitai_path):
+    diffusers_format = safetensors.torch.load_file(os.path.join(diffusers_format, 'pytorch_lora_weights.safetensors'))
 
     fixed = {}
-    for i, (orig_k, v) in enumerate(broken.items()):
+    for i, (orig_k, v) in enumerate(diffusers_format.items()):
         k = orig_k
         k = k.replace('text_encoder.', 'lora_te_')
         k = k.replace('unet.', 'lora_unet_')
@@ -417,9 +419,9 @@ def save_model_lora(model: TrainingModel, save_path: str):
         safe_serialization=True,
     )
 
-    civitai_path = save_path + "_civitai_format.safetensors"
-    print("saving civitai format LoRA to", civitai_path)
-    convert_diffusers_lora_to_civitai(save_path, civitai_path)
+    civitai_path = save_path + ".safetensors"
+    print("saving single file format LoRA to", civitai_path)
+    convert_diffusers_lora_to_single_file(save_path, civitai_path)
 
 
 def find_last_checkpoint(logdir, is_ema=False):
@@ -474,6 +476,7 @@ def load_model(args) -> TrainingModel:
         unet = pipe.unet
         if hasattr(pipe, 'text_encoder_2'):
             # sdxl
+            print('sdxl detected')
             text_encoder_2 = pipe.text_encoder_2
             tokenizer_2 = pipe.tokenizer_2
             # check assumptions for _get_add_time_ids

@@ -298,6 +298,10 @@ class EveryDreamValidator:
             seed=self.seed,
         )
         val_items = resolver.resolve_root(val_data_root, args, self.resolution, args.aspects)
+        for i in val_items:
+            if i.error is not None:
+                logging.warning(f" * Skipping invalid validation image {i.pathname}: {repr(i.error)}")
+        val_items = [i for i in val_items if i.error is None]
         val_items.sort(key=lambda i: i.pathname)
         random.shuffle(val_items)
         return val_items
@@ -322,5 +326,6 @@ class EveryDreamValidator:
             name=name,
             crop_jitter=0,
             plugin_runner=empty_plugin_runner,
+            normalize_image=True,
         )
         return ed_batch

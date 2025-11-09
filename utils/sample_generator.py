@@ -31,7 +31,7 @@ from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm.auto import tqdm
-from compel import Compel, ReturnedEmbeddingsType
+from compel import Compel, ReturnedEmbeddingsType, CompelForSDXL, CompelForSD
 import traceback
 
 from model.training_model import TrainingModel
@@ -157,6 +157,7 @@ class SampleGenerator:
             else:
                 raise ValueError(f"Unrecognized file type '{config_file_extension}' for sample config, must be .txt or .json")
         except Exception as e:
+            traceback.print_exc()
             logging.warning(
                 f" * {Fore.LIGHTYELLOW_EX}Error trying to read sample config from {self.config_file_path}: {Style.RESET_ALL}{e}")
             logging.warning(
@@ -254,15 +255,10 @@ class SampleGenerator:
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
                     if type(pipe) is StableDiffusionXLPipeline:
-                        compel = Compel(tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
-                            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
-                            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
-                            requires_pooled=[False, True])
+                        print("SDXL -> no Compel")
+                        compel = None #CompelForSDXL(pipe)
                     else:
-                        compel = Compel(tokenizer=pipe.tokenizer,
-                                        text_encoder=pipe.text_encoder
-                                        )#,
-                                        #use_penultimate_clip_layer=self.use_penultimate_clip_layer)
+                        compel = CompelForSD(pipe)
                     for batch in batches:
                         if check_semaphore_file_and_unlink(_INTERRUPT_SAMPLES_SEMAPHORE_FILE):
                             print("sample generation interrupted")
@@ -280,27 +276,31 @@ class SampleGenerator:
                         for cfg in self.cfgs:
                             pipe.set_progress_bar_config(disable=not self.show_progress_bars, position=2, leave=False,
                                                          desc=f"{Fore.LIGHTYELLOW_EX}CFG scale {cfg}{Style.RESET_ALL}")
-                            if type(pipe) is StableDiffusionXLPipeline:
-                                prompt_embeds, pooled_prompt_embeds = compel(prompts)
-                                negative_prompt_embeds, negative_pooled_prompt_embeds = compel(negative_prompts)
-                            else:
-                                prompt_embeds = compel(prompts)
-                                pooled_prompt_embeds = None
-                                negative_prompt_embeds = compel(negative_prompts)
-                                negative_pooled_prompt_embeds = None
 
-                            images = pipe(prompt_embeds=prompt_embeds,
-                                          pooled_prompt_embeds=pooled_prompt_embeds,
-                                          negative_prompt_embeds=negative_prompt_embeds,
-                                          negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-                                          num_inference_steps=self.num_inference_steps,
-                                          num_images_per_prompt=1,
-                                          guidance_scale=cfg,
-                                          generator=generators,
-                                          width=size[0],
-                                          height=size[1],
-                                          guidance_rescale=self.guidance_rescale
-                                          ).images
+                            conditioning = None if compel is None else compel(prompts, negative_prompt=negative_prompts)
+
+                            embeds, pooled_prompt_embeds, negative_embeds, negative_pooled_embeds = (
+                                (None, None, None, None) if conditioning is None else (conditioning.embeds, conditioning.pooled_embeds, conditioning.negative_embeds, conditioning.negative_pooled_embeds)
+                            )
+                            prompt, negative_prompt = (
+                                (prompts, negative_prompts) if conditioning is None else (None, None)
+                            )
+
+                            images = pipe(
+                                prompt=prompt,
+                                prompt_embeds=embeds,
+                                pooled_prompt_embeds=pooled_prompt_embeds,
+                                negative_prompt=negative_prompt,
+                                negative_prompt_embeds=negative_embeds,
+                                negative_pooled_prompt_embeds=negative_pooled_embeds,
+                                num_inference_steps=self.num_inference_steps,
+                                num_images_per_prompt=1,
+                                guidance_scale=cfg,
+                                generator=generators,
+                                width=size[0],
+                                height=size[1],
+                                guidance_rescale=self.guidance_rescale
+                            ).images
 
                             for image in images:
                                 draw = ImageDraw.Draw(image)
@@ -492,20 +492,22 @@ class SampleGenerator:
 
 
     def _recompute_sample_steps(self):
+        if self.epoch_length is None:
+            # can't recompute sample steps yet (no epoch length)
+            return
         if self.sample_steps is not None and self.sample_steps < 0:
-            if self.epoch_length is None:
-                # can't compute sample steps yet (no epoch length)
-                return
-            else:
-                self.sample_epochs = -self.sample_steps / self.epoch_length
-                self.sample_steps = None
-
-        if self.sample_epochs is None:
+            self.sample_epochs = -self.sample_steps / self.epoch_length
+            self.sample_steps = None
+        elif self.sample_epochs is None:
             every_n_steps = self.sample_steps
             offset = self.epoch_start_global_step % every_n_steps
             self.steps_to_generate_this_epoch = list(range(offset, self.epoch_length, every_n_steps))
         else:
-            self.steps_to_generate_this_epoch = get_generate_step_indices(self.epoch, self.epoch_length, every_n_epochs=self.sample_epochs)
+            self.steps_to_generate_this_epoch = get_generate_step_indices(0, self.epoch_length, every_n_epochs=self.sample_epochs)
+        # skip step 0
+        if self.epoch_start_global_step == 0 and 0 in self.steps_to_generate_this_epoch:
+            self.steps_to_generate_this_epoch.remove(0)
+
 
 
     def should_generate_samples(self, global_step, local_step):

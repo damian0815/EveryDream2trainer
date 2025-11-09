@@ -66,7 +66,6 @@ class EveryDreamOptimizer:
         self.text_encoder = model.text_encoder
         self.text_encoder_2 = model.text_encoder_2
         self.log_writer = log_writer
-        self.unet_freeze = args.freeze_unet_balanced
         self.te_config, self.base_config = self.get_final_optimizer_configs(args, optimizer_config)
         self.te_freeze_config = optimizer_config.get("text_encoder_freezing", {})
         print(" Final unet optimizer config:")
@@ -78,17 +77,21 @@ class EveryDreamOptimizer:
         self.next_grad_accum_step = self.grad_accum
         self.clip_grad_norm = args.clip_grad_norm
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
-        self.use_grad_scaler = optimizer_config.get("use_grad_scaler", True)
+        self.use_grad_scaler = optimizer_config.get("use_grad_scaler", True) and (
+            (model.unet.dtype == torch.float16 and not args.disable_unet_training) or
+            (model.text_encoder.dtype == torch.float16 and not args.disable_textenc_training)
+        )
+        logging.info(f"* grad scaler enabled: {self.use_grad_scaler}")
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
         if args.lora:
             self.text_encoder_params, self.unet_params = self.setup_lora_training(args, model)
         else:
-            self.text_encoder_params = itertools.chain([
+            self.text_encoder_params = list(itertools.chain([
                 self._apply_text_encoder_freeze(model.text_encoder),
-                self._apply_text_encoder_freeze(model.text_encoder_2)
-            ])
-            self.unet_params = self._apply_unet_freeze(model.unet)
+                self._apply_text_encoder_freeze(model.text_encoder_2) if model.text_encoder_2 is not None else []
+            ]))
+            self.unet_params = list(self._apply_unet_freeze(model.unet, unet_freeze_config=optimizer_config.get("unet_freezing", {})))
 
         if args.jacobian_descent:
             from torchjd.aggregation import UPGrad
@@ -266,6 +269,7 @@ class EveryDreamOptimizer:
         self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME), optimizer_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
         self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME), 'scaler') if self.scaler is not None else None
 
+
     def load(self, ckpt_path: str):
         """
         Loads the optimizer states from path
@@ -377,7 +381,7 @@ class EveryDreamOptimizer:
                     optimizer=self.optimizer_unet,
                     num_warmup_steps=int(unet_config["lr_warmup_steps"]),
                     num_training_steps=int(unet_config["lr_decay_steps"]),
-                    num_cycles=3
+                    num_cycles=int(unet_config.get("lr_num_restarts", 3)),
                 )
             for i in range(unet_config["lr_advance_steps"]):
                 lr_scheduler.step()
@@ -413,10 +417,16 @@ class EveryDreamOptimizer:
         """
         Saves the optimizer state to specific path/filename
         """
-        torch.save({
-            'optimizer_type': optimizer_type,
-            'state_dict': optimizer.state_dict()
-        }, path)
+        try:
+            torch.save({
+                'optimizer_type': optimizer_type,
+                'state_dict': optimizer.state_dict()
+            }, path)
+        except RuntimeError:
+            logging.warning(f"  Saving optimizer state to {path} failed, deleting")
+            if os.path.exists(path):
+                os.unlink(path)
+
 
     @staticmethod
     def _load_optimizer(optimizer: torch.optim.Optimizer, path: str, expected_type: str=None):
@@ -542,7 +552,7 @@ class EveryDreamOptimizer:
                         "d0": d0,
                         "safeguard_warmup": safeguard_warmup
                     })
-                optimizer = opt_class(param_group)
+                optimizer = opt_class(param_groups)
             elif optimizer_name == "adamw":
                 opt_class = torch.optim.AdamW
             if "dowg" in optimizer_name:
@@ -624,32 +634,27 @@ class EveryDreamOptimizer:
         log_optimizer(label, optimizer, betas, epsilon, weight_decay, curr_lr)
         return optimizer
 
-    def _apply_unet_freeze(self, unet: UNet2DConditionModel) -> chain[torch.nn.Parameter]:
-        if not self.unet_freeze:
-            return itertools.chain(unet.named_parameters())
-        def should_train(name: str) -> bool:
-            # Train Time Embeddings
-            if name.startswith("time_embedding."):
-                return True
+    def _apply_unet_freeze(self, unet: UNet2DConditionModel, unet_freeze_config: dict[str, bool]) -> chain[torch.nn.Parameter]:
 
-            # Train All Attention Layers (within down, mid, up blocks)
-            # This regex matches anything containing '.attentions.'
-            if re.search(r'\.attentions\.', name):
-                return True
+        freeze_prefixes = []
+        if unet_freeze_config.get("freeze_in", False):
+            freeze_prefixes.extend(['time_embedding.', 'conv_in.'])
+        if unet_freeze_config.get("freeze_mid", False):
+            freeze_prefixes.extend(['mid_block'])
+        if unet_freeze_config.get("freeze_out", False):
+            freeze_prefixes.extend(['conv_norm_out.', 'conv_out.'])
 
-            # Train Final Output Layers
-            if name.startswith("conv_norm_out.") or name.startswith("conv_out."):
-                return True
-
-            # --- Everything else is frozen based on the Balanced Strategy ---
-            return False
-
-        print(' ❄️ applying unet "balanced" freeze')
         for n, p in unet.named_parameters():
-            if not should_train(n):
+            if any(n.startswith(prefix) for prefix in freeze_prefixes):
                 p.requires_grad = False
+            else:
+                p.requires_grad = True
 
-        return itertools.chain([p for p in unet.named_parameters() if should_train(p[0])])
+        print("unet parameters training:")
+        for n, p in unet.named_parameters():
+            print(f"{' ' if p.requires_grad else '❄️'} {n}")
+
+        return itertools.chain([np for np in unet.named_parameters() if np[1].requires_grad])
 
 
     def _apply_text_encoder_freeze(self, text_encoder) -> chain[torch.nn.Parameter]:
@@ -712,6 +717,7 @@ class EveryDreamOptimizer:
             for p in text_encoder.text_model.final_layer_norm.parameters():
                 p.requires_grad = False
 
+
         return parameters
 
     def setup_lora_training(self, args, model: 'TrainingModel'):
@@ -725,9 +731,10 @@ class EveryDreamOptimizer:
                 text_lora_config = LoraConfig(
                     r=args.lora_rank,
                     lora_alpha=args.lora_alpha,
-                    init_lora_weights="gaussian",
+                    init_lora_weights=True,
                     target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]
                 )
+                #print("not adding lora for te")
                 model.text_encoder.add_adapter(text_lora_config)
                 if model.text_encoder_2 is not None:
                     model.text_encoder_2.add_adapter(text_lora_config)
@@ -742,7 +749,7 @@ class EveryDreamOptimizer:
                 unet_lora_config = LoraConfig(
                     r=args.lora_rank,
                     lora_alpha=args.lora_alpha,
-                    init_lora_weights="gaussian",
+                    init_lora_weights=True,
                     target_modules=["to_k", "to_q", "to_v", "to_out.0"],
                 )
                 model.unet.add_adapter(unet_lora_config)

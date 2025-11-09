@@ -60,8 +60,8 @@ def _subdivide_batch_part(part, start, end):
 def choose_effective_batch_size(args, train_progress_01):
     return max(1, round(get_exponential_scaled_value(
         train_progress_01,
-        initial_value=args.initial_batch_size or args.batch_size,
-        final_value=args.final_batch_size or args.batch_size,
+        initial_value=args.batch_size if args.initial_batch_size is None else args.initial_batch_size,
+        final_value=args.batch_size if args.final_batch_size is None else args.final_batch_size,
         alpha=args.batch_size_curriculum_alpha
     )))
 
@@ -80,9 +80,8 @@ alpha<1: Quick advance (spread hugs final_value)
 """
 def get_exponential_scaled_value(progress_01, initial_value, final_value, alpha=3.0):
     # Apply non-linear scaling with alpha (higher alpha = faster early descent)
-    scaled_progress = progress_01 ** alpha
+    scaled_progress = 1.0 - (1.0-progress_01) ** alpha
     return initial_value + scaled_progress * (final_value - initial_value)
-
 
 def get_timestep_curriculum_range(progress_01,
                                   t_min_initial=800, t_max_initial=1000,
@@ -291,9 +290,10 @@ def _get_contrastive_v2_loss():
 
 def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: torch.Tensor,
                                     timesteps: torch.Tensor, model: TrainingModel,
-                                     args=None, skip_contrastive: bool=False,
-                                     teacher_unet: UNet2DConditionModel|None=None,
-                                     teacher_mask: torch.Tensor|None=None
+                                    args=None, skip_contrastive: bool=False,
+                                    teacher_unet: UNet2DConditionModel|None=None,
+                                    teacher_mask: torch.Tensor|None=None,
+                                    teacher_conditioning: Conditioning|None=None,
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps,
                                                           args.latents_perturbation)
@@ -312,7 +312,9 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
     with torch.no_grad():
         target = _get_target(latents, noise, model.noise_scheduler, timesteps)
         if teacher_unet is not None:
-            teacher_target = teacher_unet(noisy_latents.half(), timesteps, conditioning.prompt_embeds.half()).sample.float()
+            if teacher_conditioning is None:
+                teacher_conditioning = conditioning
+            teacher_target = teacher_unet(noisy_latents.half(), timesteps, teacher_conditioning.prompt_embeds.half()).sample.float()
             target = (
                 teacher_target *  teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
                 +   target     * ~teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
@@ -373,9 +375,9 @@ def _get_noisy_latents_and_target(latents, noise, noise_scheduler: (SchedulerMix
     return noisy_latents, target
 
 
-def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, continuous_float_timestamps=False):
-    """ if continuous_float_timestamps is True, return float timestamps (continuous), otherwise return int timestamps (discrete) """
-    if continuous_float_timestamps:
+def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, continuous_float_timesteps=False):
+    """ if continuous_float_timesteps is True, return float timestamps (continuous), otherwise return int timestamps (discrete) """
+    if continuous_float_timesteps:
         timesteps = torch.cat([a + torch.rand((1,), device=device) * (b-a)
                                for a,b in timesteps_ranges])
     else:
@@ -383,7 +385,7 @@ def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, c
                                for a,b in timesteps_ranges])
     if batch_share_timesteps:
         timesteps = timesteps[:1].repeat((batch_size,))
-    if not continuous_float_timestamps:
+    if not continuous_float_timesteps:
         timesteps = timesteps.long()
     return timesteps
 
@@ -489,14 +491,18 @@ def vae_preview(latents: torch.Tensor) -> torch.Tensor:
 
 # ref https://huggingface.co/jimmycarter/LibreFLUX
 # "Beta timestep scheduling and timestep stratification"
-def get_multirank_stratified_random_timesteps(batch_size, device, alpha=2.0, beta=1.6, continuous_float_timestamps=False):
+def get_multirank_stratified_random_timesteps(batch_size, device, alpha=2.0, beta=1.6, continuous_float_timesteps=False):
     indices = torch.arange(0, batch_size, dtype=torch.float64)
     u = torch.rand(batch_size)
     p = (indices + u) / batch_size
     sigmas = torch.from_numpy(sp_beta.ppf(p.numpy(), a=alpha, b=beta)).to(device)
 
-    timestamps = (sigmas * 1000)
-    if continuous_float_timestamps:
-        return timestamps
+    timesteps = (sigmas * 1000)
+
+    # shuffle
+    perm = torch.randperm(timesteps.shape[0])
+    timesteps = timesteps[perm]
+    if continuous_float_timesteps:
+        return timesteps
     else:
-        return timestamps.long().clamp(min=0, max=999)
+        return timesteps.long().clamp(min=0, max=999)

@@ -18,6 +18,8 @@ import dataclasses
 import os
 import pprint
 import sys
+from collections import Counter
+
 import math
 import signal
 import argparse
@@ -203,6 +205,9 @@ def setup_args(args):
     if type(args.resolution) is not list:
         args.resolution = [args.resolution]
 
+    if len(args.resolution_multiplier) > 0 and len(args.resolution_multiplier) != len(args.resolution):
+        raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution: {args.resolution}, --resolution_multiplier: {args.resolution_multiplier})")
+
     return args
 
 
@@ -263,7 +268,7 @@ def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem
                             f"of {effective_multiplier}, which may cause problems. Consider adding {runt_size} or "
                             f"more images with aspect ratio {aspect_ratio_description}{batch_id_description}, or reducing your batch_size.")
 
-def resolve_image_train_items(args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
+def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, global_multiplier: float=1) -> list[ImageTrainItem]:
     logging.info(f"* DLMA resolution {resolution}, buckets: {aspects}")
     logging.info(" Preloading images...")
 
@@ -275,6 +280,8 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects) -> 
             logging.error(f"{Fore.LIGHTRED_EX} *** Error opening {Fore.LIGHTYELLOW_EX}{item.pathname}{Fore.LIGHTRED_EX} to get metadata. File may be corrupt and will be skipped.{Style.RESET_ALL}")
             logging.error(f" *** exception: {item.error}")
     resolved_items = [item for item in resolved_items if item.error is None]
+    for i in resolved_items:
+        i.multiplier *= global_multiplier
 
     # drop undersized, if requested
     if args.skip_undersized_images:
@@ -317,6 +324,15 @@ def update_ema(model, ema_model, decay, default_device, ema_device: str):
         if need_to_delete_original:
             del(original_model_on_proper_device)
 
+def _choose_backward_slice_size(args, tv: TrainingVariables):
+    return max(
+        1,
+        min(
+            args.max_backward_slice_size or args.batch_size,
+            tv.desired_effective_batch_size
+            #- tv.current_accumulated_backward_images_count,
+        ),
+    )
 
 def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables):
     if tv.accumulated_loss_images_count == 0:
@@ -330,7 +346,7 @@ def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables):
         tv.clear_accumulated_loss()
         # reset slice sizes
         tv.forward_slice_size = args.forward_slice_size or args.batch_size
-        tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+        tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
 
 def load_train_json_from_file(args, report_load = False):
     try:
@@ -395,11 +411,32 @@ def main(args):
         teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher)
         if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
             raise ValueError("Teacher and training model must use same prediction_type")
-        teacher_unet = teacher_pipeline.unet.to(device=device, dtype=torch.float16)
-        teacher_unet.eval()
+        teacher_model = TrainingModel(
+            noise_scheduler=None,
+            unet=None,
+            text_encoder=None,
+            text_encoder_2=None,
+            tokenizer=None,
+            tokenizer_2=None,
+            vae=None,
+            compel=None,
+            yaml=None
+        )
+        teacher_model.unet = teacher_pipeline.unet.to(device=device, dtype=torch.float16)
+        teacher_model.unet.eval()
+
+        teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
+        base_te_sd = model.text_encoder.state_dict()
+        delta = sum([torch.mean(torch.abs(teacher_te_sd[k] - base_te_sd[k])) for k in teacher_te_sd.keys()])
+        epsilon = 1e-2
+        if delta > epsilon:
+            teacher_model.text_encoder = teacher_pipeline.text_encoder.to(device=device, dtype=torch.float16)
+            teacher_model.text_encoder.eval()
+        del teacher_te_sd, base_te_sd, delta
+
         del teacher_pipeline
     else:
-        teacher_unet = None
+        teacher_model = None
 
     compel = None
     if args.use_compel:
@@ -430,7 +467,7 @@ def main(args):
     else:
         logging.info("* Using SDP attention *")
 
-    train_dtype = torch.float16 if device=='mps' else torch.float32
+    train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if model.is_sdxl else torch.float32)
 
     model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else train_dtype)
     model.unet = model.unet.to(device, dtype=train_dtype)
@@ -512,12 +549,21 @@ def main(args):
                                comment=args.run_name if args.run_name is not None else log_time,
                               )
 
+    if len(args.caption_variants) == 0:
+        logging.info("* Using all caption variants")
+    else:
+        logging.info(f"* Using caption variants: {args.caption_variants}")
+
     image_train_items = []
-    for batch_resolution in args.resolution:
+
+    for resolution_index, batch_resolution in enumerate(args.resolution):
         this_aspects = aspects.get_aspect_buckets(batch_resolution,
-                                                  square_only=model.is_sdxl,
+                                                  #square_only=model.is_sdxl,
                                                   )
-        image_train_items.extend(resolve_image_train_items(args, batch_resolution, this_aspects))
+        resolution_multiplier = 1.0 if len(args.resolution_multiplier) == 0 else args.resolution_multiplier[resolution_index]
+        if resolution_multiplier != 1.0:
+            print(f"Using global multiplier {resolution_multiplier} for resolution {batch_resolution}")
+        image_train_items.extend(resolve_image_train_items(args, batch_resolution, this_aspects, global_multiplier=resolution_multiplier))
 
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
@@ -562,6 +608,7 @@ def main(args):
         seed = seed,
         shuffle_tags=args.shuffle_tags,
         keep_tags=args.keep_tags,
+        normalize_image=not args.no_normalize_images,
         plugin_runner=plugin_runner,
         rated_dataset=args.rated_dataset,
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
@@ -658,7 +705,7 @@ def main(args):
     logging.info(f" saving ckpts every {args.ckpt_every_n_minutes} minutes")
     logging.info(f" saving ckpts every {args.save_every_n_epochs } epochs")
 
-    train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size)
+    train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size, num_workers=args.num_dataloader_workers)
 
     model.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model.unet.eval()
     model.text_encoder.train() if not args.disable_textenc_training else model.text_encoder.eval()
@@ -734,7 +781,7 @@ def main(args):
                                   batch_share_timesteps=False,
                                   device=model.unet.device,
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                  continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching')
+                                  continuous_float_timesteps=model.noise_scheduler.config.prediction_type == 'flow-matching')
         model.load_vae_to_device(device)
         latents = get_latents(image, model.vae, device=model.unet.device, args=args)
         if args.offload_vae:
@@ -772,6 +819,18 @@ def main(args):
                                        train_batch=train_batch,
                                        model=model
                                        )
+
+    logging.info("Warming up dataloader...")
+    warmup_start = time.time()
+    num_warmup_batches = 30
+    for i, batch in enumerate(train_dataloader):
+        if i >= num_warmup_batches:  # warm up 5 batches
+            break
+        logging.info(f"Warmup batch {i} fetched in {time.time() - warmup_start:.2f}s")
+        warmup_start = time.time()
+    logging.info("Warmup complete")
+    train_batch.shuffle(epoch_n=0, max_epochs=args.max_epochs)
+
     epoch = None
 
     try:
@@ -779,6 +838,7 @@ def main(args):
 
         needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
+        tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
         tv.remaining_timesteps = None
 
         for epoch in range(args.max_epochs):
@@ -796,7 +856,7 @@ def main(args):
                     raise("Unrecognized arg: " + arg)
 
             plugin_runner.run_on_epoch_start(
-                epoch=epoch,
+                epoch=0 if epoch is None else epoch,
                 global_step=tv.global_step,
                 epoch_length=epoch_len,
                 project_name=args.project_name,
@@ -822,10 +882,12 @@ def main(args):
             )
 
             tv.forward_slice_size = args.forward_slice_size or args.batch_size
-            tv.max_backward_slice_size = args.max_backward_slice_size or args.batch_size
+            tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
 
             step = 0
+            #logging.info("fetching batch...")
             for step, full_batch in enumerate(train_dataloader):
+                #logging.info("... fetched.")
 
                 try:
 
@@ -848,18 +910,26 @@ def main(args):
 
                     image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
                     enable_vae_attention_slicing = False
+                    if gpu is not None:
+                        _, gpu_total_mem = gpu.get_gpu_memory()
+                    else:
+                        gpu_total_mem = 0
+
+                    memory_comfort_image_count = (
+                        1 if model.is_sdxl or gpu_total_mem < 25000 else 4
+                    )
                     if image_size > (1000)*(1000):
-                        if tv.accumulated_loss_images_count > 1:
-                            print(f"emergency backward at accumulated_loss_images_count {tv.accumulated_loss_images_count}")
+                        if tv.accumulated_loss_images_count > memory_comfort_image_count:
+                            # "emergency" backward because we may OOM adding grads for an image of this size if we've already collected grads for other images
                             _optimizer_backward(ed_optimizer, tv)
 
                         enable_vae_attention_slicing = True
-                        tv.forward_slice_size = min(tv.forward_slice_size, 1)
-                        tv.max_backward_slice_size = min(tv.max_backward_slice_size, 2)
+                        tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count)
+                        tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count * 2)
 
                     elif image_size > (850)*(850):
-                        tv.forward_slice_size = min(tv.forward_slice_size, 2)
-                        tv.max_backward_slice_size = min(tv.max_backward_slice_size, 6)
+                        tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count*2)
+                        tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count*6)
 
                     if (tv.desired_effective_batch_size > 1
                             and args.everything_contrastive_learning_p > 0
@@ -877,8 +947,8 @@ def main(args):
                     timesteps = _get_step_timesteps(full_batch, train_progress_01, model, tv, args)
 
                     # apply cond dropout
-                    initial_batch_size = args.initial_batch_size or args.batch_size
-                    final_batch_size = args.final_batch_size or args.batch_size
+                    initial_batch_size = args.batch_size if args.initial_batch_size is None else args.initial_batch_size
+                    final_batch_size = args.batch_size if args.final_batch_size is None else args.final_batch_size
                     if final_batch_size == initial_batch_size:
                         cdp_01_bs = 0
                     else:
@@ -906,11 +976,15 @@ def main(args):
                         tv.cond_dropouts.append(this_cond_dropout_p)
                         if train_batch.random_instance.random() <= this_cond_dropout_p:
                             for k in full_batch["captions"].keys():
+                                if full_batch["captions"][k][sample_index] is None:
+                                    continue
                                 full_batch["tokens"][k][sample_index] = train_batch.cond_dropout_tokens
                                 if model.is_sdxl:
                                     full_batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens
                                 full_batch["captions"][k][sample_index] = train_batch.cond_dropout_caption
                             full_batch["loss_scale"][sample_index] *= args.cond_dropout_loss_scale
+                            if train_batch.random_instance.random() <= args.cond_dropout_noise_p:
+                                full_batch["image"][sample_index] = torch.randn_like(full_batch["image"][sample_index])
 
                     batch = None
                     remaining_batch = full_batch
@@ -944,13 +1018,30 @@ def main(args):
                         batch_resolution = _get_best_match_resolution(args.resolution, image_size)
 
                         assert type(batch["captions"]) is dict
-                        caption_variants = [c for c in list(sorted(batch["captions"].keys()))
-                                            if args.caption_variants is None
-                                            or c in args.caption_variants
-                                            and c != 'default']
-                        if len(caption_variants) == 0:
-                            caption_variants.append("default")
-                        if not args.all_caption_variants:
+                        if args.all_caption_variants:
+                            caption_counter = Counter()
+                            for k in batch["captions"].keys():
+                                for image_index in range(len(batch["captions"][k])):
+                                    if batch["captions"][k][image_index] is not None:
+                                        caption_counter[k] += 1
+                            print("caption variants for this batch of:", image_shape[0], "images:", caption_counter)
+                            caption_variants = list(caption_counter.keys())
+                        else:
+                            caption_variants = [
+                                c for c in list(sorted(batch["captions"].keys()))
+                                if (
+                                    not args.caption_variants
+                                    or c in args.caption_variants
+                                )
+                                and c != "default"
+                            ]
+                            if len(caption_variants) == 0:
+                                caption_variants.append("default")
+
+                                if "default" not in batch["captions"]:
+                                    logging.info(f"surprise cond dropout: ** Apparently no captions: {batch.get("pathnames", "(no paths)")}: {batch["captions"]}")
+                                    batch["captions"]["default"] = [train_batch.cond_dropout_caption]                   * image_shape[0]
+                                    batch["tokens"]["default"] = [train_batch.cond_dropout_tokens]                     * image_shape[0]
                             caption_variants = [random.choice(caption_variants)]
 
                         batch_size = image_shape[0]
@@ -993,6 +1084,22 @@ def main(args):
                             del latents_slices
 
                         for caption_variant in caption_variants:
+
+                            if teacher_model is None:
+                                teacher_mask = None
+                            else:
+                                if args.teacher_timestep_max is None:
+                                    teacher_p = args.teacher_p
+                                else:
+                                    # 1000...args.teacher_timestep_max: p = 0
+                                    # args.teacher_timestep_max...0: ramp from 0 to args.teacher_p
+                                    scale = torch.maximum(
+                                        args.teacher_timestep_max - timesteps.float(),
+                                        torch.zeros([1])
+                                    ) / args.teacher_timestep_max
+                                    teacher_p = args.teacher_p * scale
+                                    # scale teacher_p based on timesteps
+                                teacher_mask = (torch.rand((batch_size)) < teacher_p).to(model.unet.device)
 
                             with (
                                 torch.no_grad()
@@ -1046,6 +1153,14 @@ def main(args):
                                 encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
                                     tokens, tokens_2, caption_str, model, args
                                 )
+                                if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
+                                    teacher_encoder_hidden_states = None
+                                else:
+                                    assert not teacher_model.is_sdxl
+                                    teacher_encoder_hidden_states, _, _ = get_text_conditioning(
+                                        tokens, None, caption_str, teacher_model, args
+                                    )
+
                                 if args.offload_text_encoder:
                                     model.load_textenc_to_device('cpu')
 
@@ -1053,21 +1168,21 @@ def main(args):
                             model_pred_wrong_all = []
                             model_pred_wrong_mask_all = []
                             target_all = []
-                            if teacher_unet is None:
-                                teacher_mask = None
-                            else:
-                                teacher_mask = torch.rand((batch_size)).to(model.unet.device) < args.teacher_p
 
                             cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
                                                               for s in caption_str[0:batch_size]], device=model.unet.device, dtype=torch.bool)
-                            if teacher_mask is not None:
-                                teacher_mask *= ~cond_dropout_mask
+                            tv.cond_dropout_count += torch.sum(cond_dropout_mask)
+                            tv.non_cond_dropout_count += torch.sum(~cond_dropout_mask)
 
                             slices = list(get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size))
                             for slice_index, (slice_start, slice_end) in enumerate(slices):
                                 # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                                 latents_slice = latents[slice_start:slice_end]
                                 encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+                                if teacher_encoder_hidden_states is None:
+                                    teacher_encoder_hidden_states_slice = None
+                                else:
+                                    teacher_encoder_hidden_states_slice = teacher_encoder_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
                                 timesteps_slice = timesteps[slice_start:slice_end]
                                 if teacher_mask is None:
@@ -1086,11 +1201,20 @@ def main(args):
                                         add_time_ids = add_time_ids_slice
                                     )
                                     del encoder_2_hidden_states_slice, encoder_2_pooled_embeds_slice, add_time_ids_slice
+                                    teacher_conditioning = None
                                 else:
                                     conditioning = Conditioning.sd12_conditioning(
                                         text_encoder_hidden_states=encoder_hidden_states_slice
                                     )
+                                    if teacher_encoder_hidden_states_slice is None:
+                                        teacher_conditioning = None
+                                    else:
+                                        teacher_conditioning = Conditioning.sd12_conditioning(
+                                            text_encoder_hidden_states=teacher_encoder_hidden_states_slice
+                                        )
+
                                 del encoder_hidden_states_slice
+                                del teacher_encoder_hidden_states_slice
 
                                 model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
                                     latents=latents_slice,
@@ -1099,8 +1223,9 @@ def main(args):
                                     timesteps=timesteps_slice,
                                     model=model,
                                     args=args,
-                                    teacher_unet=teacher_unet,
-                                    teacher_mask=teacher_mask_slice
+                                    teacher_unet=teacher_model.unet if teacher_model else None,
+                                    teacher_mask=teacher_mask_slice,
+                                    teacher_conditioning=teacher_conditioning,
                                 )
                                 model_pred_all.append(model_pred)
                                 model_pred_wrong_all.append(model_pred_wrong)
@@ -1135,6 +1260,7 @@ def main(args):
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
+                            #log_data.loss_preview_image = torch.cat([model_pred, target], dim=-2).detach().clone().cpu()
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
                             log_data.loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
@@ -1150,7 +1276,6 @@ def main(args):
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
                                                timesteps=timesteps[0:nibble_size_actual].tolist())
-                            log_data.loss_preview_image = loss.detach().clone().cpu()
                             loss_step = loss.detach().mean().item()
                             del loss, loss_sum
                             steps_pbar.set_postfix({"loss/step": loss_step, "gs": tv.global_step})
@@ -1293,6 +1418,8 @@ def main(args):
                     logging.error(f"step {tv.global_step} failed. full_batch: {full_batch}, current batch: {current_batch}, training values: {dataclasses.asdict(tv)}")
                     raise
 
+                #logging.info("fetching...")
+
             steps_pbar.close()
 
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
@@ -1425,7 +1552,7 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                     do_contrastive_learning or args.batch_share_timesteps),
             device=model.device,
             timesteps_ranges=timesteps_ranges_expanded,
-            continuous_float_timestamps=model.noise_scheduler.config.prediction_type == 'flow-matching'
+            continuous_float_timesteps=model.noise_scheduler.config.prediction_type == 'flow-matching'
         )
         return timesteps
 
@@ -1474,6 +1601,7 @@ if __name__ == "__main__":
     argparser.add_argument("--final_cond_dropout", type=float, default=None, help="if doing cond dropout curriculum, the final cond dropout (timestep=0)")
     argparser.add_argument("--cond_dropout_loss_scale", type=float, default=1, help="additional loss scaling for cond dropout samples")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
+    argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
     argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
     argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
@@ -1508,7 +1636,9 @@ if __name__ == "__main__":
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
     argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=aspects.get_supported_resolutions())
+    argparser.add_argument("--resolution_multiplier", type=float, nargs='+', default=[], help="multipliers to apply per-resolution (specify one per resolution, like --resolution_multiply <multiplier> [<multiplier>] ...)")
     argparser.add_argument("--keep_same_sample_at_different_resolutions_together", action='store_true', help="if passed, re-order batches to put samples with the same path but different resolutions near to each other")
+    argparser.add_argument("--no_normalize_images", action='store_true', help="if passed, do not normalize image pixels")
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
     argparser.add_argument("--resume_ckpt_variant", type=str, required=False, default=None, help="For Hugging Face repo resume_ckpts, the variant (eg fp16) - required for some models")
     argparser.add_argument("--run_name", type=str, required=False, default=None, help="Run name for wandb (child of project name), and comment for tensorboard, (def: None)")
@@ -1558,6 +1688,7 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
     argparser.add_argument("--teacher_p", type=float, default=0.5, help="Probability of teacher model being used as target")
+    argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
     argparser.add_argument("--contrastive_learning_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[])")
     argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=0.2, help="Scaling factor for contrastive learning negative loss")
     argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")
@@ -1572,7 +1703,7 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_learning_info_nce_temperature", type=float, default=1, help="Temperature for InfoNCE contrastive loss")
     argparser.add_argument("--everything_contrastive_learning_p", type=float, default=0, help="probability to run contrastive learning on everything, 0..1")
     argparser.add_argument("--everything_contrastive_learning_curriculum_alpha", type=float, default=0, help="if >0, attenuate everything_contrastive_learning_p to 0 using this alpha as timestep approaches 0")
-    argparser.add_argument("--caption_variants", type=str, nargs="*", default=None, help="If passed, use only these caption variants from json captions")
+    argparser.add_argument("--caption_variants", type=str, nargs="*", default=[], help="If passed, use only these caption variants from json captions")
     argparser.add_argument("--all_caption_variants", action='store_true', help='if passed, use ALL caption variants every step')
     argparser.add_argument("--use_compel", action='store_true', help='if passed, use Compel to process prompts with long-prompt support')
 

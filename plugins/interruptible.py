@@ -34,8 +34,11 @@ class InterruptiblePlugin(BasePlugin):
             save_path = os.path.join(log_folder, "ckpts", ckpt_name)
             print(f"{type(self)} saving model to {save_path}")
             try:
+                save_optimizer = False
+                if not save_optimizer:
+                    print("NOT saving optimizer")
                 save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None,
-                           yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=True)
+                           yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=save_optimizer)
                 self._remove_previous()
             except OSError as e:
                 if e.errno == errno.ENOSPC:
@@ -43,7 +46,7 @@ class InterruptiblePlugin(BasePlugin):
                     shutil.rmtree(save_path, ignore_errors=True)
                     self._remove_previous()
                     save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None,
-                       yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=True)
+                       yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=save_optimizer)
                 else:
                     raise
             self.previous_save_path = save_path
