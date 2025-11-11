@@ -91,7 +91,13 @@ class EveryDreamOptimizer:
                 self._apply_text_encoder_freeze(model.text_encoder),
                 self._apply_text_encoder_freeze(model.text_encoder_2) if model.text_encoder_2 is not None else []
             ]))
-            self.unet_params = list(self._apply_unet_freeze(model.unet, unet_freeze_config=optimizer_config.get("unet_freezing", {})))
+            self.unet_params = list(
+                self._apply_unet_freeze(
+                    model.unet,
+                    unet_freeze_config=optimizer_config.get("unet_freezing", {}),
+                    cross_attention_dim_to_find=2048 if model.is_sdxl else model.text_encoder.config.hidden_size
+                )
+            )
 
         if args.jacobian_descent:
             from torchjd.aggregation import UPGrad
@@ -634,21 +640,81 @@ class EveryDreamOptimizer:
         log_optimizer(label, optimizer, betas, epsilon, weight_decay, curr_lr)
         return optimizer
 
-    def _apply_unet_freeze(self, unet: UNet2DConditionModel, unet_freeze_config: dict[str, bool]) -> chain[torch.nn.Parameter]:
+
+
+    def _get_cross_attention_layer_names(self, unet, cross_attention_dim_to_find: int) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            # Look for cross-attention modules
+            if 'attn' in name.lower() and (
+                hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
+            ) and (
+                module.cross_attention_dim == cross_attention_dim_to_find
+            ):
+                yield name
+
+    def _get_self_attention_layer_names(self, unet, cross_attention_dim_to_ignore: int) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            # Look for cross-attention modules
+            if 'attn' in name.lower() and (
+                hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
+            ) and (
+                module.cross_attention_dim != cross_attention_dim_to_ignore
+            ):
+                yield name
+
+    def _apply_unet_freeze(self, unet: UNet2DConditionModel,
+                           unet_freeze_config: dict[str, bool], cross_attention_dim_to_find: int
+                           ) -> chain[torch.nn.Parameter]:
 
         freeze_prefixes = []
         if unet_freeze_config.get("freeze_in", False):
-            freeze_prefixes.extend(['time_embedding.', 'conv_in.'])
+            freeze_prefixes.extend(['time_embedding.', 'conv_in.', 'down_blocks.', 'add_embedding.'])
         if unet_freeze_config.get("freeze_mid", False):
             freeze_prefixes.extend(['mid_block'])
         if unet_freeze_config.get("freeze_out", False):
-            freeze_prefixes.extend(['conv_norm_out.', 'conv_out.'])
+            freeze_prefixes.extend(['conv_norm_out.', 'conv_out.', 'up_blocks.'])
+
+        if 'unfreeze_cross_attention' in unet_freeze_config or 'unfreeze_self_attention' in unet_freeze_config or 'unfreeze_spatial_resnets' in unet_freeze_config:
+            raise ValueError("unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)")
+
+        cross_attn_layer_names = list(self._get_cross_attention_layer_names(
+            unet,
+            cross_attention_dim_to_find=cross_attention_dim_to_find,
+        ))
+        freeze_cross_attn = unet_freeze_config.get("freeze_cross_attention", None)
+        if freeze_cross_attn:
+            print(f"{'' if freeze_cross_attn else 'un'}freezing cross attention layers:")
+            print(cross_attn_layer_names)
+
+        freeze_self_attn = unet_freeze_config.get("freeze_self_attention", None)
+        self_attn_layer_names = list(self._get_self_attention_layer_names(
+            unet,
+            cross_attention_dim_to_ignore=cross_attention_dim_to_find,
+        ))
+        if freeze_self_attn is not None:
+            print(f"{'' if freeze_self_attn else 'un'}freezing self attention layers:")
+            print(self_attn_layer_names)
+
+        freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
+        spatial_resnet_prefixes = ["mid_block.resnets.0", "mid_block.resnets.1", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
+        freeze_detail_layers = unet_freeze_config.get("freeze_detail_layers", None)
+        detail_layer_prefixes = ["up_blocks.1.resnets", "up_blocks.2.resnets", "up_blocks.3.resnets", "conv_out"]
+
+        def should_freeze(n):
+            # maybe freeze
+            if freeze_cross_attn is not None and any(n.startswith(prefix) for prefix in cross_attn_layer_names):
+                return freeze_cross_attn
+            elif freeze_self_attn is not None and any(n.startswith(prefix) for prefix in self_attn_layer_names):
+                return freeze_self_attn
+            elif freeze_spatial_resnets is not None and any(n.startswith(prefix) for prefix in spatial_resnet_prefixes):
+                return freeze_spatial_resnets
+            elif freeze_detail_layers is not None and any(n.startswith(prefix) for prefix in detail_layer_prefixes):
+                return freeze_detail_layers
+            # fallback to general prefixes
+            return any(n.startswith(prefix) for prefix in freeze_prefixes)
 
         for n, p in unet.named_parameters():
-            if any(n.startswith(prefix) for prefix in freeze_prefixes):
-                p.requires_grad = False
-            else:
-                p.requires_grad = True
+            p.requires_grad = not should_freeze(n)
 
         print("unet parameters training:")
         for n, p in unet.named_parameters():

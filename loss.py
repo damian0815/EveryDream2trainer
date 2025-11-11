@@ -96,13 +96,14 @@ def get_timestep_curriculum_range(progress_01,
 
 
 
-def get_latents(image, vae, device, args):
+def get_latents(image, model: TrainingModel, device, args):
     with torch.no_grad():
         with autocast(enabled=args.amp):
-            pixel_values = image.to(memory_format=torch.contiguous_format).to(device, dtype=vae.dtype)
-            latents = vae.encode(pixel_values, return_dict=False)
+            pixel_values = image.to(memory_format=torch.contiguous_format).to(device, dtype=model.vae.dtype)
+            latents = model.vae.encode(pixel_values, return_dict=False)
         del pixel_values
-        latents = latents[0].sample() * 0.18215
+        scaling_factor = 0.13025 if model.is_sdxl else 0.18215
+        latents = latents[0].sample() * scaling_factor
         return latents
 
 def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,

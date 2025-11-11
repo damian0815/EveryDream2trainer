@@ -388,22 +388,7 @@ class ImageTrainItem:
     def __compute_target_width_height(self):
         self.target_wh = None
         try:
-
-            # check if truncated
-            # If they are JPEG, they must end with EOI, namely the two bytes 0xff 0xd9
-            # If they are PNG, they must end with an IEND marker 49 45 4e 44 ae 42 60 82
-            with open(self.pathname, 'rb') as f:
-                file_bytes = f.read()
-                if file_bytes.startswith(b'\xff\xd8'):
-                    eoi_index = file_bytes.rfind(b"\xff\xd9")
-                    if eoi_index == -1:
-                        raise ValueError(f"image {self.pathname} appears to be a truncated JPEG file (missing EOI marker)")
-                    elif eoi_index < 0.9 * len(file_bytes):
-                        print(f"Warning: {self.pathname} has >10% junk data after the \\xff\\xd9 end marker")
-                elif file_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-                    if not file_bytes.endswith(b'IEND\xaeB`\x82'):
-                        raise ValueError(f"image {self.pathname} appears to be a truncated PNG file (missing IEND marker)")
-
+            # check if image can be opened
             with PIL.Image.open(self.pathname) as image:
                 if self._needs_transpose(image):
                     height, width = image.size

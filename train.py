@@ -783,7 +783,7 @@ def main(args):
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
                                   continuous_float_timesteps=model.noise_scheduler.config.prediction_type == 'flow-matching')
         model.load_vae_to_device(device)
-        latents = get_latents(image, model.vae, device=model.unet.device, args=args)
+        latents = get_latents(image, model, device=model.unet.device, args=args)
         if args.offload_vae:
             model.load_vae_to_device('cpu')
         noise = get_noise(latents.shape, model.unet.device, image.dtype,
@@ -819,17 +819,6 @@ def main(args):
                                        train_batch=train_batch,
                                        model=model
                                        )
-
-    logging.info("Warming up dataloader...")
-    warmup_start = time.time()
-    num_warmup_batches = 30
-    for i, batch in enumerate(train_dataloader):
-        if i >= num_warmup_batches:  # warm up 5 batches
-            break
-        logging.info(f"Warmup batch {i} fetched in {time.time() - warmup_start:.2f}s")
-        warmup_start = time.time()
-    logging.info("Warmup complete")
-    train_batch.shuffle(epoch_n=0, max_epochs=args.max_epochs)
 
     epoch = None
 
@@ -910,26 +899,28 @@ def main(args):
 
                     image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
                     enable_vae_attention_slicing = False
-                    if gpu is not None:
-                        _, gpu_total_mem = gpu.get_gpu_memory()
-                    else:
-                        gpu_total_mem = 0
 
-                    memory_comfort_image_count = (
-                        1 if model.is_sdxl or gpu_total_mem < 25000 else 4
-                    )
-                    if image_size > (1000)*(1000):
-                        if tv.accumulated_loss_images_count > memory_comfort_image_count:
-                            # "emergency" backward because we may OOM adding grads for an image of this size if we've already collected grads for other images
-                            _optimizer_backward(ed_optimizer, tv)
+                    if not args.disable_backward_memsafe:
+                        if gpu is not None:
+                            _, gpu_total_mem = gpu.get_gpu_memory()
+                        else:
+                            gpu_total_mem = 0
 
-                        enable_vae_attention_slicing = True
-                        tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count)
-                        tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count * 2)
+                        memory_comfort_image_count = (
+                            1 if model.is_sdxl or gpu_total_mem < 25000 else 4
+                        )
+                        if image_size > (1000)*(1000):
+                            if tv.accumulated_loss_images_count > memory_comfort_image_count:
+                                # "emergency" backward because we may OOM adding grads for an image of this size if we've already collected grads for other images
+                                _optimizer_backward(ed_optimizer, tv)
+                            if model.is_sdxl and gpu_total_mem < 25000:
+                                enable_vae_attention_slicing = model.is_sdxl
+                            tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count)
+                            tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count * 2)
 
-                    elif image_size > (850)*(850):
-                        tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count*2)
-                        tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count*6)
+                        elif image_size > (850)*(850):
+                            tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count*2)
+                            tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count*6)
 
                     if (tv.desired_effective_batch_size > 1
                             and args.everything_contrastive_learning_p > 0
@@ -1039,7 +1030,7 @@ def main(args):
                                 caption_variants.append("default")
 
                                 if "default" not in batch["captions"]:
-                                    logging.info(f"surprise cond dropout: ** Apparently no captions: {batch.get("pathnames", "(no paths)")}: {batch["captions"]}")
+                                    logging.info(f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']}")
                                     batch["captions"]["default"] = [train_batch.cond_dropout_caption]                   * image_shape[0]
                                     batch["tokens"]["default"] = [train_batch.cond_dropout_tokens]                     * image_shape[0]
                             caption_variants = [random.choice(caption_variants)]
@@ -1069,7 +1060,8 @@ def main(args):
                                         logging.error(f"vae.encode failed for batch {batch['pathnames']} slice [{slice_start}:{slice_end}] @resolution {batch_resolution}. pixel_values shape is {pixel_values.shape}")
                                         raise
                                     model.vae.disable_slicing()
-                                    latents_slice = latents_slice[0].sample() * 0.18215
+                                    vae_scaling_factor = 0.13025 if model.is_sdxl else 0.18215
+                                    latents_slice = latents_slice[0].sample() * vae_scaling_factor
                                     latents_slices.append(latents_slice)
                                     del latents_slice
                                 except torch.cuda.OutOfMemoryError:
@@ -1615,6 +1607,7 @@ if __name__ == "__main__":
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
     argparser.add_argument("--forward_slice_size", type=int, default=1, help="Slice forward step into chunks of <= this ")
     argparser.add_argument("--max_backward_slice_size", type=int, default=None, help="Max number of samples to accumulate graph before doing backward (NOT optimizer step)")
+    argparser.add_argument("--disable_backward_memsafe", action="store_true", default=False, help="If passed, disable 'emergency' backward to avoid OOM with large backward slices")
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")
