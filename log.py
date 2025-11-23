@@ -34,9 +34,12 @@ class LogData:
 
 def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, model: TrainingModel, tv: TrainingVariables):
     global_step = tv.global_step
+
     lr_unet = ed_optimizer.get_unet_lr()
+    for tag, lr_value in lr_unet.items():
+        log_writer.add_scalar(tag=f"hyperparameter/{tag}", scalar_value=lr_value, global_step=global_step)
+
     lr_textenc = ed_optimizer.get_textenc_lr()
-    log_writer.add_scalar(tag="hyperparameter/lr unet", scalar_value=lr_unet, global_step=global_step)
     log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
     if tv.timesteps_ranges:
         log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=tv.timesteps_ranges[0][0],
@@ -65,7 +68,10 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         global_step=global_step
     )
     log_writer.add_scalar(tag="performance/images per second", scalar_value=avg, global_step=global_step)
-    logs = {"lr_unet": lr_unet, "lr_te": lr_textenc, "img/s": log_data.images_per_sec}
+
+    # For progress bar, use first unet LR or 0 if none
+    lr_unet_for_display = list(lr_unet.values())[0] if lr_unet else 0
+    logs = {"lr_unet": lr_unet_for_display, "lr_te": lr_textenc, "img/s": log_data.images_per_sec}
     if len(log_data.loss_log_step) > 0:
         loss_step = sum(log_data.loss_log_step) / len(log_data.loss_log_step)
         log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)

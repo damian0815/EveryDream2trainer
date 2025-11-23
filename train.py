@@ -1,3 +1,4 @@
+print("Hello")
 """
 Copyright [2022-2023] Victor C Hall
 
@@ -359,6 +360,8 @@ def load_train_json_from_file(args, report_load = False):
         args.__dict__.update(read_json)
     except Exception as config_read:
         print(f"Error on loading training config from {args.config}:", config_read)
+        raise
+
 
 def main(args):
     """
@@ -741,14 +744,15 @@ def main(args):
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
 
-    def generate_samples(global_step: int, batch):
+    def generate_samples(global_step: int, batch: dict|None):
 
         with isolate_rng():
             sample_generator.reload_config()
-            flattened_captions_dict = [v
-                                       for _, l in batch["captions"].items()
-                                       for v in l]
-            sample_generator.update_random_captions(flattened_captions_dict)
+            if batch is not None:
+                flattened_captions_dict = [v
+                                           for _, l in batch["captions"].items()
+                                           for v in l]
+                sample_generator.update_random_captions(flattened_captions_dict)
 
             extra_info: str = ""
             torch.cuda.empty_cache()
@@ -823,7 +827,7 @@ def main(args):
     epoch = None
 
     try:
-        plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name)
+        plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name, max_epochs=args.max_epochs, ed_state=make_current_ed_state(),)
 
         needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
@@ -1015,25 +1019,34 @@ def main(args):
                                 for image_index in range(len(batch["captions"][k])):
                                     if batch["captions"][k][image_index] is not None:
                                         caption_counter[k] += 1
-                            print("caption variants for this batch of:", image_shape[0], "images:", caption_counter)
+                            #print("caption variants for this batch of:", image_shape[0], "images:", caption_counter)
                             caption_variants = list(caption_counter.keys())
                         else:
-                            caption_variants = [
-                                c for c in list(sorted(batch["captions"].keys()))
-                                if (
-                                    not args.caption_variants
-                                    or c in args.caption_variants
-                                )
-                                and c != "default"
-                            ]
-                            if len(caption_variants) == 0:
-                                caption_variants.append("default")
+                            caption_candidates = []
+                            available_non_default = [k for k in batch["captions"].keys() if k != "default"]
 
+                            if args.caption_variants:
+                                available_requested = list(set(available_non_default).intersection(set(args.caption_variants)))
+                                if '*' in args.caption_variants:
+                                    available_requested.append('*')
+
+                                if available_requested:
+                                    requested_choice = random.choice(available_requested)
+                                    if requested_choice == '*':
+                                        caption_candidates = available_non_default
+                                    else:
+                                        caption_candidates = [requested_choice]
+                            else:
+                                caption_candidates = available_non_default
+
+                            if len(caption_candidates) == 0:
+                                caption_candidates.append("default")
                                 if "default" not in batch["captions"]:
                                     logging.info(f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']}")
                                     batch["captions"]["default"] = [train_batch.cond_dropout_caption]                   * image_shape[0]
                                     batch["tokens"]["default"] = [train_batch.cond_dropout_tokens]                     * image_shape[0]
-                            caption_variants = [random.choice(caption_variants)]
+                            caption_variants = [random.choice(caption_candidates)]
+                            #print('picked caption variant: ', caption_variants)
 
                         batch_size = image_shape[0]
 
@@ -1264,7 +1277,8 @@ def main(args):
 
                             # take mean of all dimensions except B
                             loss_sum = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
-                            tv.accumulate_loss(loss_sum,
+                            loss_divisor = 1 #tv.desired_effective_batch_size
+                            tv.accumulate_loss(loss_sum / loss_divisor,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
                                                timesteps=timesteps[0:nibble_size_actual].tolist())
@@ -1425,7 +1439,10 @@ def main(args):
                                            project_name=args.project_name,
                                            log_folder=log_folder,
                                            data_root=args.data_root,
-                                           arg_update_callback=update_arg)
+                                           arg_update_callback=update_arg,
+                                           ed_state=make_current_ed_state(),
+                                           training_variables=tv,
+                                           sample_generator_cb=generate_samples)
 
             epoch_pbar.update(1)
             if epoch < args.max_epochs - 1:
@@ -1445,7 +1462,7 @@ def main(args):
         # end of training
         epoch = args.max_epochs
 
-        plugin_runner.run_on_training_end()
+        plugin_runner.run_on_training_end(ed_state=make_current_ed_state(), log_folder=log_folder, project_name=args.project_name, global_step=tv.global_step)
 
         save_path = make_save_path(
             epoch, tv.global_step, prepend=("" if args.no_prepend_last else "last-")

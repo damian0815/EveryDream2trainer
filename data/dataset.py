@@ -63,12 +63,14 @@ class ImageConfig:
         if other is None:
             return self
 
+        other_multiply = 1.0 if other.multiply is None else other.multiply
+        self_multiply = 1.0 if self.multiply is None else self.multiply
         return ImageConfig(
             main_prompts=other.main_prompts | self.main_prompts,
             rating=overlay(other.rating, self.rating),
             max_caption_length=overlay(other.max_caption_length, self.max_caption_length),
             tags= other.tags | self.tags,
-            multiply=overlay(other.multiply, self.multiply),
+            multiply=other_multiply * self_multiply,
             cond_dropout=overlay(other.cond_dropout, self.cond_dropout),
             flip_p=overlay(other.flip_p, self.flip_p),
             shuffle_tags=overlay(other.shuffle_tags, self.shuffle_tags),

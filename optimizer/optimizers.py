@@ -20,12 +20,13 @@ import os
 from itertools import chain
 from typing import List, Tuple, Generator
 
+import math
 import torch
 from diffusers import UNet2DConditionModel
 from peft import LoraConfig
 
 from torch.cuda.amp import GradScaler
-from diffusers.optimization import get_scheduler, get_polynomial_decay_schedule_with_warmup
+from diffusers.optimization import get_scheduler
 
 from colorama import Fore, Style
 import pprint
@@ -68,10 +69,14 @@ class EveryDreamOptimizer:
         self.log_writer = log_writer
         self.te_config, self.base_config = self.get_final_optimizer_configs(args, optimizer_config)
         self.te_freeze_config = optimizer_config.get("text_encoder_freezing", {})
+        self.unet_component_lr_config = optimizer_config.get("unet_component_lr", {})
         print(" Final unet optimizer config:")
         pprint.pprint(self.base_config)
         print(" Final text encoder optimizer config:")
         pprint.pprint(self.te_config)
+        if self.unet_component_lr_config:
+            print(" UNet component-specific learning rates:")
+            pprint.pprint(self.unet_component_lr_config)
 
         self.grad_accum = args.grad_accum
         self.next_grad_accum_step = self.grad_accum
@@ -87,16 +92,15 @@ class EveryDreamOptimizer:
         if args.lora:
             self.text_encoder_params, self.unet_params = self.setup_lora_training(args, model)
         else:
-            self.text_encoder_params = list(itertools.chain([
+            self.text_encoder_params = {'default': list(itertools.chain([
                 self._apply_text_encoder_freeze(model.text_encoder),
                 self._apply_text_encoder_freeze(model.text_encoder_2) if model.text_encoder_2 is not None else []
-            ]))
-            self.unet_params = list(
-                self._apply_unet_freeze(
-                    model.unet,
-                    unet_freeze_config=optimizer_config.get("unet_freezing", {}),
-                    cross_attention_dim_to_find=2048 if model.is_sdxl else model.text_encoder.config.hidden_size
-                )
+            ]))}
+            self.unet_params = self._apply_unet_freeze(
+                model.unet,
+                unet_freeze_config=optimizer_config.get("unet_freezing", {}),
+                unet_component_lr_config=self.unet_component_lr_config,
+                cross_attention_dim_to_find=2048 if model.is_sdxl else model.text_encoder.config.hidden_size
             )
 
         if args.jacobian_descent:
@@ -107,8 +111,7 @@ class EveryDreamOptimizer:
         else:
             self.jacobian_aggregator = None
 
-        self.text_encoder_params, self.unet_params = plugin_runner.run_add_parameters(self.text_encoder_params, self.unet_params)
-        self.unet_params = list(self.unet_params)
+        self.text_encoder_params, _ = plugin_runner.run_add_parameters(self.text_encoder_params, [])
         self.text_encoder_params = list(self.text_encoder_params)
 
         #with torch.no_grad():
@@ -117,6 +120,7 @@ class EveryDreamOptimizer:
         #    self._log_weight_normal(unet.parameters(), "unet", log_action)
 
         self.optimizers = []
+        self.optimizer_te_2 = None  # todo: support 2nd text encoder optimizer
         self.optimizer_te, self.optimizer_unet = self.create_optimizers(args,
                                                                         self.text_encoder_params,
                                                                         self.unet_params)
@@ -262,8 +266,25 @@ class EveryDreamOptimizer:
         return self.scaler.get_scale()
     
     def get_unet_lr(self):
-        return self.optimizer_unet.param_groups[0]['lr'] if self.optimizer_unet is not None else 0
-    
+        """
+        Returns dict of learning rates keyed by tag name.
+        Single param group: {"lr unet": <value>}
+        Multiple param groups: {"lr unet <group_name>": <value>, ...}
+        """
+        if self.optimizer_unet is None:
+            return {}
+
+        param_groups = self.optimizer_unet.param_groups
+        if len(param_groups) == 1:
+            # Single param group - use simple key for backward compatibility
+            return {"lr unet": param_groups[0]['lr']}
+        else:
+            # Multiple param groups - include group name in key
+            return {
+                f"lr unet {pg.get('name', f'group_{idx}')}": pg['lr']
+                for idx, pg in enumerate(param_groups)
+            }
+
     def get_textenc_lr(self):
         return self.optimizer_te.param_groups[0]['lr'] if self.optimizer_te is not None else 0
     
@@ -290,7 +311,7 @@ class EveryDreamOptimizer:
         if os.path.exists(scaler_state_path) and self.scaler is not None:
             self._load_optimizer(self.scaler, scaler_state_path, expected_type='scaler')
 
-    def create_optimizers(self, args, text_encoder_params, unet_params):
+    def create_optimizers(self, args, text_encoder_params: dict[str, list], unet_params: dict[str, list]):
         """
         creates optimizers from config and args for unet and text encoder
         returns (optimizer_te, optimizer_unet)
@@ -374,10 +395,16 @@ class EveryDreamOptimizer:
             unet_config = optimizer_config["base"]
 
             if unet_config["lr_scheduler"] == "polynomial":
+                num_restarts = unet_config.get("lr_num_restarts", 1)
+                if num_restarts != 1 and args.auto_decay_steps_multiplier != 1:
+                    raise ValueError("Cannot use lr_num_restarts != 1 with --auto_decay_steps_multiplier != 1 when using polynomial LR scheduler")
+                if num_restarts < 1:
+                    raise ValueError("Must have >=1 (re)starts for polynomial LR scheduler")
                 lr_scheduler = _get_polynomial_decay_schedule_with_warmup_adj(
                     optimizer=self.optimizer_unet,
                     lr_end=unet_config.get("lr_end", unet_config["lr"]/100.0),
                     power=unet_config.get("power", 2),
+                    num_cycles=num_restarts,
                     num_warmup_steps=int(unet_config["lr_warmup_steps"]),
                     num_training_steps=int(unet_config["lr_decay_steps"]),
                 )
@@ -455,8 +482,12 @@ class EveryDreamOptimizer:
             logging.warning(f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}")
             pass
 
-    def _create_optimizer(self, label, args, local_optimizer_config, parameters: List[Tuple[str, torch.nn.Parameter]]):
-        #l = [parameters]
+    def _create_optimizer(self, label, args, local_optimizer_config, parameters: dict[str, list]):
+        """
+        parameters is always a dict:
+        - Single group: {"default": [(name, param), ...]}
+        - Multi-group: {"cross_attention": [...], "self_attention": [...], ...}
+        """
         betas = BETAS_DEFAULT
         epsilon = EPSILON_DEFAULT
         weight_decay = WEIGHT_DECAY_DEFAULT
@@ -501,37 +532,82 @@ class EveryDreamOptimizer:
             curr_lr = default_lr
             logging.warning(f"No LR setting found, defaulting to {default_lr}")
 
+        # Check if this is component-specific LR (multi-group) or standard (single group)
+        is_component_lr = label == "unet" and len(parameters) > 1 and "cross_attention" in parameters
+
         param_groups = []
-        attention_weight_decay = local_optimizer_config.get("weight_decay_attn_qk", None)
-        if attention_weight_decay is None:
-            param_groups = [
-                {
-                    "params": [p for n, p in parameters],
-                    "betas": (betas[0], betas[1]),
-                    "weight_decay": weight_decay,
-                    "lr": curr_lr,
-                    "name": "attention_high_decay",
+
+        if is_component_lr:
+            # Component-specific LR mode for UNet
+            logging.info(f"{Fore.CYAN}=== Using Component-Specific Learning Rates for UNet ==={Style.RESET_ALL}")
+
+            component_configs = {
+                "cross_attention": {
+                    "lr_scale": self.unet_component_lr_config.get("cross_attention_lr_scale", 1.0),
+                    "weight_decay": self.unet_component_lr_config.get("cross_attention_weight_decay", weight_decay),
+                },
+                "self_attention": {
+                    "lr_scale": self.unet_component_lr_config.get("self_attention_lr_scale", 1.0),
+                    "weight_decay": self.unet_component_lr_config.get("self_attention_weight_decay", weight_decay),
+                },
+                "resnet": {
+                    "lr_scale": self.unet_component_lr_config.get("resnet_lr_scale", 1.0),
+                    "weight_decay": self.unet_component_lr_config.get("resnet_weight_decay", weight_decay),
+                },
+                "other": {
+                    "lr_scale": self.unet_component_lr_config.get("other_lr_scale", 1.0),
+                    "weight_decay": self.unet_component_lr_config.get("other_weight_decay", weight_decay),
                 }
-            ]
+            }
+
+            for component_name, component_params in parameters.items():
+                if component_params:  # Only add non-empty groups
+                    config = component_configs[component_name]
+                    component_lr = curr_lr * config["lr_scale"]
+                    param_groups.append({
+                        "params": [p for n, p in component_params],
+                        "betas": (betas[0], betas[1]),
+                        "weight_decay": config["weight_decay"],
+                        "lr": component_lr,
+                        "name": component_name,
+                    })
+                    logging.info(f"{Fore.CYAN}  {component_name}: {len(component_params)} params, LR={component_lr:.2e}, WD={config['weight_decay']}{Style.RESET_ALL}")
         else:
-            regular_group, attention_group = _extract_attention_parameter_group(parameters)
-            logging.info(f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}")
-            param_groups = [
-                {
-                    "params": [p for n, p in regular_group],
-                    "betas": (betas[0], betas[1]),
-                    "weight_decay": weight_decay,
-                    "lr": curr_lr,
-                    "name": "regular",
-                },
-                {
-                    "params": [p for n, p in attention_group],
-                    "betas": (betas[0], betas[1]),
-                    "weight_decay": attention_weight_decay,
-                    "lr": curr_lr,
-                    "name": "attention_high_decay",
-                },
-            ]
+            # Standard mode: single group (dict with one key, usually "default")
+            # Get the single group's parameters
+            group_name = list(parameters.keys())[0]
+            param_list = parameters[group_name]
+
+            attention_weight_decay = local_optimizer_config.get("weight_decay_attn_qk", None)
+            if attention_weight_decay is None:
+                param_groups = [
+                    {
+                        "params": [p for n, p in param_list],
+                        "betas": (betas[0], betas[1]),
+                        "weight_decay": weight_decay,
+                        "lr": curr_lr,
+                        "name": group_name,
+                    }
+                ]
+            else:
+                regular_group, attention_group = _extract_attention_parameter_group(param_list)
+                logging.info(f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}")
+                param_groups = [
+                    {
+                        "params": [p for n, p in regular_group],
+                        "betas": (betas[0], betas[1]),
+                        "weight_decay": weight_decay,
+                        "lr": curr_lr,
+                        "name": "regular",
+                    },
+                    {
+                        "params": [p for n, p in attention_group],
+                        "betas": (betas[0], betas[1]),
+                        "weight_decay": attention_weight_decay,
+                        "lr": curr_lr,
+                        "name": "attention_high_decay",
+                    },
+                ]
 
         if optimizer_name:
             optimizer_name = optimizer_name.lower()
@@ -663,9 +739,15 @@ class EveryDreamOptimizer:
                 yield name
 
     def _apply_unet_freeze(self, unet: UNet2DConditionModel,
-                           unet_freeze_config: dict[str, bool], cross_attention_dim_to_find: int
-                           ) -> chain[torch.nn.Parameter]:
-
+                           unet_freeze_config: dict[str, bool],
+                           unet_component_lr_config: dict,
+                           cross_attention_dim_to_find: int
+                           ):
+        """
+        Returns either:
+        - A simple chain of parameters (old behavior) if no component LR config
+        - A dict with component groups if component LR config is provided
+        """
         freeze_prefixes = []
         if unet_freeze_config.get("freeze_in", False):
             freeze_prefixes.extend(['time_embedding.', 'conv_in.', 'down_blocks.', 'add_embedding.'])
@@ -673,6 +755,8 @@ class EveryDreamOptimizer:
             freeze_prefixes.extend(['mid_block'])
         if unet_freeze_config.get("freeze_out", False):
             freeze_prefixes.extend(['conv_norm_out.', 'conv_out.', 'up_blocks.'])
+        if unet_freeze_config.get("freeze_resnets", False):
+            freeze_prefixes.extend()
 
         if 'unfreeze_cross_attention' in unet_freeze_config or 'unfreeze_self_attention' in unet_freeze_config or 'unfreeze_spatial_resnets' in unet_freeze_config:
             raise ValueError("unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)")
@@ -696,9 +780,11 @@ class EveryDreamOptimizer:
             print(self_attn_layer_names)
 
         freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
-        spatial_resnet_prefixes = ["mid_block.resnets.0", "mid_block.resnets.1", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
+        spatial_resnet_prefixes = ["mid_block.resnets", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
         freeze_detail_layers = unet_freeze_config.get("freeze_detail_layers", None)
         detail_layer_prefixes = ["up_blocks.1.resnets", "up_blocks.2.resnets", "up_blocks.3.resnets", "conv_out"]
+        freeze_all_resnets = unet_freeze_config.get("freeze_all_resnets", None)
+        resnet_layer_prefixes = [f"down_blocks.{i}.resnets" for i in range(4)] + ["mid_blocks.resnets"] + [f"up_blocks.{i}.resnets" for i in range(4)]
 
         def should_freeze(n):
             # maybe freeze
@@ -710,8 +796,21 @@ class EveryDreamOptimizer:
                 return freeze_spatial_resnets
             elif freeze_detail_layers is not None and any(n.startswith(prefix) for prefix in detail_layer_prefixes):
                 return freeze_detail_layers
+            elif freeze_all_resnets is not None and any(n.startswith(prefix) for prefix in resnet_layer_prefixes):
+                return freeze_all_resnets
             # fallback to general prefixes
             return any(n.startswith(prefix) for prefix in freeze_prefixes)
+
+        def get_component_type(n):
+            """Determine which component type a parameter belongs to"""
+            if any(n.startswith(prefix) for prefix in cross_attn_layer_names):
+                return "cross_attention"
+            elif any(n.startswith(prefix) for prefix in self_attn_layer_names):
+                return "self_attention"
+            elif "resnet" in n.lower() or "resnets" in n.lower():
+                return "resnet"
+            else:
+                return "other"
 
         for n, p in unet.named_parameters():
             p.requires_grad = not should_freeze(n)
@@ -720,7 +819,34 @@ class EveryDreamOptimizer:
         for n, p in unet.named_parameters():
             print(f"{' ' if p.requires_grad else '❄️'} {n}")
 
-        return itertools.chain([np for np in unet.named_parameters() if np[1].requires_grad])
+        # Always return dict structure
+        if unet_component_lr_config and unet_component_lr_config.get("enabled", False):
+            # Component-specific LR mode: return 4 separate groups
+            component_groups = {
+                "cross_attention": [],
+                "self_attention": [],
+                "resnet": [],
+                "other": []
+            }
+
+            for n, p in unet.named_parameters():
+                if p.requires_grad:
+                    component_type = get_component_type(n)
+                    component_groups[component_type].append((n, p))
+
+            # Log component counts
+            print("\n=== UNet Component-Specific LR Groups ===")
+            for component, params in component_groups.items():
+                if params:
+                    lr_scale = unet_component_lr_config.get(f"{component}_lr_scale", 1.0)
+                    print(f"  {component}: {len(params)} parameters (LR scale: {lr_scale}x)")
+
+            return component_groups
+        else:
+            # Standard mode: return single group dict for consistency
+            return {
+                "default": list(itertools.chain([np for np in unet.named_parameters() if np[1].requires_grad]))
+            }
 
 
     def _apply_text_encoder_freeze(self, text_encoder) -> chain[torch.nn.Parameter]:
@@ -786,7 +912,7 @@ class EveryDreamOptimizer:
 
         return parameters
 
-    def setup_lora_training(self, args, model: 'TrainingModel'):
+    def setup_lora_training(self, args, model: 'TrainingModel') -> tuple[dict[str, list], dict[str, list]]:
 
         if args.disable_textenc_training:
             text_encoder_params = []
@@ -821,7 +947,7 @@ class EveryDreamOptimizer:
                 model.unet.add_adapter(unet_lora_config)
             unet_params = list(filter(lambda p: p[1].requires_grad, model.unet.named_parameters()))
 
-        return text_encoder_params, unet_params
+        return {'default': text_encoder_params}, {'default': unet_params}
 
 
 
@@ -865,6 +991,7 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
     optimizer: Optimizer,
     num_warmup_steps: int,
     num_training_steps: int,
+    num_cycles: int = 1,
     lr_end: float = 1e-7,
     power: float = 1.0,
     last_epoch: int = -1,
@@ -889,6 +1016,8 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
             Power factor.
         last_epoch (`int`, *optional*, defaults to -1):
             The index of the last epoch when resuming training.
+        num_cycles (`int`, *optional*, defaults to 1):
+            How many times to repeat the cycle of warmup/cooldown during training.
 
     Note: *power* defaults to 1.0 as in the fairseq implementation, which in turn is based on the original BERT
     implementation at
@@ -901,17 +1030,24 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
 
     lr_init = optimizer.defaults["lr"]
 
-    def lr_lambda(current_step: int):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        elif current_step > num_training_steps:
+    num_warmup_steps_cycle = math.ceil(num_warmup_steps / num_cycles)
+    num_training_steps_cycle = math.ceil(num_training_steps / num_cycles)
+
+    def lr_lambda_cycleinternal(current_cycle_step: int):
+        if current_cycle_step < num_warmup_steps_cycle:
+            return float(current_cycle_step) / float(max(1, num_warmup_steps_cycle))
+        elif current_cycle_step > num_training_steps_cycle:
             return lr_end / lr_init  # as LambdaLR multiplies by lr_init
         else:
             lr_range = lr_init - lr_end
-            decay_steps = num_training_steps - num_warmup_steps
-            pct_remaining = 1 - (current_step - num_warmup_steps) / decay_steps
+            decay_steps = num_training_steps_cycle - num_warmup_steps_cycle
+            pct_remaining = 1 - (current_cycle_step - num_warmup_steps_cycle) / decay_steps
             decay = lr_range * pct_remaining**power + lr_end
             return decay / lr_init  # as LambdaLR multiplies by lr_init
+
+    def lr_lambda(current_step: int):
+        current_cycle_step = current_step % int(num_warmup_steps_cycle + num_training_steps_cycle)
+        return lr_lambda_cycleinternal(current_cycle_step)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 

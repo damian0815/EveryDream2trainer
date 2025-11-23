@@ -425,7 +425,6 @@ class CheckpointMergerPipeline(DiffusionPipeline):
         return theta0 + delta_scaled + perturbation
 
 
-
 def merge(a, b, alpha, preloaded_a=None, module_override_alphas: dict = None, block_weights=None, algorithm='weighted_sum'):
 
     print(f"merging {a} and {b} with alpha {alpha}. preloaded_a is {preloaded_a}")
@@ -491,8 +490,11 @@ def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, b
 
 def _do_multi_merge_core(models, model_weights, per_module_alphas, block_weights, algorithm='weighted_sum'):
 
-    if len(models) < 2:
-        raise ValueError("Must pass at least 2 models")
+    if len(models) == 0:
+        raise ValueError("Must pass at least 1 model")
+    elif len(models) == 1:
+        # nothing to do
+        return models[0]
 
     merged = None
     for i in tqdm(range(1, len(models))):
@@ -538,11 +540,15 @@ if __name__ == "__main__":
                         required=True,
                         type=str,
                         help="output path")
+    parser.add_argument("--sdxl", action='store_true', help="if passed, merge only SDXL UNet blocks (for SDXL models); block merge disabled")
     parser.add_argument("--num_intermediates", type=int, default=1, help="number of intermediates to use, default 1 means no intermediates. >1 uses extra disk space to save intermediates")
     parser.add_argument("--half", action='store_true', help="save fp16 rather than fp32")
     parser.add_argument("--algorithm", type=str, default='weighted_sum', help="merging algorithm: weighted_sum, sigmoid, inv_sigmoid, add_diff, reset_and_perturb")
 
     args = parser.parse_args()
+
+    if args.sdxl:
+        print("** SDXL merge")
 
     if args.algorithm == 'reset_and_perturb':
         if len(args.repo_ids_or_paths) != 2:

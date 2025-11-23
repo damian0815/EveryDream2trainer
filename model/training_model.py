@@ -146,6 +146,26 @@ class TrainingVariables:
         self.accumulated_captions = []
         self.accumulated_timesteps = []
 
+    def reset(self):
+        # Clear all loss accumulation
+        self.clear_accumulated_loss()
+
+        self.current_accumulated_backward_images_count = 0
+        self.prev_accumulated_pathnames = []
+        self.prev_accumulated_captions = []
+        self.prev_accumulated_timesteps = []
+
+        # Reset backward tracking
+        self.last_effective_batch_size = 0
+        self.effective_backward_size = 0
+
+        # Clear conditional dropout tracking
+        self.cond_dropouts = []
+        self.cond_dropout_count = 0
+        self.non_cond_dropout_count = 0
+
+        # Note: global_step is NOT reset - it continues incrementing across cycles
+
 
 @dataclass
 class TrainingModel:
