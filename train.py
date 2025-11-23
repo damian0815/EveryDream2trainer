@@ -989,9 +989,10 @@ def main(args):
                                 raise ValueError(f"get_nibble_size: no nibble left? desired effective batch size {tv.desired_effective_batch_size} - current accumulated backward images count {tv.current_accumulated_backward_images_count}")
                             if tv.interleaved_bs1_count is not None:
                                 return 1
-                            required_to_fill_batch = tv.desired_effective_batch_size - tv.current_accumulated_backward_images_count
-                            permitted_until_backward_step = tv.max_backward_slice_size - tv.accumulated_loss_images_count
-                            return max(1, min(required_to_fill_batch, permitted_until_backward_step))
+
+                            permitted_until_optimizer_step = (tv.accumulated_loss_images_count + tv.current_accumulated_backward_images_count) - tv.desired_effective_batch_size
+                            permitted_until_backward_step = tv.max_backward_slice_size - tv.current_accumulated_backward_images_count
+                            return max(1, min(permitted_until_optimizer_step, permitted_until_backward_step))
 
                         batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size())
                         assert batch["runt_size"] == 0
@@ -1277,8 +1278,8 @@ def main(args):
 
                             # take mean of all dimensions except B
                             loss_sum = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
-                            loss_divisor = 1 #tv.desired_effective_batch_size
-                            tv.accumulate_loss(loss_sum / loss_divisor,
+                            # when stepping the optimizer we want the mean of the loss over all images in the effective batch
+                            tv.accumulate_loss(loss_sum / tv.desired_effective_batch_size,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
                                                timesteps=timesteps[0:nibble_size_actual].tolist())
