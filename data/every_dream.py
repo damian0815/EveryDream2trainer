@@ -315,7 +315,7 @@ def build_torch_dataloader(dataset, batch_size, num_workers=None) -> torch.utils
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=False
     )
     return dataloader
 

@@ -295,20 +295,24 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                                     teacher_unet: UNet2DConditionModel|None=None,
                                     teacher_mask: torch.Tensor|None=None,
                                     teacher_conditioning: Conditioning|None=None,
+                                    debug_fake: bool = False
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps,
                                                           args.latents_perturbation)
-    with autocast(enabled=args.amp):
-        if model.is_sdxl:
-            model_pred = model.unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=conditioning.prompt_embeds,
-                    added_cond_kwargs=conditioning.added_cond_kwargs
-            ).sample
-        else:
-            # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
-            model_pred = model.unet(noisy_latents, timesteps, conditioning.prompt_embeds).sample
+    if debug_fake:
+        model_pred = torch.ones_like(target).to(model.device)
+    else:
+        with autocast(enabled=args.amp):
+            if model.is_sdxl:
+                model_pred = model.unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=conditioning.prompt_embeds,
+                        added_cond_kwargs=conditioning.added_cond_kwargs
+                ).sample
+            else:
+                # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
+                model_pred = model.unet(noisy_latents, timesteps, conditioning.prompt_embeds).sample
 
     with torch.no_grad():
         target = _get_target(latents, noise, model.noise_scheduler, timesteps)

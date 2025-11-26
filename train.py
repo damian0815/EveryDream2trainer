@@ -1081,11 +1081,12 @@ def main(args):
                                     latents_slice = latents_slice[0].sample() * vae_scaling_factor
                                     latents_slices.append(latents_slice)
                                     del latents_slice
-                                except torch.cuda.OutOfMemoryError:
-                                    print(f"OOM in vae.encode encoding slice size {tv.forward_slice_size} from pixel values "
+                                except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
+                                    print(f"OOM step {tv.global_step} in vae.encode encoding slice size {tv.forward_slice_size} from pixel values "
                                           f"of shape {pixel_values.shape}, from {slice_start} to {slice_end} of {batch_size}. "
                                           f"loss images accumulated: {tv.accumulated_loss_images_count}")
                                     raise
+
                             del pixel_values
                             latents = torch.cat(latents_slices)
                             if args.offload_vae:
@@ -1225,17 +1226,24 @@ def main(args):
                                 del encoder_hidden_states_slice
                                 del teacher_encoder_hidden_states_slice
 
-                                model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
-                                    latents=latents_slice,
-                                    conditioning=conditioning,
-                                    noise=noise_slice,
-                                    timesteps=timesteps_slice,
-                                    model=model,
-                                    args=args,
-                                    teacher_unet=teacher_model.unet if teacher_model else None,
-                                    teacher_mask=teacher_mask_slice,
-                                    teacher_conditioning=teacher_conditioning,
-                                )
+                                try:
+                                    model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
+                                        latents=latents_slice,
+                                        conditioning=conditioning,
+                                        noise=noise_slice,
+                                        timesteps=timesteps_slice,
+                                        model=model,
+                                        args=args,
+                                        teacher_unet=teacher_model.unet if teacher_model else None,
+                                        teacher_mask=teacher_mask_slice,
+                                        teacher_conditioning=teacher_conditioning,
+                                    )
+                                except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
+                                    logging.error(f"OOM step {tv.global_step} in unet forward slice size {tv.forward_slice_size} from latents "
+                                          f"of shape {latents_slice.shape}, from {slice_start} to {slice_end} of {batch_size}. "
+                                          f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.readlink(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant]}, timesteps: {timesteps_slice.detach().cpu().tolist()}")
+                                    raise
+
                                 model_pred_all.append(model_pred)
                                 model_pred_wrong_all.append(model_pred_wrong)
                                 model_pred_wrong_mask_all.append(model_pred_wrong_mask)
@@ -1274,17 +1282,19 @@ def main(args):
 
                             log_data.loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
                             log_data.loss_log_step_non_cd.append(loss[~cond_dropout_mask].mean().detach().item())
+                            consumed_timesteps = []
                             for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
                                 used_timestep_detached = int(used_timestep.detach().item())
                                 current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
+                                consumed_timesteps.append(used_timestep_detached)
 
                             # take mean of all dimensions except B
                             loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / tv.desired_effective_batch_size
                             tv.accumulate_loss(loss_mean,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
-                                               timesteps=timesteps[0:nibble_size_actual].tolist())
+                                               timesteps=timesteps[0:nibble_size_actual].detach().cpu().tolist())
                             loss_step = loss_mean.detach().item()
                             steps_pbar.set_postfix(
                                 {
@@ -1295,6 +1305,10 @@ def main(args):
                                     "gs": tv.global_step,
                                 }
                             )
+
+                            with torch.no_grad():
+                                timesteps = timesteps[nibble_size_actual:]
+
                             del loss, loss_mean
                             log_data.loss_log_step.append(loss_step)
                             log_data.loss_epoch.append(loss_step)
@@ -1307,6 +1321,9 @@ def main(args):
                                     tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                                 _optimizer_backward(ed_optimizer, tv)
+
+                            #if tv.global_step >= 653 and tv.global_step < 656:
+                            #    print("step:", tv.global_step, "caption:", caption_variant, " - batch:", [os.readlink(x) for x in batch["pathnames"]], batch["captions"][caption_variant], "; timestep slice:", consumed_timesteps)
 
                             if should_step_optimizer:
                                 if tv.backwarded_images_count == 0:
@@ -1432,7 +1449,8 @@ def main(args):
                         current_batch = batch
                     except NameError:
                         current_batch = None
-                    logging.error(f"step {tv.global_step} failed. full_batch: {full_batch}, current batch: {current_batch}, training values: {dataclasses.asdict(tv)}")
+                    logging.error(f"step {tv.global_step} failed. full_batch: {full_batch}, current batch: {current_batch},")
+                    logging.error(f"  training values: {dataclasses.asdict(tv)}")
                     raise
 
                 #logging.info("fetching...")
