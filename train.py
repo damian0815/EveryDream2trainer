@@ -331,7 +331,7 @@ def _choose_backward_slice_size(args, tv: TrainingVariables):
         min(
             args.max_backward_slice_size or args.batch_size,
             tv.desired_effective_batch_size
-            #- tv.current_accumulated_backward_images_count,
+            #- tv.backwarded_images_count,
         ),
     )
 
@@ -341,9 +341,9 @@ def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables):
     else:
         optimizer.backward(tv.accumulated_loss)
         tv.effective_backward_size = tv.accumulated_loss_images_count
-        tv.current_accumulated_backward_images_count += tv.accumulated_loss_images_count
+        tv.backwarded_images_count += tv.accumulated_loss_images_count
         #print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
-        #      f"backward accumulated {tv.current_accumulated_backward_images_count}")
+        #      f"backward accumulated {tv.backwarded_images_count}")
         tv.clear_accumulated_loss()
         # reset slice sizes
         tv.forward_slice_size = args.forward_slice_size or args.batch_size
@@ -940,6 +940,7 @@ def main(args):
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
                     timesteps = _get_step_timesteps(full_batch, train_progress_01, model, tv, args)
+                    #print('timesteps: ', timesteps.detach().clone().cpu().tolist())
 
                     # apply cond dropout
                     initial_batch_size = args.batch_size if args.initial_batch_size is None else args.initial_batch_size
@@ -985,13 +986,15 @@ def main(args):
                     remaining_batch = full_batch
                     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
                         def get_nibble_size() -> int:
-                            if tv.desired_effective_batch_size - tv.current_accumulated_backward_images_count <= 0:
-                                raise ValueError(f"get_nibble_size: no nibble left? desired effective batch size {tv.desired_effective_batch_size} - current accumulated backward images count {tv.current_accumulated_backward_images_count}")
+                            if tv.desired_effective_batch_size - tv.backwarded_images_count <= 0:
+                                raise ValueError(f"get_nibble_size: no nibble left? desired effective batch size {tv.desired_effective_batch_size} - current accumulated backward images count {tv.backwarded_images_count}")
                             if tv.interleaved_bs1_count is not None:
                                 return 1
 
-                            permitted_until_optimizer_step = (tv.accumulated_loss_images_count + tv.current_accumulated_backward_images_count) - tv.desired_effective_batch_size
-                            permitted_until_backward_step = tv.max_backward_slice_size - tv.current_accumulated_backward_images_count
+                            permitted_until_optimizer_step = tv.desired_effective_batch_size - (tv.accumulated_loss_images_count + tv.backwarded_images_count)
+                            permitted_until_backward_step = tv.max_backward_slice_size - tv.accumulated_loss_images_count
+                            #print(f'ebs {tv.desired_effective_batch_size}, acc loss {tv.accumulated_loss_images_count} -> permitted until optimizer step: {permitted_until_optimizer_step}')
+                            #print(f'curr acc bwd {tv.backwarded_images_count}, max bwd slice {tv.max_backward_slice_size} -> permitted until backward step: {permitted_until_backward_step}')
                             return max(1, min(permitted_until_optimizer_step, permitted_until_backward_step))
 
                         batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size())
@@ -1277,20 +1280,27 @@ def main(args):
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
                             # take mean of all dimensions except B
-                            loss_sum = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
-                            # when stepping the optimizer we want the mean of the loss over all images in the effective batch
-                            tv.accumulate_loss(loss_sum / tv.desired_effective_batch_size,
+                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / tv.desired_effective_batch_size
+                            tv.accumulate_loss(loss_mean,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
                                                timesteps=timesteps[0:nibble_size_actual].tolist())
-                            loss_step = loss.detach().mean().item()
-                            del loss, loss_sum
-                            steps_pbar.set_postfix({"loss/step": loss_step, "gs": tv.global_step})
+                            loss_step = loss_mean.detach().item()
+                            steps_pbar.set_postfix(
+                                {
+                                    "loss/step": loss_step,
+                                    "nImg": loss.shape[0],
+                                    "nBack": tv.accumulated_loss_images_count,
+                                    "nBatch": tv.backwarded_images_count,
+                                    "gs": tv.global_step,
+                                }
+                            )
+                            del loss, loss_mean
                             log_data.loss_log_step.append(loss_step)
                             log_data.loss_epoch.append(loss_step)
 
                             should_step_optimizer = (
-                                    (tv.current_accumulated_backward_images_count + tv.accumulated_loss_images_count)
+                                    (tv.backwarded_images_count + tv.accumulated_loss_images_count)
                                     >= tv.desired_effective_batch_size
                             ) or tv.interleaved_bs1_count is not None
                             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
@@ -1299,15 +1309,15 @@ def main(args):
                                 _optimizer_backward(ed_optimizer, tv)
 
                             if should_step_optimizer:
-                                if tv.current_accumulated_backward_images_count == 0:
+                                if tv.backwarded_images_count == 0:
                                     print("Batch has 0 images, not stepping optimizer")
                                 else:
-                                    # print(f'\nstepping optimizer - current_accumulated_backward_images_count '
-                                    #      f'{tv.current_accumulated_backward_images_count}, '
+                                    # print(f'\nstepping optimizer - backwarded_images_count '
+                                    #      f'{tv.backwarded_images_count}, '
                                     #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
-                                    tv.last_effective_batch_size = tv.current_accumulated_backward_images_count
+                                    tv.last_effective_batch_size = tv.backwarded_images_count
                                     ed_optimizer.step_optimizer(tv.global_step)
-                                    tv.current_accumulated_backward_images_count = 0
+                                    tv.backwarded_images_count = 0
 
                                     # if we are interleaving BS1, increment counter
                                     if tv.interleaved_bs1_count is not None:
@@ -1535,7 +1545,7 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                                                                t_min_final=t_min_final,
                                                                t_max_final=t_max_final,
                                                                alpha=args.timestep_curriculum_alpha)
-                # print('timestep range:', timestep_range)
+                print('timestep range:', timestep_range)
             timesteps_ranges_base = [timestep_range] * full_batch_size
 
         # randomly expand
@@ -1606,7 +1616,7 @@ if __name__ == "__main__":
     argparser.add_argument("--clip_skip", type=int, default=0, help="Train using penultimate layer (def: 0) (2 is 'penultimate')", choices=[0, 1, 2, 3, 4])
     argparser.add_argument("--cond_dropout", type=float, default=0.04, help="Conditional drop out as decimal 0.0-1.0, see docs for more info (def: 0.04)")
     argparser.add_argument("--cond_dropout_curriculum_alpha", type=float, default=0, help="cond dropout curriculum alpha, from cond_dropout to final_cond_dropout, controlled by --cond_dropout_curriculum_source")
-    argparser.add_argument("--cond_dropout_curriculum_source", choices=['timestep', 'batch_size', 'batch_size_and_timestep', 'global_step'], default='timestep',
+    argparser.add_argument("--cond_dropout_curriculum_source", choices=['timestep', 'batch_size', 'batch_size_and_timestep', 'global_step'], default='global_step',
                            help="source for cond dropout curriculum - timestep (high timestep (high noise)...low timestep), batch size (initial_batch_size...final_batch_size), or global_step")
     argparser.add_argument("--final_cond_dropout", type=float, default=None, help="if doing cond dropout curriculum, the final cond dropout (timestep=0)")
     argparser.add_argument("--cond_dropout_loss_scale", type=float, default=1, help="additional loss scaling for cond dropout samples")

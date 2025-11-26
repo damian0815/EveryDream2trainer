@@ -96,7 +96,7 @@ class TrainingVariables:
 
     last_effective_batch_size: int = 0
     effective_backward_size: int = 0
-    current_accumulated_backward_images_count: int = 0 # images that have been backward()ed but not yet optimizer.stepped
+    backwarded_images_count: int = 0 # images that have been backward()ed but not yet optimizer.stepped
     accumulated_loss_images_count: int = 0 # images that are in the current loss (not yet backward()ed)
     accumulated_loss: torch.Tensor|None = None
     accumulated_pathnames: list[str] = field(default_factory=list)
@@ -150,7 +150,7 @@ class TrainingVariables:
         # Clear all loss accumulation
         self.clear_accumulated_loss()
 
-        self.current_accumulated_backward_images_count = 0
+        self.backwarded_images_count = 0
         self.prev_accumulated_pathnames = []
         self.prev_accumulated_captions = []
         self.prev_accumulated_timesteps = []

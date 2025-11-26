@@ -83,8 +83,8 @@ class EveryDreamOptimizer:
         self.clip_grad_norm = args.clip_grad_norm
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
         self.use_grad_scaler = optimizer_config.get("use_grad_scaler", True) and (
-            (model.unet.dtype == torch.float16 and not args.disable_unet_training) or
-            (model.text_encoder.dtype == torch.float16 and not args.disable_textenc_training)
+            ((model.unet.dtype == torch.float16 or model.unet.dtype == torch.bfloat16) and not args.disable_unet_training) or
+            ((model.text_encoder.dtype == torch.float16 or model.text_encoder.dtype == torch.bfloat16) and not args.disable_textenc_training)
         )
         logging.info(f"* grad scaler enabled: {self.use_grad_scaler}")
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
@@ -215,6 +215,14 @@ class EveryDreamOptimizer:
                     self.log_writer.add_scalar("optimizer/te_grad_norm_post_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
                     if self.text_encoder_2 is not None:
                         self.log_writer.add_scalar("optimizer/te2_grad_norm_post_clip", _get_grad_norm(self.text_encoder_2.parameters()), global_step)
+
+                    exp_avg, exp_avg_sq = _get_moment_norms(self.optimizer_unet)
+                    self.log_writer.add_scalar(
+                        "optimizer/unet_adamw_exp_avg", exp_avg, global_step
+                    )
+                    self.log_writer.add_scalar(
+                        "optimizer/unet_adamw_exp_avg_sq", exp_avg_sq, global_step
+                    )
 
         if self.scaler is None:
             for optimizer in self.optimizers:
@@ -985,6 +993,21 @@ def _get_grad_norm(parameters) -> float:
             2.0,
         ).item()
 
+def _get_moment_norms(optimizer) -> tuple[float, float]:
+    if optimizer is None:
+        return 0, 0
+    with torch.no_grad():
+        exp_avg_norms = []
+        exp_avg_sq_norms = []
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if p in optimizer.state:
+                    state = optimizer.state[p]
+                    if 'exp_avg' in state and 'exp_avg_sq' in state:
+                        exp_avg_norms.append(torch.norm(state['exp_avg']).item() ** 2)
+                        exp_avg_sq_norms.append(torch.norm(state['exp_avg_sq']).item() ** 2)
+
+        return sum(exp_avg_norms) ** 0.5, sum(exp_avg_sq_norms) ** 0.5
 
 
 def _get_polynomial_decay_schedule_with_warmup_adj(
