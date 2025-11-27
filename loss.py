@@ -111,6 +111,7 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
              do_contrastive_learning,
              contrastive_learning_negative_loss_scale, args):
 
+    logging.info(f"get_loss timesteps: {timesteps.detach().cpu().tolist()}")
     device = model_pred.device
 
     if mask is not None:
@@ -297,8 +298,8 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                                     teacher_conditioning: Conditioning|None=None,
                                     debug_fake: bool = False
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps,
-                                                          args.latents_perturbation)
+    logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
+    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation)
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
@@ -315,7 +316,6 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                 model_pred = model.unet(noisy_latents, timesteps, conditioning.prompt_embeds).sample
 
     with torch.no_grad():
-        target = _get_target(latents, noise, model.noise_scheduler, timesteps)
         if teacher_unet is not None:
             if teacher_conditioning is None:
                 teacher_conditioning = conditioning
@@ -351,10 +351,11 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
             model_pred_wrong_caption_mask = torch.tensor([False] * encoder_hidden_states.shape[0],
                                                               dtype=torch.bool, device=model_pred.device)
 
-    return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask
+    return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask, noisy_latents
 
 
 def _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation):
+    logging.info(f"get_noisy_latents timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
     if latents_perturbation > 0:
         noisy_latents += torch.randn_like(noisy_latents) * latents_perturbation
@@ -362,6 +363,7 @@ def _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_pertu
 
 
 def _get_target(latents, noise, noise_scheduler, timesteps):
+    logging.info(f"get_target timesteps: {timesteps.detach().cpu().tolist()}")
     if noise_scheduler.config.prediction_type == "epsilon":
         target = noise
     elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
@@ -392,6 +394,7 @@ def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, c
         timesteps = timesteps[:1].repeat((batch_size,))
     if not continuous_float_timesteps:
         timesteps = timesteps.long()
+    logging.info(f"get_timesteps: {timesteps.detach().cpu().tolist()} from ranges: {timesteps_ranges}")
     return timesteps
 
 
@@ -507,7 +510,9 @@ def get_multirank_stratified_random_timesteps(batch_size, device, alpha=2.0, bet
     # shuffle
     perm = torch.randperm(timesteps.shape[0])
     timesteps = timesteps[perm]
-    if continuous_float_timesteps:
-        return timesteps
-    else:
-        return timesteps.long().clamp(min=0, max=999)
+    if not continuous_float_timesteps:
+        timesteps = timesteps.long().clamp(min=0, max=999)
+    logging.info(
+        f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
+    )
+    return timesteps

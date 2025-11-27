@@ -795,7 +795,7 @@ def main(args):
                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                           batch_share_noise=False)
 
-        model_pred, target, _, _ = get_model_prediction_and_target(
+        model_pred, target, _, _, noisy_latents = get_model_prediction_and_target(
             latents,
             conditioning,
             noise,
@@ -1227,7 +1227,7 @@ def main(args):
                                 del teacher_encoder_hidden_states_slice
 
                                 try:
-                                    model_pred, target, model_pred_wrong, model_pred_wrong_mask = get_model_prediction_and_target(
+                                    model_pred, target, model_pred_wrong, model_pred_wrong_mask, noisy_latents = get_model_prediction_and_target(
                                         latents=latents_slice,
                                         conditioning=conditioning,
                                         noise=noise_slice,
@@ -1277,7 +1277,7 @@ def main(args):
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
-                            #log_data.loss_preview_image = torch.cat([model_pred, target], dim=-2).detach().clone().cpu()
+                            log_data.loss_preview_image = torch.cat([model_pred, target], dim=-2).detach().clone().cpu()
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
                             log_data.loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
@@ -1289,12 +1289,17 @@ def main(args):
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
                                 consumed_timesteps.append(used_timestep_detached)
 
-                            # take mean of all dimensions except B
-                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / tv.desired_effective_batch_size
+                            # take mean of all dimensions except batch
+                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
+                            if not args.disable_loss_mean_division:
+                                loss_mean = loss_mean / tv.desired_effective_batch_size
+                            nibble_timesteps_detached = timesteps[0:nibble_size_actual].detach().cpu().tolist()
                             tv.accumulate_loss(loss_mean,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
                                                captions=caption_str[0:nibble_size_actual],
-                                               timesteps=timesteps[0:nibble_size_actual].detach().cpu().tolist())
+                                               timesteps=nibble_timesteps_detached)
+                            for t in nibble_timesteps_detached:
+                                log_data.timestep_coverage[t] += 1
                             loss_step = loss_mean.detach().item()
                             steps_pbar.set_postfix(
                                 {
@@ -1666,6 +1671,7 @@ if __name__ == "__main__":
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
     argparser.add_argument("--lr_advance_steps", type=int, default=None, help="Steps to advance the LR during training")
+    argparser.add_argument("--disable_loss_mean_division", action='store_true', help="If passed, disable dividing the loss through by batch size")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
     argparser.add_argument("--max_steps", type=int, default=None, help="Maximum number of steps to train for")
     argparser.add_argument("--auto_decay_steps_multiplier", type=float, default=1.1, help="Multiplier for calculating decay steps from epoch count")

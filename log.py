@@ -3,8 +3,9 @@ import json
 import logging
 import math
 import os
-from collections import defaultdict
+from collections import defaultdict, Counter
 
+import numpy as np
 import torch
 import torchvision
 from colorama import Style, Fore
@@ -29,8 +30,10 @@ class LogData:
     loss_epoch = []
     images_per_sec = []
     images_per_sec_log_step = []
+    timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
 
     attention_activation_logger: ActivationLogger = None
+
 
 def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, model: TrainingModel, tv: TrainingVariables):
     global_step = tv.global_step
@@ -134,6 +137,16 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
     # log activations every 4th logging action
     if log_data.attention_activation_logger and (global_step + 1) % (args.log_step * 4) == 0:
         log_data.attention_activation_logger.log_to_tensorboard(global_step=global_step)
+
+    if log_data.timestep_coverage:
+        values = []
+        for key, count in log_data.timestep_coverage.items():
+            values.extend([key] * count)
+        log_writer.add_histogram('timesteps/histogram', np.array(values), global_step)
+        log_writer.add_scalar('timesteps/min', min(log_data.timestep_coverage), global_step)
+        log_writer.add_scalar('timesteps/max', min(log_data.timestep_coverage), global_step)
+
+    log_data.timestep_coverage.clear()
 
     return logs
 
