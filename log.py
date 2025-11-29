@@ -114,7 +114,7 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         logs["loss/log_step non-CD"] = loss_step_non_cd
     if log_data.loss_preview_image is not None:
         loss_preview_image_rgb = torchvision.utils.make_grid(
-            vae_preview(log_data.loss_preview_image)
+            log_data.loss_preview_image
         )
         log_writer.add_image(tag="loss/last model_pred and target", img_tensor=loss_preview_image_rgb, global_step=global_step)
     if args.log_named_parameters_magnitudes:
@@ -144,7 +144,7 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
             values.extend([key] * count)
         log_writer.add_histogram('timesteps/histogram', np.array(values), global_step)
         log_writer.add_scalar('timesteps/min', min(log_data.timestep_coverage), global_step)
-        log_writer.add_scalar('timesteps/max', min(log_data.timestep_coverage), global_step)
+        log_writer.add_scalar('timesteps/max', max(log_data.timestep_coverage), global_step)
 
     log_data.timestep_coverage.clear()
 

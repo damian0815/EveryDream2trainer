@@ -101,6 +101,12 @@ class EveryDreamBatch(Dataset):
                                         padding="max_length",
                                         max_length=self.tokenizer.model_max_length,
                                         ).input_ids)
+        if self.tokenizer_2 is not None:
+            self.cond_dropout_tokens_2 = torch.tensor(self.tokenizer_2(self.cond_dropout_caption,
+                                            truncation=True,
+                                            padding="max_length",
+                                            max_length=self.tokenizer_2.model_max_length,
+                                            ).input_ids)
 
     @property
     def is_sdxl(self):

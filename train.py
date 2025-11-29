@@ -971,12 +971,13 @@ def main(args):
                                                                            alpha=args.cond_dropout_curriculum_alpha)
                         tv.cond_dropouts.append(this_cond_dropout_p)
                         if train_batch.random_instance.random() <= this_cond_dropout_p:
+                            # drop all captions for this sample
                             for k in full_batch["captions"].keys():
                                 if full_batch["captions"][k][sample_index] is None:
                                     continue
                                 full_batch["tokens"][k][sample_index] = train_batch.cond_dropout_tokens
                                 if model.is_sdxl:
-                                    full_batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens
+                                    full_batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens_2
                                 full_batch["captions"][k][sample_index] = train_batch.cond_dropout_caption
                             full_batch["loss_scale"][sample_index] *= args.cond_dropout_loss_scale
                             if train_batch.random_instance.random() <= args.cond_dropout_noise_p:
@@ -1277,7 +1278,7 @@ def main(args):
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
-                            log_data.loss_preview_image = torch.cat([model_pred, target], dim=-2).detach().clone().cpu()
+                            log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
                             log_data.loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
@@ -1291,6 +1292,7 @@ def main(args):
 
                             # take mean of all dimensions except batch
                             loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
+                            loss_step = loss_mean.detach().item() / loss.shape[0]
                             if not args.disable_loss_mean_division:
                                 loss_mean = loss_mean / tv.desired_effective_batch_size
                             nibble_timesteps_detached = timesteps[0:nibble_size_actual].detach().cpu().tolist()
@@ -1300,7 +1302,6 @@ def main(args):
                                                timesteps=nibble_timesteps_detached)
                             for t in nibble_timesteps_detached:
                                 log_data.timestep_coverage[t] += 1
-                            loss_step = loss_mean.detach().item()
                             steps_pbar.set_postfix(
                                 {
                                     "loss/step": loss_step,
@@ -1536,6 +1537,7 @@ def main(args):
 
 def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: TrainingModel, tv: TrainingVariables, args):
     full_batch_size = full_batch["image"].shape[0]
+
     if args.timesteps_multirank_stratified:
         # the point of multirank stratified is to spread timesteps evenly across the batch.
         # so we need to do a dance here to make sure that we're actually spreading across the
