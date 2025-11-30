@@ -82,12 +82,11 @@ class EveryDreamOptimizer:
         self.next_grad_accum_step = self.grad_accum
         self.clip_grad_norm = args.clip_grad_norm
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
-        #self.use_grad_scaler = optimizer_config.get("use_grad_scaler", True) and (
-        #    ((model.unet.dtype == torch.float16 or model.unet.dtype == torch.bfloat16) and not args.disable_unet_training) or
-        #    ((model.text_encoder.dtype == torch.float16 or model.text_encoder.dtype == torch.bfloat16) and not args.disable_textenc_training)
-        #)
+
+        if not optimizer_config.get("use_grad_scaler", True):
+            logging.warning("* Ignoring use_grad_scaler: False in optimizer config (you should always use grad scaler with mixed precision training)")
         self.use_grad_scaler = True
-        logging.info(f"* grad scaler enabled: {self.use_grad_scaler}")
+
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
         if args.lora:
