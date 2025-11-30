@@ -1290,11 +1290,9 @@ def main(args):
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
                                 consumed_timesteps.append(used_timestep_detached)
 
-                            # take mean of all dimensions except batch
-                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum()
-                            loss_step = loss_mean.detach().item() / loss.shape[0]
-                            if not args.disable_loss_mean_division:
-                                loss_mean = loss_mean / tv.desired_effective_batch_size
+                            # take mean of all dimensions except batch, then divide through by the fixed "batch size". this is to ensure we get a stable divisor, regardless of forward/backward slice sizes.
+                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / args.batch_size
+                            loss_step = loss_mean.detach().item()
                             nibble_timesteps_detached = timesteps[0:nibble_size_actual].detach().cpu().tolist()
                             tv.accumulate_loss(loss_mean,
                                                pathnames=batch["pathnames"][0:nibble_size_actual],
@@ -1673,7 +1671,6 @@ if __name__ == "__main__":
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
     argparser.add_argument("--lr_advance_steps", type=int, default=None, help="Steps to advance the LR during training")
-    argparser.add_argument("--disable_loss_mean_division", action='store_true', help="If passed, disable dividing the loss through by batch size")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
     argparser.add_argument("--max_steps", type=int, default=None, help="Maximum number of steps to train for")
     argparser.add_argument("--auto_decay_steps_multiplier", type=float, default=1.1, help="Multiplier for calculating decay steps from epoch count")
