@@ -178,19 +178,16 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
         if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
             if args.train_sampler == 'flow-matching':
                 raise ValueError("can't use min-SNR with flow matching")
-            snr = compute_snr(timesteps, noise_scheduler, max_sigma=22000)
-            # kohya implementation
-            min_snr_gamma = torch.minimum(snr, torch.full_like(snr, args.min_snr_gamma))
-            if noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
-                snr_weight = min_snr_gamma / (snr + 1)
-            else:
-                snr_weight = min_snr_gamma / snr
-
-            # blend snr with regular weight
-            snr_weight = (1 - args.min_snr_alpha) + (snr_weight * args.min_snr_alpha)
-
+            snr = compute_snr(timesteps, noise_scheduler)
+            v_pred = noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]
+            divisor = (snr + 1) if v_pred else snr
+            snr_weight = (
+                torch.stack(
+                    [snr, args.min_snr_gamma * torch.ones_like(timesteps).float()], dim=1
+                ).min(dim=1)[0]
+                / divisor
+            )
             snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
-
             loss = loss * snr_weight.to(loss.device)
 
         return loss
@@ -428,11 +425,11 @@ def pyramid_noise_like(x, discount=0.8):
     if w==1 or h==1: break # Lowest resolution is 1x1
   return noise/noise.std() # Scaled back to roughly unit variance
 
-def compute_snr(timesteps, noise_scheduler, max_sigma=22000):
+def compute_snr(timesteps, noise_scheduler):
     """
     Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
     """
-    minimal_value = 1/max_sigma
+    minimal_value = 1e-9
     alphas_cumprod = noise_scheduler.alphas_cumprod
     # Use .any() to check if any elements in the tensor are zero
     if (alphas_cumprod[:-1] == 0).any():

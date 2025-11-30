@@ -29,6 +29,11 @@ truncate_sentences_p = 0
 ending_dot_p = 0.5
 replace_dots_with_commas_p = 0.02
 
+caption_variants = [
+    'long',
+    #'*'
+]
+
 class CaptionMungerPlugin(BasePlugin):
 
     tokenizer: CLIPTokenizer|None = None
@@ -60,8 +65,14 @@ class CaptionMungerPlugin(BasePlugin):
                                           if (v and len(v.strip())>0)
                                           else None)
                 for k, v in d.items()}
+
+        variant = random.choice(caption_variants)
+        if variant not in transformed_json.keys() or variant == '*':
+            variant = random.choice(list(transformed_json.keys()))
+        return {variant: transformed_json[variant]}
+
         #print(f"transformed caption from '{d}' to '{transformed_json}'")
-        return transformed_json
+        #return transformed_json
 
     def transform_caption(self, caption_in:str) -> str | dict[str, str]:
         caption = caption_in
