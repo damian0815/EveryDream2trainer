@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 import itertools
 import os
+from functools import partial
 from itertools import chain
 from typing import List, Tuple, Generator
 
@@ -45,6 +46,11 @@ LR_DEFAULT = 1e-6
 OPTIMIZER_TE_STATE_FILENAME = "optimizer_te.pt"
 OPTIMIZER_UNET_STATE_FILENAME = "optimizer_unet.pt"
 SCALER_STATE_FILENAME = 'scaler.pt'
+
+
+class InfOrNanException(Exception):
+    pass
+
 
 class EveryDreamOptimizer:
     """
@@ -83,9 +89,23 @@ class EveryDreamOptimizer:
         self.clip_grad_norm = args.clip_grad_norm
         self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
 
-        if not optimizer_config.get("use_grad_scaler", True):
-            logging.warning("* Ignoring use_grad_scaler: False in optimizer config (you should always use grad scaler with mixed precision training)")
-        self.use_grad_scaler = True
+        if 'use_grad_scaler' in optimizer_config:
+            logging.warning("* Ignoring use_grad_scaler entry in optimizer config, will be set automatically")
+        if model.is_sdxl:
+            self.use_grad_scaler = False
+            logging.info("* SDXL: no grad scaler")
+        elif model.unet.dtype in [torch.float16, torch.bfloat16]:
+            self.use_grad_scaler = True
+            logging.info("* float16/bfloat16 traning: using grad scaler")
+        elif self.unet_params['optimizer'].endswith('8bit') or self.text_encoder_params['optimizer'].endswith('8bit'):
+            self.use_grad_scaler = True
+            logging.info("* 8bit optimizer: using grad scaler")
+        elif model.unet.dtype != torch.float32:
+            self.use_grad_scaler = True
+            logging.info(f"* unet dtype = {model.unet.dtype}: using grad scaler")
+        else:
+            self.use_grad_scaler = False
+            logging.info("* no grad scaler")
 
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
@@ -189,7 +209,93 @@ class EveryDreamOptimizer:
         else:
             loss_scaled_if_necessary.backward()
 
-    def step_optimizer(self, global_step):
+    def register_unet_nan_hooks_full(self):
+        def detailed_nan_hook(module, grad_input, grad_output, name: str='unknown'):
+            module_name = f'{name}({module.__class__.__name__})'
+
+            # Check what's coming FROM the next layer (flowing backward)
+            grad_out_has_nan_or_inf = False
+            if grad_output is not None:
+                for i, grad in enumerate(grad_output):
+                    if grad is not None and (
+                        torch.isnan(grad).any() or torch.isinf(grad).any()
+                    ):
+                        grad_out_has_nan_or_inf = True
+                        print(
+                            f"  ⬅️  NaN/inf in grad_output[{i}] flowing INTO {module_name}"
+                        )
+                        print(
+                            f"      shape: {grad.shape}, has NaN: {torch.isnan(grad).sum().item()}/{grad.numel()} inf: {torch.isinf(grad).sum().item()}/{grad.numel()}"
+                        )
+
+            # Check what THIS layer produces (flowing backward to previous layer)
+            grad_in_has_nan_or_inf = False
+            if grad_input is not None:
+                for i, grad in enumerate(grad_input):
+                    if grad is not None and (
+                        torch.isnan(grad).any() or torch.isinf(grad).any()
+                    ):
+                        # This layer CREATED the NaN if input is clean but output has NaN
+                        # Only log this once
+                        if not grad_in_has_nan_or_inf and not grad_out_has_nan_or_inf:
+                            print(
+                                f"🔴 ORIGIN: {module_name} created NaN/inf during its backward pass!"
+                            )
+                        grad_in_has_nan_or_inf = True
+
+                        print(
+                            f"  ➡️  NaN/inf in grad_input[{i}] flowing OUT OF {module_name}"
+                        )
+                        print(
+                            f"      shape: {grad.shape}, has NaN: {torch.isnan(grad).sum().item()}/{grad.numel()} inf: {torch.isinf(grad).sum().item()}/{grad.numel()}"
+                        )
+
+
+        for name, module in self.unet.named_modules():
+            if type(module) is UNet2DConditionModel:
+                continue
+            #print(f"registering detailed NaN hook for {name} ({module.__class__.__name__})")
+            # pass name to hook by making a partial
+            hook_with_module_name = partial(detailed_nan_hook, name=name)
+            module.register_full_backward_hook(hook_with_module_name)
+
+
+    def register_unet_nan_hooks_simple(self):
+        # Register hooks to catch where NaN first appears
+        def check_nan_hook(module, grad_input, grad_output, name):
+            for i, grad in enumerate(grad_output):
+                if grad is not None and (
+                    torch.isnan(grad).any() or torch.isinf(grad).any()
+                ):
+                    print(f"NaN/Inf detected after {name}({module.__class__.__name__}) backward (hooked)")
+        for name, module in self.unet.named_modules():
+            if type(module) is not UNet2DConditionModel:
+                continue
+            module.register_backward_hook(partial(check_nan_hook, name=name))
+
+    def unet_grads_have_inf_or_nan(self, log_hint: str) -> bool:
+        # check for inf/nan in unet gradients
+        has_inf_or_nan = False
+        for name, p in self.unet.named_parameters():
+            if p.grad is not None:
+                grad_data = p.grad.data
+                if torch.isinf(grad_data).any() or torch.isnan(grad_data).any():
+                    logging.error(f"** {log_hint}: inf or NaN detected in UNet gradient for parameter: {name}. min: {grad_data.min()}, max: {grad_data.max()}")
+                    has_inf_or_nan = True
+        return has_inf_or_nan
+
+    def check_for_inf_or_nan(self, tv: 'TrainingVariables', log_hint: str):
+        if self.unet_grads_have_inf_or_nan(log_hint):
+            logging.error("Dumping training vars:")
+            logging.error(f" - Timesteps: {tv.accumulated_timesteps}")
+            logging.error(f" - Paths: {tv.accumulated_pathnames}")
+            logging.error(f" - Captions: {tv.accumulated_captions}")
+            logging.error(f" - Accumulated loss: {tv.accumulated_loss}")
+            logging.error(f"Global step: {tv.global_step}")
+            raise InfOrNanException("** inf or NaN detected in UNet gradients")
+
+
+    def step_optimizer(self, global_step, tv: 'TrainingVariables', log_hint: str=''):
         if self.scaler is not None:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
@@ -371,6 +477,7 @@ class EveryDreamOptimizer:
         base_config["lr_decay_steps"] = base_config.get("lr_decay_steps", None) or args.lr_decay_steps
         base_config["lr_advance_steps"] = base_config.get("lr_advance_steps", None) or args.lr_advance_steps
         base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
+        base_config["lr_num_restarts"] = base_config.get("lr_num_restarts", None) or args.lr_num_restarts
 
         te_config["lr"] = te_config.get("lr", None) or base_config["lr"]
         te_config["optimizer"] = te_config.get("optimizer", None) or base_config["optimizer"]
@@ -763,8 +870,6 @@ class EveryDreamOptimizer:
             freeze_prefixes.extend(['mid_block'])
         if unet_freeze_config.get("freeze_out", False):
             freeze_prefixes.extend(['conv_norm_out.', 'conv_out.', 'up_blocks.'])
-        if unet_freeze_config.get("freeze_resnets", False):
-            freeze_prefixes.extend()
 
         if 'unfreeze_cross_attention' in unet_freeze_config or 'unfreeze_self_attention' in unet_freeze_config or 'unfreeze_spatial_resnets' in unet_freeze_config:
             raise ValueError("unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)")
@@ -789,10 +894,10 @@ class EveryDreamOptimizer:
 
         freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
         spatial_resnet_prefixes = ["mid_block.resnets", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
-        freeze_detail_layers = unet_freeze_config.get("freeze_detail_layers", None)
-        detail_layer_prefixes = ["up_blocks.1.resnets", "up_blocks.2.resnets", "up_blocks.3.resnets", "conv_out"]
         freeze_all_resnets = unet_freeze_config.get("freeze_all_resnets", None)
         resnet_layer_prefixes = [f"down_blocks.{i}.resnets" for i in range(4)] + ["mid_blocks.resnets"] + [f"up_blocks.{i}.resnets" for i in range(4)]
+        freeze_late_up_resnets = unet_freeze_config.get("freeze_late_up_resnets", None)
+        late_up_resnet_layer_prefixes = ["up_blocks.2.resnets", "up_blocks.3.resnets"]
 
         def should_freeze(n):
             # maybe freeze
@@ -802,8 +907,8 @@ class EveryDreamOptimizer:
                 return freeze_self_attn
             elif freeze_spatial_resnets is not None and any(n.startswith(prefix) for prefix in spatial_resnet_prefixes):
                 return freeze_spatial_resnets
-            elif freeze_detail_layers is not None and any(n.startswith(prefix) for prefix in detail_layer_prefixes):
-                return freeze_detail_layers
+            elif freeze_late_up_resnets is not None and any(n.startswith(prefix) for prefix in late_up_resnet_layer_prefixes):
+                return freeze_late_up_resnets
             elif freeze_all_resnets is not None and any(n.startswith(prefix) for prefix in resnet_layer_prefixes):
                 return freeze_all_resnets
             # fallback to general prefixes

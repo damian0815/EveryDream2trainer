@@ -1,7 +1,7 @@
 import logging
 import math
 import random
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Literal
 
 import torch
 from compel import Compel
@@ -98,7 +98,7 @@ def get_timestep_curriculum_range(progress_01,
 
 def get_latents(image, model: TrainingModel, device, args):
     with torch.no_grad():
-        with autocast(enabled=args.amp):
+        with autocast(enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16):
             pixel_values = image.to(memory_format=torch.contiguous_format).to(device, dtype=model.vae.dtype)
             latents = model.vae.encode(pixel_values, return_dict=False)
         del pixel_values
@@ -189,6 +189,18 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             )
             snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
             loss = loss * snr_weight.to(loss.device)
+
+        elif args.loss_mode_scale > 0:
+            # Scale loss to emphasize middle timesteps (mode around 500)
+            # loss_mode_scale=0 means uniform, higher values increase the peak
+            t_normalized = timesteps.float() / 1000.0  # normalize to [0, 1]
+            sharpness = 3
+            mode_weight = (
+                torch.cos(math.pi * (t_normalized - 0.5)) ** sharpness + 1
+            ) - 1
+            mode_weight = (1 - args.loss_mode_scale) + args.loss_mode_scale * mode_weight
+            mode_weight = mode_weight.view(-1, 1, 1, 1).expand_as(loss)
+            loss = loss * mode_weight.to(loss.device)
 
         return loss
 
@@ -299,7 +311,7 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
-        with autocast(enabled=args.amp):
+        with autocast(enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16):
             if model.is_sdxl:
                 model_pred = model.unet(
                         noisy_latents,
@@ -333,7 +345,10 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
             # v_pred_positive = unet(z_t, t, c_positive).
             # v_pred_negative_1 = unet(z_t, t, c_negative_1)
             # v_pred_negative_2 = unet(z_t, t, c_negative_2)
-            with autocast(enabled=args.amp):
+            with autocast(
+                enabled=args.amp,
+                dtype=torch.bfloat16 if model.is_sdxl else torch.float16,
+            ):
                 wrong_caption_i = rotate_dim0(encoder_hidden_states, i + 1)
                 model_pred_wrong_caption_i = model_being_trained.unet(noisy_latents, timesteps, wrong_caption_i).sample
                 model_pred_wrong_caption.append(model_pred_wrong_caption_i)
@@ -364,7 +379,7 @@ def _get_target(latents, noise, noise_scheduler, timesteps):
         target = noise
     elif noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]:
         target = noise_scheduler.get_velocity(latents, noise, timesteps)
-    elif noise_scheduler.config.prediction_type == "flow-matching":
+    elif noise_scheduler.config.prediction_type in ['flow-matching', 'flow_prediction']:
         target = noise - latents
     else:
         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
@@ -492,15 +507,42 @@ def vae_preview(latents: torch.Tensor) -> torch.Tensor:
     return torch.stack([sample_to_lowres_estimated_image(latents[i], SD1_5_LATENT_RGB_FACTORS).permute(2, 0, 1)
                        for i in range(latents.shape[0])], dim=0)
 
-
 # ref https://huggingface.co/jimmycarter/LibreFLUX
 # "Beta timestep scheduling and timestep stratification"
-def get_multirank_stratified_random_timesteps(batch_size, device, alpha=2.0, beta=1.6, continuous_float_timesteps=False):
+def get_multirank_stratified_random_timesteps(batch_size, device, distribution: Literal['beta', 'mode'] = 'beta', alpha=2, beta=1.6, mode_scale=0.5, continuous_float_timesteps=False, stratify=True):
+    """
+    get timesteps, with stratified distribution across batches
+    distribution: 'beta' or 'mode'
+    alpha, beta: parameters for beta distribution
+    mode_scale: parameter for mode distribution. 0 = uniform distribution, 0.5 = ts500 is about 2.2x more likely than tails
+    """
+    indices = torch.arange(0, batch_size, dtype=torch.float64)
+    u = torch.rand(batch_size)
+    p = ((indices + u) / batch_size) if stratify else u
+    sigmas = _get_beta_sigmas(p, alpha, beta) if distribution == 'beta' else _get_mode_sigmas(p, mode_scale)
+    timesteps = (sigmas * 1000).to(device)
+    # shuffle
+    perm = torch.randperm(timesteps.shape[0])
+    timesteps = timesteps[perm]
+    if not continuous_float_timesteps:
+        timesteps = timesteps.long().clamp(min=0, max=999)
+    #logging.info(
+    #    f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
+    #)
+    return timesteps
+
+def _get_beta_sigmas(p, alpha, beta):
+    return torch.from_numpy(sp_beta.ppf(p.numpy(), a=alpha, b=beta))
+
+def _get_mode_sigmas(p, mode_scale):
+    return 1 - p - mode_scale * (torch.cos(math.pi * p / 2) ** 2 - 1 + p)
+
+
+def get_multirank_stratified_random_timesteps_beta(batch_size, device, alpha=2.0, beta=1.6, continuous_float_timesteps=False, offset=0):
     indices = torch.arange(0, batch_size, dtype=torch.float64)
     u = torch.rand(batch_size)
     p = (indices + u) / batch_size
     sigmas = torch.from_numpy(sp_beta.ppf(p.numpy(), a=alpha, b=beta)).to(device)
-
     timesteps = (sigmas * 1000)
 
     # shuffle
@@ -512,3 +554,4 @@ def get_multirank_stratified_random_timesteps(batch_size, device, alpha=2.0, bet
     #    f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
     #)
     return timesteps
+

@@ -179,6 +179,7 @@ class CheckpointMergerPipeline(DiffusionPipeline):
         torch_dtype = kwargs.pop("torch_dtype", None)
         device_map = kwargs.pop("device_map", None)
         preloaded_model_0 = kwargs.pop("preloaded_model_0", None)
+        unet_only = kwargs.pop("unet_only", False)
 
         alpha = kwargs.pop("alpha", 0.5)
         interp = kwargs.pop("interp", None)
@@ -298,6 +299,8 @@ class CheckpointMergerPipeline(DiffusionPipeline):
 
         # Find each module's state dict.
         for attr in final_pipe.config.keys():
+            if unet_only and attr != "unet":
+                continue
             if not attr.startswith("_"):
                 checkpoint_path_1 = os.path.join(cached_folders[1], attr)
                 if os.path.exists(checkpoint_path_1):
@@ -355,14 +358,18 @@ class CheckpointMergerPipeline(DiffusionPipeline):
                             or 
                             any(k != 'text_model.embeddings.position_ids' for k in in_theta1_not_theta0)
                         ): 
-                            print(f"Skipping {attr}: key mismatch")
+                            print(f"skipping {attr}: key mismatch")
                             print("in theta_0, not in theta_1:", in_theta0_not_theta1)
                             print("in theta_1, not in theta_0:", in_theta1_not_theta0)
                             continue
                         else:
                             print('key mismatch but it was just text_model.embeddings.position_ids - ignoring')
                     if theta_2 and not theta_1.keys() == theta_2.keys():
-                        print(f"Skipping {attr}: key mismatch")
+                        print(f"WARNING: {attr}: key mismatch")
+                        in_theta1_not_theta2 = [k for k in theta_1.keys() if k not in theta_2.keys()]
+                        in_theta2_not_theta1 = [k for k in theta_2.keys() if k not in theta_1.keys()]
+                        print("in theta_1, not in theta_2:", in_theta1_not_theta2)
+                        print("in theta_2, not in theta_1:", in_theta2_not_theta1)
 
                 except Exception as e:
                     print(f"Skipping {attr} do to an unexpected error: {str(e)}")
@@ -384,6 +391,9 @@ class CheckpointMergerPipeline(DiffusionPipeline):
                         else get_block_alpha(block_weights, key)
                     )
                     if theta_2:
+                        if key not in theta_2:
+                            print(f" - {key} not in theta_2 -> using theta 0 value for {key}")
+                            theta_2[key] = theta_0[key]
                         theta_0[key] = theta_func(theta_0[key], theta_1[key], theta_2[key], block_alpha)
                     else:
                         theta_0[key] = theta_func(theta_0[key], theta_1[key], None, block_alpha)
@@ -425,7 +435,7 @@ class CheckpointMergerPipeline(DiffusionPipeline):
         return theta0 + delta_scaled + perturbation
 
 
-def merge(a, b, alpha, preloaded_a=None, module_override_alphas: dict = None, block_weights=None, algorithm='weighted_sum'):
+def merge(a, b, alpha, preloaded_a=None, module_override_alphas: dict = None, block_weights=None, algorithm='weighted_sum', unet_only=False):
 
     print(f"merging {a} and {b} with alpha {alpha}. preloaded_a is {preloaded_a}")
     pipe: CheckpointMergerPipeline = DiffusionPipeline.from_pretrained(b, 
@@ -435,24 +445,27 @@ def merge(a, b, alpha, preloaded_a=None, module_override_alphas: dict = None, bl
                         module_override_alphas=module_override_alphas or {}, 
                         interp=algorithm,
                         block_weights=block_weights,
-                        force=True)
+                        force=True,
+                        unet_only=unet_only)
     del pipe
     return merged
 
 
-def merge_add_diff(a, b, c, alpha):
+def merge_add_diff(a, b, c, alpha, unet_only=False):
     print(f"merging {a}, {b}, {c} as add_difference with alpha {alpha}")
     pipe: CheckpointMergerPipeline = DiffusionPipeline.from_pretrained(b, custom_pipeline = __file__)
     merged = pipe.merge([a, b, c], alpha=alpha,
                         interp='add_diff',
-                        force=True)
+                        force=True,
+                        unet_only=unet_only)
     del pipe
     return merged
 
 
 def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, block_weights=None,
                    num_intermediates=1,
-                   algorithm='weighted_sum'):
+                   algorithm='weighted_sum',
+                   unet_only=False):
     if not model_weights:
         model_weights = [1]*len(models)
 
@@ -470,7 +483,7 @@ def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, b
             chunk = models[i:i+chunk_size]
             chunk_weights = model_weights[i:i+chunk_size]
             print(f"merging chunk {i//chunk_size} with weights {chunk_weights}")
-            intermediate = _do_multi_merge_core(chunk, chunk_weights, per_module_alphas, block_weights, algorithm=algorithm)
+            intermediate = _do_multi_merge_core(chunk, chunk_weights, per_module_alphas, block_weights, algorithm=algorithm, unet_only=unet_only)
             if num_intermediates == 1:
                 return intermediate
             else:
@@ -482,13 +495,13 @@ def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, b
                 print("done merging chunk")
 
         print(f'merging {len(merged_intermediates)} intermediates with weights {merged_intermediates_weights}')
-        merged = _do_multi_merge_core(merged_intermediates, merged_intermediates_weights, per_module_alphas, block_weights, algorithm=algorithm)
+        merged = _do_multi_merge_core(merged_intermediates, merged_intermediates_weights, per_module_alphas, block_weights, algorithm=algorithm, unet_only=unet_only)
         return merged
     finally:
         print(f'deleting intermediates folder {intermediates_folder}')
         shutil.rmtree(intermediates_folder)
 
-def _do_multi_merge_core(models, model_weights, per_module_alphas, block_weights, algorithm='weighted_sum'):
+def _do_multi_merge_core(models, model_weights, per_module_alphas, block_weights, algorithm='weighted_sum', unet_only=False):
 
     if len(models) == 0:
         raise ValueError("Must pass at least 1 model")
@@ -511,7 +524,7 @@ def _do_multi_merge_core(models, model_weights, per_module_alphas, block_weights
         
         # module_override_alphas - dict of str -> float for per-module alpha overrides eg {'unet': 0.2, 'text_encoder': 0.8}
 
-        merged = merge(a, b, alpha=alpha, preloaded_a=merged, module_override_alphas = per_module_alphas, block_weights=block_weights, algorithm=algorithm)
+        merged = merge(a, b, alpha=alpha, preloaded_a=merged, module_override_alphas = per_module_alphas, block_weights=block_weights, algorithm=algorithm, unet_only=unet_only)
     return merged
 
 def save_merge(merged, path, half=False):
@@ -544,6 +557,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_intermediates", type=int, default=1, help="number of intermediates to use, default 1 means no intermediates. >1 uses extra disk space to save intermediates")
     parser.add_argument("--half", action='store_true', help="save fp16 rather than fp32")
     parser.add_argument("--algorithm", type=str, default='weighted_sum', help="merging algorithm: weighted_sum, sigmoid, inv_sigmoid, add_diff, reset_and_perturb")
+    parser.add_argument("--not_only_unet", action="store_true", help="If passed, merge all components, otherwise just merge the unet")
 
     args = parser.parse_args()
 
@@ -553,14 +567,14 @@ if __name__ == "__main__":
     if args.algorithm == 'reset_and_perturb':
         if len(args.repo_ids_or_paths) != 2:
             raise ValueError("reset_and_perturb requires 2 repos")
-        merged = merge(args.repo_ids_or_paths[0], args.repo_ids_or_paths[1], args.alphas[0], algorithm='reset_and_perturb')
+        merged = merge(args.repo_ids_or_paths[0], args.repo_ids_or_paths[1], args.alphas[0], algorithm='reset_and_perturb', unet_only=not args.not_only_unet)
     elif args.algorithm == 'add_diff':
         if len(args.repo_ids_or_paths) != 3:
             raise ValueError("add_diff requires 3 repos")
-        merged = merge_add_diff(args.repo_ids_or_paths[0], args.repo_ids_or_paths[1], args.repo_ids_or_paths[2], args.alphas[0])
+        merged = merge_add_diff(args.repo_ids_or_paths[0], args.repo_ids_or_paths[1], args.repo_ids_or_paths[2], args.alphas[0], unet_only=not args.not_only_unet)
     else:
         if len(args.repo_ids_or_paths) != len(args.alphas):
             raise ValueError(f"must pass one alpha for each model ({len(args.repo_ids_or_paths)} models)")
-        merged = do_multi_merge(args.repo_ids_or_paths, args.alphas, num_intermediates=args.num_intermediates)
+        merged = do_multi_merge(args.repo_ids_or_paths, args.alphas, num_intermediates=args.num_intermediates, unet_only=not args.not_only_unet)
     save_merge(merged, args.output_path, half=args.half)
     

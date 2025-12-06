@@ -31,6 +31,7 @@ class LogData:
     images_per_sec = []
     images_per_sec_log_step = []
     timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
+    cumulative_timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
 
     attention_activation_logger: ActivationLogger = None
 
@@ -139,14 +140,21 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         log_data.attention_activation_logger.log_to_tensorboard(global_step=global_step)
 
     if log_data.timestep_coverage:
-        values = []
-        for key, count in log_data.timestep_coverage.items():
-            values.extend([key] * count)
-        log_writer.add_histogram('timesteps/histogram', np.array(values), global_step)
-        log_writer.add_scalar('timesteps/min', min(log_data.timestep_coverage), global_step)
-        log_writer.add_scalar('timesteps/max', max(log_data.timestep_coverage), global_step)
+        def log_timestep_histogram(tag_prefix, coverage_dict, log_min_max=False):
+            values = []
+            for key, count in coverage_dict.items():
+                values.extend([key] * count)
+            log_writer.add_histogram(f'timesteps/{tag_prefix} histogram', np.array(values), global_step)
+            if log_min_max:
+                log_writer.add_scalar(f'timesteps/{tag_prefix} min', min(coverage_dict.keys()), global_step)
+                log_writer.add_scalar(f'timesteps/{tag_prefix} max', max(coverage_dict.keys()), global_step)
 
-    log_data.timestep_coverage.clear()
+        log_timestep_histogram("log step", log_data.timestep_coverage, log_min_max=True)
+        for key, count in log_data.timestep_coverage.items():
+            log_data.cumulative_timestep_coverage[key] += count
+        log_timestep_histogram("cumulative", log_data.cumulative_timestep_coverage)
+
+        log_data.timestep_coverage.clear()
 
     return logs
 

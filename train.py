@@ -77,7 +77,7 @@ from semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAP
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
-from optimizer.optimizers import EveryDreamOptimizer
+from optimizer.optimizers import EveryDreamOptimizer, InfOrNanException
 from copy import deepcopy
 
 if torch.cuda.is_available():
@@ -335,16 +335,27 @@ def _choose_backward_slice_size(args, tv: TrainingVariables):
         ),
     )
 
-def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables):
+def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, log_hint=''):
     if tv.accumulated_loss_images_count == 0:
         print("no accumulated loss images, not doing backward")
     else:
         optimizer.backward(tv.accumulated_loss)
-        tv.effective_backward_size = tv.accumulated_loss_images_count
-        tv.backwarded_images_count += tv.accumulated_loss_images_count
-        #print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
-        #      f"backward accumulated {tv.backwarded_images_count}")
+        try:
+            optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
+            tv.effective_backward_size = tv.accumulated_loss_images_count
+            tv.backwarded_images_count += tv.accumulated_loss_images_count
+            # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
+            #      f"backward accumulated {tv.backwarded_images_count}")
+            tv.clear_accumulated_loss()
+        except InfOrNanException as e:
+            logging.error(
+                "* Caught Inf or NaN during backward pass, clearing accumulated loss and resetting optimizer"
+            )
+            optimizer._zero_grad(set_to_none=True)
+            tv.backwarded_images_count = 0
+
         tv.clear_accumulated_loss()
+
         # reset slice sizes
         tv.forward_slice_size = args.forward_slice_size or args.batch_size
         tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
@@ -643,6 +654,8 @@ def main(args):
                                        epoch_len,
                                        plugin_runner,
                                        log_writer)
+    ed_optimizer.register_unet_nan_hooks_simple()
+    ed_optimizer.register_unet_nan_hooks_full()
 
     log_args(log_writer, args, optimizer_config, log_folder, log_time)
 
@@ -680,7 +693,7 @@ def main(args):
             if not interrupted:
                 interrupted=True
                 global_step = tv.global_step
-                interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step}")
+                interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step:05}")
                 print()
                 if args.no_save_on_error:
                    logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, but NOT saving because --no_save_on_error was passed{Style.RESET_ALL}")
@@ -785,7 +798,7 @@ def main(args):
                                   batch_share_timesteps=False,
                                   device=model.unet.device,
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                  continuous_float_timesteps=model.noise_scheduler.config.prediction_type == 'flow-matching')
+                                  continuous_float_timesteps=False)
         model.load_vae_to_device(device)
         latents = get_latents(image, model, device=model.unet.device, args=args)
         if args.offload_vae:
@@ -916,7 +929,7 @@ def main(args):
                         if image_size > (1000)*(1000):
                             if tv.accumulated_loss_images_count > memory_comfort_image_count:
                                 # "emergency" backward because we may OOM adding grads for an image of this size if we've already collected grads for other images
-                                _optimizer_backward(ed_optimizer, tv)
+                                _optimizer_backward(ed_optimizer, tv, 'emergency backward: ')
                             if model.is_sdxl and gpu_total_mem < 25000:
                                 enable_vae_attention_slicing = model.is_sdxl
                             tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count)
@@ -1278,6 +1291,15 @@ def main(args):
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
+                            logging.info(
+                                f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
+                            )
+                            logging.info(
+                                f"target has NaN: {torch.isnan(target).any()} inf: {torch.isinf(target).any()} range: [{target.min():.4f}, {target.max():.4f}]"
+                            )
+                            logging.info(
+                                f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
+                            )
                             log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
@@ -1290,8 +1312,14 @@ def main(args):
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
                                 consumed_timesteps.append(used_timestep_detached)
 
-                            # take mean of all dimensions except batch, then divide through by the fixed "batch size". this is to ensure we get a stable divisor, regardless of forward/backward slice sizes.
-                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / args.batch_size
+                            # take mean of all dimensions except batch, then divide through by a fixed batch size
+                            if args.enable_loss_mean_over_full_effective_batch:
+                                # strictly more correct, but LR scaling becomes necessary
+                                loss_mean_divisor = tv.desired_effective_batch_size
+                            else:
+                                # this method gives us a stable divisor, regardless of forward/backward slice sizes - LR scaling isn't necessary
+                                loss_mean_divisor = args.batch_size
+                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / loss_mean_divisor
                             loss_step = loss_mean.detach().item()
                             nibble_timesteps_detached = timesteps[0:nibble_size_actual].detach().cpu().tolist()
                             tv.accumulate_loss(loss_mean,
@@ -1324,7 +1352,7 @@ def main(args):
                             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                                     tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
-                                _optimizer_backward(ed_optimizer, tv)
+                                _optimizer_backward(ed_optimizer, tv, 'regular backward: ')
 
                             #if tv.global_step >= 653 and tv.global_step < 656:
                             #    print("step:", tv.global_step, "caption:", caption_variant, " - batch:", [os.readlink(x) for x in batch["pathnames"]], batch["captions"][caption_variant], "; timestep slice:", consumed_timesteps)
@@ -1337,7 +1365,7 @@ def main(args):
                                     #      f'{tv.backwarded_images_count}, '
                                     #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
                                     tv.last_effective_batch_size = tv.backwarded_images_count
-                                    ed_optimizer.step_optimizer(tv.global_step)
+                                    ed_optimizer.step_optimizer(tv.global_step, tv)
                                     tv.backwarded_images_count = 0
 
                                     # if we are interleaving BS1, increment counter
@@ -1542,10 +1570,16 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
         # desired_effective_batch_size - which will be "nibbled" below in chunks
         while tv.remaining_timesteps is None or tv.remaining_timesteps.shape[0] < max(full_batch_size,
                                                                                 tv.desired_effective_batch_size):
-            next_timesteps = get_multirank_stratified_random_timesteps(tv.desired_effective_batch_size,
-                                                                       device=model.unet.device,
-                                                                       alpha=args.timesteps_multirank_stratified_alpha,
-                                                                       beta=args.timesteps_multirank_stratified_beta)
+            next_timesteps = get_multirank_stratified_random_timesteps(
+                tv.desired_effective_batch_size,
+                device=model.unet.device,
+                distribution=args.timesteps_multirank_stratified_distribution,
+                alpha=args.timesteps_multirank_stratified_alpha,
+                beta=args.timesteps_multirank_stratified_beta,
+                mode_scale=args.timesteps_multirank_stratified_mode_scale,
+                continuous_float_timesteps=False,
+                stratify=args.timesteps_multirank_stratified_stratify,
+            )
             tv.remaining_timesteps = next_timesteps if tv.remaining_timesteps is None else torch.cat(
                 [tv.remaining_timesteps, next_timesteps])
         timesteps: torch.Tensor = tv.remaining_timesteps[:full_batch_size]
@@ -1595,8 +1629,9 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                     do_contrastive_learning or args.batch_share_timesteps),
             device=model.device,
             timesteps_ranges=timesteps_ranges_expanded,
-            continuous_float_timesteps=model.noise_scheduler.config.prediction_type == 'flow-matching'
+            continuous_float_timesteps=False
         )
+
         return timesteps
 
 
@@ -1664,13 +1699,15 @@ if __name__ == "__main__":
     argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")
     argparser.add_argument('--log_attention_activations', action='store_true', help='If passed, magnitudes of attention activation modules in the unet')
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
-                           help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "v-mse"])
+                           help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "huber_mse", "sd3-cosmap", "v-mse"])
+    argparser.add_argument("--enable_loss_mean_over_full_effective_batch", action='store_true', help="If passed, mean the loss over the full effective batch size, rather than the minibatch size")
     argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
     argparser.add_argument("--lr_advance_steps", type=int, default=None, help="Steps to advance the LR during training")
+    argparser.add_argument("--lr_num_restarts", type=int, default=1, help="Number of times to (re-)start the LR scheduler, default=1 (no restarts)")
     argparser.add_argument("--max_epochs", type=int, default=300, help="Maximum number of epochs to train for")
     argparser.add_argument("--max_steps", type=int, default=None, help="Maximum number of steps to train for")
     argparser.add_argument("--auto_decay_steps_multiplier", type=float, default=1.1, help="Multiplier for calculating decay steps from epoch count")
@@ -1697,9 +1734,12 @@ if __name__ == "__main__":
     argparser.add_argument("--shuffle_tags", action="store_true", default=False, help="randomly shuffles CSV tags in captions, for booru datasets")
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
-    argparser.add_argument("--timesteps_multirank_stratified", action="store_true", default=False, help="use multirank stratified timesteps (recommended: disable min_snr_gamma")
+    argparser.add_argument("--timesteps_multirank_stratified", action=argparse.BooleanOptionalAction, default=False, help="use multirank stratified timesteps (recommended: disable min_snr_gamma")
+    argparser.add_argument("--timesteps_multirank_stratified_distribution", type=str, choices=['beta', 'mode'], default='beta', help="multirank stratified timesteps distribution model. for 'beta', uses alpha and beta params; for 'mode', uses mode_scale param")
+    argparser.add_argument("--timesteps_multirank_stratified_stratify", action=argparse.BooleanOptionalAction, default=True, help="whether to stratify timestep distribution, or just leave to chance")
     argparser.add_argument("--timesteps_multirank_stratified_alpha", type=float, default=1.5, help="multirank stratified timesteps PPF alpha")
     argparser.add_argument("--timesteps_multirank_stratified_beta", type=float, default=2, help="multirank stratified timesteps PPF beta")
+    argparser.add_argument("--timesteps_multirank_stratified_mode_scale", type=float, default=0.5, help="multirank stratified timesteps mode scale")
     argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_initial_start", type=int, default=800, help="If using timestep_curriculum_alpha, the initial start timestep (default 800); will transition to --timestep_start")
     argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")
@@ -1717,6 +1757,7 @@ if __name__ == "__main__":
     argparser.add_argument("--mix_zero_terminal_snr", action="store_true", default=None, help="Mix zero termianl SNR with regular training")
     argparser.add_argument("--match_zero_terminal_snr", action="store_true", default=None, help="use zero terminal SNR target as regular noise scheduler input")
     argparser.add_argument("--load_settings_every_epoch", action="store_true", default=None, help="Enable reloading of 'train.json' at start of every epoch.")
+    argparser.add_argument("--loss_mode_scale", default=0, type=float, help="Mode scale for mode-curve loss scaling. default 0/disabled, recommended 0.5 for flow matching")
     argparser.add_argument("--min_snr_gamma", type=float, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
     argparser.add_argument("--min_snr_alpha", type=float, default=1, help="Blending factor for min-SNR-gamma weighting. 1=use pure min SNR gamma weighting, 0.5=use a 50/50 blend of min SNR gamma and regular loss weighting (default: 1)")
     argparser.add_argument("--debug_invert_min_snr_gamma", action='store_true', help="invert the timestep/scale equation for min snr gamma")

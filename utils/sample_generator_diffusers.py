@@ -9,7 +9,8 @@ import torch
 from diffusers import (
     DDIMScheduler, DDPMScheduler, DPMSolverMultistepScheduler, DPMSolverSDEScheduler,
     EulerAncestralDiscreteScheduler, PNDMScheduler, LMSDiscreteScheduler,
-    KDPM2AncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverSinglestepScheduler, StableDiffusionXLPipeline
+    KDPM2AncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverSinglestepScheduler, StableDiffusionXLPipeline,
+    FlowMatchEulerDiscreteScheduler
 )
 from diffusers import StableDiffusionPipeline
 from compel import CompelForSD, CompelForSDXL
@@ -133,8 +134,9 @@ def get_auto1111_md_for_invoke_md(invokeai_metadata, model_name_override=None, m
             return "LMS"
         elif invokeai_scheduler_name == 'kdpm_2_a':
             return "DPM2 a Karras"
+        elif invokeai_scheduler_name == 'flow-matching':
+            return "Flow Matching"
         else:
-
             raise RuntimeError("Unhandled scheduler:", invokeai_scheduler_name)
 
     """
@@ -230,7 +232,14 @@ def create_scheduler(name, scheduler_config: dict):
         return EulerAncestralDiscreteScheduler.from_config(scheduler_config)
     elif scheduler == 'kdpm_2_a':
         return KDPM2AncestralDiscreteScheduler.from_config(scheduler_config)
+    elif scheduler == "flow-matching":
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+        # hack for StableDiffusionPipeline support
+        scheduler.init_noise_sigma = 1
+        scheduler.scale_model_input = lambda x, t: x
+        return scheduler
     else:
+
         raise ValueError(f"unknown scheduler '{scheduler}'")
 
 

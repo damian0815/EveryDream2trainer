@@ -24,7 +24,7 @@ class TrainFlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
         (scheduler, unused_kwargs) = cls.from_config(scheduler_ref.config,
                                                      return_unused_kwargs=True,
                                                      **kwargs)
-        scheduler.config.prediction_type = 'flow-matching'
+        scheduler.config.prediction_type = 'flow_prediction'
         if return_unused_kwargs:
             return (scheduler, unused_kwargs)
         else:
@@ -32,7 +32,7 @@ class TrainFlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.config.prediction_type = "flow-matching"
+        self.config.prediction_type = "flow_prediction"
 
 
 

@@ -1,6 +1,8 @@
 import contextlib
 import gc
 import logging
+
+import diffusers
 import math
 import os
 import shutil
@@ -48,7 +50,9 @@ def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=No
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "flow-matching":
         logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        noise_scheduler = TrainFlowMatchScheduler.from_config(scheduler.config)
+        config = dict(scheduler.config)
+        config.update({'prediction_type': 'flow_prediction'})
+        noise_scheduler = TrainFlowMatchScheduler.from_config(config)
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
         noise_scheduler = DDPMScheduler.from_config(scheduler.config,
@@ -167,16 +171,24 @@ class TrainingVariables:
         # Note: global_step is NOT reset - it continues incrementing across cycles
 
 
+
 @dataclass
 class TrainingModel:
 
     @property
-    def is_sdxl(self):
+    def is_sdxl(self) -> bool:
         return self.text_encoder_2 is not None
 
     @property
-    def is_sd1attn(self):
+    def is_sd1attn(self) -> bool:
         return check_for_sd1_attn(self.unet.config)
+
+    @property
+    def is_flow_matching(self) -> bool:
+        return self.noise_scheduler.config.prediction_type in [
+            "flow-matching",
+            "flow_prediction",
+        ]
 
     @property
     def device(self):
@@ -379,6 +391,8 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if plugin_runner is not None:
         plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
 
+    noise_scheduler = diffusers.FlowMatchEulerDiscreteScheduler.from_config(ed_state.model.noise_scheduler.config) if isinstance(ed_state.model.noise_scheduler, TrainFlowMatchScheduler) else ed_state.model.noise_scheduler
+
     if ed_state.model.is_sdxl:
         pipeline = StableDiffusionXLPipeline(
             vae=ed_state.model.vae,
@@ -387,7 +401,7 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
             tokenizer=ed_state.model.tokenizer,
             tokenizer_2=ed_state.model.tokenizer_2,
             unet=ed_state.model.unet,
-            scheduler=ed_state.model.noise_scheduler,
+            scheduler=noise_scheduler,
             feature_extractor=None,  # must be none of no safety checker
             add_watermarker=None
         )
@@ -397,7 +411,7 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
             text_encoder=ed_state.model.text_encoder,
             tokenizer=ed_state.model.tokenizer,
             unet=ed_state.model.unet,
-            scheduler=ed_state.model.noise_scheduler,
+            scheduler=noise_scheduler,
             safety_checker=None,  # save vram
             requires_safety_checker=None,  # avoid nag
             feature_extractor=None,  # must be none of no safety checker
