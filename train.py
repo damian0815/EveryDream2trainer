@@ -337,7 +337,7 @@ def _choose_backward_slice_size(args, tv: TrainingVariables):
 
 def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, log_hint=''):
     if tv.accumulated_loss_images_count == 0:
-        print("no accumulated loss images, not doing backward")
+        logging.warning("no accumulated loss images, not doing backward")
     else:
         optimizer.backward(tv.accumulated_loss)
         try:
@@ -992,7 +992,6 @@ def main(args):
                                 if model.is_sdxl:
                                     full_batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens_2
                                 full_batch["captions"][k][sample_index] = train_batch.cond_dropout_caption
-                            full_batch["loss_scale"][sample_index] *= args.cond_dropout_loss_scale
                             if train_batch.random_instance.random() <= args.cond_dropout_noise_p:
                                 full_batch["image"][sample_index] = torch.randn_like(full_batch["image"][sample_index])
 
@@ -1023,7 +1022,7 @@ def main(args):
                                                                        alpha=args.contrastive_learning_curriculum_alpha)
                             # print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
 
-                        loss_scale = batch["loss_scale"]
+                        loss_scale = args.loss_scale * batch["loss_scale"]
                         assert loss_scale.shape[0] == batch["image"].shape[0]
                         image_shape = batch["image"].shape
                         reference_image_size = 512*512
@@ -1291,15 +1290,15 @@ def main(args):
                                             contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
                                             args=args,
                                             )
-                            logging.info(
-                                f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
-                            )
-                            logging.info(
-                                f"target has NaN: {torch.isnan(target).any()} inf: {torch.isinf(target).any()} range: [{target.min():.4f}, {target.max():.4f}]"
-                            )
-                            logging.info(
-                                f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
-                            )
+                            #logging.info(
+                            #    f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
+                            #)
+                            #logging.info(
+                            #    f"target has NaN: {torch.isnan(target).any()} inf: {torch.isinf(target).any()} range: [{target.min():.4f}, {target.max():.4f}]"
+                            #)
+                            #logging.info(
+                            #    f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
+                            #)
                             log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
@@ -1313,12 +1312,11 @@ def main(args):
                                 consumed_timesteps.append(used_timestep_detached)
 
                             # take mean of all dimensions except batch, then divide through by a fixed batch size
-                            if args.enable_loss_mean_over_full_effective_batch:
+                            if args.loss_mean_over_full_effective_batch:
                                 # strictly more correct, but LR scaling becomes necessary
                                 loss_mean_divisor = tv.desired_effective_batch_size
                             else:
-                                # this method gives us a stable divisor, regardless of forward/backward slice sizes - LR scaling isn't necessary
-                                loss_mean_divisor = args.batch_size
+                                loss_mean_divisor = 1
                             loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / loss_mean_divisor
                             loss_step = loss_mean.detach().item()
                             nibble_timesteps_detached = timesteps[0:nibble_size_actual].detach().cpu().tolist()
@@ -1677,7 +1675,7 @@ if __name__ == "__main__":
     argparser.add_argument("--cond_dropout_curriculum_source", choices=['timestep', 'batch_size', 'batch_size_and_timestep', 'global_step'], default='global_step',
                            help="source for cond dropout curriculum - timestep (high timestep (high noise)...low timestep), batch size (initial_batch_size...final_batch_size), or global_step")
     argparser.add_argument("--final_cond_dropout", type=float, default=None, help="if doing cond dropout curriculum, the final cond dropout (timestep=0)")
-    argparser.add_argument("--cond_dropout_loss_scale", type=float, default=1, help="additional loss scaling for cond dropout samples")
+    argparser.add_argument("--loss_scale", type=float, default=1, help="additional loss scaling")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
@@ -1700,7 +1698,7 @@ if __name__ == "__main__":
     argparser.add_argument('--log_attention_activations', action='store_true', help='If passed, magnitudes of attention activation modules in the unet')
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
                            help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "huber_mse", "sd3-cosmap", "v-mse"])
-    argparser.add_argument("--enable_loss_mean_over_full_effective_batch", action='store_true', help="If passed, mean the loss over the full effective batch size, rather than the minibatch size")
+    argparser.add_argument("--loss_mean_over_full_effective_batch", default=True, action=argparse.BooleanOptionalAction, help="If passed, mean the loss over the full effective batch size, rather than the minibatch size")
     argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")

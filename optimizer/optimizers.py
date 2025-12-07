@@ -91,13 +91,13 @@ class EveryDreamOptimizer:
 
         if 'use_grad_scaler' in optimizer_config:
             logging.warning("* Ignoring use_grad_scaler entry in optimizer config, will be set automatically")
-        if model.is_sdxl:
+        if model.unet.dtype == torch.bfloat16:
             self.use_grad_scaler = False
-            logging.info("* SDXL: no grad scaler")
-        elif model.unet.dtype in [torch.float16, torch.bfloat16]:
+            logging.info("* bfloat16 unet: no grad scaler")
+        elif model.unet.dtype == torch.float16:
             self.use_grad_scaler = True
-            logging.info("* float16/bfloat16 traning: using grad scaler")
-        elif self.unet_params['optimizer'].endswith('8bit') or self.text_encoder_params['optimizer'].endswith('8bit'):
+            logging.info("* float16 unet: using grad scaler")
+        elif self.base_config['optimizer'].endswith('8bit') or self.te_config['optimizer'].endswith('8bit'):
             self.use_grad_scaler = True
             logging.info("* 8bit optimizer: using grad scaler")
         elif model.unet.dtype != torch.float32:
@@ -322,13 +322,14 @@ class EveryDreamOptimizer:
                     if self.text_encoder_2 is not None:
                         self.log_writer.add_scalar("optimizer/te2_grad_norm_post_clip", _get_grad_norm(self.text_encoder_2.parameters()), global_step)
 
-                    exp_avg, exp_avg_sq = _get_moment_norms(self.optimizer_unet)
-                    self.log_writer.add_scalar(
-                        "optimizer/unet_adamw_exp_avg", exp_avg, global_step
-                    )
-                    self.log_writer.add_scalar(
-                        "optimizer/unet_adamw_exp_avg_sq", exp_avg_sq, global_step
-                    )
+        if self.log_grad_norm:
+            exp_avg, exp_avg_sq = _get_moment_norms(self.optimizer_unet)
+            self.log_writer.add_scalar(
+                "optimizer/unet_adamw_exp_avg", exp_avg, global_step
+            )
+            self.log_writer.add_scalar(
+                "optimizer/unet_adamw_exp_avg_sq", exp_avg_sq, global_step
+            )
 
         if self.scaler is None:
             for optimizer in self.optimizers:
