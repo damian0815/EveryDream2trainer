@@ -798,7 +798,7 @@ def main(args):
                                   batch_share_timesteps=False,
                                   device=model.unet.device,
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                  continuous_float_timesteps=False)
+                                  continuous_float_timesteps=model.is_flow_matching)
         model.load_vae_to_device(device)
         latents = get_latents(image, model, device=model.unet.device, args=args)
         if args.offload_vae:
@@ -1575,7 +1575,7 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                 alpha=args.timesteps_multirank_stratified_alpha,
                 beta=args.timesteps_multirank_stratified_beta,
                 mode_scale=args.timesteps_multirank_stratified_mode_scale,
-                continuous_float_timesteps=False,
+                continuous_float_timesteps=model.is_flow_matching,
                 stratify=args.timesteps_multirank_stratified_stratify,
             )
             tv.remaining_timesteps = next_timesteps if tv.remaining_timesteps is None else torch.cat(
@@ -1627,7 +1627,7 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                     do_contrastive_learning or args.batch_share_timesteps),
             device=model.device,
             timesteps_ranges=timesteps_ranges_expanded,
-            continuous_float_timesteps=False
+            continuous_float_timesteps=model.is_flow_matching
         )
 
         return timesteps
@@ -1701,6 +1701,7 @@ if __name__ == "__main__":
     argparser.add_argument("--loss_mean_over_full_effective_batch", default=True, action=argparse.BooleanOptionalAction, help="If passed, mean the loss over the full effective batch size, rather than the minibatch size")
     argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
+    argparser.add_argument("--lr_end", type=float, default=None, help="Final learning rate, if using scheduler is minimum LR at end of curve")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")

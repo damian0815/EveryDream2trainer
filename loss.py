@@ -208,30 +208,39 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
     if not do_contrastive_learning:
         return non_contrastive_loss * mask
 
-    if args.contrastive_learning_info_nce_sample_count > 0 and model_pred_wrong_mask.sum() > 0:
-        contrastive_negative_losses = []
-        for i in range(args.contrastive_learning_info_nce_sample_count):
-            # positive_loss = MSE(v_pred_positive, v_target) (This is just L_simple)
-            # negative_loss_1 = MSE(v_pred_negative_1, v_target)
-            contrastive_negative_losses.append(compute_loss(model_pred_wrong[i], target, timesteps, loss_scale))
-        contrastive_negative_losses = torch.stack(contrastive_negative_losses)
-        # InfoNCE (Noise Contrastive Estimation) Style
-        """
-        Calculate scores, often inversely related to error: 
-          score_positive = -error_positive / T 
-          score_negative_i = -error_negative_i / T (where T is a temperature hyperparameter).
-        Calculate the loss: 
-          L_contrastive = -log( exp(score_positive) / (exp(score_positive) + sum(exp(score_negative_i))) )
-            (This is the cross-entropy loss for classifying the positive correctly).
-        """
-        temperature = args.contrastive_learning_info_nce_temperature
-        score_positive = -non_contrastive_loss / temperature
-        scores_negative = -contrastive_negative_losses / temperature
-        exp_positive = torch.exp(score_positive)
-        exps_negative = torch.exp(scores_negative)[model_pred_wrong_mask.unsqueeze(0)]
-        # if exps_negative is empty (because of the mask), contrastive_loss is torch.log(1) (== 0)
-        contrastive_loss = -torch.log(exp_positive / (exp_positive + torch.sum(exps_negative, dim=0)))
-        return (non_contrastive_loss + args.contrastive_learning_negative_loss_scale * contrastive_loss) * mask
+    B = model_pred.shape[0]
+    temperature = 0.07
+
+    # Contrastive loss
+    # Flatten spatial dimensions for similarity computation
+    pred_flat = model_pred.reshape(B, -1)  # [B, C*H*W]
+    target_flat = target.reshape(B, -1)  # [B, C*H*W]
+
+    # Compute similarity matrix: how similar is each prediction to each target
+    # Using negative L2 distance as similarity (could also use cosine)
+    # sim[i, j] = similarity between prediction_i and target_j
+    sim_matrix = -torch.cdist(pred_flat, target_flat, p=2)  # [B, B]
+
+    # Alternative: cosine similarity
+    # pred_norm = F.normalize(pred_flat, p=2, dim=1)
+    # target_norm = F.normalize(target_flat, p=2, dim=1)
+    # sim_matrix = torch.mm(pred_norm, target_norm.t())  # [B, B]
+
+    # Scale by temperature
+    sim_matrix = sim_matrix / temperature
+
+    # InfoNCE: diagonal should be high, off-diagonal should be low
+    # Loss for each sample: -log(exp(sim[i,i]) / sum_j(exp(sim[i,j])))
+    labels = torch.arange(B, device=model_pred.device)
+    contrastive_loss = F.cross_entropy(sim_matrix, labels)
+
+    # Combined loss
+    total_loss = (non_contrastive_loss + args.contrastive_learning_negative_loss_scale * contrastive_loss) * mask  # tune the weight
+
+    return total_loss
+
+
+def contrastive_loss_old():
 
     # Generate negative samples
     # max_negative_loss = torch.tensor(args.contrastive_learning_max_negative_loss,
@@ -341,7 +350,7 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
             return torch.cat([x[-c:], x[:-c]])
         model_pred_wrong_caption = []
         model_pred_wrong_caption_mask = []
-        for i in range(min(args.contrastive_learning_info_nce_sample_count, encoder_hidden_states.shape[0]-1)):
+        for i in range(min(args.contrastive_learning_info_nce_sample_count, conditioning.prompt_embeds.shape[0]-1)):
             # v_pred_positive = unet(z_t, t, c_positive).
             # v_pred_negative_1 = unet(z_t, t, c_negative_1)
             # v_pred_negative_2 = unet(z_t, t, c_negative_2)
@@ -349,17 +358,17 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                 enabled=args.amp,
                 dtype=torch.bfloat16 if model.is_sdxl else torch.float16,
             ):
-                wrong_caption_i = rotate_dim0(encoder_hidden_states, i + 1)
-                model_pred_wrong_caption_i = model_being_trained.unet(noisy_latents, timesteps, wrong_caption_i).sample
+                wrong_caption_i = rotate_dim0(conditioning.prompt_embeds, i + 1)
+                model_pred_wrong_caption_i = model.unet(noisy_latents, timesteps, wrong_caption_i).sample
                 model_pred_wrong_caption.append(model_pred_wrong_caption_i)
                 del wrong_caption_i, model_pred_wrong_caption_i
         if len(model_pred_wrong_caption) > 0:
             model_pred_wrong_caption = torch.stack(model_pred_wrong_caption)
-            model_pred_wrong_caption_mask = torch.tensor([True] * encoder_hidden_states.shape[0],
+            model_pred_wrong_caption_mask = torch.tensor([True] * conditioning.prompt_embeds.shape[0],
                                                               dtype=torch.bool, device=model_pred.device)
         else:
             model_pred_wrong_caption = torch.zeros_like(model_pred).unsqueeze(0)
-            model_pred_wrong_caption_mask = torch.tensor([False] * encoder_hidden_states.shape[0],
+            model_pred_wrong_caption_mask = torch.tensor([False] * conditioning.prompt_embeds.shape[0],
                                                               dtype=torch.bool, device=model_pred.device)
 
     return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask, noisy_latents

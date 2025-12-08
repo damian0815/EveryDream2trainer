@@ -478,7 +478,7 @@ def find_last_checkpoint(logdir, is_ema=False):
     assert last_ckpt, f"Could not find last checkpoint in logdir: {logdir}"
     assert "errored" not in last_ckpt, f"Found last checkpoint: {last_ckpt}, but it was errored, cancelling"
 
-    print(f"    {Fore.LIGHTCYAN_EX}Found last checkpoint: {last_ckpt}, resuming{Style.RESET_ALL}")
+    logging.info(f"    {Fore.LIGHTCYAN_EX}Found last checkpoint: {last_ckpt}, resuming{Style.RESET_ALL}")
 
     return last_ckpt
 

@@ -365,12 +365,6 @@ class EveryDreamOptimizer:
         if self.apply_grad_scaler_step_tweaks:
             self._update_grad_scaler(global_step)
 
-    def step(self, step: int, global_step: int, ):
-        if self._should_do_grad_accum_step(step, global_step):
-            self.step_optimizer(global_step)
-
-        self.step_schedulers(global_step)
-
     def _zero_grad(self, set_to_none=False):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
@@ -449,7 +443,7 @@ class EveryDreamOptimizer:
         cli LR arg will override LR for both unet and text encoder for legacy reasons
         """
         base_config = global_optimizer_config.get("base")
-        te_config = global_optimizer_config.get("text_encoder_overrides")
+        te_config = global_optimizer_config.get("text_encoder_overrides", {})
 
         if args.lr_decay_steps is None or args.lr_decay_steps < 1:
             # sets cosine so the zero crossing is past the end of training, this results in a terminal LR that is about 25% of the nominal LR
@@ -469,6 +463,8 @@ class EveryDreamOptimizer:
         if args.lr is not None:
             # override for legacy support reasons
             base_config["lr"] = args.lr
+
+        base_config["lr_end"] = base_config.get("lr_end", args.lr_end) or base_config["lr"]/100.0
 
         base_config["optimizer"] = base_config.get("optimizer", None) or "adamw8bit"
 
@@ -494,7 +490,7 @@ class EveryDreamOptimizer:
 
     def create_lr_schedulers(self, args, optimizer_config):
         unet_config = optimizer_config["base"]
-        te_config = optimizer_config["text_encoder_overrides"]
+        te_config = optimizer_config.get("text_encoder_overrides", {})
 
         ret_val = []
 
@@ -523,6 +519,13 @@ class EveryDreamOptimizer:
                     num_cycles=num_restarts,
                     num_warmup_steps=int(unet_config["lr_warmup_steps"]),
                     num_training_steps=int(unet_config["lr_decay_steps"]),
+                )
+            elif unet_config["lr_scheduler"] == "findlr":
+                lr_scheduler = _get_findlr_scheduler(
+                    optimizer=self.optimizer_unet,
+                    base_lr=unet_config.get("lr", unet_config["lr"] * 10.0),
+                    min_lr=unet_config.get("lr_end", unet_config["lr"]/100.0),
+                    num_warmup_steps=int(unet_config["lr_warmup_steps"]),
                 )
             else:
                 lr_scheduler = get_scheduler(
@@ -1114,6 +1117,27 @@ def _get_moment_norms(optimizer) -> tuple[float, float]:
                         exp_avg_sq_norms.append(torch.norm(state['exp_avg_sq']).item() ** 2)
 
         return sum(exp_avg_norms) ** 0.5, sum(exp_avg_sq_norms) ** 0.5
+
+def _get_findlr_scheduler(
+    optimizer: Optimizer,
+    min_lr: float,
+    base_lr: float,
+    num_warmup_steps: int
+) -> LambdaLR:
+    """
+    Create a schedule with a learning rate that increases exponentially from min_lr to base_lr over num_warmup_steps.
+    """
+    def findlr_lambda(current_step: int):
+        if current_step >= num_warmup_steps:
+            # just use base_lr
+            return 1.0
+
+        t = current_step / num_warmup_steps
+        # LambdaLR multiplies by base_lr, so we need to return the ratio of the desired LR to base_lr
+        return (min_lr * (base_lr / min_lr) ** t) / base_lr
+
+    return LambdaLR(optimizer, findlr_lambda)
+
 
 
 def _get_polynomial_decay_schedule_with_warmup_adj(

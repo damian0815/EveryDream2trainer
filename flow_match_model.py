@@ -34,9 +34,8 @@ class TrainFlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
         super().__init__(**kwargs)
         self.config.prediction_type = "flow_prediction"
 
-
-
     def add_noise(self, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        #return self.scale_noise(latents, timesteps, noise)
         alpha = (timesteps / self.config.num_train_timesteps).view(-1, 1, 1, 1)
         x_t = alpha*noise + (1-alpha)*latents
         return x_t
