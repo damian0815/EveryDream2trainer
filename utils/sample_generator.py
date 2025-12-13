@@ -111,15 +111,16 @@ class SampleGenerator:
     def __init__(self,
                  log_folder: str,
                  log_writer: SummaryWriter,
-                 default_resolution: int,
-                 config_file_path: str,
-                 batch_size: int,
-                 default_seed: int,
-                 default_sample_steps: int|None,
-                 default_sample_epochs: int|None,
-                 use_xformers: bool,
-                 use_penultimate_clip_layer: bool,
-                 is_ztsnr: bool,
+                 default_resolution: int = 768,
+                 config_file_path: str|None = None,
+                 sample_requests: list[SampleRequest]|None = None,
+                 batch_size: int = 2,
+                 default_seed: int = 555,
+                 default_sample_steps: int|None = 1000,
+                 default_sample_epochs: int|None = None,
+                 use_xformers: bool = False,
+                 use_penultimate_clip_layer: bool = False,
+                 is_ztsnr: bool = False,
                  guidance_rescale: float = 0):
         self.log_folder = log_folder
         self.log_writer = log_writer
@@ -140,7 +141,7 @@ class SampleGenerator:
 
         self.sample_invokeai_info_dicts_json = None
         self.sample_invokeai_info_dicts = None
-        self.sample_requests = None
+        self.sample_requests = sample_requests
         self.reload_config()
         print(f" * SampleGenerator initialized with {len(self.sample_requests)} prompts, generating samples every {self.sample_steps} training steps, using scheduler '{self.scheduler}' with {self.num_inference_steps} inference steps")
         if not os.path.exists(f"{log_folder}/samples/"):
@@ -148,25 +149,27 @@ class SampleGenerator:
 
 
     def reload_config(self):
-        try:
-            config_file_extension = os.path.splitext(self.config_file_path)[1].lower()
-            if config_file_extension == '.txt':
-                self._reload_sample_prompts_txt(self.config_file_path)
-            elif config_file_extension == '.json':
-                self._reload_config_json(self.config_file_path)
-            else:
-                raise ValueError(f"Unrecognized file type '{config_file_extension}' for sample config, must be .txt or .json")
-        except Exception as e:
-            traceback.print_exc()
-            logging.warning(
-                f" * {Fore.LIGHTYELLOW_EX}Error trying to read sample config from {self.config_file_path}: {Style.RESET_ALL}{e}")
-            logging.warning(
-                f"    Edit {self.config_file_path} to fix the problem. It will be automatically reloaded next time samples are due to be generated."
-            )
-            if self.sample_requests == None:
+        if self.config_file_path is not None:
+            try:
+                config_file_extension = os.path.splitext(self.config_file_path)[1].lower()
+                if config_file_extension == '.txt':
+                    self._reload_sample_prompts_txt(self.config_file_path)
+                elif config_file_extension == '.json':
+                    self._reload_config_json(self.config_file_path)
+                else:
+                    raise ValueError(f"Unrecognized file type '{config_file_extension}' for sample config, must be .txt or .json")
+            except Exception as e:
+                traceback.print_exc()
                 logging.warning(
-                    f"    Will generate samples from random training image captions until the problem is fixed.")
-                self.sample_requests = self._make_random_caption_sample_requests()
+                    f" * {Fore.LIGHTYELLOW_EX}Error trying to read sample config from {self.config_file_path}: {Style.RESET_ALL}{e}")
+                logging.warning(
+                    f"    Edit {self.config_file_path} to fix the problem. It will be automatically reloaded next time samples are due to be generated."
+                )
+                if self.sample_requests == None:
+                    logging.warning(
+                        f"    Will generate samples from random training image captions until the problem is fixed.")
+                    self.sample_requests = self._make_random_caption_sample_requests()
+        self._recompute_sample_steps()
 
     def update_random_captions(self, possible_captions: list[str]|dict[str, str]):
         possible_captions = [p for p in possible_captions
@@ -225,7 +228,6 @@ class SampleGenerator:
                                                       ) for p in sample_requests_config]
             if len(self.sample_requests) == 0:
                 self.sample_requests = self._make_random_caption_sample_requests()
-            self._recompute_sample_steps()
 
 
     @torch.no_grad()
@@ -390,27 +392,7 @@ class SampleGenerator:
         creates a pipeline for SD inference
         """
         scheduler = self._create_scheduler(diffusers_scheduler_config)
-        if model_being_trained.is_sdxl:
-            pipe = StableDiffusionXLPipeline(
-                vae=model_being_trained.vae,
-                text_encoder=model_being_trained.text_encoder,
-                text_encoder_2=model_being_trained.text_encoder_2,
-                tokenizer=model_being_trained.tokenizer,
-                tokenizer_2=model_being_trained.tokenizer_2,
-                unet=model_being_trained.unet,
-                scheduler=scheduler,
-            )
-        else:
-            pipe = StableDiffusionPipeline(
-                vae=model_being_trained.vae,
-                text_encoder=model_being_trained.text_encoder,
-                tokenizer=model_being_trained.tokenizer,
-                unet=model_being_trained.unet,
-                scheduler=scheduler,
-                safety_checker=None, # save vram
-                requires_safety_checker=None, # avoid nag
-                feature_extractor=None, # must be None if no safety checker
-            )
+        pipe = model_being_trained.build_inference_pipeline(scheduler=scheduler)
         if self.use_xformers:
             pipe.enable_xformers_memory_efficient_attention()
         return pipe

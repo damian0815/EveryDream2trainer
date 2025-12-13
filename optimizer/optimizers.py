@@ -901,15 +901,9 @@ class EveryDreamOptimizer:
         log_optimizer(label, optimizer, betas, epsilon, weight_decay, curr_lr)
         return optimizer
 
-
-    def _get_resnet_norm2_layer_names(self, unet) -> Generator[str, None, None]:
+    def _get_module_component_layer_names(self, unet, module_name, component_name) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            if '.resnets.' in name.lower() and '.norm2' in name.lower():
-                yield name
-
-    def _get_resnet_conv2_layer_names(self, unet) -> Generator[str, None, None]:
-        for name, module in unet.named_modules():
-            if '.resnets.' in name.lower() and '.conv2' in name.lower():
+            if f'.{module_name}.' in name and f'.{component_name}' in name:
                 yield name
 
     def _get_cross_attention_layer_names(self, unet, cross_attention_dim_to_find: int) -> Generator[str, None, None]:
@@ -974,11 +968,19 @@ class EveryDreamOptimizer:
             unet,
             cross_attention_dim_to_find=cross_attention_dim_to_find,
         ))
-        attn_norm2_layer_names = list(self._get_attention_norm2_layer_names(unet))
-        attn_norm3_layer_names = list(self._get_attention_norm3_layer_names(unet))
-        attn_feedforward_layer_names = list(self._get_attention_feedforward_layer_names(unet))
-        resnets_norm2_layer_names = list(self._get_resnet_norm2_layer_names(unet))
-        resnets_conv2_layer_names = list(self._get_resnet_conv2_layer_names(unet))
+
+        attn_norm2_layer_names = list(
+            self._get_module_component_layer_names(unet, 'attentions', 'norm2')
+        )
+        attn_norm3_layer_names = list(
+            self._get_module_component_layer_names(unet, "attentions", "norm3")
+        )
+        attn_feedforward_layer_names = list(
+            self._get_module_component_layer_names(unet, "attentions", "ff")
+        )
+        resnets_norm1_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm1'))
+        resnets_norm2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm2'))
+        resnets_conv2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'conv2'))
 
         freeze_cross_attn = unet_freeze_config.get("freeze_cross_attention", None)
         if freeze_cross_attn is not None:
@@ -1000,6 +1002,10 @@ class EveryDreamOptimizer:
             )
             print(attn_feedforward_layer_names)
 
+        freeze_resnets_norm1 = unet_freeze_config.get("freeze_resnets_norm1", None)
+        if freeze_resnets_norm1 is not None:
+            print(f"{'' if freeze_resnets_norm1 else 'un'}freezing resnets norm1 layers:")
+            print(resnets_norm1_layer_names)
         freeze_resnets_norm2 = unet_freeze_config.get("freeze_resnets_norm2", None)
         if freeze_resnets_norm2 is not None:
             print(f"{'' if freeze_resnets_norm2 else 'un'}freezing resnets norm2 layers:")
@@ -1049,6 +1055,8 @@ class EveryDreamOptimizer:
                 return freeze_time_embedding
             elif freeze_time_proj is not None and any(n.startswith(prefix) for prefix in time_proj_layer_names):
                 return freeze_time_proj
+            elif freeze_resnets_norm1 is not None and any(n.startswith(prefix) for prefix in resnets_norm1_layer_names):
+                return freeze_resnets_norm1
             elif freeze_resnets_norm2 is not None and any(n.startswith(prefix) for prefix in resnets_norm2_layer_names):
                 return freeze_resnets_norm2
             elif freeze_resnets_conv2 is not None and any(n.startswith(prefix) for prefix in resnets_conv2_layer_names):

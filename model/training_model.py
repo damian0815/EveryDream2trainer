@@ -211,6 +211,31 @@ class TrainingModel:
         if self.text_encoder_2:
             self.text_encoder_2.to(device)
 
+    def build_inference_pipeline(self, scheduler: SchedulerMixin|None = None) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
+        if scheduler is None:
+            scheduler = self.noise_scheduler
+        if self.is_sdxl:
+            return StableDiffusionXLPipeline(
+                vae=self.vae,
+                text_encoder=self.text_encoder,
+                text_encoder_2=self.text_encoder_2,
+                tokenizer=self.tokenizer,
+                tokenizer_2=self.tokenizer_2,
+                unet=self.unet,
+                scheduler=scheduler,
+            )
+        else:
+            return StableDiffusionPipeline(
+                vae=self.vae,
+                text_encoder=self.text_encoder,
+                tokenizer=self.tokenizer,
+                unet=self.unet,
+                scheduler=scheduler,
+                safety_checker=None, # save vram
+                requires_safety_checker=None, # avoid nag
+                feature_extractor=None, # must be None if no safety checker
+            )
+
 
 @dataclass
 class Conditioning:

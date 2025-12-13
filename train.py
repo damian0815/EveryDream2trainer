@@ -1459,6 +1459,7 @@ def main(args):
                                           global_step=tv.global_step,
                                           local_step=step,
                                           project_name=args.project_name,
+                                          log_writer=log_writer,
                                           log_folder=log_folder,
                                           data_root=args.data_root,
                                           batch=batch,
