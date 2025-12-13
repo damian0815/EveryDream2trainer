@@ -138,7 +138,43 @@ class AttentionMapCollector:
     def register_hooks(self):
         """Register forward hooks on all cross-attention modules in the UNet."""
 
-        def _sdp_with_map_saving(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, target: AttentionMapCollector=None, map_name: str= "", is_cross_attn=False):
+        def _sdp_with_map_saving(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=None,
+            enable_gqa=False,
+            target: AttentionMapCollector = None,
+            map_name: str = "",
+            is_cross_attn=False,
+            **kwargs
+        ):
+            attn_output, attn_weights = (
+                _scaled_dot_product_attention_with_weight_return(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                )
+            )
+            # merge all heads together by averaging
+            # attn_weights has shape [B, num_heads, (H*W), num_tokens]
+            attn_weights = torch.mean(attn_weights, dim=1)  # now [B, (H*W), N]
+            # maps = torch.mean(maps, dim=1, keepdim=True)
+            if self.verbose and map_name not in target.attention_maps:
+                # log on first addition
+                print(f"storing maps of size {attn_weights.shape} for '{map_name}'")
+            target.attention_maps[map_name].append(attn_weights.detach().cpu())
+            return attn_output
+
+        def _sdp_with_all_map_saving(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, target: AttentionMapCollector=None, map_name: str= "", is_cross_attn=False):
             attn_output, attn_weights = _scaled_dot_product_attention_with_weight_return(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
             # merge all heads together by averaging
             # attn_weights has shape [B, num_heads, (H*W), num_tokens]
@@ -177,6 +213,8 @@ class AttentionMapCollector:
                 hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
             ):
                 is_cross_attn = module.cross_attention_dim == self.text_encoder_hidden_size
+                #if not is_cross_attn:
+                #    continue
                 module: torch.nn.Module
                 pre_hook = module.register_forward_pre_hook(
                     lambda mod, inp, n=name, is_cross=is_cross_attn: pre_hook_fn(module=mod, input=inp, name=n, is_cross_attn=is_cross)
