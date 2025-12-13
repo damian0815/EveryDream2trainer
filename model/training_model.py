@@ -37,7 +37,7 @@ from utils.huggingface_downloader import try_download_model_from_hf
 from utils.unet_utils import check_for_sd1_attn
 
 
-def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=None, rescale_betas_zero_snr=False):
+def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=None, rescale_betas_zero_snr=False, flow_match_shift=1):
     if train_sampler.lower() == "pndm":
         logging.info(f" * Using PNDM noise scheduler for training: {train_sampler}")
         noise_scheduler = PNDMScheduler.from_config(scheduler.config,
@@ -50,9 +50,7 @@ def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=No
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "flow-matching":
         logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        config = dict(scheduler.config)
-        config.update({'prediction_type': 'flow_prediction'})
-        noise_scheduler = TrainFlowMatchScheduler.from_config(config)
+        noise_scheduler = TrainFlowMatchScheduler(shift=flow_match_shift)
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
         noise_scheduler = DDPMScheduler.from_config(scheduler.config,
@@ -508,6 +506,13 @@ def load_model(args) -> TrainingModel:
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer
         unet = pipe.unet
+
+        qk_norm = unet.config.get('qk_norm', None)
+        if qk_norm is not None:
+            logging.info(f" * unet has qk_norm={qk_norm}")
+        else:
+            logging.info(f" * no qk_norm setting found")
+
         if hasattr(pipe, 'text_encoder_2'):
             # sdxl
             print('sdxl detected')
@@ -557,11 +562,13 @@ def load_model(args) -> TrainingModel:
         temp_scheduler = DDIMScheduler.from_pretrained(model_root_folder, subfolder="scheduler")
         trained_betas = enforce_zero_terminal_snr(temp_scheduler.betas).numpy().tolist()
         noise_scheduler = get_training_noise_scheduler(temp_scheduler, args.train_sampler,
-                                                       trained_betas=trained_betas, rescale_betas_zero_snr=False
+                                                       trained_betas=trained_betas,
+                                                       rescale_betas_zero_snr=False,
+                                                       flow_match_shift=args.flow_match_shift
                                                        # True
                                                        )
     else:
-        noise_scheduler = get_training_noise_scheduler(scheduler, args.train_sampler)
+        noise_scheduler = get_training_noise_scheduler(scheduler, args.train_sampler, flow_match_shift=args.flow_match_shift)
 
     compel = None
     if args.use_compel:

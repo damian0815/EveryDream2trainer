@@ -1,3 +1,5 @@
+from flow_match_model import TrainFlowMatchScheduler
+
 print("Hello")
 """
 Copyright [2022-2023] Victor C Hall
@@ -341,7 +343,7 @@ def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, l
     else:
         optimizer.backward(tv.accumulated_loss)
         try:
-            optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
+            #optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
             tv.effective_backward_size = tv.accumulated_loss_images_count
             tv.backwarded_images_count += tv.accumulated_loss_images_count
             # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
@@ -481,7 +483,7 @@ def main(args):
     else:
         logging.info("* Using SDP attention *")
 
-    train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if model.is_sdxl else torch.float32)
+    train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float32)
 
     model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else train_dtype)
     model.unet = model.unet.to(device, dtype=train_dtype)
@@ -798,7 +800,8 @@ def main(args):
                                   batch_share_timesteps=False,
                                   device=model.unet.device,
                                   timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                  continuous_float_timesteps=model.is_flow_matching)
+                                  scheduler=model.noise_scheduler
+        )
         model.load_vae_to_device(device)
         latents = get_latents(image, model, device=model.unet.device, args=args)
         if args.offload_vae:
@@ -953,6 +956,8 @@ def main(args):
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
                     timesteps = _get_step_timesteps(full_batch, train_progress_01, model, tv, args)
+                    if isinstance(model.noise_scheduler, TrainFlowMatchScheduler):
+                        timesteps = timesteps.to(model.unet.dtype)
                     #print('timesteps: ', timesteps.detach().clone().cpu().tolist())
 
                     # apply cond dropout
@@ -1575,7 +1580,7 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                 alpha=args.timesteps_multirank_stratified_alpha,
                 beta=args.timesteps_multirank_stratified_beta,
                 mode_scale=args.timesteps_multirank_stratified_mode_scale,
-                continuous_float_timesteps=model.is_flow_matching,
+                scheduler=model.noise_scheduler,
                 stratify=args.timesteps_multirank_stratified_stratify,
             )
             tv.remaining_timesteps = next_timesteps if tv.remaining_timesteps is None else torch.cat(
@@ -1627,7 +1632,7 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                     do_contrastive_learning or args.batch_share_timesteps),
             device=model.device,
             timesteps_ranges=timesteps_ranges_expanded,
-            continuous_float_timesteps=model.is_flow_matching
+            scheduler=model.noise_scheduler,
         )
 
         return timesteps
@@ -1659,6 +1664,7 @@ if __name__ == "__main__":
 
     argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
     argparser.add_argument("--amp", action="store_true",  default=True, help="deprecated, use --disable_amp if you wish to disable AMP")
+    argparser.add_argument("--force_bfloat16", action=argparse.BooleanOptionalAction, default=False, help="If passed, use bfloat16 for training")
     argparser.add_argument("--init_grad_scale", type=int, default=None, help="initial value for GradScaler (default=2^17.5)")
     argparser.add_argument("--attn_type", type=str, default="sdp", help="Attention mechanismto use", choices=["xformers", "sdp", "slice"])
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
@@ -1697,7 +1703,7 @@ if __name__ == "__main__":
     argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")
     argparser.add_argument('--log_attention_activations', action='store_true', help='If passed, magnitudes of attention activation modules in the unet')
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
-                           help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "huber_mse", "sd3-cosmap", "v-mse"])
+                           help="type of loss / weight (def: mse_huber)", choices=["huber", "mse", "mse_huber", "huber_mse", "sd3-cosmap", "v-mse", "cosmap-2"])
     argparser.add_argument("--loss_mean_over_full_effective_batch", default=True, action=argparse.BooleanOptionalAction, help="If passed, mean the loss over the full effective batch size, rather than the minibatch size")
     argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
@@ -1734,7 +1740,7 @@ if __name__ == "__main__":
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
     argparser.add_argument("--timesteps_multirank_stratified", action=argparse.BooleanOptionalAction, default=False, help="use multirank stratified timesteps (recommended: disable min_snr_gamma")
-    argparser.add_argument("--timesteps_multirank_stratified_distribution", type=str, choices=['beta', 'mode'], default='beta', help="multirank stratified timesteps distribution model. for 'beta', uses alpha and beta params; for 'mode', uses mode_scale param")
+    argparser.add_argument("--timesteps_multirank_stratified_distribution", type=str, choices=['beta', 'mode', 'boundary-oversampling', 'lognormal'], default='beta', help="multirank stratified timesteps distribution model. for 'beta', uses alpha and beta params; for 'mode', uses mode_scale param")
     argparser.add_argument("--timesteps_multirank_stratified_stratify", action=argparse.BooleanOptionalAction, default=True, help="whether to stratify timestep distribution, or just leave to chance")
     argparser.add_argument("--timesteps_multirank_stratified_alpha", type=float, default=1.5, help="multirank stratified timesteps PPF alpha")
     argparser.add_argument("--timesteps_multirank_stratified_beta", type=float, default=2, help="multirank stratified timesteps PPF beta")
@@ -1744,6 +1750,7 @@ if __name__ == "__main__":
     argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")
     argparser.add_argument("--train_sampler", type=str, default="ddpm",
                            help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim", "flow-matching"])
+    argparser.add_argument("--flow_match_shift", type=float, default=1.0, help="For flow-matching train sampler, the noise shift parameter (def: 1.0)")
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
     argparser.add_argument("--validation_config", default=None, help="Path to a JSON configuration file for the validator.  Default is no validation.")

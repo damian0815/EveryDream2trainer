@@ -157,8 +157,11 @@ class EveryDreamBatch(Dataset):
         if self.random_instance.random() <= self.contrastive_learning_dropout_p:
             example["do_contrastive_learning"] = False
 
-        example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
-        example["image"] = image_transforms(example["image"])
+        if train_item["image"] is None:
+            example["image"] = None
+        else:
+            example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
+            example["image"] = image_transforms(example["image"])
         if train_item["mask"] is not None:
             mask_transforms = transforms.Compose(
                 [
@@ -234,8 +237,10 @@ class EveryDreamBatch(Dataset):
                        if image_train_item.runt_size > 0 # and do_contrastive_learning
                        else self.crop_jitter)
         image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=self.use_masks, return_crop_info=True)
-
-        example["image"] = image_train_tmp.image.copy() # hack for now to avoid memory leak
+        if image_train_tmp is None:
+            example["image"] = None
+        else:
+            example["image"] = image_train_tmp.image.copy() # hack for now to avoid memory leak
         example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy() # hack for now to avoid memory leak
         image_train_tmp.image = None # hack for now to avoid memory leak
         image_train_tmp.mask = None # hack for now to avoid memory leak
@@ -417,6 +422,16 @@ def collate_fn(batch):
     """
     Collates batches
     """
+    batch_no_none = [e for e in batch if e["image"] is not None]
+    dropped = len(batch) - len(batch_no_none)
+    if dropped > 0:
+        logging.warning(f"collate_fn: dropped {dropped} examples with None images")
+        # duplicate last example to fill batch
+        while len(batch_no_none) < len(batch):
+            batch_no_none.append(batch_no_none[-1])
+            batch[0]["runt_size"] += 1
+        batch = batch_no_none
+
     images = [example["image"] for example in batch]
     masks = [example["mask"] for example in batch]
     pathnames = [example["pathname"] for example in batch]

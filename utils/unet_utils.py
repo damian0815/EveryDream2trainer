@@ -57,7 +57,7 @@ def get_attn_yaml(ckpt_path):
         scheduler_cfg = json.load(f)
 
     if 'prediction_type' not in scheduler_cfg:
-        logging.warn(f"Model has no prediction_type, assuming epsilon")
+        logging.warn(f"Model has no prediction_type, assuming epsilon (only relevant for .yaml+.ckpt/.safetensors saving)")
         prediction_type = "epsilon"
     else:
         prediction_type = scheduler_cfg["prediction_type"]

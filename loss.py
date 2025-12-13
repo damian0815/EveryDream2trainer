@@ -4,7 +4,6 @@ import random
 from typing import Tuple, Optional, Literal
 
 import torch
-from compel import Compel
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
@@ -13,6 +12,7 @@ from scipy.stats import beta as sp_beta
 
 from diffusers import SchedulerMixin, ConfigMixin, UNet2DConditionModel
 
+from flow_match_model import TrainFlowMatchScheduler
 from model.training_model import TrainingModel, Conditioning
 
 
@@ -162,6 +162,13 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             weights = compute_loss_weighting_for_sd3(weighting_scheme=weighting_scheme, sigmas=sigmas)
             loss = loss_mse * weights.view(-1, 1, 1, 1).to(loss_mse.device) * loss_scale.to(device)
             del weights, sigmas
+        elif loss_type == 'cosmap-2':
+            lmbd = 0.9
+            sigmas = timesteps / 1000
+            weights = 1 - lmbd * (
+                torch.exp(-10 * (sigmas - 0) ** 2) + torch.exp(-10 * (sigmas - 1) ** 2)
+            )
+            loss = loss_mse * weights.view(-1, 1, 1, 1).to(loss_mse.device) * loss_scale.to(device)
         else:
             if loss_type != 'mse':
                 raise ValueError(f"Unrecognized --loss_type {args.loss_type}")
@@ -177,16 +184,19 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
 
         if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
             if args.train_sampler == 'flow-matching':
-                raise ValueError("can't use min-SNR with flow matching")
-            snr = compute_snr(timesteps, noise_scheduler)
-            v_pred = noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]
-            divisor = (snr + 1) if v_pred else snr
-            snr_weight = (
-                torch.stack(
-                    [snr, args.min_snr_gamma * torch.ones_like(timesteps).float()], dim=1
-                ).min(dim=1)[0]
-                / divisor
-            )
+                t = timesteps / noise_scheduler.config.num_train_timesteps
+                snr = (1 - t) / (t + 1e-8)  # Linear approximation
+                snr_weight = torch.minimum(snr, torch.tensor(args.min_snr_gamma)) / (snr + 1e-8)
+            else:
+                snr = compute_snr(timesteps, noise_scheduler)
+                v_pred = noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]
+                divisor = (snr + 1) if v_pred else snr
+                snr_weight = (
+                    torch.stack(
+                        [snr, args.min_snr_gamma * torch.ones_like(timesteps).float()], dim=1
+                    ).min(dim=1)[0]
+                    / divisor
+                )
             snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
             loss = loss * snr_weight.to(loss.device)
 
@@ -402,17 +412,15 @@ def _get_noisy_latents_and_target(latents, noise, noise_scheduler: (SchedulerMix
     return noisy_latents, target
 
 
-def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, continuous_float_timesteps=False):
+def get_timesteps(batch_size, batch_share_timesteps, device, timesteps_ranges, scheduler):
     """ if continuous_float_timesteps is True, return float timestamps (continuous), otherwise return int timestamps (discrete) """
-    if continuous_float_timesteps:
-        timesteps = torch.cat([a + torch.rand((1,), device=device) * (b-a)
-                               for a,b in timesteps_ranges])
-    else:
-        timesteps = torch.cat([torch.randint(a, b, size=(1,), device=device)
-                               for a,b in timesteps_ranges])
+    timesteps = torch.cat([torch.randint(a, b, size=(1,), device=device)
+                           for a,b in timesteps_ranges])
     if batch_share_timesteps:
         timesteps = timesteps[:1].repeat((batch_size,))
-    if not continuous_float_timesteps:
+    if isinstance(scheduler, TrainFlowMatchScheduler):
+        timesteps = scheduler.get_exact_timesteps(timesteps).to(device)
+    else:
         timesteps = timesteps.long()
     #logging.info(f"get_timesteps: {timesteps.detach().cpu().tolist()} from ranges: {timesteps_ranges}")
     return timesteps
@@ -518,23 +526,37 @@ def vae_preview(latents: torch.Tensor) -> torch.Tensor:
 
 # ref https://huggingface.co/jimmycarter/LibreFLUX
 # "Beta timestep scheduling and timestep stratification"
-def get_multirank_stratified_random_timesteps(batch_size, device, distribution: Literal['beta', 'mode'] = 'beta', alpha=2, beta=1.6, mode_scale=0.5, continuous_float_timesteps=False, stratify=True):
+def get_multirank_stratified_random_timesteps(batch_size, device, distribution: Literal['beta', 'mode', 'boundary-oversampling', 'lognormal'] = 'beta', alpha=2, beta=1.6, mode_scale=0.5, scheduler=None, stratify=True):
     """
     get timesteps, with stratified distribution across batches
     distribution: 'beta' or 'mode'
     alpha, beta: parameters for beta distribution
     mode_scale: parameter for mode distribution. 0 = uniform distribution, 0.5 = ts500 is about 2.2x more likely than tails
     """
-    indices = torch.arange(0, batch_size, dtype=torch.float64)
-    u = torch.rand(batch_size)
-    p = ((indices + u) / batch_size) if stratify else u
-    sigmas = _get_beta_sigmas(p, alpha, beta) if distribution == 'beta' else _get_mode_sigmas(p, mode_scale)
+    if distribution == 'boundary-oversampling':
+        sigmas = _get_boundary_oversampling_sigmas(batch_size, lambda_=1e3)
+    elif distribution == 'lognormal':
+        std = 1
+        mean = 0
+        u = torch.randn(batch_size) * std + mean
+        sigmas = torch.sigmoid(u)
+    else:
+        indices = torch.arange(0, batch_size, dtype=torch.float64)
+        u = torch.rand(batch_size)
+        p = ((indices + u) / batch_size) if stratify else u
+        if distribution == 'beta':
+            sigmas = _get_beta_sigmas(p, alpha, beta)
+        elif distribution == 'mode':
+            sigmas = _get_mode_sigmas(p, mode_scale)
+
     timesteps = (sigmas * 1000).to(device)
     # shuffle
     perm = torch.randperm(timesteps.shape[0])
     timesteps = timesteps[perm]
-    if not continuous_float_timesteps:
-        timesteps = timesteps.long().clamp(min=0, max=999)
+    timesteps = timesteps.long().clamp(min=0, max=999)
+    if isinstance(scheduler, TrainFlowMatchScheduler):
+        timesteps = scheduler.get_exact_timesteps(timesteps).to(device)
+
     #logging.info(
     #    f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
     #)
@@ -545,6 +567,22 @@ def _get_beta_sigmas(p, alpha, beta):
 
 def _get_mode_sigmas(p, mode_scale):
     return 1 - p - mode_scale * (torch.cos(math.pi * p / 2) ** 2 - 1 + p)
+
+def _get_boundary_oversampling_sigmas(k, lambda_=1.0):
+    n_bins = 1000
+    t_bins = torch.linspace(0, 1, n_bins)
+
+    # Compute unnormalized weights
+    w = 1 + lambda_ * (torch.exp(-10 * t_bins**2) + torch.exp(-10 * (t_bins - 1)**2))
+
+    # Sample indices according to weights
+    indices = torch.multinomial(w, k, replacement=True)
+
+    # Add jitter within bins for continuity
+    jitter = torch.rand(k) / n_bins
+    t_samples = t_bins[indices] + jitter
+
+    return t_samples.clamp(0, 1)
 
 
 def get_multirank_stratified_random_timesteps_beta(batch_size, device, alpha=2.0, beta=1.6, continuous_float_timesteps=False, offset=0):
@@ -563,4 +601,3 @@ def get_multirank_stratified_random_timesteps_beta(batch_size, device, alpha=2.0
     #    f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
     #)
     return timesteps
-

@@ -207,6 +207,9 @@ class ImageTrainItem:
         try:
             mask = PIL.Image.open(self.pathname_mask).convert('L')
             mask = self._try_transpose(mask, print_error=False)
+        except OSError as e:
+            logging.error(f"fatal error loading mask {self.pathname}: {e}")
+            raise e
         except SyntaxError as e:
             pass
         return mask
@@ -330,7 +333,13 @@ class ImageTrainItem:
     def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, return_crop_info=False
                 ) -> typing.Union['ImageTrainItem',
                                   tuple['ImageTrainItem', tuple[int, int, int, int]]]:
-        image = self.load_image()
+        try:
+            image = self.load_image()
+        except Exception as e:
+            err = f"Unable to load image for {self.pathname}: {e}"
+            logging.error(err)
+            print(err)
+            return None, (None, None, None, None) if return_crop_info else None
         mask = self.load_mask() if load_mask else None
 
         width, height = image.size

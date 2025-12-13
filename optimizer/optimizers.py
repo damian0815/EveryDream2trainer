@@ -25,6 +25,8 @@ import math
 import torch
 from diffusers import UNet2DConditionModel
 from peft import LoraConfig
+import json
+from pathlib import Path
 
 from torch.cuda.amp import GradScaler
 from diffusers.optimization import get_scheduler
@@ -50,6 +52,67 @@ SCALER_STATE_FILENAME = 'scaler.pt'
 
 class InfOrNanException(Exception):
     pass
+
+
+class LRSteering:
+    def __init__(self):
+        self.steer_file = Path("steer_lr.tweak")
+        self.target_lr = None
+        self.start_lr = None
+        self.tween_steps = 0
+        self.current_step = 0
+
+    def apply_steering_if_necessary(self, schedulers):
+        """Apply tweening if active."""
+
+        self._check_for_steering(schedulers)
+
+        if self.target_lr is None or self.current_step >= self.tween_steps:
+            return
+
+        # Linear interpolation
+        self.current_step += 1
+        progress = self.current_step / self.tween_steps
+
+        for scheduler, start_lr in zip(schedulers, self.start_lr):
+            new_lr = start_lr + (self.target_lr - start_lr) * progress
+            self._set_base_lr(scheduler, new_lr)
+            logging.info(f" * LRSteering tween step {self.current_step}/{self.tween_steps} tweaked base LR to {new_lr}")
+
+        # Clear steering when done
+        if self.current_step >= self.tween_steps:
+            self.target_lr = None
+
+    def _check_for_steering(self, schedulers):
+        """Check for steering file and initialize tweening if found."""
+        if not self.steer_file.exists():
+            return
+
+        try:
+            with open(self.steer_file) as f:
+                config = json.load(f)
+
+            self.target_lr = config["new_lr"]
+            self.tween_steps = config["tween_steps"]
+            self.start_lr = [self._get_base_lr(s) for s in schedulers]
+            self.current_step = 0
+            logging.info(f" * LRSteering tweaking LR from {self.start_lr} to {self.target_lr} over {self.tween_steps} steps")
+
+            # Remove file after reading
+            self.steer_file.unlink()
+
+        except (json.JSONDecodeError, KeyError, IOError) as e:
+            print(f"Error reading steer file: {e}")
+
+
+    def _get_base_lr(self, scheduler):
+        """Get the base LR from a scheduler."""
+        return scheduler.optimizer.param_groups[0]["lr"]
+
+    def _set_base_lr(self, scheduler, lr):
+        """Set the base LR for a scheduler."""
+        for param_group in scheduler.optimizer.param_groups:
+            param_group["lr"] = lr
 
 
 class EveryDreamOptimizer:
@@ -150,6 +213,8 @@ class EveryDreamOptimizer:
         self.lr_schedulers = []
         schedulers = self.create_lr_schedulers(args, optimizer_config)
         self.lr_schedulers.extend(schedulers)
+
+        self.lr_steering = LRSteering()
 
         if args.amp and self.use_grad_scaler:
             self.scaler = GradScaler(
@@ -359,6 +424,7 @@ class EveryDreamOptimizer:
 
 
     def step_schedulers(self, global_step):
+        self.lr_steering.apply_steering_if_necessary(self.lr_schedulers)
         for scheduler in self.lr_schedulers:
             scheduler.step()
 
@@ -836,10 +902,19 @@ class EveryDreamOptimizer:
         return optimizer
 
 
+    def _get_resnet_norm2_layer_names(self, unet) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            if '.resnets.' in name.lower() and '.norm2' in name.lower():
+                yield name
+
+    def _get_resnet_conv2_layer_names(self, unet) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            if '.resnets.' in name.lower() and '.conv2' in name.lower():
+                yield name
 
     def _get_cross_attention_layer_names(self, unet, cross_attention_dim_to_find: int) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            # Look for cross-attention modules
+            # Look for cross-attention modules (typically attn2 but let's not guess)
             if 'attn' in name.lower() and (
                 hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
             ) and (
@@ -847,9 +922,24 @@ class EveryDreamOptimizer:
             ):
                 yield name
 
+    def _get_attention_norm2_layer_names(self, unet) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            if '.attentions.' in name.lower() and '.norm2' in name.lower():
+                yield name
+
+    def _get_attention_norm3_layer_names(self, unet) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            if '.attentions.' in name.lower() and '.norm3' in name.lower():
+                yield name
+
+    def _get_attention_feedforward_layer_names(self, unet) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            if '.attentions.' in name.lower() and '.ff' in name.lower():
+                yield name
+
     def _get_self_attention_layer_names(self, unet, cross_attention_dim_to_ignore: int) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            # Look for cross-attention modules
+            # Look for self-attention modules (typically attn1 but let's not guess)
             if 'attn' in name.lower() and (
                 hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
             ) and (
@@ -857,11 +947,13 @@ class EveryDreamOptimizer:
             ):
                 yield name
 
-    def _apply_unet_freeze(self, unet: UNet2DConditionModel,
-                           unet_freeze_config: dict[str, bool],
-                           unet_component_lr_config: dict,
-                           cross_attention_dim_to_find: int
-                           ):
+    def _apply_unet_freeze(
+        self,
+        unet: UNet2DConditionModel,
+        unet_freeze_config: dict[str, bool],
+        unet_component_lr_config: dict,
+        cross_attention_dim_to_find: int,
+    ):
         """
         Returns either:
         - A simple chain of parameters (old behavior) if no component LR config
@@ -882,10 +974,40 @@ class EveryDreamOptimizer:
             unet,
             cross_attention_dim_to_find=cross_attention_dim_to_find,
         ))
+        attn_norm2_layer_names = list(self._get_attention_norm2_layer_names(unet))
+        attn_norm3_layer_names = list(self._get_attention_norm3_layer_names(unet))
+        attn_feedforward_layer_names = list(self._get_attention_feedforward_layer_names(unet))
+        resnets_norm2_layer_names = list(self._get_resnet_norm2_layer_names(unet))
+        resnets_conv2_layer_names = list(self._get_resnet_conv2_layer_names(unet))
+
         freeze_cross_attn = unet_freeze_config.get("freeze_cross_attention", None)
-        if freeze_cross_attn:
+        if freeze_cross_attn is not None:
             print(f"{'' if freeze_cross_attn else 'un'}freezing cross attention layers:")
             print(cross_attn_layer_names)
+        freeze_attn_norm2 = unet_freeze_config.get("freeze_attention_norm2", None)
+        if freeze_attn_norm2 is not None:
+            print(f"{'' if freeze_attn_norm2 else 'un'}freezing attention norm2 layers:")
+            print(attn_norm2_layer_names)
+        freeze_attn_norm3 = unet_freeze_config.get("freeze_attention_norm3", None)
+        if freeze_attn_norm3 is not None:
+            print(f"{'' if freeze_attn_norm3 else 'un'}freezing attention norm3 layers:")
+            print(attn_norm3_layer_names)
+
+        freeze_attn_feedforward = unet_freeze_config.get("freeze_attention_feedforward", None)
+        if freeze_attn_feedforward is not None:
+            print(
+                f"{'' if freeze_attn_feedforward else 'un'}freezing attention feedforward layers:"
+            )
+            print(attn_feedforward_layer_names)
+
+        freeze_resnets_norm2 = unet_freeze_config.get("freeze_resnets_norm2", None)
+        if freeze_resnets_norm2 is not None:
+            print(f"{'' if freeze_resnets_norm2 else 'un'}freezing resnets norm2 layers:")
+            print(resnets_norm2_layer_names)
+        freeze_resnets_conv2 = unet_freeze_config.get("freeze_resnets_conv2", None)
+        if freeze_resnets_conv2 is not None:
+            print(f"{'' if freeze_resnets_conv2 else 'un'}freezing resnets conv2 layers:")
+            print(resnets_conv2_layer_names)
 
         freeze_self_attn = unet_freeze_config.get("freeze_self_attention", None)
         self_attn_layer_names = list(self._get_self_attention_layer_names(
@@ -896,12 +1018,20 @@ class EveryDreamOptimizer:
             print(f"{'' if freeze_self_attn else 'un'}freezing self attention layers:")
             print(self_attn_layer_names)
 
+        time_embedding_layer_names = [name for name, _ in unet.named_parameters()
+                                      if name.startswith('time_embedding.linear')]
+        time_proj_layer_names = [name for name, _ in unet.named_parameters() if 'time_emb_proj' in name]
+
         freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
         spatial_resnet_prefixes = ["mid_block.resnets", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
         freeze_all_resnets = unet_freeze_config.get("freeze_all_resnets", None)
         resnet_layer_prefixes = [f"down_blocks.{i}.resnets" for i in range(4)] + ["mid_blocks.resnets"] + [f"up_blocks.{i}.resnets" for i in range(4)]
         freeze_late_up_resnets = unet_freeze_config.get("freeze_late_up_resnets", None)
         late_up_resnet_layer_prefixes = ["up_blocks.2.resnets", "up_blocks.3.resnets"]
+        freeze_time_embedding_and_proj = unet_freeze_config.get("freeze_time_embedding_and_proj", None)
+        freeze_time_embedding = unet_freeze_config.get("freeze_time_embedding", freeze_time_embedding_and_proj)
+        freeze_time_proj = unet_freeze_config.get("freeze_time_proj", freeze_time_embedding_and_proj)
+
 
         def should_freeze(n):
             # maybe freeze
@@ -909,6 +1039,20 @@ class EveryDreamOptimizer:
                 return freeze_cross_attn
             elif freeze_self_attn is not None and any(n.startswith(prefix) for prefix in self_attn_layer_names):
                 return freeze_self_attn
+            elif freeze_attn_feedforward is not None and any(n.startswith(prefix) for prefix in attn_feedforward_layer_names):
+                return freeze_attn_feedforward
+            elif freeze_attn_norm2 is not None and any(n.startswith(prefix) for prefix in attn_norm2_layer_names):
+                return freeze_attn_norm2
+            elif freeze_attn_norm3 is not None and any(n.startswith(prefix) for prefix in attn_norm3_layer_names):
+                return freeze_attn_norm3
+            elif freeze_time_embedding is not None and any(n.startswith(prefix) for prefix in time_embedding_layer_names):
+                return freeze_time_embedding
+            elif freeze_time_proj is not None and any(n.startswith(prefix) for prefix in time_proj_layer_names):
+                return freeze_time_proj
+            elif freeze_resnets_norm2 is not None and any(n.startswith(prefix) for prefix in resnets_norm2_layer_names):
+                return freeze_resnets_norm2
+            elif freeze_resnets_conv2 is not None and any(n.startswith(prefix) for prefix in resnets_conv2_layer_names):
+                return freeze_resnets_conv2
             elif freeze_spatial_resnets is not None and any(n.startswith(prefix) for prefix in spatial_resnet_prefixes):
                 return freeze_spatial_resnets
             elif freeze_late_up_resnets is not None and any(n.startswith(prefix) for prefix in late_up_resnet_layer_prefixes):
