@@ -106,25 +106,61 @@ def get_latents(image, model: TrainingModel, device, args):
         latents = latents[0].sample() * scaling_factor
         return latents
 
-def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
-             caption_str, mask, timesteps, loss_scale, noise_scheduler,
+def get_loss(model_pred, target, is_cond_dropout,
+             mask_img, timesteps, loss_scale,
+             noise_scheduler,
              do_contrastive_learning,
-             contrastive_learning_negative_loss_scale, args):
+             contrastive_loss_scale,
+             args,
+             verbose=False):
 
     #logging.info(f"get_loss timesteps: {timesteps.detach().cpu().tolist()}")
     device = model_pred.device
 
-    if mask is not None:
-        mask = mask.repeat(1, target.shape[1], 1, 1).to(target.device)
+    if mask_img is not None:
+        mask_img = mask_img.repeat(1, target.shape[1], 1, 1).to(target.device)
     else:
-        mask = torch.ones_like(target)
+        mask_img = torch.ones_like(target)
+
+    def timestep_weight_loss(loss: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+
+        if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
+            if args.train_sampler == 'flow-matching':
+                t = timesteps / noise_scheduler.config.num_train_timesteps
+                snr = (1 - t) / (t + 1e-8)  # Linear approximation
+                snr_weight = torch.minimum(snr, torch.tensor(args.min_snr_gamma)) / (snr + 1e-8)
+            else:
+                snr = compute_snr(timesteps, noise_scheduler)
+                v_pred = noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]
+                divisor = (snr + 1) if v_pred else snr
+                snr_weight = (
+                    torch.stack(
+                        [snr, args.min_snr_gamma * torch.ones_like(timesteps).float()], dim=1
+                    ).min(dim=1)[0]
+                    / divisor
+                )
+            snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
+            return loss * snr_weight.to(loss.device)
+        elif args.loss_mode_scale > 0:
+            # Scale loss to emphasize middle timesteps (mode around 500)
+            # loss_mode_scale=0 means uniform, higher values increase the peak
+            t_normalized = timesteps.float() / 1000.0  # normalize to [0, 1]
+            sharpness = 3
+            mode_weight = (
+                torch.cos(math.pi * (t_normalized - 0.5)) ** sharpness + 1
+            ) - 1
+            mode_weight = (1 - args.loss_mode_scale) + args.loss_mode_scale * mode_weight
+            mode_weight = mode_weight.view(-1, 1, 1, 1).expand_as(loss)
+            return loss * mode_weight.to(loss.device)
+        else:
+            return loss
+
 
     def compute_loss(model_pred: torch.Tensor, target: torch.Tensor, timesteps: torch.LongTensor, loss_scale: torch.Tensor):
         reduction = "none"
         loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction=reduction)
         loss_scale = torch.ones(model_pred.shape[0], dtype=torch.float) * loss_scale
         loss_scale = loss_scale.view(-1, 1, 1, 1).expand_as(loss_mse)
-
 
         loss_type = args.loss_type
         if loss_type == "mse_huber":
@@ -182,72 +218,124 @@ def get_loss(model_pred, target, model_pred_wrong, model_pred_wrong_mask,
             negative_loss_mask = ((loss_scale < 0) * 1.0).to(loss.device)
             loss = repulsion_loss * negative_loss_mask + loss * (1-negative_loss_mask)
 
-        if args.min_snr_gamma is not None and args.min_snr_gamma > 0:
-            if args.train_sampler == 'flow-matching':
-                t = timesteps / noise_scheduler.config.num_train_timesteps
-                snr = (1 - t) / (t + 1e-8)  # Linear approximation
-                snr_weight = torch.minimum(snr, torch.tensor(args.min_snr_gamma)) / (snr + 1e-8)
-            else:
-                snr = compute_snr(timesteps, noise_scheduler)
-                v_pred = noise_scheduler.config.prediction_type in ["v_prediction", "v-prediction"]
-                divisor = (snr + 1) if v_pred else snr
-                snr_weight = (
-                    torch.stack(
-                        [snr, args.min_snr_gamma * torch.ones_like(timesteps).float()], dim=1
-                    ).min(dim=1)[0]
-                    / divisor
-                )
-            snr_weight = snr_weight.view(-1, 1, 1, 1).expand_as(loss)
-            loss = loss * snr_weight.to(loss.device)
-
-        elif args.loss_mode_scale > 0:
-            # Scale loss to emphasize middle timesteps (mode around 500)
-            # loss_mode_scale=0 means uniform, higher values increase the peak
-            t_normalized = timesteps.float() / 1000.0  # normalize to [0, 1]
-            sharpness = 3
-            mode_weight = (
-                torch.cos(math.pi * (t_normalized - 0.5)) ** sharpness + 1
-            ) - 1
-            mode_weight = (1 - args.loss_mode_scale) + args.loss_mode_scale * mode_weight
-            mode_weight = mode_weight.view(-1, 1, 1, 1).expand_as(loss)
-            loss = loss * mode_weight.to(loss.device)
-
         return loss
 
-    non_contrastive_loss = compute_loss(model_pred, target, timesteps, loss_scale)
-    if not do_contrastive_learning:
-        return non_contrastive_loss * mask
+    non_contrastive_loss = timestep_weight_loss(compute_loss(model_pred, target, timesteps, loss_scale), timesteps=timesteps)
 
-    B = model_pred.shape[0]
-    temperature = 0.07
+    num_valid_contrastive_samples = (~is_cond_dropout).sum()
+    if not do_contrastive_learning or num_valid_contrastive_samples <= 1:
+        return non_contrastive_loss * mask_img
 
-    # Contrastive loss
-    # Flatten spatial dimensions for similarity computation
-    pred_flat = model_pred.reshape(B, -1)  # [B, C*H*W]
-    target_flat = target.reshape(B, -1)  # [B, C*H*W]
 
-    # Compute similarity matrix: how similar is each prediction to each target
-    # Using negative L2 distance as similarity (could also use cosine)
-    # sim[i, j] = similarity between prediction_i and target_j
-    sim_matrix = -torch.cdist(pred_flat, target_flat, p=2)  # [B, B]
+    def contrastive_loss_delta(model_pred, target, is_cond_dropout):
+        """
+        Delta-based contrastive loss: penalize when prediction deltas
+        match target deltas for different captions.
 
-    # Alternative: cosine similarity
-    # pred_norm = F.normalize(pred_flat, p=2, dim=1)
-    # target_norm = F.normalize(target_flat, p=2, dim=1)
-    # sim_matrix = torch.mm(pred_norm, target_norm.t())  # [B, B]
+        Args:
+            model_pred: [B, C, H, W] - model predictions
+            target: [B, C, H, W] - ground truth targets
+            is_dropped: [B] - boolean mask, True where conditioning was dropped
 
-    # Scale by temperature
-    sim_matrix = sim_matrix / temperature
+        Returns:
+            per_sample_loss: [B] - contrastive loss per sample (0 for dropped samples)
+        """
+        B = model_pred.shape[0]
+        device = model_pred.device
 
-    # InfoNCE: diagonal should be high, off-diagonal should be low
-    # Loss for each sample: -log(exp(sim[i,i]) / sum_j(exp(sim[i,j])))
-    labels = torch.arange(B, device=model_pred.device)
-    contrastive_loss = F.cross_entropy(sim_matrix, labels)
+        # Identify valid samples (not dropped)
+        valid_mask = ~is_cond_dropout
+
+        # Initialize per-sample losses
+        losses = torch.zeros(B, device=device)
+        neg_counts = torch.zeros(B, device=device)
+
+        # For each sample i
+        for i in range(B):
+            if not valid_mask[i]:
+                continue
+
+            # For each other sample j (negative)
+            for j in range(B):
+                if i == j or not valid_mask[j]:
+                    continue
+
+                # Compute delta between predictions
+                pred_delta = model_pred[j] - model_pred[i]
+                target_delta = target[j] - target[i]
+
+                # Loss: how much does pred_delta match target_delta?
+                # We want them to NOT match (higher loss = worse)
+                delta_loss = F.mse_loss(pred_delta, target_delta, reduction='mean')
+
+                losses[i] += delta_loss
+                neg_counts[i] += 1
+
+        # Average over number of negatives (avoid batch size dependence)
+        neg_counts = torch.clamp(neg_counts, min=1.0)  # Avoid division by zero
+        losses = losses / neg_counts
+
+        return losses
+
+
+    def contrastive_loss_infonce(model_pred, target, is_cond_dropout, timesteps):
+
+        [B_full, C, H, W] = model_pred.shape
+        valid_mask = ~is_cond_dropout
+        pred_valid = model_pred[valid_mask]
+        target_valid = target[valid_mask]
+
+        # Contrastive loss
+        # Flatten spatial dimensions for similarity computation
+        pred_flat = pred_valid.reshape(num_valid_contrastive_samples, -1)  # [B, C*H*W]
+        target_flat = target_valid.reshape(num_valid_contrastive_samples, -1)  # [B, C*H*W]
+
+        # Compute similarity matrix: how similar is each prediction to each target
+        # Using negative L2 distance as similarity (could also use cosine)
+        # sim[i, j] = similarity between prediction_i and target_j
+        dist_matrix = torch.cdist(pred_flat, target_flat, p=2)  # [B, B]
+        # Normalize by the dimensionality to get reasonable scale
+        dist_matrix = dist_matrix / (C * H * W) ** 0.5
+        sim_matrix = -dist_matrix / args.contrastive_loss_temperature
+
+        # Alternative: cosine similarity
+        # pred_norm = F.normalize(pred_flat, p=2, dim=1)
+        # target_norm = F.normalize(target_flat, p=2, dim=1)
+        # sim_matrix = torch.mm(pred_norm, target_norm.t())  # [B, B]
+
+        # InfoNCE: diagonal should be high, off-diagonal should be low
+        # Loss for each sample: -log(exp(sim[i,i]) / sum_j(exp(sim[i,j])))
+        labels = torch.arange(num_valid_contrastive_samples, device=model_pred.device)
+        contrastive_loss_valid = F.cross_entropy(sim_matrix, labels, reduction='none') / math.sqrt(num_valid_contrastive_samples)
+
+        # expand to cover cond dropout samples
+        contrastive_loss_full = torch.zeros(B_full, device=model_pred.device)
+        contrastive_loss_full[valid_mask] = contrastive_loss_valid
+
+        del contrastive_loss_valid
+
+        return contrastive_loss_full
+
+    with torch.autocast('cuda'):
+        contrastive_loss = contrastive_loss_infonce(model_pred, target, is_cond_dropout, timesteps) if args.contrastive_loss_type == 'infonce' else contrastive_loss_delta(model_pred, target, is_cond_dropout)
+    contrastive_loss = contrastive_loss.view(-1, 1, 1, 1).expand_as(
+        non_contrastive_loss
+    )
+    contrastive_loss = timestep_weight_loss(contrastive_loss, timesteps)
 
     # Combined loss
-    total_loss = (non_contrastive_loss + args.contrastive_learning_negative_loss_scale * contrastive_loss) * mask  # tune the weight
-
+    if verbose:
+        logging.info(
+            f"verbose loss logging:\n"
+            f" - timestep: {timesteps.detach().cpu().tolist()}\n"
+            f" - contrastive loss: {contrastive_loss.mean(dim=(1, 2, 3)).detach().cpu().tolist()} mean: {contrastive_loss.mean()}\n"
+            f" - non-contrastive loss: {non_contrastive_loss.mean(dim=(1, 2, 3)).detach().cpu().tolist()} mean: {non_contrastive_loss.mean()}\n"
+        )
+    total_loss = (
+        non_contrastive_loss + contrastive_loss * contrastive_loss_scale
+    ) * mask_img
     return total_loss
+
 
 
 def contrastive_loss_old():

@@ -149,8 +149,7 @@ class AttentionMapCollector:
             enable_gqa=False,
             target: AttentionMapCollector = None,
             map_name: str = "",
-            is_cross_attn=False,
-            **kwargs
+            is_cross_attn=False
         ):
             attn_output, attn_weights = (
                 _scaled_dot_product_attention_with_weight_return(
@@ -166,7 +165,10 @@ class AttentionMapCollector:
             )
             # merge all heads together by averaging
             # attn_weights has shape [B, num_heads, (H*W), num_tokens]
-            attn_weights = torch.mean(attn_weights, dim=1)  # now [B, (H*W), N]
+            if is_cross_attn:
+                attn_weights = torch.mean(attn_weights, dim=1)  # now [B, (H*W), N]
+            else:
+                attn_weights = torch.mean(attn_output, dim=1)
             # maps = torch.mean(maps, dim=1, keepdim=True)
             if self.verbose and map_name not in target.attention_maps:
                 # log on first addition
@@ -183,7 +185,6 @@ class AttentionMapCollector:
             if self.verbose and map_name not in target.attention_maps:
                 # log on first addition
                 print(f"storing maps of size {attn_weights.shape} for '{map_name}'")
-
             attn_output_to_store = attn_output.detach().cpu()
             if len(attn_output_to_store.shape) == 2:
                 attn_output_to_store = attn_output_to_store.unsqueeze(-1)
@@ -197,13 +198,20 @@ class AttentionMapCollector:
             return attn_output
 
         def pre_hook_fn(module, input, name, is_cross_attn):
-            # oerride sdp
+            # override sdp
             self._original_sdp_func = torch.nn.functional.scaled_dot_product_attention
             torch.nn.functional.scaled_dot_product_attention = partial(_sdp_with_map_saving, target=self, map_name=name, is_cross_attn=is_cross_attn)
 
         def post_hook_fn(module, input, output):
             # restore sdp
             torch.nn.functional.scaled_dot_product_attention = self._original_sdp_func
+
+        def output_save_hook_fn(module, input, output, target: AttentionMapCollector, map_name: str):
+            # save output directly
+            if self.verbose and map_name not in target.attention_maps:
+                # log on first addition
+                print(f"storing attn outputs of size {output.shape} for '{map_name}'")
+            target.attention_maps[map_name].append(output.detach().cpu())
 
         # Find all cross-attention modules and register hooks
         # attn_modules = {n: m for n, m in pipeline.unet.named_modules() if 'attn' in n.lower() and hasattr(m, 'to_q') and hasattr(m, 'to_k') and hasattr(m, 'to_v') and m.cross_attention_dim == pipeline.text_encoder.config.hidden_size}
@@ -213,15 +221,18 @@ class AttentionMapCollector:
                 hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
             ):
                 is_cross_attn = module.cross_attention_dim == self.text_encoder_hidden_size
-                #if not is_cross_attn:
-                #    continue
-                module: torch.nn.Module
-                pre_hook = module.register_forward_pre_hook(
-                    lambda mod, inp, n=name, is_cross=is_cross_attn: pre_hook_fn(module=mod, input=inp, name=n, is_cross_attn=is_cross)
-                )
-                self.hooks.append(pre_hook)
-                post_hook = module.register_forward_hook(post_hook_fn)
-                self.hooks.append(post_hook)
+                if is_cross_attn:
+                    module: torch.nn.Module
+                    pre_hook = module.register_forward_pre_hook(
+                        lambda mod, inp, n=name, is_cross=is_cross_attn: pre_hook_fn(module=mod, input=inp, name=n, is_cross_attn=is_cross)
+                    )
+                    self.hooks.append(pre_hook)
+                    post_hook = module.register_forward_hook(post_hook_fn)
+                    self.hooks.append(post_hook)
+                else:
+                    save_output_hook = partial(output_save_hook_fn, target=self, map_name=name)
+                    self.hooks.append(module.register_forward_hook(save_output_hook))
+
 
     def remove_hooks(self):
         """Remove all registered hooks."""

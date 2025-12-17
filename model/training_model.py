@@ -112,7 +112,9 @@ class TrainingVariables:
     cond_dropout_count = 0
     non_cond_dropout_count = 0
 
-    remaining_timesteps: torch.Tensor|None = None
+    remaining_stratified_timesteps: torch.Tensor | None = None
+    shared_timestep: int|None = None
+    shared_noise: torch.Tensor|None = None
 
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
 

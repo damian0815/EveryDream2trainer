@@ -339,50 +339,55 @@ class ImageTrainItem:
             err = f"Unable to load image for {self.pathname}: {e}"
             logging.error(err)
             print(err)
-            return None, (None, None, None, None) if return_crop_info else None
+            image = None
         mask = self.load_mask() if load_mask else None
 
-        width, height = image.size
-        if mask is not None:
-            if mask.size[0] != width or mask.size[1] != height:
-                logging.error(f"found a mask at {self.pathname_mask} but it was the wrong size (image size {image.size}, mask size {mask.size}) - ignoring mask")
-                mask = None
-
-        img_jitter = min((width-self.target_wh[0])/self.target_wh[0], (height-self.target_wh[1])/self.target_wh[1])
-        img_jitter = min(img_jitter, crop_jitter)
-        img_jitter = max(img_jitter, 0.0)
-        
-        if img_jitter > 0.0:
-            jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
-            image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
-            if mask is not None:
-                mask = self._apply_crop_jitter(mask, precomputed_jitter=jitter_amounts)
+        if image is None:
+            uncropped_width, uncropped_height = self.target_wh
+            crop_topleft = (0, 0)
         else:
-            jitter_amounts = (0, 0, 0, 0)
-        crop_topleft = (jitter_amounts[0], jitter_amounts[2])
-
-        uncropped_width, uncropped_height = image.size
-        image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh)
-        if mask is not None:
-            mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh)
-        crop_topleft = (crop_topleft[0] + trim_crop_offset[0], crop_topleft[1] + trim_crop_offset[1])
-
-        image = image.resize(self.target_wh)
-        if mask:
-            mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
-
-        if random.random() < self.flip.p:
-            image = TF.hflip(image)
+            width, height = image.size
             if mask is not None:
-                mask = TF.hflip(mask)
+                if mask.size[0] != width or mask.size[1] != height:
+                    logging.error(f"found a mask at {self.pathname_mask} but it was the wrong size (image size {image.size}, mask size {mask.size}) - ignoring mask")
+                    mask = None
+    
+            img_jitter = min((width-self.target_wh[0])/self.target_wh[0], (height-self.target_wh[1])/self.target_wh[1])
+            img_jitter = min(img_jitter, crop_jitter)
+            img_jitter = max(img_jitter, 0.0)
+            
+            if img_jitter > 0.0:
+                jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
+                image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
+                if mask is not None:
+                    mask = self._apply_crop_jitter(mask, precomputed_jitter=jitter_amounts)
+            else:
+                jitter_amounts = (0, 0, 0, 0)
+            crop_topleft = (jitter_amounts[0], jitter_amounts[2])
+
+            uncropped_width, uncropped_height = image.size
+            image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh)
+            if mask is not None:
+                mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh)
+            crop_topleft = (crop_topleft[0] + trim_crop_offset[0], crop_topleft[1] + trim_crop_offset[1])
+
+            image = image.resize(self.target_wh)
+            if mask:
+                mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
+
+            if random.random() < self.flip.p:
+                image = TF.hflip(image)
+                if mask is not None:
+                    mask = TF.hflip(mask)
+
+            if save:
+                self._debug_save_image(image, "final")
+
+            image = np.array(image).astype(np.uint8)
 
         self.image = image
         self.mask = mask
 
-        if save:
-            self._debug_save_image(self.image, "final")
-
-        self.image = np.array(self.image).astype(np.uint8)
         if self.mask is not None:
             self.mask = np.array(self.mask.convert('L')).astype(np.float32) / 255
             if np.count_nonzero(self.mask) == 0:

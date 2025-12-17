@@ -343,7 +343,10 @@ def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, l
     else:
         optimizer.backward(tv.accumulated_loss)
         try:
-            #optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
+            if not optimizer.use_grad_scaler:
+                # if we have a grad scaler it suppresses NaN/Inf for us.
+                # otherwise, we have to suppress NaN/Inf manually
+                optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
             tv.effective_backward_size = tv.accumulated_loss_images_count
             tv.backwarded_images_count += tv.accumulated_loss_images_count
             # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
@@ -628,7 +631,7 @@ def main(args):
         plugin_runner=plugin_runner,
         rated_dataset=args.rated_dataset,
         rated_dataset_dropout_target=(1.0 - (args.rated_dataset_target_dropout_percent / 100.0)),
-        contrastive_learning_batch_ids=args.contrastive_learning_batch_ids,
+        contrastive_loss_batch_ids=args.contrastive_loss_batch_ids,
         contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
         cond_dropout_noise_p=args.cond_dropout_noise_p,
         use_masks=args.use_masks,
@@ -848,7 +851,8 @@ def main(args):
         needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
         tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
-        tv.remaining_timesteps = None
+        tv.remaining_stratified_timesteps = None
+        tv.shared_timestep = None
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1019,13 +1023,13 @@ def main(args):
                         assert batch["runt_size"] == 0
 
                         if args.contrastive_learning_curriculum_alpha == 0:
-                            contrastive_learning_negative_loss_scale = args.contrastive_learning_negative_loss_scale
+                            contrastive_loss_scale = args.contrastive_loss_scale
                         else:
-                            contrastive_learning_negative_loss_scale = get_exponential_scaled_value(train_progress_01,
+                            contrastive_loss_scale = get_exponential_scaled_value(train_progress_01,
                                                                        initial_value=args.contrastive_learning_negative_loss_scale,
                                                                        final_value=0,
                                                                        alpha=args.contrastive_learning_curriculum_alpha)
-                            # print('contrastive learning negative loss scale:', contrastive_learning_negative_loss_scale)
+                            # print('contrastive learning negative loss scale:', contrastive_loss_scale)
 
                         loss_scale = args.loss_scale * batch["loss_scale"]
                         assert loss_scale.shape[0] == batch["image"].shape[0]
@@ -1197,10 +1201,10 @@ def main(args):
                             model_pred_wrong_mask_all = []
                             target_all = []
 
-                            cond_dropout_mask = torch.tensor([(s is None or len(s.strip()) == 0)
+                            is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
                                                               for s in caption_str[0:batch_size]], device=model.unet.device, dtype=torch.bool)
-                            tv.cond_dropout_count += torch.sum(cond_dropout_mask)
-                            tv.non_cond_dropout_count += torch.sum(~cond_dropout_mask)
+                            tv.cond_dropout_count += torch.sum(is_cond_dropout)
+                            tv.non_cond_dropout_count += torch.sum(~is_cond_dropout)
 
                             slices = list(get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size))
                             for slice_index, (slice_start, slice_end) in enumerate(slices):
@@ -1270,7 +1274,7 @@ def main(args):
                                 del conditioning
 
                             nibble_size_actual = min(slice_end, batch_size - runt_size)
-                            mask = None if batch["mask"] is None else batch["mask"][0:nibble_size_actual]
+                            mask_img = None if batch["mask"] is None else batch["mask"][0:nibble_size_actual]
 
                             model_pred = torch.cat(model_pred_all)
                             if any(x is not None for x in model_pred_wrong_all):
@@ -1284,15 +1288,14 @@ def main(args):
 
                             loss = get_loss(model_pred,
                                             target,
-                                            model_pred_wrong=model_pred_wrong,
-                                            model_pred_wrong_mask=model_pred_wrong_mask,
-                                            caption_str=caption_str[0:nibble_size_actual],
-                                            mask=mask,
+                                            is_cond_dropout=is_cond_dropout,
+                                            mask_img=mask_img,
                                             timesteps=timesteps[0:nibble_size_actual],
                                             loss_scale=loss_scale[0:nibble_size_actual],
                                             noise_scheduler=model.noise_scheduler,
                                             do_contrastive_learning=full_batch["do_contrastive_learning"],
-                                            contrastive_learning_negative_loss_scale=contrastive_learning_negative_loss_scale,
+                                            contrastive_loss_scale = contrastive_loss_scale,
+                                            verbose=(tv.global_step % 200 == 0),
                                             args=args,
                                             )
                             #logging.info(
@@ -1307,8 +1310,8 @@ def main(args):
                             log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
                             del target, model_pred, model_pred_wrong, model_pred_wrong_mask
 
-                            log_data.loss_log_step_cd.append(loss[cond_dropout_mask].mean().detach().item())
-                            log_data.loss_log_step_non_cd.append(loss[~cond_dropout_mask].mean().detach().item())
+                            log_data.loss_log_step_cd.append(loss[is_cond_dropout].mean().detach().item())
+                            log_data.loss_log_step_non_cd.append(loss[~is_cond_dropout].mean().detach().item())
                             consumed_timesteps = []
                             for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
                                 used_timestep_detached = int(used_timestep.detach().item())
@@ -1567,13 +1570,31 @@ def main(args):
 
 def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: TrainingModel, tv: TrainingVariables, args):
     full_batch_size = full_batch["image"].shape[0]
+    timesteps = _get_step_timesteps_internal(
+        full_batch_size,
+        full_batch_timesteps_range=full_batch["timesteps_range"],
+        train_progress_01=train_progress_01,
+        model=model,
+        tv=tv,
+        args=args,
+    )
+    # share timestep?
+    do_contrastive_learning = full_batch["do_contrastive_learning"]
+    if do_contrastive_learning or args.batch_share_timesteps:
+        timestep_index = torch.randint(full_batch_size, size=(1,))[0]
+        timesteps = timesteps[timestep_index].unsqueeze(0).repeat(full_batch_size)
+
+    return timesteps
+
+
+def _get_step_timesteps_internal(full_batch_size: int, full_batch_timesteps_range, train_progress_01: float, model: TrainingModel, tv: TrainingVariables, args) -> torch.Tensor:
 
     if args.timesteps_multirank_stratified:
         # the point of multirank stratified is to spread timesteps evenly across the batch.
         # so we need to do a dance here to make sure that we're actually spreading across the
         # desired_effective_batch_size - which will be "nibbled" below in chunks
-        while tv.remaining_timesteps is None or tv.remaining_timesteps.shape[0] < max(full_batch_size,
-                                                                                tv.desired_effective_batch_size):
+        while tv.remaining_stratified_timesteps is None or tv.remaining_stratified_timesteps.shape[0] < max(full_batch_size,
+                                                                                                            tv.desired_effective_batch_size):
             next_timesteps = get_multirank_stratified_random_timesteps(
                 tv.desired_effective_batch_size,
                 device=model.unet.device,
@@ -1584,14 +1605,14 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                 scheduler=model.noise_scheduler,
                 stratify=args.timesteps_multirank_stratified_stratify,
             )
-            tv.remaining_timesteps = next_timesteps if tv.remaining_timesteps is None else torch.cat(
-                [tv.remaining_timesteps, next_timesteps])
-        timesteps: torch.Tensor = tv.remaining_timesteps[:full_batch_size]
-        tv.remaining_timesteps = tv.remaining_timesteps[full_batch_size:]
+            tv.remaining_stratified_timesteps = next_timesteps if tv.remaining_stratified_timesteps is None else torch.cat(
+                [tv.remaining_stratified_timesteps, next_timesteps])
+        timesteps: torch.Tensor = tv.remaining_stratified_timesteps[:full_batch_size]
+        tv.remaining_stratified_timesteps = tv.remaining_stratified_timesteps[full_batch_size:]
         return timesteps
     else:
-        if full_batch["timesteps_range"] is not None:
-            timesteps_ranges_base = full_batch["timesteps_range"]
+        if full_batch_timesteps_range is not None:
+            timesteps_ranges_base = full_batch_timesteps_range
         else:
             if args.timestep_curriculum_alpha == 0:
                 timestep_range = (args.timestep_start, args.timestep_end)
@@ -1626,11 +1647,9 @@ def _get_step_timesteps(full_batch: dict, train_progress_01: float, model: Train
                 max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], num_train_timesteps)))),
         ) for tsr in timesteps_ranges_base]
 
-        do_contrastive_learning = full_batch["do_contrastive_learning"]
         timesteps: torch.LongTensor = get_timesteps(
             batch_size=full_batch_size,
-            batch_share_timesteps=(
-                    do_contrastive_learning or args.batch_share_timesteps),
+            batch_share_timesteps=False,
             device=model.device,
             timesteps_ranges=timesteps_ranges_expanded,
             scheduler=model.noise_scheduler,
@@ -1720,6 +1739,8 @@ if __name__ == "__main__":
     argparser.add_argument("--no_prepend_last", action="store_true", help="Do not prepend 'last-' to the final checkpoint filename")
     argparser.add_argument("--no_save_ckpt", action="store_true", help="Save only diffusers files, not .safetensors files (save disk space if you do not need LDM-style checkpoints)" )
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
+    argparser.add_argument("--unet_freeze_regex", default=None, help="Unet freeze regex(es). Specify multiply matches by separating with `;`. Matches are applied in order. `!` specifies negative (unfreeze). Last match wins. eg: --unet_freeze_regex \"\\.*;!down_blocks\\.0\\..*attentions.*;.*\\.norm1\" -> freeze all, then unfreeze attention modules in down_block 0 except norm1 layers. Use --debug_unet_freeze_regex to apply rules and dump to console without actually training.")
+    argparser.add_argument("--debug_unet_freeze_regex", action="store_true", help="If passed, apply unet freeze regex and dump results to console without training")
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
     argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=aspects.get_supported_resolutions())
@@ -1781,8 +1802,11 @@ if __name__ == "__main__":
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
     argparser.add_argument("--teacher_p", type=float, default=0.5, help="Probability of teacher model being used as target")
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
-    argparser.add_argument("--contrastive_learning_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[])")
-    argparser.add_argument("--contrastive_learning_negative_loss_scale", type=float, default=0.2, help="Scaling factor for contrastive learning negative loss")
+    argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")
+    argparser.add_argument("--contrastive_loss_scale", type=float, default=1, help="Scaling factor for contrastive loss")
+    argparser.add_argument("--contrastive_loss_type", type=str, choices=['infonce', 'delta'], help="Type of contrastive loss (infonce or negative-delta)")
+    argparser.add_argument("--contrastive_loss_temperature", type=float, default=0.07, help="Temperature for infonce contrastive loss (lower=more aggressive)")
+
     argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")
     argparser.add_argument("--contrastive_learning_use_l1_loss", action="store_true", help="use L1 loss instead of MSE for contrastive negative term")
     argparser.add_argument("--contrastive_learning_no_average_negatives", action="store_true", help="do not average negative terms per batch")

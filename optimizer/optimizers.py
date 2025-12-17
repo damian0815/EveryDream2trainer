@@ -183,8 +183,12 @@ class EveryDreamOptimizer:
                 model.unet,
                 unet_freeze_config=optimizer_config.get("unet_freezing", {}),
                 unet_component_lr_config=self.unet_component_lr_config,
-                cross_attention_dim_to_find=2048 if model.is_sdxl else model.text_encoder.config.hidden_size
+                cross_attention_dim_to_find=2048 if model.is_sdxl else model.text_encoder.config.hidden_size,
+                unet_freeze_regex=args.unet_freeze_regex
             )
+        if args.debug_unet_freeze_regex:
+            logging.info("--debug_unet_freeze_regex passed - bailing out")
+            exit(0)
 
         if args.jacobian_descent:
             from torchjd.aggregation import UPGrad
@@ -931,6 +935,19 @@ class EveryDreamOptimizer:
             if '.attentions.' in name.lower() and '.ff' in name.lower():
                 yield name
 
+    def _get_upearly_attention_layer_names(self, unet, cross_attention_dim: int, cross_attn: bool, self_attn: bool) -> Generator[str, None, None]:
+        for name, module in unet.named_modules():
+            # Look for self-attention modules (typically attn1 but let's not guess)
+            if 'attn' in name and 'up_blocks' in name and 'up_blocks.3' not in name and (
+                hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
+            ):
+                is_cross = module.cross_attention_dim == cross_attention_dim
+                if cross_attn and is_cross:
+                    yield name
+                elif self_attn and not is_cross:
+                    yield name
+
+
     def _get_self_attention_layer_names(self, unet, cross_attention_dim_to_ignore: int) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
             # Look for self-attention modules (typically attn1 but let's not guess)
@@ -945,6 +962,7 @@ class EveryDreamOptimizer:
         self,
         unet: UNet2DConditionModel,
         unet_freeze_config: dict[str, bool],
+        unet_freeze_regex: str|None,
         unet_component_lr_config: dict,
         cross_attention_dim_to_find: int,
     ):
@@ -953,122 +971,164 @@ class EveryDreamOptimizer:
         - A simple chain of parameters (old behavior) if no component LR config
         - A dict with component groups if component LR config is provided
         """
-        freeze_prefixes = []
-        if unet_freeze_config.get("freeze_in", False):
-            freeze_prefixes.extend(['time_embedding.', 'conv_in.', 'down_blocks.', 'add_embedding.'])
-        if unet_freeze_config.get("freeze_mid", False):
-            freeze_prefixes.extend(['mid_block'])
-        if unet_freeze_config.get("freeze_out", False):
-            freeze_prefixes.extend(['conv_norm_out.', 'conv_out.', 'up_blocks.'])
 
-        if 'unfreeze_cross_attention' in unet_freeze_config or 'unfreeze_self_attention' in unet_freeze_config or 'unfreeze_spatial_resnets' in unet_freeze_config:
-            raise ValueError("unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)")
+        if unet_freeze_regex is not None:
+            if len(unet_freeze_config.keys()) > 0:
+                raise ValueError("Cannot use both --unet_freeze_regex args and unet_freeze_config optimizer.json section at the same time")
 
-        cross_attn_layer_names = list(self._get_cross_attention_layer_names(
-            unet,
-            cross_attention_dim_to_find=cross_attention_dim_to_find,
-        ))
+            def should_freeze_from_regex(name: str) -> bool:
+                # regex can be multi-command - separated by ;
+                # 1. split at ;
+                # 2. apply each rule in sequence, last match wins
+                should_freeze = False
+                rules = unet_freeze_regex.split(';')
+                for rule in rules:
+                    rule = rule.strip()
+                    if rule == '':
+                        continue
+                    if rule.startswith('#'):
+                        # comment
+                        continue
+                    is_negative = rule.startswith('!')
+                    pattern = rule[1:].strip() if is_negative else rule
+                    if re.search(pattern, name):
+                        should_freeze = not is_negative
+                return should_freeze
 
-        attn_norm2_layer_names = list(
-            self._get_module_component_layer_names(unet, 'attentions', 'norm2')
-        )
-        attn_norm3_layer_names = list(
-            self._get_module_component_layer_names(unet, "attentions", "norm3")
-        )
-        attn_feedforward_layer_names = list(
-            self._get_module_component_layer_names(unet, "attentions", "ff")
-        )
-        resnets_norm1_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm1'))
-        resnets_norm2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm2'))
-        resnets_conv2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'conv2'))
+            should_freeze = lambda name: should_freeze_from_regex(name)
 
-        freeze_cross_attn = unet_freeze_config.get("freeze_cross_attention", None)
-        if freeze_cross_attn is not None:
-            print(f"{'' if freeze_cross_attn else 'un'}freezing cross attention layers:")
-            print(cross_attn_layer_names)
-        freeze_attn_norm2 = unet_freeze_config.get("freeze_attention_norm2", None)
-        if freeze_attn_norm2 is not None:
-            print(f"{'' if freeze_attn_norm2 else 'un'}freezing attention norm2 layers:")
-            print(attn_norm2_layer_names)
-        freeze_attn_norm3 = unet_freeze_config.get("freeze_attention_norm3", None)
-        if freeze_attn_norm3 is not None:
-            print(f"{'' if freeze_attn_norm3 else 'un'}freezing attention norm3 layers:")
-            print(attn_norm3_layer_names)
+        else:
+            freeze_prefixes = []
+            if unet_freeze_config.get("freeze_in", False):
+                freeze_prefixes.extend(['time_embedding.', 'conv_in.', 'down_blocks.', 'add_embedding.'])
+            if unet_freeze_config.get("freeze_mid", False):
+                freeze_prefixes.extend(['mid_block'])
+            if unet_freeze_config.get("freeze_out", False):
+                freeze_prefixes.extend(['conv_norm_out.', 'conv_out.', 'up_blocks.'])
 
-        freeze_attn_feedforward = unet_freeze_config.get("freeze_attention_feedforward", None)
-        if freeze_attn_feedforward is not None:
-            print(
-                f"{'' if freeze_attn_feedforward else 'un'}freezing attention feedforward layers:"
+            if 'unfreeze_cross_attention' in unet_freeze_config or 'unfreeze_self_attention' in unet_freeze_config or 'unfreeze_spatial_resnets' in unet_freeze_config:
+                raise ValueError("unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)")
+
+            cross_attn_layer_names = list(self._get_cross_attention_layer_names(
+                unet,
+                cross_attention_dim_to_find=cross_attention_dim_to_find,
+            ))
+
+            attn_norm2_layer_names = list(
+                self._get_module_component_layer_names(unet, 'attentions', 'norm2')
             )
-            print(attn_feedforward_layer_names)
+            attn_norm3_layer_names = list(
+                self._get_module_component_layer_names(unet, "attentions", "norm3")
+            )
+            attn_feedforward_layer_names = list(
+                self._get_module_component_layer_names(unet, "attentions", "ff")
+            )
+            resnets_norm1_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm1'))
+            resnets_norm2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm2'))
+            resnets_conv2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'conv2'))
 
-        freeze_resnets_norm1 = unet_freeze_config.get("freeze_resnets_norm1", None)
-        if freeze_resnets_norm1 is not None:
-            print(f"{'' if freeze_resnets_norm1 else 'un'}freezing resnets norm1 layers:")
-            print(resnets_norm1_layer_names)
-        freeze_resnets_norm2 = unet_freeze_config.get("freeze_resnets_norm2", None)
-        if freeze_resnets_norm2 is not None:
-            print(f"{'' if freeze_resnets_norm2 else 'un'}freezing resnets norm2 layers:")
-            print(resnets_norm2_layer_names)
-        freeze_resnets_conv2 = unet_freeze_config.get("freeze_resnets_conv2", None)
-        if freeze_resnets_conv2 is not None:
-            print(f"{'' if freeze_resnets_conv2 else 'un'}freezing resnets conv2 layers:")
-            print(resnets_conv2_layer_names)
+            freeze_cross_attn = unet_freeze_config.get("freeze_cross_attention", None)
+            if freeze_cross_attn is not None:
+                print(f"{'' if freeze_cross_attn else 'un'}freezing cross attention layers:")
+                print(cross_attn_layer_names)
+            freeze_attn_norm2 = unet_freeze_config.get("freeze_attention_norm2", None)
+            if freeze_attn_norm2 is not None:
+                print(f"{'' if freeze_attn_norm2 else 'un'}freezing attention norm2 layers:")
+                print(attn_norm2_layer_names)
+            freeze_attn_norm3 = unet_freeze_config.get("freeze_attention_norm3", None)
+            if freeze_attn_norm3 is not None:
+                print(f"{'' if freeze_attn_norm3 else 'un'}freezing attention norm3 layers:")
+                print(attn_norm3_layer_names)
 
-        freeze_self_attn = unet_freeze_config.get("freeze_self_attention", None)
-        self_attn_layer_names = list(self._get_self_attention_layer_names(
-            unet,
-            cross_attention_dim_to_ignore=cross_attention_dim_to_find,
-        ))
-        if freeze_self_attn is not None:
-            print(f"{'' if freeze_self_attn else 'un'}freezing self attention layers:")
-            print(self_attn_layer_names)
+            freeze_attn_feedforward = unet_freeze_config.get("freeze_attention_feedforward", None)
+            if freeze_attn_feedforward is not None:
+                print(
+                    f"{'' if freeze_attn_feedforward else 'un'}freezing attention feedforward layers:"
+                )
+                print(attn_feedforward_layer_names)
 
-        time_embedding_layer_names = [name for name, _ in unet.named_parameters()
-                                      if name.startswith('time_embedding.linear')]
-        time_proj_layer_names = [name for name, _ in unet.named_parameters() if 'time_emb_proj' in name]
+            freeze_resnets_norm1 = unet_freeze_config.get("freeze_resnets_norm1", None)
+            if freeze_resnets_norm1 is not None:
+                print(f"{'' if freeze_resnets_norm1 else 'un'}freezing resnets norm1 layers:")
+                print(resnets_norm1_layer_names)
+            freeze_resnets_norm2 = unet_freeze_config.get("freeze_resnets_norm2", None)
+            if freeze_resnets_norm2 is not None:
+                print(f"{'' if freeze_resnets_norm2 else 'un'}freezing resnets norm2 layers:")
+                print(resnets_norm2_layer_names)
+            freeze_resnets_conv2 = unet_freeze_config.get("freeze_resnets_conv2", None)
+            if freeze_resnets_conv2 is not None:
+                print(f"{'' if freeze_resnets_conv2 else 'un'}freezing resnets conv2 layers:")
+                print(resnets_conv2_layer_names)
 
-        freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
-        spatial_resnet_prefixes = ["mid_block.resnets", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
-        freeze_all_resnets = unet_freeze_config.get("freeze_all_resnets", None)
-        resnet_layer_prefixes = [f"down_blocks.{i}.resnets" for i in range(4)] + ["mid_blocks.resnets"] + [f"up_blocks.{i}.resnets" for i in range(4)]
-        freeze_late_up_resnets = unet_freeze_config.get("freeze_late_up_resnets", None)
-        late_up_resnet_layer_prefixes = ["up_blocks.2.resnets", "up_blocks.3.resnets"]
-        freeze_time_embedding_and_proj = unet_freeze_config.get("freeze_time_embedding_and_proj", None)
-        freeze_time_embedding = unet_freeze_config.get("freeze_time_embedding", freeze_time_embedding_and_proj)
-        freeze_time_proj = unet_freeze_config.get("freeze_time_proj", freeze_time_embedding_and_proj)
+            freeze_self_attn = unet_freeze_config.get("freeze_self_attention", None)
+            self_attn_layer_names = list(self._get_self_attention_layer_names(
+                unet,
+                cross_attention_dim_to_ignore=cross_attention_dim_to_find,
+            ))
 
+            upearly_attn_layer_names = list(self._get_upearly_attention_layer_names(
+                unet,
+                cross_attention_dim=cross_attention_dim_to_find,
+                cross_attn=True,
+                self_attn=True
+            ))
+            freeze_upearly_attn = unet_freeze_config.get("freeze_upearly_attention", None)
+            if freeze_upearly_attn is not None:
+                print(f"{'' if freeze_self_attn else 'un'}freezing self up-early attention layers:")
+                print(upearly_attn_layer_names)
 
-        def should_freeze(n):
-            # maybe freeze
-            if freeze_cross_attn is not None and any(n.startswith(prefix) for prefix in cross_attn_layer_names):
-                return freeze_cross_attn
-            elif freeze_self_attn is not None and any(n.startswith(prefix) for prefix in self_attn_layer_names):
-                return freeze_self_attn
-            elif freeze_attn_feedforward is not None and any(n.startswith(prefix) for prefix in attn_feedforward_layer_names):
-                return freeze_attn_feedforward
-            elif freeze_attn_norm2 is not None and any(n.startswith(prefix) for prefix in attn_norm2_layer_names):
-                return freeze_attn_norm2
-            elif freeze_attn_norm3 is not None and any(n.startswith(prefix) for prefix in attn_norm3_layer_names):
-                return freeze_attn_norm3
-            elif freeze_time_embedding is not None and any(n.startswith(prefix) for prefix in time_embedding_layer_names):
-                return freeze_time_embedding
-            elif freeze_time_proj is not None and any(n.startswith(prefix) for prefix in time_proj_layer_names):
-                return freeze_time_proj
-            elif freeze_resnets_norm1 is not None and any(n.startswith(prefix) for prefix in resnets_norm1_layer_names):
-                return freeze_resnets_norm1
-            elif freeze_resnets_norm2 is not None and any(n.startswith(prefix) for prefix in resnets_norm2_layer_names):
-                return freeze_resnets_norm2
-            elif freeze_resnets_conv2 is not None and any(n.startswith(prefix) for prefix in resnets_conv2_layer_names):
-                return freeze_resnets_conv2
-            elif freeze_spatial_resnets is not None and any(n.startswith(prefix) for prefix in spatial_resnet_prefixes):
-                return freeze_spatial_resnets
-            elif freeze_late_up_resnets is not None and any(n.startswith(prefix) for prefix in late_up_resnet_layer_prefixes):
-                return freeze_late_up_resnets
-            elif freeze_all_resnets is not None and any(n.startswith(prefix) for prefix in resnet_layer_prefixes):
-                return freeze_all_resnets
-            # fallback to general prefixes
-            return any(n.startswith(prefix) for prefix in freeze_prefixes)
+            time_embedding_layer_names = [name for name, _ in unet.named_parameters()
+                                          if name.startswith('time_embedding.linear')]
+            time_proj_layer_names = [name for name, _ in unet.named_parameters() if 'time_emb_proj' in name]
+
+            freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
+            spatial_resnet_prefixes = ["mid_block.resnets", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
+            freeze_all_resnets = unet_freeze_config.get("freeze_all_resnets", None)
+            resnet_layer_prefixes = [f"down_blocks.{i}.resnets" for i in range(4)] + ["mid_blocks.resnets"] + [f"up_blocks.{i}.resnets" for i in range(4)]
+            freeze_late_up_resnets = unet_freeze_config.get("freeze_late_up_resnets", None)
+            late_up_resnet_layer_prefixes = ["up_blocks.2.resnets", "up_blocks.3.resnets"]
+            freeze_early_up_resnets = unet_freeze_config.get("freeze_early_up_resnets", None)
+            early_up_resnet_layer_prefixes = ["up_blocks.0.resnets", "up_blocks.1.resnets", "up_blocks.2.resnets"]
+            freeze_time_embedding_and_proj = unet_freeze_config.get("freeze_time_embedding_and_proj", None)
+            freeze_time_embedding = unet_freeze_config.get("freeze_time_embedding", freeze_time_embedding_and_proj)
+            freeze_time_proj = unet_freeze_config.get("freeze_time_proj", freeze_time_embedding_and_proj)
+
+            def should_freeze_from_optimizer_json(n):
+                # maybe freeze
+                if freeze_cross_attn is not None and any(n.startswith(prefix) for prefix in cross_attn_layer_names):
+                    return freeze_cross_attn
+                elif freeze_self_attn is not None and any(n.startswith(prefix) for prefix in self_attn_layer_names):
+                    return freeze_self_attn
+                elif freeze_attn_feedforward is not None and any(n.startswith(prefix) for prefix in attn_feedforward_layer_names):
+                    return freeze_attn_feedforward
+                elif freeze_attn_norm2 is not None and any(n.startswith(prefix) for prefix in attn_norm2_layer_names):
+                    return freeze_attn_norm2
+                elif freeze_attn_norm3 is not None and any(n.startswith(prefix) for prefix in attn_norm3_layer_names):
+                    return freeze_attn_norm3
+                elif freeze_time_embedding is not None and any(n.startswith(prefix) for prefix in time_embedding_layer_names):
+                    return freeze_time_embedding
+                elif freeze_time_proj is not None and any(n.startswith(prefix) for prefix in time_proj_layer_names):
+                    return freeze_time_proj
+                elif freeze_resnets_norm1 is not None and any(n.startswith(prefix) for prefix in resnets_norm1_layer_names):
+                    return freeze_resnets_norm1
+                elif freeze_resnets_norm2 is not None and any(n.startswith(prefix) for prefix in resnets_norm2_layer_names):
+                    return freeze_resnets_norm2
+                elif freeze_resnets_conv2 is not None and any(n.startswith(prefix) for prefix in resnets_conv2_layer_names):
+                    return freeze_resnets_conv2
+                elif freeze_spatial_resnets is not None and any(n.startswith(prefix) for prefix in spatial_resnet_prefixes):
+                    return freeze_spatial_resnets
+                elif freeze_upearly_attn is not None and any(n.startswith(prefix) for prefix in upearly_attn_layer_names):
+                    return freeze_upearly_attn
+
+                elif freeze_late_up_resnets is not None and any(n.startswith(prefix) for prefix in late_up_resnet_layer_prefixes):
+                    return freeze_late_up_resnets
+                elif freeze_early_up_resnets is not None and any(n.startswith(prefix) for prefix in early_up_resnet_layer_prefixes):
+                    return freeze_early_up_resnets
+                elif freeze_all_resnets is not None and any(n.startswith(prefix) for prefix in resnet_layer_prefixes):
+                    return freeze_all_resnets
+                # fallback to general prefixes
+                return any(n.startswith(prefix) for prefix in freeze_prefixes)
+            should_freeze = lambda name: should_freeze_from_optimizer_json(name)
 
         def get_component_type(n):
             """Determine which component type a parameter belongs to"""

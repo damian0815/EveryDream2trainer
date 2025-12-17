@@ -54,7 +54,7 @@ class EveryDreamBatch(Dataset):
                  rated_dataset=False,
                  rated_dataset_dropout_target=0.5,
                  name='train',
-                 contrastive_learning_batch_ids=None,
+                 contrastive_loss_batch_ids=None,
                  use_masks=False,
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0,
@@ -66,7 +66,7 @@ class EveryDreamBatch(Dataset):
             print("EveryDreamBatch using empty PluginRunner")
             plugin_runner = PluginRunner()
 
-        self.contrastive_learning_batch_ids = contrastive_learning_batch_ids or []
+        self.contrastive_loss_batch_ids = contrastive_loss_batch_ids or []
         self.data_loader = data_loader
         self.batch_size = data_loader.batch_size
         self.debug_level = debug_level
@@ -232,15 +232,12 @@ class EveryDreamBatch(Dataset):
         example = {}
         save = debug_level > 2
 
-        do_contrastive_learning = (image_train_item.batch_id in self.contrastive_learning_batch_ids)
+        do_contrastive_learning = (image_train_item.batch_id in self.contrastive_loss_batch_ids)
         crop_jitter = (0.0
                        if image_train_item.runt_size > 0 # and do_contrastive_learning
                        else self.crop_jitter)
         image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=self.use_masks, return_crop_info=True)
-        if image_train_tmp is None:
-            example["image"] = None
-        else:
-            example["image"] = image_train_tmp.image.copy() # hack for now to avoid memory leak
+        example["image"] = None if image_train_tmp.image is None else image_train_tmp.image.copy() # hack for now to avoid memory leak
         example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy() # hack for now to avoid memory leak
         image_train_tmp.image = None # hack for now to avoid memory leak
         image_train_tmp.mask = None # hack for now to avoid memory leak
