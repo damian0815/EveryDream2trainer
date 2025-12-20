@@ -1,8 +1,8 @@
 import json
 import logging
 import random
-import threading
 import time
+import os
 
 from transformers import CLIPTokenizer
 
@@ -19,6 +19,8 @@ ending_dot_p = 0.5
 replace_dots_with_commas_p = 0.3
 """
 
+
+
 shuffle_sentences_p = 0.02
 too_long_caption_shuffle_sentences_p = 0.5
 shuffle_phrases_within_sentences_p = 0.01
@@ -31,9 +33,22 @@ replace_dots_with_commas_p = 0.02
 
 caption_variants = None
 
+config_path = 'caption_munger_config.json'
+
 class CaptionMungerPlugin(BasePlugin):
 
     tokenizer: CLIPTokenizer|None = None
+    config: dict
+
+    def on_training_start(self, **kwargs):
+        if os.path.exists(config_path):
+            logging.info(" * CaptionMungerPlugin: loading config from " + config_path)
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+        else:
+            logging.info(" * CaptionMungerPlugin: no config found at " + config_path + ", using defaults")
+            self.config = {}
+
 
     def on_model_load(self, **kwargs):
         self.tokenizer = kwargs['tokenizer']
@@ -72,6 +87,18 @@ class CaptionMungerPlugin(BasePlugin):
             variant = random.choice(list(transformed_json.keys()))
         return {variant: transformed_json[variant]}
 
+    def _get_prepend(self) -> str:
+        prepend_p = self.config.get('prepend_p', 0.5)
+        if prepend_p < random.random():
+            return ""
+        prepend_word = random.choice(self.config.get('prepend', ['']))
+        return prepend_word + ", "
+
+    def _get_dropout(self) -> str | None:
+        dropout_p = self.config.get('dropout_p', 0.0)
+        if dropout_p < random.random():
+            return None
+        return random.choice(self.config.get("dropout", ['']))
 
     def transform_caption(self, caption_in:str) -> str | dict[str, str]:
         caption = caption_in
@@ -79,6 +106,10 @@ class CaptionMungerPlugin(BasePlugin):
             return self.transform_caption_json_raw(
                 caption.replace("<<json>>", "")
             )
+
+        dropout = self._get_dropout()
+        if dropout is not None:
+            return dropout
 
         prefix = ""
         suffix = ""
@@ -89,6 +120,8 @@ class CaptionMungerPlugin(BasePlugin):
                                       shuffle_sentences_p=shuffle_sentences_p,
                                       truncate_sentences_p=0)
             caption = "<<shufbreak>>".join(parts[1:])
+
+        prefix = self._get_prepend() + prefix
 
         if "<<finally>>" in caption:
             parts = [p.strip() for p in caption.split("<<finally>>")]
@@ -126,11 +159,6 @@ class CaptionMungerPlugin(BasePlugin):
         if ending_dot_p > random.random():
             out_caption += "."
 
-        #print(f"transformed caption from '{caption}' to '{out_caption}'")
-        if 'cleavage<' in out_caption or '<cleavage' in out_caption:
-            print("broke!")
-            time.sleep(1)
-            return self.transform_caption(caption_in)
         return out_caption
 
 def _get_tokens_full(caption_with_shufbreaks, prefix, suffix, tokenizer: CLIPTokenizer) -> list[str]:

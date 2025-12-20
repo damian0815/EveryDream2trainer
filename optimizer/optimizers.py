@@ -19,7 +19,7 @@ import itertools
 import os
 from functools import partial
 from itertools import chain
-from typing import List, Tuple, Generator
+from typing import Generator
 
 import math
 import torch
@@ -28,6 +28,7 @@ from peft import LoraConfig
 import json
 from pathlib import Path
 
+from prodigyopt import Prodigy
 from torch.cuda.amp import GradScaler
 from diffusers.optimization import get_scheduler
 
@@ -47,7 +48,7 @@ WEIGHT_DECAY_DEFAULT = 0.01
 LR_DEFAULT = 1e-6
 OPTIMIZER_TE_STATE_FILENAME = "optimizer_te.pt"
 OPTIMIZER_UNET_STATE_FILENAME = "optimizer_unet.pt"
-SCALER_STATE_FILENAME = 'scaler.pt'
+SCALER_STATE_FILENAME = "scaler.pt"
 
 
 class InfOrNanException(Exception):
@@ -77,7 +78,9 @@ class LRSteering:
         for scheduler, start_lr in zip(schedulers, self.start_lr):
             new_lr = start_lr + (self.target_lr - start_lr) * progress
             self._set_base_lr(scheduler, new_lr)
-            logging.info(f" * LRSteering tween step {self.current_step}/{self.tween_steps} tweaked base LR to {new_lr}")
+            logging.info(
+                f" * LRSteering tween step {self.current_step}/{self.tween_steps} tweaked base LR to {new_lr}"
+            )
 
         # Clear steering when done
         if self.current_step >= self.tween_steps:
@@ -96,14 +99,15 @@ class LRSteering:
             self.tween_steps = config["tween_steps"]
             self.start_lr = [self._get_base_lr(s) for s in schedulers]
             self.current_step = 0
-            logging.info(f" * LRSteering tweaking LR from {self.start_lr} to {self.target_lr} over {self.tween_steps} steps")
+            logging.info(
+                f" * LRSteering tweaking LR from {self.start_lr} to {self.target_lr} over {self.tween_steps} steps"
+            )
 
             # Remove file after reading
             self.steer_file.unlink()
 
         except (json.JSONDecodeError, KeyError, IOError) as e:
             print(f"Error reading steer file: {e}")
-
 
     def _get_base_lr(self, scheduler):
         """Get the base LR from a scheduler."""
@@ -123,7 +127,16 @@ class EveryDreamOptimizer:
     text_encoder: text encoder model parameters
     unet: unet model parameters
     """
-    def __init__(self, args, optimizer_config, model: 'TrainingModel', epoch_len, plugin_runner: PluginRunner, log_writer=None):
+
+    def __init__(
+        self,
+        args,
+        optimizer_config,
+        model: "TrainingModel",
+        epoch_len,
+        plugin_runner: PluginRunner,
+        log_writer=None,
+    ):
         if optimizer_config is None:
             raise ValueError("missing optimizer_config")
         if "doc" in optimizer_config:
@@ -132,11 +145,13 @@ class EveryDreamOptimizer:
         pprint.pprint(optimizer_config)
         self.epoch_len = epoch_len
         self.max_epochs = args.max_epochs
-        self.unet = model.unet # needed for weight norm logging, unet.parameters() has to be called again, Diffusers quirk
+        self.unet = model.unet  # needed for weight norm logging, unet.parameters() has to be called again, Diffusers quirk
         self.text_encoder = model.text_encoder
         self.text_encoder_2 = model.text_encoder_2
         self.log_writer = log_writer
-        self.te_config, self.base_config = self.get_final_optimizer_configs(args, optimizer_config)
+        self.te_config, self.base_config = self.get_final_optimizer_configs(
+            args, optimizer_config
+        )
         self.te_freeze_config = optimizer_config.get("text_encoder_freezing", {})
         self.unet_component_lr_config = optimizer_config.get("unet_component_lr", {})
         print(" Final unet optimizer config:")
@@ -150,17 +165,23 @@ class EveryDreamOptimizer:
         self.grad_accum = args.grad_accum
         self.next_grad_accum_step = self.grad_accum
         self.clip_grad_norm = args.clip_grad_norm
-        self.apply_grad_scaler_step_tweaks = optimizer_config.get("apply_grad_scaler_step_tweaks", True)
+        self.apply_grad_scaler_step_tweaks = optimizer_config.get(
+            "apply_grad_scaler_step_tweaks", True
+        )
 
-        if 'use_grad_scaler' in optimizer_config:
-            logging.warning("* Ignoring use_grad_scaler entry in optimizer config, will be set automatically")
+        if "use_grad_scaler" in optimizer_config:
+            logging.warning(
+                "* Ignoring use_grad_scaler entry in optimizer config, will be set automatically"
+            )
         if model.unet.dtype == torch.bfloat16:
             self.use_grad_scaler = False
             logging.info("* bfloat16 unet: no grad scaler")
         elif model.unet.dtype == torch.float16:
             self.use_grad_scaler = True
             logging.info("* float16 unet: using grad scaler")
-        elif self.base_config['optimizer'].endswith('8bit') or self.te_config['optimizer'].endswith('8bit'):
+        elif self.base_config["optimizer"].endswith("8bit") or self.te_config[
+            "optimizer"
+        ].endswith("8bit"):
             self.use_grad_scaler = True
             logging.info("* 8bit optimizer: using grad scaler")
         elif model.unet.dtype != torch.float32:
@@ -173,18 +194,30 @@ class EveryDreamOptimizer:
         self.log_grad_norm = optimizer_config.get("log_grad_norm", True)
 
         if args.lora:
-            self.text_encoder_params, self.unet_params = self.setup_lora_training(args, model)
+            self.text_encoder_params, self.unet_params = self.setup_lora_training(
+                args, model
+            )
         else:
-            self.text_encoder_params = {'default': list(itertools.chain([
-                self._apply_text_encoder_freeze(model.text_encoder),
-                self._apply_text_encoder_freeze(model.text_encoder_2) if model.text_encoder_2 is not None else []
-            ]))}
+            self.text_encoder_params = {
+                "default": list(
+                    itertools.chain(
+                        [
+                            self._apply_text_encoder_freeze(model.text_encoder),
+                            self._apply_text_encoder_freeze(model.text_encoder_2)
+                            if model.text_encoder_2 is not None
+                            else [],
+                        ]
+                    )
+                )
+            }
             self.unet_params = self._apply_unet_freeze(
                 model.unet,
                 unet_freeze_config=optimizer_config.get("unet_freezing", {}),
                 unet_component_lr_config=self.unet_component_lr_config,
-                cross_attention_dim_to_find=2048 if model.is_sdxl else model.text_encoder.config.hidden_size,
-                unet_freeze_regex=args.unet_freeze_regex
+                cross_attention_dim_to_find=2048
+                if model.is_sdxl
+                else model.text_encoder.config.hidden_size,
+                unet_freeze_regex=args.unet_freeze_regex,
             )
         if args.debug_unet_freeze_regex:
             logging.info("--debug_unet_freeze_regex passed - bailing out")
@@ -193,26 +226,33 @@ class EveryDreamOptimizer:
         if args.jacobian_descent:
             from torchjd.aggregation import UPGrad
             import torchjd
+
             self.jacobian_aggregator = UPGrad()
             self.jacobian_backward = torchjd.backward
         else:
             self.jacobian_aggregator = None
 
-        self.text_encoder_params, _ = plugin_runner.run_add_parameters(self.text_encoder_params, [])
+        self.text_encoder_params, _ = plugin_runner.run_add_parameters(
+            self.text_encoder_params, []
+        )
         self.text_encoder_params = list(self.text_encoder_params)
 
-        #with torch.no_grad():
+        # with torch.no_grad():
         #    log_action = lambda n, label: logging.info(f"{Fore.LIGHTBLUE_EX} {label} weight normal: {n:.1f}{Style.RESET_ALL}")
         #    self._log_weight_normal(text_encoder.text_model.encoder.layers.parameters(), "text encoder", log_action)
         #    self._log_weight_normal(unet.parameters(), "unet", log_action)
 
         self.optimizers = []
         self.optimizer_te_2 = None  # todo: support 2nd text encoder optimizer
-        self.optimizer_te, self.optimizer_unet = self.create_optimizers(args,
-                                                                        self.text_encoder_params,
-                                                                        self.unet_params)
-        self.optimizers.append(self.optimizer_te) if self.optimizer_te is not None else None
-        self.optimizers.append(self.optimizer_unet) if self.optimizer_unet is not None else None
+        self.optimizer_te, self.optimizer_unet = self.create_optimizers(
+            args, self.text_encoder_params, self.unet_params
+        )
+        self.optimizers.append(
+            self.optimizer_te
+        ) if self.optimizer_te is not None else None
+        self.optimizers.append(
+            self.optimizer_unet
+        ) if self.optimizer_unet is not None else None
 
         self.lr_schedulers = []
         schedulers = self.create_lr_schedulers(args, optimizer_config)
@@ -225,7 +265,7 @@ class EveryDreamOptimizer:
                 enabled=args.amp,
                 init_scale=args.init_grad_scale or 2**17.5,
                 growth_factor=2,
-                backoff_factor=1.0/2,
+                backoff_factor=1.0 / 2,
                 growth_interval=25,
             )
         else:
@@ -233,10 +273,14 @@ class EveryDreamOptimizer:
 
         self.load(args.resume_ckpt)
 
-        logging.info(f" Grad scaler enabled: {self.scaler is not None and self.scaler.is_enabled()} (amp mode)")
+        logging.info(
+            f" Grad scaler enabled: {self.scaler is not None and self.scaler.is_enabled()} (amp mode)"
+        )
 
     def _log_gradient_normal(self, parameters: Generator, label: str, log_action=None):
-        total_norm = self._get_norm([p for p in parameters if p.grad is not None], lambda p: p.grad.data)
+        total_norm = self._get_norm(
+            [p for p in parameters if p.grad is not None], lambda p: p.grad.data
+        )
         log_action(total_norm, label)
 
     def _log_weight_normal(self, parameters: Generator, label: str, log_action=None):
@@ -248,7 +292,7 @@ class EveryDreamOptimizer:
         for p in parameters:
             param = param_type(p)
             total_norm += self._calculate_norm(param, p)
-        total_norm = total_norm ** (1. / 2)
+        total_norm = total_norm ** (1.0 / 2)
         return total_norm
 
     def _calculate_norm(self, param, p):
@@ -258,29 +302,31 @@ class EveryDreamOptimizer:
             return 0.0
 
     def _should_do_grad_accum_step(self, step, global_step):
-        return (
-            (global_step + 1) % self.grad_accum == 0
-            or ((global_step // self.epoch_len) == self.max_epochs-1 and (step == self.epoch_len - 1))
+        return (global_step + 1) % self.grad_accum == 0 or (
+            (global_step // self.epoch_len) == self.max_epochs - 1
+            and (step == self.epoch_len - 1)
         )
 
     def will_do_grad_accum_step(self, step, global_step):
         return self._should_do_grad_accum_step(step, global_step)
 
     def backward(self, loss: torch.Tensor | list[torch.Tensor]):
-        loss_scaled_if_necessary = loss if self.scaler is None else self.scaler.scale(loss)
+        loss_scaled_if_necessary = (
+            loss if self.scaler is None else self.scaler.scale(loss)
+        )
         if self.jacobian_aggregator is not None:
             self.jacobian_backward(
                 tensors=loss_scaled_if_necessary,
                 inputs=itertools.chain(self.text_encoder_params, self.unet_params),
                 A=self.jacobian_aggregator,
-                parallel_chunk_size=None
+                parallel_chunk_size=None,
             )
         else:
             loss_scaled_if_necessary.backward()
 
     def register_unet_nan_hooks_full(self):
-        def detailed_nan_hook(module, grad_input, grad_output, name: str='unknown'):
-            module_name = f'{name}({module.__class__.__name__})'
+        def detailed_nan_hook(module, grad_input, grad_output, name: str = "unknown"):
+            module_name = f"{name}({module.__class__.__name__})"
 
             # Check what's coming FROM the next layer (flowing backward)
             grad_out_has_nan_or_inf = False
@@ -319,15 +365,13 @@ class EveryDreamOptimizer:
                             f"      shape: {grad.shape}, has NaN: {torch.isnan(grad).sum().item()}/{grad.numel()} inf: {torch.isinf(grad).sum().item()}/{grad.numel()}"
                         )
 
-
         for name, module in self.unet.named_modules():
             if type(module) is UNet2DConditionModel:
                 continue
-            #print(f"registering detailed NaN hook for {name} ({module.__class__.__name__})")
+            # print(f"registering detailed NaN hook for {name} ({module.__class__.__name__})")
             # pass name to hook by making a partial
             hook_with_module_name = partial(detailed_nan_hook, name=name)
             module.register_full_backward_hook(hook_with_module_name)
-
 
     def register_unet_nan_hooks_simple(self):
         # Register hooks to catch where NaN first appears
@@ -336,7 +380,10 @@ class EveryDreamOptimizer:
                 if grad is not None and (
                     torch.isnan(grad).any() or torch.isinf(grad).any()
                 ):
-                    print(f"NaN/Inf detected after {name}({module.__class__.__name__}) backward (hooked)")
+                    print(
+                        f"NaN/Inf detected after {name}({module.__class__.__name__}) backward (hooked)"
+                    )
+
         for name, module in self.unet.named_modules():
             if type(module) is not UNet2DConditionModel:
                 continue
@@ -349,11 +396,13 @@ class EveryDreamOptimizer:
             if p.grad is not None:
                 grad_data = p.grad.data
                 if torch.isinf(grad_data).any() or torch.isnan(grad_data).any():
-                    logging.error(f"** {log_hint}: inf or NaN detected in UNet gradient for parameter: {name}. min: {grad_data.min()}, max: {grad_data.max()}")
+                    logging.error(
+                        f"** {log_hint}: inf or NaN detected in UNet gradient for parameter: {name}. min: {grad_data.min()}, max: {grad_data.max()}"
+                    )
                     has_inf_or_nan = True
         return has_inf_or_nan
 
-    def check_for_inf_or_nan(self, tv: 'TrainingVariables', log_hint: str):
+    def check_for_inf_or_nan(self, tv: "TrainingVariables", log_hint: str):
         if self.unet_grads_have_inf_or_nan(log_hint):
             logging.error("Dumping training vars:")
             logging.error(f" - Timesteps: {tv.accumulated_timesteps}")
@@ -363,42 +412,67 @@ class EveryDreamOptimizer:
             logging.error(f"Global step: {tv.global_step}")
             raise InfOrNanException("** inf or NaN detected in UNet gradients")
 
-
-    def step_optimizer(self, global_step, tv: 'TrainingVariables', log_hint: str=''):
+    def step_optimizer(self, global_step, tv: "TrainingVariables", log_hint: str = ""):
         if self.scaler is not None:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
 
         if self.log_grad_norm:
             with torch.no_grad():
-                self.log_writer.add_scalar("optimizer/unet_grad_norm_pre_clip", _get_grad_norm(self.unet.parameters()), global_step)
-                self.log_writer.add_scalar("optimizer/te_grad_norm_pre_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
-                if self.text_encoder_2 is not None:
-                    self.log_writer.add_scalar("optimizer/te2_grad_norm_pre_clip", _get_grad_norm(self.text_encoder_2.parameters()),global_step,)
+                self.log_writer.add_scalar(
+                    "optimizer/unet_grad_norm_pre_clip",
+                    _get_grad_norm(self.unet.parameters()),
+                    global_step,
+                )
+                if self.optimizer_te is not None:
+                    self.log_writer.add_scalar(
+                        "optimizer/te_grad_norm_pre_clip",
+                        _get_grad_norm(self.text_encoder.parameters()),
+                        global_step,
+                    )
+                    if self.text_encoder_2 is not None:
+                        self.log_writer.add_scalar(
+                            "optimizer/te2_grad_norm_pre_clip",
+                            _get_grad_norm(self.text_encoder_2.parameters()),
+                            global_step,
+                        )
 
         if self.clip_grad_norm:
-            torch.nn.utils.clip_grad_norm_(parameters=self.unet.parameters(), max_norm=self.clip_grad_norm)
-            torch.nn.utils.clip_grad_norm_(parameters=self.text_encoder.parameters(), max_norm=self.clip_grad_norm)
-            if self.text_encoder_2 is not None:
+            torch.nn.utils.clip_grad_norm_(
+                parameters=self.unet.parameters(), max_norm=self.clip_grad_norm
+            )
+            if self.optimizer_te is not None:
                 torch.nn.utils.clip_grad_norm_(
-                    parameters=self.text_encoder_2.parameters(),
+                    parameters=self.text_encoder.parameters(),
                     max_norm=self.clip_grad_norm,
                 )
+                if self.text_encoder_2 is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        parameters=self.text_encoder_2.parameters(),
+                        max_norm=self.clip_grad_norm,
+                    )
             if self.log_grad_norm:
                 with torch.no_grad():
-                    self.log_writer.add_scalar("optimizer/unet_grad_norm_post_clip", _get_grad_norm(self.unet.parameters()), global_step)
-                    self.log_writer.add_scalar("optimizer/te_grad_norm_post_clip", _get_grad_norm(self.text_encoder.parameters()), global_step)
-                    if self.text_encoder_2 is not None:
-                        self.log_writer.add_scalar("optimizer/te2_grad_norm_post_clip", _get_grad_norm(self.text_encoder_2.parameters()), global_step)
+                    self.log_writer.add_scalar(
+                        "optimizer/unet_grad_norm_post_clip",
+                        _get_grad_norm(self.unet.parameters()),
+                        global_step,
+                    )
+                    if self.optimizer_te is not None:
+                        self.log_writer.add_scalar(
+                            "optimizer/te_grad_norm_post_clip",
+                            _get_grad_norm(self.text_encoder.parameters()),
+                            global_step,
+                        )
+                        if self.text_encoder_2 is not None:
+                            self.log_writer.add_scalar(
+                                "optimizer/te2_grad_norm_post_clip",
+                                _get_grad_norm(self.text_encoder_2.parameters()),
+                                global_step,
+                            )
 
         if self.log_grad_norm:
-            exp_avg, exp_avg_sq = _get_moment_norms(self.optimizer_unet)
-            self.log_writer.add_scalar(
-                "optimizer/unet_adamw_exp_avg", exp_avg, global_step
-            )
-            self.log_writer.add_scalar(
-                "optimizer/unet_adamw_exp_avg_sq", exp_avg_sq, global_step
-            )
+            _log_grad_norms(self.optimizer_unet, self.log_writer, optimizer_name='unet', global_step=global_step)
 
         if self.scaler is None:
             for optimizer in self.optimizers:
@@ -409,23 +483,37 @@ class EveryDreamOptimizer:
             self.scaler.update()
 
         if self.log_grad_norm and self.log_writer:
-            log_action = lambda n, label: self.log_writer.add_scalar(label, n, global_step)
-            with (torch.no_grad()):
-                self._log_gradient_normal(self.unet.parameters(), "optimizer/unet_grad_norm", log_action)
-                self._log_gradient_normal(self.text_encoder.parameters(), "optimizer/te_grad_norm",
-                                          log_action)
-                self._log_weight_normal(self.unet.parameters(), "optimizer/unet_weight_norm", log_action)
-                self._log_weight_normal(self.text_encoder.parameters(), "optimizer/te_weight_norm", log_action)
+            log_action = lambda n, label: self.log_writer.add_scalar(
+                label, n, global_step
+            )
+            with torch.no_grad():
+                self._log_gradient_normal(
+                    self.unet.parameters(), "optimizer/unet_grad_norm", log_action
+                )
+                self._log_gradient_normal(
+                    self.text_encoder.parameters(), "optimizer/te_grad_norm", log_action
+                )
+                self._log_weight_normal(
+                    self.unet.parameters(), "optimizer/unet_weight_norm", log_action
+                )
+                self._log_weight_normal(
+                    self.text_encoder.parameters(),
+                    "optimizer/te_weight_norm",
+                    log_action,
+                )
                 if self.text_encoder_2 is not None:
                     self._log_gradient_normal(
                         self.text_encoder_2.parameters(),
                         "optimizer/te2_grad_norm",
                         log_action,
                     )
-                    self._log_weight_normal(self.text_encoder_2.parameters(), "optimizer/te2_weight_norm", log_action)
+                    self._log_weight_normal(
+                        self.text_encoder_2.parameters(),
+                        "optimizer/te2_weight_norm",
+                        log_action,
+                    )
 
         self._zero_grad(set_to_none=True)
-
 
     def step_schedulers(self, global_step):
         self.lr_steering.apply_steering_if_necessary(self.lr_schedulers)
@@ -438,12 +526,12 @@ class EveryDreamOptimizer:
     def _zero_grad(self, set_to_none=False):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
-    
+
     def get_scale(self):
         if self.scaler is None:
             return 1
         return self.scaler.get_scale()
-    
+
     def get_unet_lr(self):
         """
         Returns dict of learning rates keyed by tag name.
@@ -456,41 +544,69 @@ class EveryDreamOptimizer:
         param_groups = self.optimizer_unet.param_groups
         if len(param_groups) == 1:
             # Single param group - use simple key for backward compatibility
-            return {"lr unet": param_groups[0]['lr']}
+            return {"lr unet": param_groups[0]["lr"]}
         else:
             # Multiple param groups - include group name in key
             return {
-                f"lr unet {pg.get('name', f'group_{idx}')}": pg['lr']
+                f"lr unet {pg.get('name', f'group_{idx}')}": pg["lr"]
                 for idx, pg in enumerate(param_groups)
             }
 
     def get_textenc_lr(self):
-        return self.optimizer_te.param_groups[0]['lr'] if self.optimizer_te is not None else 0
-    
+        return (
+            self.optimizer_te.param_groups[0]["lr"]
+            if self.optimizer_te is not None
+            else 0
+        )
+
     def save(self, ckpt_path: str):
         """
         Saves the optimizer states to path
         """
-        self._save_optimizer(self.optimizer_te, os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME), optimizer_type=self.te_config['optimizer']) if self.optimizer_te is not None else None
-        self._save_optimizer(self.optimizer_unet, os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME), optimizer_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
-        self._save_optimizer(self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME), 'scaler') if self.scaler is not None else None
-
+        self._save_optimizer(
+            self.optimizer_te,
+            os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME),
+            optimizer_type=self.te_config["optimizer"],
+        ) if self.optimizer_te is not None else None
+        self._save_optimizer(
+            self.optimizer_unet,
+            os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME),
+            optimizer_type=self.base_config["optimizer"],
+        ) if self.optimizer_unet is not None else None
+        self._save_optimizer(
+            self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME), "scaler"
+        ) if self.scaler is not None else None
 
     def load(self, ckpt_path: str):
         """
         Loads the optimizer states from path
         """
         te_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME)
-        unet_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_UNET_STATE_FILENAME)
+        unet_optimizer_state_path = os.path.join(
+            ckpt_path, OPTIMIZER_UNET_STATE_FILENAME
+        )
         scaler_state_path = os.path.join(ckpt_path, SCALER_STATE_FILENAME)
         if os.path.exists(te_optimizer_state_path) and self.optimizer_te is not None:
-            self._load_optimizer(self.optimizer_te, te_optimizer_state_path, expected_type=self.te_config['optimizer']) if self.optimizer_te is not None else None
-        if os.path.exists(unet_optimizer_state_path) and self.optimizer_unet is not None:
-            self._load_optimizer(self.optimizer_unet, unet_optimizer_state_path, expected_type=self.base_config['optimizer']) if self.optimizer_unet is not None else None
+            self._load_optimizer(
+                self.optimizer_te,
+                te_optimizer_state_path,
+                expected_type=self.te_config["optimizer"],
+            ) if self.optimizer_te is not None else None
+        if (
+            os.path.exists(unet_optimizer_state_path)
+            and self.optimizer_unet is not None
+        ):
+            self._load_optimizer(
+                self.optimizer_unet,
+                unet_optimizer_state_path,
+                expected_type=self.base_config["optimizer"],
+            ) if self.optimizer_unet is not None else None
         if os.path.exists(scaler_state_path) and self.scaler is not None:
-            self._load_optimizer(self.scaler, scaler_state_path, expected_type='scaler')
+            self._load_optimizer(self.scaler, scaler_state_path, expected_type="scaler")
 
-    def create_optimizers(self, args, text_encoder_params: dict[str, list], unet_params: dict[str, list]):
+    def create_optimizers(
+        self, args, text_encoder_params: dict[str, list], unet_params: dict[str, list]
+    ):
         """
         creates optimizers from config and args for unet and text encoder
         returns (optimizer_te, optimizer_unet)
@@ -499,11 +615,15 @@ class EveryDreamOptimizer:
         if args.disable_textenc_training:
             optimizer_te = None
         else:
-            optimizer_te = self._create_optimizer("text encoder", args, self.te_config, text_encoder_params)
+            optimizer_te = self._create_optimizer(
+                "text encoder", args, self.te_config, text_encoder_params
+            )
         if args.disable_unet_training:
             optimizer_unet = None
         else:
-            optimizer_unet = self._create_optimizer("unet", args, self.base_config, unet_params)
+            optimizer_unet = self._create_optimizer(
+                "unet", args, self.base_config, unet_params
+            )
 
         return optimizer_te, optimizer_unet
 
@@ -521,7 +641,9 @@ class EveryDreamOptimizer:
             if args.max_steps is not None:
                 total_steps = min(args.max_steps, total_steps)
             args.lr_decay_steps = int(total_steps * args.auto_decay_steps_multiplier)
-            print('total_steps:', total_steps, ' -> lr_decay_steps:', args.lr_decay_steps)
+            print(
+                "total_steps:", total_steps, " -> lr_decay_steps:", args.lr_decay_steps
+            )
 
         if args.lr_warmup_steps is None:
             # set warmup to 2% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 3% of max epochs
@@ -534,25 +656,53 @@ class EveryDreamOptimizer:
             # override for legacy support reasons
             base_config["lr"] = args.lr
 
-        base_config["lr_end"] = base_config.get("lr_end", args.lr_end) or base_config["lr"]/100.0
+        base_config["lr_end"] = (
+            base_config.get("lr_end", args.lr_end) or base_config["lr"] / 100.0
+        )
 
         base_config["optimizer"] = base_config.get("optimizer", None) or "adamw8bit"
 
-        base_config["lr_decay_steps"] = base_config.get("lr_decay_steps", None) or args.lr_decay_steps
-        base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
-        base_config["lr_warmup_steps"] = base_config.get("lr_warmup_steps", None) or args.lr_warmup_steps
-        base_config["lr_decay_steps"] = base_config.get("lr_decay_steps", None) or args.lr_decay_steps
-        base_config["lr_advance_steps"] = base_config.get("lr_advance_steps", None) or args.lr_advance_steps
-        base_config["lr_scheduler"] = base_config.get("lr_scheduler", None) or args.lr_scheduler
-        base_config["lr_num_restarts"] = base_config.get("lr_num_restarts", None) or args.lr_num_restarts
+        base_config["lr_decay_steps"] = (
+            base_config.get("lr_decay_steps", None) or args.lr_decay_steps
+        )
+        base_config["lr_scheduler"] = (
+            base_config.get("lr_scheduler", None) or args.lr_scheduler
+        )
+        base_config["lr_warmup_steps"] = (
+            base_config.get("lr_warmup_steps", None) or args.lr_warmup_steps
+        )
+        base_config["lr_decay_steps"] = (
+            base_config.get("lr_decay_steps", None) or args.lr_decay_steps
+        )
+        base_config["lr_advance_steps"] = (
+            base_config.get("lr_advance_steps", None) or args.lr_advance_steps
+        )
+        base_config["lr_scheduler"] = (
+            base_config.get("lr_scheduler", None) or args.lr_scheduler
+        )
+        base_config["lr_num_restarts"] = (
+            base_config.get("lr_num_restarts", None) or args.lr_num_restarts
+        )
 
         te_config["lr"] = te_config.get("lr", None) or base_config["lr"]
-        te_config["optimizer"] = te_config.get("optimizer", None) or base_config["optimizer"]
-        te_config["lr_scheduler"] = te_config.get("lr_scheduler", None) or base_config["lr_scheduler"]
-        te_config["lr_warmup_steps"] = te_config.get("lr_warmup_steps", None) or base_config["lr_warmup_steps"]
-        te_config["lr_advance_steps"] = te_config.get("lr_advance_steps", None) or base_config["lr_advance_steps"]
-        te_config["lr_decay_steps"] = te_config.get("lr_decay_steps", None) or base_config["lr_decay_steps"]
-        te_config["weight_decay"] = te_config.get("weight_decay", None) or base_config["weight_decay"]
+        te_config["optimizer"] = (
+            te_config.get("optimizer", None) or base_config["optimizer"]
+        )
+        te_config["lr_scheduler"] = (
+            te_config.get("lr_scheduler", None) or base_config["lr_scheduler"]
+        )
+        te_config["lr_warmup_steps"] = (
+            te_config.get("lr_warmup_steps", None) or base_config["lr_warmup_steps"]
+        )
+        te_config["lr_advance_steps"] = (
+            te_config.get("lr_advance_steps", None) or base_config["lr_advance_steps"]
+        )
+        te_config["lr_decay_steps"] = (
+            te_config.get("lr_decay_steps", None) or base_config["lr_decay_steps"]
+        )
+        te_config["weight_decay"] = (
+            te_config.get("weight_decay", None) or base_config["weight_decay"]
+        )
         te_config["betas"] = te_config.get("betas", None) or base_config["betas"]
         te_config["epsilon"] = te_config.get("epsilon", None) or base_config["epsilon"]
 
@@ -568,8 +718,14 @@ class EveryDreamOptimizer:
             lr_scheduler = get_scheduler(
                 te_config.get("lr_scheduler", args.lr_scheduler),
                 optimizer=self.optimizer_te,
-                num_warmup_steps=int(te_config.get("lr_warmup_steps", None) or unet_config.get("lr_warmup_steps",0)),
-                num_training_steps=int(te_config.get("lr_decay_steps", None) or unet_config.get("lr_decay_steps",1e9))
+                num_warmup_steps=int(
+                    te_config.get("lr_warmup_steps", None)
+                    or unet_config.get("lr_warmup_steps", 0)
+                ),
+                num_training_steps=int(
+                    te_config.get("lr_decay_steps", None)
+                    or unet_config.get("lr_decay_steps", 1e9)
+                ),
             )
             ret_val.append(lr_scheduler)
 
@@ -579,12 +735,16 @@ class EveryDreamOptimizer:
             if unet_config["lr_scheduler"] == "polynomial":
                 num_restarts = unet_config.get("lr_num_restarts", 1)
                 if num_restarts != 1 and args.auto_decay_steps_multiplier != 1:
-                    raise ValueError("Cannot use lr_num_restarts != 1 with --auto_decay_steps_multiplier != 1 when using polynomial LR scheduler")
+                    raise ValueError(
+                        "Cannot use lr_num_restarts != 1 with --auto_decay_steps_multiplier != 1 when using polynomial LR scheduler"
+                    )
                 if num_restarts < 1:
-                    raise ValueError("Must have >=1 (re)starts for polynomial LR scheduler")
+                    raise ValueError(
+                        "Must have >=1 (re)starts for polynomial LR scheduler"
+                    )
                 lr_scheduler = _get_polynomial_decay_schedule_with_warmup_adj(
                     optimizer=self.optimizer_unet,
-                    lr_end=unet_config.get("lr_end", unet_config["lr"]/100.0),
+                    lr_end=unet_config.get("lr_end", unet_config["lr"] / 100.0),
                     power=unet_config.get("power", 2),
                     num_cycles=num_restarts,
                     num_warmup_steps=int(unet_config["lr_warmup_steps"]),
@@ -594,7 +754,7 @@ class EveryDreamOptimizer:
                 lr_scheduler = _get_findlr_scheduler(
                     optimizer=self.optimizer_unet,
                     base_lr=unet_config.get("lr", unet_config["lr"] * 10.0),
-                    min_lr=unet_config.get("lr_end", unet_config["lr"]/100.0),
+                    min_lr=unet_config.get("lr_end", unet_config["lr"] / 100.0),
                     num_warmup_steps=int(unet_config["lr_warmup_steps"]),
                 )
             else:
@@ -616,22 +776,22 @@ class EveryDreamOptimizer:
         if global_step == 500:
             factor = 1.8
             self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1/factor)
+            self.scaler.set_backoff_factor(1 / factor)
             self.scaler.set_growth_interval(100)
         if global_step == 1000:
             factor = 1.6
             self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1/factor)
+            self.scaler.set_backoff_factor(1 / factor)
             self.scaler.set_growth_interval(200)
         if global_step == 2000:
             factor = 1.3
             self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1/factor)
+            self.scaler.set_backoff_factor(1 / factor)
             self.scaler.set_growth_interval(500)
         if global_step == 4000:
             factor = 1.15
             self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1/factor)
+            self.scaler.set_backoff_factor(1 / factor)
             self.scaler.set_growth_interval(2000)
 
     @staticmethod
@@ -640,18 +800,22 @@ class EveryDreamOptimizer:
         Saves the optimizer state to specific path/filename
         """
         try:
-            torch.save({
-                'optimizer_type': optimizer_type,
-                'state_dict': optimizer.state_dict()
-            }, path)
+            torch.save(
+                {
+                    "optimizer_type": optimizer_type,
+                    "state_dict": optimizer.state_dict(),
+                },
+                path,
+            )
         except RuntimeError:
             logging.warning(f"  Saving optimizer state to {path} failed, deleting")
             if os.path.exists(path):
                 os.unlink(path)
 
-
     @staticmethod
-    def _load_optimizer(optimizer: torch.optim.Optimizer, path: str, expected_type: str=None):
+    def _load_optimizer(
+        optimizer: torch.optim.Optimizer, path: str, expected_type: str = None
+    ):
         """
         Loads the optimizer state to an Optimizer object
         optimizer: torch.optim.Optimizer
@@ -659,19 +823,25 @@ class EveryDreamOptimizer:
         """
         try:
             state_dict = torch.load(path)
-            if 'optimizer_type' in state_dict:
-                optimizer_type = state_dict['optimizer_type']
+            if "optimizer_type" in state_dict:
+                optimizer_type = state_dict["optimizer_type"]
                 if expected_type is not None and optimizer_type != expected_type:
-                    logging.warning(f"{Fore.LIGHTYELLOW_EX}**Loaded optimizer type in {path} is {optimizer_type} but we expect {expected_type} - skipping optimizer load{Style.RESET_ALL}")
+                    logging.warning(
+                        f"{Fore.LIGHTYELLOW_EX}**Loaded optimizer type in {path} is {optimizer_type} but we expect {expected_type} - skipping optimizer load{Style.RESET_ALL}"
+                    )
                     return
                 state_dict = state_dict["state_dict"]
             optimizer.load_state_dict(state_dict)
             logging.info(f" Loaded optimizer state from {path}")
         except Exception as e:
-            logging.warning(f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}")
+            logging.warning(
+                f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}"
+            )
             pass
 
-    def _create_optimizer(self, label, args, local_optimizer_config, parameters: dict[str, list]):
+    def _create_optimizer(
+        self, label, args, local_optimizer_config, parameters: dict[str, list]
+    ):
         """
         parameters is always a dict:
         - Single group: {"default": [(name, param), ...]}
@@ -681,35 +851,42 @@ class EveryDreamOptimizer:
         epsilon = EPSILON_DEFAULT
         weight_decay = WEIGHT_DECAY_DEFAULT
         import bitsandbytes as bnb
+
         opt_class = bnb.optim.AdamW8bit
         optimizer = None
 
         default_lr = 1e-6
         curr_lr = args.lr
-        d0 = 1e-6 # dadapt
-        decouple = True # seems bad to turn off, dadapt_adam only
-        momentum = 0.0 # dadapt_sgd
-        no_prox = False # ????, dadapt_adan
-        use_bias_correction = True # suggest by prodigy github
-        growth_rate=float("inf") # dadapt various, no idea what a sane default is
-        safeguard_warmup = True # per recommendation from prodigy documentation
+        d0 = args.lr_d0
+        d_coef = 1.0    
+        decouple = True  # seems bad to turn off, dadapt_adam only
+        momentum = 0.0  # dadapt_sgd
+        no_prox = False  # ????, dadapt_adan
+        use_bias_correction = True  # suggest by prodigy github
+        growth_rate = float("inf")  # dadapt various, no idea what a sane default is
+        safeguard_warmup = True  # per recommendation from prodigy documentation
 
         optimizer_name = None
         if local_optimizer_config is not None:
             betas = local_optimizer_config.get("betas", betas)
             epsilon = local_optimizer_config.get("epsilon", epsilon)
             weight_decay = local_optimizer_config.get("weight_decay", weight_decay)
-            no_prox =  local_optimizer_config.get("no_prox", False)
+            no_prox = local_optimizer_config.get("no_prox", False)
             optimizer_name = local_optimizer_config.get("optimizer", "adamw8bit")
             curr_lr = local_optimizer_config.get("lr", curr_lr)
             d0 = local_optimizer_config.get("d0", d0)
+            d_coef = local_optimizer_config.get("d_coef", d_coef)
             decouple = local_optimizer_config.get("decouple", decouple)
             momentum = local_optimizer_config.get("momentum", momentum)
             growth_rate = local_optimizer_config.get("growth_rate", growth_rate)
-            safeguard_warmup = local_optimizer_config.get("safeguard_warmup", safeguard_warmup) 
+            safeguard_warmup = local_optimizer_config.get(
+                "safeguard_warmup", safeguard_warmup
+            )
             if args.lr is not None:
                 curr_lr = args.lr
-                logging.info(f"Overriding LR from optimizer config with main config/cli LR setting: {curr_lr}")
+                logging.info(
+                    f"Overriding LR from optimizer config with main config/cli LR setting: {curr_lr}"
+                )
 
         if optimizer_name is None or optimizer_name == "adamw8bit":
             if not self.use_grad_scaler:
@@ -722,52 +899,78 @@ class EveryDreamOptimizer:
             logging.warning(f"No LR setting found, defaulting to {default_lr}")
 
         # Check if this is component-specific LR (multi-group) or standard (single group)
-        is_component_lr = label == "unet" and len(parameters) > 1 and "cross_attention" in parameters
+        is_component_lr = (
+            label == "unet" and len(parameters) > 1 and "cross_attention" in parameters
+        )
 
         param_groups = []
 
         if is_component_lr:
             # Component-specific LR mode for UNet
-            logging.info(f"{Fore.CYAN}=== Using Component-Specific Learning Rates for UNet ==={Style.RESET_ALL}")
+            logging.info(
+                f"{Fore.CYAN}=== Using Component-Specific Learning Rates for UNet ==={Style.RESET_ALL}"
+            )
 
             component_configs = {
                 "cross_attention": {
-                    "lr_scale": self.unet_component_lr_config.get("cross_attention_lr_scale", 1.0),
-                    "weight_decay": self.unet_component_lr_config.get("cross_attention_weight_decay", weight_decay),
+                    "lr_scale": self.unet_component_lr_config.get(
+                        "cross_attention_lr_scale", 1.0
+                    ),
+                    "weight_decay": self.unet_component_lr_config.get(
+                        "cross_attention_weight_decay", weight_decay
+                    ),
                 },
                 "self_attention": {
-                    "lr_scale": self.unet_component_lr_config.get("self_attention_lr_scale", 1.0),
-                    "weight_decay": self.unet_component_lr_config.get("self_attention_weight_decay", weight_decay),
+                    "lr_scale": self.unet_component_lr_config.get(
+                        "self_attention_lr_scale", 1.0
+                    ),
+                    "weight_decay": self.unet_component_lr_config.get(
+                        "self_attention_weight_decay", weight_decay
+                    ),
                 },
                 "resnet": {
-                    "lr_scale": self.unet_component_lr_config.get("resnet_lr_scale", 1.0),
-                    "weight_decay": self.unet_component_lr_config.get("resnet_weight_decay", weight_decay),
+                    "lr_scale": self.unet_component_lr_config.get(
+                        "resnet_lr_scale", 1.0
+                    ),
+                    "weight_decay": self.unet_component_lr_config.get(
+                        "resnet_weight_decay", weight_decay
+                    ),
                 },
                 "other": {
-                    "lr_scale": self.unet_component_lr_config.get("other_lr_scale", 1.0),
-                    "weight_decay": self.unet_component_lr_config.get("other_weight_decay", weight_decay),
-                }
+                    "lr_scale": self.unet_component_lr_config.get(
+                        "other_lr_scale", 1.0
+                    ),
+                    "weight_decay": self.unet_component_lr_config.get(
+                        "other_weight_decay", weight_decay
+                    ),
+                },
             }
 
             for component_name, component_params in parameters.items():
                 if component_params:  # Only add non-empty groups
                     config = component_configs[component_name]
                     component_lr = curr_lr * config["lr_scale"]
-                    param_groups.append({
-                        "params": [p for n, p in component_params],
-                        "betas": (betas[0], betas[1]),
-                        "weight_decay": config["weight_decay"],
-                        "lr": component_lr,
-                        "name": component_name,
-                    })
-                    logging.info(f"{Fore.CYAN}  {component_name}: {len(component_params)} params, LR={component_lr:.2e}, WD={config['weight_decay']}{Style.RESET_ALL}")
+                    param_groups.append(
+                        {
+                            "params": [p for n, p in component_params],
+                            "betas": (betas[0], betas[1]),
+                            "weight_decay": config["weight_decay"],
+                            "lr": component_lr,
+                            "name": component_name,
+                        }
+                    )
+                    logging.info(
+                        f"{Fore.CYAN}  {component_name}: {len(component_params)} params, LR={component_lr:.2e}, WD={config['weight_decay']}{Style.RESET_ALL}"
+                    )
         else:
             # Standard mode: single group (dict with one key, usually "default")
             # Get the single group's parameters
             group_name = list(parameters.keys())[0]
             param_list = parameters[group_name]
 
-            attention_weight_decay = local_optimizer_config.get("weight_decay_attn_qk", None)
+            attention_weight_decay = local_optimizer_config.get(
+                "weight_decay_attn_qk", None
+            )
             if attention_weight_decay is None:
                 param_groups = [
                     {
@@ -779,8 +982,12 @@ class EveryDreamOptimizer:
                     }
                 ]
             else:
-                regular_group, attention_group = _extract_attention_parameter_group(param_list)
-                logging.info(f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}")
+                regular_group, attention_group = _extract_attention_parameter_group(
+                    param_list
+                )
+                logging.info(
+                    f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}"
+                )
                 param_groups = [
                     {
                         "params": [p for n, p in regular_group],
@@ -803,143 +1010,176 @@ class EveryDreamOptimizer:
 
             if optimizer_name == "lion":
                 from lion_pytorch import Lion
+
                 opt_class = Lion
                 optimizer = opt_class(param_groups)
             elif optimizer_name == "lion8bit":
                 from bitsandbytes.optim import Lion8bit
+
                 opt_class = Lion8bit
                 for g in param_groups:
-                    g.update({"percentile_clipping": 100,
-                              "min_8bit_size": 4096})
+                    g.update({"percentile_clipping": 100, "min_8bit_size": 4096})
                 optimizer = opt_class(param_groups)
 
             elif optimizer_name == "prodigy":
                 from prodigyopt import Prodigy
+
                 opt_class = Prodigy
-                for g in param_groups:
-                    g.update({
-                        "use_bias_correction": use_bias_correction,
-                        "growth_rate": growth_rate,
-                        "d0": d0,
-                        "safeguard_warmup": safeguard_warmup
-                    })
-                optimizer = opt_class(param_groups)
+                optimizer = opt_class(param_groups, d0=d0, d_coef=d_coef, growth_rate=growth_rate, safeguard_warmup=safeguard_warmup, use_bias_correction=use_bias_correction)
             elif optimizer_name == "adamw":
                 opt_class = torch.optim.AdamW
             if "dowg" in optimizer_name:
                 # coordinate_dowg, scalar_dowg require no additional parameters. Epsilon is overrideable but is unnecessary in all stable diffusion training situations.
                 import dowg
+
                 if optimizer_name == "coordinate_dowg":
                     opt_class = dowg.CoordinateDoWG
                 elif optimizer_name == "scalar_dowg":
                     opt_class = dowg.ScalarDoWG
                 else:
-                    raise ValueError(f"Unknown DoWG optimizer {optimizer_name}. Available options are 'coordinate_dowg' and 'scalar_dowg'")
+                    raise ValueError(
+                        f"Unknown DoWG optimizer {optimizer_name}. Available options are 'coordinate_dowg' and 'scalar_dowg'"
+                    )
             elif optimizer_name in ["dadapt_adam", "dadapt_lion", "dadapt_sgd"]:
                 import dadaptation
 
                 if curr_lr < 1e-4:
-                    logging.warning(f"{Fore.YELLOW} LR, {curr_lr}, is very low for Dadaptation.  Consider reviewing Dadaptation documentation, but proceeding anyway.{Style.RESET_ALL}")
+                    logging.warning(
+                        f"{Fore.YELLOW} LR, {curr_lr}, is very low for Dadaptation.  Consider reviewing Dadaptation documentation, but proceeding anyway.{Style.RESET_ALL}"
+                    )
                 if weight_decay < 1e-3:
-                    logging.warning(f"{Fore.YELLOW} Weight decay, {weight_decay}, is very low for Dadaptation.  Consider reviewing Dadaptation documentation, but proceeding anyway.{Style.RESET_ALL}")
+                    logging.warning(
+                        f"{Fore.YELLOW} Weight decay, {weight_decay}, is very low for Dadaptation.  Consider reviewing Dadaptation documentation, but proceeding anyway.{Style.RESET_ALL}"
+                    )
 
                 if optimizer_name == "dadapt_adam":
                     opt_class = dadaptation.DAdaptAdam
                     for g in param_groups:
-                        g.update({
-                            "eps": epsilon, # unused for dadapt_adam
-                            "d0": d0,
-                            "log_every": args.log_step,
-                            "growth_rate": growth_rate,
-                            "decouple": decouple,
-                        })
+                        g.update(
+                            {
+                                "eps": epsilon,  # unused for dadapt_adam
+                                "d0": d0,
+                                "log_every": args.log_step,
+                                "growth_rate": growth_rate,
+                                "decouple": decouple,
+                            }
+                        )
                     optimizer = opt_class(param_groups)
                 elif optimizer_name == "dadapt_adan":
                     opt_class = dadaptation.DAdaptAdan
                     for g in param_groups:
-                        g.update({
-                            "no_prox": no_prox,
-                            "eps": epsilon,
-                            "d0": d0,
-                            "log_every": args.log_step,
-                            "growth_rate": growth_rate,
-                        })
+                        g.update(
+                            {
+                                "no_prox": no_prox,
+                                "eps": epsilon,
+                                "d0": d0,
+                                "log_every": args.log_step,
+                                "growth_rate": growth_rate,
+                            }
+                        )
                     optimizer = opt_class(param_groups)
                 elif optimizer_name == "dadapt_lion":
                     opt_class = dadaptation.DAdaptLion
                     for g in param_groups:
-                        g.update({
-                            "eps": epsilon,
-                            "d0": d0,
-                            "log_every": args.log_step,
-                        })
+                        g.update(
+                            {
+                                "eps": epsilon,
+                                "d0": d0,
+                                "log_every": args.log_step,
+                            }
+                        )
                     optimizer = opt_class(param_groups)
                 elif optimizer_name == "dadapt_sgd":
                     opt_class = dadaptation.DAdaptSGD
                     for g in param_groups:
-                        g.update({
-                            "momentum": momentum,
-                            "d0": d0,
-                            "log_every": args.log_step,
-                            "growth_rate": growth_rate,
-                        })
+                        g.update(
+                            {
+                                "momentum": momentum,
+                                "d0": d0,
+                                "log_every": args.log_step,
+                                "growth_rate": growth_rate,
+                            }
+                        )
                     optimizer = opt_class(param_groups)
             elif optimizer_name == "adacoor":
                 from optimizer.adacoor import AdaCoor
 
                 opt_class = AdaCoor
                 for g in param_groups:
-                    g.update({
-                        "eps": epsilon,
-                    })
+                    g.update(
+                        {
+                            "eps": epsilon,
+                        }
+                    )
                 optimizer = opt_class(param_groups)
 
         if not optimizer:
             for g in param_groups:
-                g.update({
-                    "eps": epsilon,
-                    "amsgrad": False,
-                })
+                g.update(
+                    {
+                        "eps": epsilon,
+                        "amsgrad": False,
+                    }
+                )
             optimizer = opt_class(param_groups)
 
         log_optimizer(label, optimizer, betas, epsilon, weight_decay, curr_lr)
         return optimizer
 
-    def _get_module_component_layer_names(self, unet, module_name, component_name) -> Generator[str, None, None]:
+    def _get_module_component_layer_names(
+        self, unet, module_name, component_name
+    ) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            if f'.{module_name}.' in name and f'.{component_name}' in name:
+            if f".{module_name}." in name and f".{component_name}" in name:
                 yield name
 
-    def _get_cross_attention_layer_names(self, unet, cross_attention_dim_to_find: int) -> Generator[str, None, None]:
+    def _get_cross_attention_layer_names(
+        self, unet, cross_attention_dim_to_find: int
+    ) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
             # Look for cross-attention modules (typically attn2 but let's not guess)
-            if 'attn' in name.lower() and (
-                hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
-            ) and (
-                module.cross_attention_dim == cross_attention_dim_to_find
+            if (
+                "attn" in name.lower()
+                and (
+                    hasattr(module, "to_q")
+                    and hasattr(module, "to_k")
+                    and hasattr(module, "to_v")
+                )
+                and (module.cross_attention_dim == cross_attention_dim_to_find)
             ):
                 yield name
 
     def _get_attention_norm2_layer_names(self, unet) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            if '.attentions.' in name.lower() and '.norm2' in name.lower():
+            if ".attentions." in name.lower() and ".norm2" in name.lower():
                 yield name
 
     def _get_attention_norm3_layer_names(self, unet) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            if '.attentions.' in name.lower() and '.norm3' in name.lower():
+            if ".attentions." in name.lower() and ".norm3" in name.lower():
                 yield name
 
-    def _get_attention_feedforward_layer_names(self, unet) -> Generator[str, None, None]:
+    def _get_attention_feedforward_layer_names(
+        self, unet
+    ) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
-            if '.attentions.' in name.lower() and '.ff' in name.lower():
+            if ".attentions." in name.lower() and ".ff" in name.lower():
                 yield name
 
-    def _get_upearly_attention_layer_names(self, unet, cross_attention_dim: int, cross_attn: bool, self_attn: bool) -> Generator[str, None, None]:
+    def _get_upearly_attention_layer_names(
+        self, unet, cross_attention_dim: int, cross_attn: bool, self_attn: bool
+    ) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
             # Look for self-attention modules (typically attn1 but let's not guess)
-            if 'attn' in name and 'up_blocks' in name and 'up_blocks.3' not in name and (
-                hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
+            if (
+                "attn" in name
+                and "up_blocks" in name
+                and "up_blocks.3" not in name
+                and (
+                    hasattr(module, "to_q")
+                    and hasattr(module, "to_k")
+                    and hasattr(module, "to_v")
+                )
             ):
                 is_cross = module.cross_attention_dim == cross_attention_dim
                 if cross_attn and is_cross:
@@ -947,14 +1187,19 @@ class EveryDreamOptimizer:
                 elif self_attn and not is_cross:
                     yield name
 
-
-    def _get_self_attention_layer_names(self, unet, cross_attention_dim_to_ignore: int) -> Generator[str, None, None]:
+    def _get_self_attention_layer_names(
+        self, unet, cross_attention_dim_to_ignore: int
+    ) -> Generator[str, None, None]:
         for name, module in unet.named_modules():
             # Look for self-attention modules (typically attn1 but let's not guess)
-            if 'attn' in name.lower() and (
-                hasattr(module, "to_q") and hasattr(module, "to_k") and hasattr(module, "to_v")
-            ) and (
-                module.cross_attention_dim != cross_attention_dim_to_ignore
+            if (
+                "attn" in name.lower()
+                and (
+                    hasattr(module, "to_q")
+                    and hasattr(module, "to_k")
+                    and hasattr(module, "to_v")
+                )
+                and (module.cross_attention_dim != cross_attention_dim_to_ignore)
             ):
                 yield name
 
@@ -962,7 +1207,7 @@ class EveryDreamOptimizer:
         self,
         unet: UNet2DConditionModel,
         unet_freeze_config: dict[str, bool],
-        unet_freeze_regex: str|None,
+        unet_freeze_regex: str | None,
         unet_component_lr_config: dict,
         cross_attention_dim_to_find: int,
     ):
@@ -974,48 +1219,43 @@ class EveryDreamOptimizer:
 
         if unet_freeze_regex is not None:
             if len(unet_freeze_config.keys()) > 0:
-                raise ValueError("Cannot use both --unet_freeze_regex args and unet_freeze_config optimizer.json section at the same time")
+                raise ValueError(
+                    "Cannot use both --unet_freeze_regex args and unet_freeze_config optimizer.json section at the same time"
+                )
 
-            def should_freeze_from_regex(name: str) -> bool:
-                # regex can be multi-command - separated by ;
-                # 1. split at ;
-                # 2. apply each rule in sequence, last match wins
-                should_freeze = False
-                rules = unet_freeze_regex.split(';')
-                for rule in rules:
-                    rule = rule.strip()
-                    if rule == '':
-                        continue
-                    if rule.startswith('#'):
-                        # comment
-                        continue
-                    is_negative = rule.startswith('!')
-                    pattern = rule[1:].strip() if is_negative else rule
-                    if re.search(pattern, name):
-                        should_freeze = not is_negative
-                return should_freeze
-
-            should_freeze = lambda name: should_freeze_from_regex(name)
+            should_freeze = lambda name: _should_freeze_from_regexes(
+                unet_freeze_regex, name
+            )
 
         else:
             freeze_prefixes = []
             if unet_freeze_config.get("freeze_in", False):
-                freeze_prefixes.extend(['time_embedding.', 'conv_in.', 'down_blocks.', 'add_embedding.'])
+                freeze_prefixes.extend(
+                    ["time_embedding.", "conv_in.", "down_blocks.", "add_embedding."]
+                )
             if unet_freeze_config.get("freeze_mid", False):
-                freeze_prefixes.extend(['mid_block'])
+                freeze_prefixes.extend(["mid_block"])
             if unet_freeze_config.get("freeze_out", False):
-                freeze_prefixes.extend(['conv_norm_out.', 'conv_out.', 'up_blocks.'])
+                freeze_prefixes.extend(["conv_norm_out.", "conv_out.", "up_blocks."])
 
-            if 'unfreeze_cross_attention' in unet_freeze_config or 'unfreeze_self_attention' in unet_freeze_config or 'unfreeze_spatial_resnets' in unet_freeze_config:
-                raise ValueError("unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)")
+            if (
+                "unfreeze_cross_attention" in unet_freeze_config
+                or "unfreeze_self_attention" in unet_freeze_config
+                or "unfreeze_spatial_resnets" in unet_freeze_config
+            ):
+                raise ValueError(
+                    "unfreeze_* options are no longer supported in unet freeze config, please use freeze_* options instead (may be None)"
+                )
 
-            cross_attn_layer_names = list(self._get_cross_attention_layer_names(
-                unet,
-                cross_attention_dim_to_find=cross_attention_dim_to_find,
-            ))
+            cross_attn_layer_names = list(
+                self._get_cross_attention_layer_names(
+                    unet,
+                    cross_attention_dim_to_find=cross_attention_dim_to_find,
+                )
+            )
 
             attn_norm2_layer_names = list(
-                self._get_module_component_layer_names(unet, 'attentions', 'norm2')
+                self._get_module_component_layer_names(unet, "attentions", "norm2")
             )
             attn_norm3_layer_names = list(
                 self._get_module_component_layer_names(unet, "attentions", "norm3")
@@ -1023,24 +1263,38 @@ class EveryDreamOptimizer:
             attn_feedforward_layer_names = list(
                 self._get_module_component_layer_names(unet, "attentions", "ff")
             )
-            resnets_norm1_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm1'))
-            resnets_norm2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'norm2'))
-            resnets_conv2_layer_names = list(self._get_module_component_layer_names(unet, 'resnets', 'conv2'))
+            resnets_norm1_layer_names = list(
+                self._get_module_component_layer_names(unet, "resnets", "norm1")
+            )
+            resnets_norm2_layer_names = list(
+                self._get_module_component_layer_names(unet, "resnets", "norm2")
+            )
+            resnets_conv2_layer_names = list(
+                self._get_module_component_layer_names(unet, "resnets", "conv2")
+            )
 
             freeze_cross_attn = unet_freeze_config.get("freeze_cross_attention", None)
             if freeze_cross_attn is not None:
-                print(f"{'' if freeze_cross_attn else 'un'}freezing cross attention layers:")
+                print(
+                    f"{'' if freeze_cross_attn else 'un'}freezing cross attention layers:"
+                )
                 print(cross_attn_layer_names)
             freeze_attn_norm2 = unet_freeze_config.get("freeze_attention_norm2", None)
             if freeze_attn_norm2 is not None:
-                print(f"{'' if freeze_attn_norm2 else 'un'}freezing attention norm2 layers:")
+                print(
+                    f"{'' if freeze_attn_norm2 else 'un'}freezing attention norm2 layers:"
+                )
                 print(attn_norm2_layer_names)
             freeze_attn_norm3 = unet_freeze_config.get("freeze_attention_norm3", None)
             if freeze_attn_norm3 is not None:
-                print(f"{'' if freeze_attn_norm3 else 'un'}freezing attention norm3 layers:")
+                print(
+                    f"{'' if freeze_attn_norm3 else 'un'}freezing attention norm3 layers:"
+                )
                 print(attn_norm3_layer_names)
 
-            freeze_attn_feedforward = unet_freeze_config.get("freeze_attention_feedforward", None)
+            freeze_attn_feedforward = unet_freeze_config.get(
+                "freeze_attention_feedforward", None
+            )
             if freeze_attn_feedforward is not None:
                 print(
                     f"{'' if freeze_attn_feedforward else 'un'}freezing attention feedforward layers:"
@@ -1049,85 +1303,164 @@ class EveryDreamOptimizer:
 
             freeze_resnets_norm1 = unet_freeze_config.get("freeze_resnets_norm1", None)
             if freeze_resnets_norm1 is not None:
-                print(f"{'' if freeze_resnets_norm1 else 'un'}freezing resnets norm1 layers:")
+                print(
+                    f"{'' if freeze_resnets_norm1 else 'un'}freezing resnets norm1 layers:"
+                )
                 print(resnets_norm1_layer_names)
             freeze_resnets_norm2 = unet_freeze_config.get("freeze_resnets_norm2", None)
             if freeze_resnets_norm2 is not None:
-                print(f"{'' if freeze_resnets_norm2 else 'un'}freezing resnets norm2 layers:")
+                print(
+                    f"{'' if freeze_resnets_norm2 else 'un'}freezing resnets norm2 layers:"
+                )
                 print(resnets_norm2_layer_names)
             freeze_resnets_conv2 = unet_freeze_config.get("freeze_resnets_conv2", None)
             if freeze_resnets_conv2 is not None:
-                print(f"{'' if freeze_resnets_conv2 else 'un'}freezing resnets conv2 layers:")
+                print(
+                    f"{'' if freeze_resnets_conv2 else 'un'}freezing resnets conv2 layers:"
+                )
                 print(resnets_conv2_layer_names)
 
             freeze_self_attn = unet_freeze_config.get("freeze_self_attention", None)
-            self_attn_layer_names = list(self._get_self_attention_layer_names(
-                unet,
-                cross_attention_dim_to_ignore=cross_attention_dim_to_find,
-            ))
+            self_attn_layer_names = list(
+                self._get_self_attention_layer_names(
+                    unet,
+                    cross_attention_dim_to_ignore=cross_attention_dim_to_find,
+                )
+            )
 
-            upearly_attn_layer_names = list(self._get_upearly_attention_layer_names(
-                unet,
-                cross_attention_dim=cross_attention_dim_to_find,
-                cross_attn=True,
-                self_attn=True
-            ))
-            freeze_upearly_attn = unet_freeze_config.get("freeze_upearly_attention", None)
+            upearly_attn_layer_names = list(
+                self._get_upearly_attention_layer_names(
+                    unet,
+                    cross_attention_dim=cross_attention_dim_to_find,
+                    cross_attn=True,
+                    self_attn=True,
+                )
+            )
+            freeze_upearly_attn = unet_freeze_config.get(
+                "freeze_upearly_attention", None
+            )
             if freeze_upearly_attn is not None:
-                print(f"{'' if freeze_self_attn else 'un'}freezing self up-early attention layers:")
+                print(
+                    f"{'' if freeze_self_attn else 'un'}freezing self up-early attention layers:"
+                )
                 print(upearly_attn_layer_names)
 
-            time_embedding_layer_names = [name for name, _ in unet.named_parameters()
-                                          if name.startswith('time_embedding.linear')]
-            time_proj_layer_names = [name for name, _ in unet.named_parameters() if 'time_emb_proj' in name]
+            time_embedding_layer_names = [
+                name
+                for name, _ in unet.named_parameters()
+                if name.startswith("time_embedding.linear")
+            ]
+            time_proj_layer_names = [
+                name for name, _ in unet.named_parameters() if "time_emb_proj" in name
+            ]
 
-            freeze_spatial_resnets = unet_freeze_config.get("freeze_spatial_resnets", None)
-            spatial_resnet_prefixes = ["mid_block.resnets", "down_blocks.2.resnets", "down_blocks.3.resnets", "up_blocks.0.resnets", "up_blocks.1.resnets"]
+            freeze_spatial_resnets = unet_freeze_config.get(
+                "freeze_spatial_resnets", None
+            )
+            spatial_resnet_prefixes = [
+                "mid_block.resnets",
+                "down_blocks.2.resnets",
+                "down_blocks.3.resnets",
+                "up_blocks.0.resnets",
+                "up_blocks.1.resnets",
+            ]
             freeze_all_resnets = unet_freeze_config.get("freeze_all_resnets", None)
-            resnet_layer_prefixes = [f"down_blocks.{i}.resnets" for i in range(4)] + ["mid_blocks.resnets"] + [f"up_blocks.{i}.resnets" for i in range(4)]
-            freeze_late_up_resnets = unet_freeze_config.get("freeze_late_up_resnets", None)
-            late_up_resnet_layer_prefixes = ["up_blocks.2.resnets", "up_blocks.3.resnets"]
-            freeze_early_up_resnets = unet_freeze_config.get("freeze_early_up_resnets", None)
-            early_up_resnet_layer_prefixes = ["up_blocks.0.resnets", "up_blocks.1.resnets", "up_blocks.2.resnets"]
-            freeze_time_embedding_and_proj = unet_freeze_config.get("freeze_time_embedding_and_proj", None)
-            freeze_time_embedding = unet_freeze_config.get("freeze_time_embedding", freeze_time_embedding_and_proj)
-            freeze_time_proj = unet_freeze_config.get("freeze_time_proj", freeze_time_embedding_and_proj)
+            resnet_layer_prefixes = (
+                [f"down_blocks.{i}.resnets" for i in range(4)]
+                + ["mid_blocks.resnets"]
+                + [f"up_blocks.{i}.resnets" for i in range(4)]
+            )
+            freeze_late_up_resnets = unet_freeze_config.get(
+                "freeze_late_up_resnets", None
+            )
+            late_up_resnet_layer_prefixes = [
+                "up_blocks.2.resnets",
+                "up_blocks.3.resnets",
+            ]
+            freeze_early_up_resnets = unet_freeze_config.get(
+                "freeze_early_up_resnets", None
+            )
+            early_up_resnet_layer_prefixes = [
+                "up_blocks.0.resnets",
+                "up_blocks.1.resnets",
+                "up_blocks.2.resnets",
+            ]
+            freeze_time_embedding_and_proj = unet_freeze_config.get(
+                "freeze_time_embedding_and_proj", None
+            )
+            freeze_time_embedding = unet_freeze_config.get(
+                "freeze_time_embedding", freeze_time_embedding_and_proj
+            )
+            freeze_time_proj = unet_freeze_config.get(
+                "freeze_time_proj", freeze_time_embedding_and_proj
+            )
 
             def should_freeze_from_optimizer_json(n):
                 # maybe freeze
-                if freeze_cross_attn is not None and any(n.startswith(prefix) for prefix in cross_attn_layer_names):
+                if freeze_cross_attn is not None and any(
+                    n.startswith(prefix) for prefix in cross_attn_layer_names
+                ):
                     return freeze_cross_attn
-                elif freeze_self_attn is not None and any(n.startswith(prefix) for prefix in self_attn_layer_names):
+                elif freeze_self_attn is not None and any(
+                    n.startswith(prefix) for prefix in self_attn_layer_names
+                ):
                     return freeze_self_attn
-                elif freeze_attn_feedforward is not None and any(n.startswith(prefix) for prefix in attn_feedforward_layer_names):
+                elif freeze_attn_feedforward is not None and any(
+                    n.startswith(prefix) for prefix in attn_feedforward_layer_names
+                ):
                     return freeze_attn_feedforward
-                elif freeze_attn_norm2 is not None and any(n.startswith(prefix) for prefix in attn_norm2_layer_names):
+                elif freeze_attn_norm2 is not None and any(
+                    n.startswith(prefix) for prefix in attn_norm2_layer_names
+                ):
                     return freeze_attn_norm2
-                elif freeze_attn_norm3 is not None and any(n.startswith(prefix) for prefix in attn_norm3_layer_names):
+                elif freeze_attn_norm3 is not None and any(
+                    n.startswith(prefix) for prefix in attn_norm3_layer_names
+                ):
                     return freeze_attn_norm3
-                elif freeze_time_embedding is not None and any(n.startswith(prefix) for prefix in time_embedding_layer_names):
+                elif freeze_time_embedding is not None and any(
+                    n.startswith(prefix) for prefix in time_embedding_layer_names
+                ):
                     return freeze_time_embedding
-                elif freeze_time_proj is not None and any(n.startswith(prefix) for prefix in time_proj_layer_names):
+                elif freeze_time_proj is not None and any(
+                    n.startswith(prefix) for prefix in time_proj_layer_names
+                ):
                     return freeze_time_proj
-                elif freeze_resnets_norm1 is not None and any(n.startswith(prefix) for prefix in resnets_norm1_layer_names):
+                elif freeze_resnets_norm1 is not None and any(
+                    n.startswith(prefix) for prefix in resnets_norm1_layer_names
+                ):
                     return freeze_resnets_norm1
-                elif freeze_resnets_norm2 is not None and any(n.startswith(prefix) for prefix in resnets_norm2_layer_names):
+                elif freeze_resnets_norm2 is not None and any(
+                    n.startswith(prefix) for prefix in resnets_norm2_layer_names
+                ):
                     return freeze_resnets_norm2
-                elif freeze_resnets_conv2 is not None and any(n.startswith(prefix) for prefix in resnets_conv2_layer_names):
+                elif freeze_resnets_conv2 is not None and any(
+                    n.startswith(prefix) for prefix in resnets_conv2_layer_names
+                ):
                     return freeze_resnets_conv2
-                elif freeze_spatial_resnets is not None and any(n.startswith(prefix) for prefix in spatial_resnet_prefixes):
+                elif freeze_spatial_resnets is not None and any(
+                    n.startswith(prefix) for prefix in spatial_resnet_prefixes
+                ):
                     return freeze_spatial_resnets
-                elif freeze_upearly_attn is not None and any(n.startswith(prefix) for prefix in upearly_attn_layer_names):
+                elif freeze_upearly_attn is not None and any(
+                    n.startswith(prefix) for prefix in upearly_attn_layer_names
+                ):
                     return freeze_upearly_attn
 
-                elif freeze_late_up_resnets is not None and any(n.startswith(prefix) for prefix in late_up_resnet_layer_prefixes):
+                elif freeze_late_up_resnets is not None and any(
+                    n.startswith(prefix) for prefix in late_up_resnet_layer_prefixes
+                ):
                     return freeze_late_up_resnets
-                elif freeze_early_up_resnets is not None and any(n.startswith(prefix) for prefix in early_up_resnet_layer_prefixes):
+                elif freeze_early_up_resnets is not None and any(
+                    n.startswith(prefix) for prefix in early_up_resnet_layer_prefixes
+                ):
                     return freeze_early_up_resnets
-                elif freeze_all_resnets is not None and any(n.startswith(prefix) for prefix in resnet_layer_prefixes):
+                elif freeze_all_resnets is not None and any(
+                    n.startswith(prefix) for prefix in resnet_layer_prefixes
+                ):
                     return freeze_all_resnets
                 # fallback to general prefixes
                 return any(n.startswith(prefix) for prefix in freeze_prefixes)
+
             should_freeze = lambda name: should_freeze_from_optimizer_json(name)
 
         def get_component_type(n):
@@ -1148,6 +1481,14 @@ class EveryDreamOptimizer:
         for n, p in unet.named_parameters():
             print(f"{' ' if p.requires_grad else '❄️'} {n}")
 
+        unfrozen_parameter_count = len(
+            [p for p in unet.parameters() if p.requires_grad]
+        )
+        if unfrozen_parameter_count == 0:
+            raise ValueError(
+                "All UNet parameters are frozen, nothing to train! Double-check your unet freeze config."
+            )
+
         # Always return dict structure
         if unet_component_lr_config and unet_component_lr_config.get("enabled", False):
             # Component-specific LR mode: return 4 separate groups
@@ -1155,7 +1496,7 @@ class EveryDreamOptimizer:
                 "cross_attention": [],
                 "self_attention": [],
                 "resnet": [],
-                "other": []
+                "other": [],
             }
 
             for n, p in unet.named_parameters():
@@ -1167,16 +1508,23 @@ class EveryDreamOptimizer:
             print("\n=== UNet Component-Specific LR Groups ===")
             for component, params in component_groups.items():
                 if params:
-                    lr_scale = unet_component_lr_config.get(f"{component}_lr_scale", 1.0)
-                    print(f"  {component}: {len(params)} parameters (LR scale: {lr_scale}x)")
+                    lr_scale = unet_component_lr_config.get(
+                        f"{component}_lr_scale", 1.0
+                    )
+                    print(
+                        f"  {component}: {len(params)} parameters (LR scale: {lr_scale}x)"
+                    )
 
             return component_groups
         else:
             # Standard mode: return single group dict for consistency
             return {
-                "default": list(itertools.chain([np for np in unet.named_parameters() if np[1].requires_grad]))
+                "default": list(
+                    itertools.chain(
+                        [np for np in unet.named_parameters() if np[1].requires_grad]
+                    )
+                )
             }
-
 
     def _apply_text_encoder_freeze(self, text_encoder) -> chain[torch.nn.Parameter]:
         num_layers = len(text_encoder.text_model.encoder.layers)
@@ -1185,9 +1533,10 @@ class EveryDreamOptimizer:
         unfreeze_final_layer_norm = True
         if "freeze_front_n_layers" in self.te_freeze_config:
             logging.warning(
-                ' * Found "freeze_front_n_layers" in JSON, please use "unfreeze_last_n_layers" instead')
+                ' * Found "freeze_front_n_layers" in JSON, please use "unfreeze_last_n_layers" instead'
+            )
             freeze_front_n_layers = self.te_freeze_config["freeze_front_n_layers"]
-            if freeze_front_n_layers<0:
+            if freeze_front_n_layers < 0:
                 # eg -2 = freeze all but the last 2
                 unfreeze_last_n_layers = -freeze_front_n_layers
             else:
@@ -1200,7 +1549,7 @@ class EveryDreamOptimizer:
             unfreeze_last_n_layers = num_layers
         else:
             # something specified:
-            #assert(unfreeze_last_n_layers > 0)
+            # assert(unfreeze_last_n_layers > 0)
             if unfreeze_last_n_layers < num_layers:
                 # if we're unfreezing layers then by default we ought to freeze the embeddings
                 unfreeze_embeddings = False
@@ -1208,60 +1557,84 @@ class EveryDreamOptimizer:
         if "freeze_embeddings" in self.te_freeze_config:
             unfreeze_embeddings = not self.te_freeze_config["freeze_embeddings"]
         if "freeze_final_layer_norm" in self.te_freeze_config:
-            unfreeze_final_layer_norm = not self.te_freeze_config["freeze_final_layer_norm"]
+            unfreeze_final_layer_norm = not self.te_freeze_config[
+                "freeze_final_layer_norm"
+            ]
 
         parameters = itertools.chain([])
 
         if unfreeze_embeddings:
-            parameters = itertools.chain(parameters, text_encoder.text_model.embeddings.named_parameters())
+            parameters = itertools.chain(
+                parameters, text_encoder.text_model.embeddings.named_parameters()
+            )
         else:
             print(" ❄️ freezing embeddings")
-            #for p in text_encoder.text_model.embeddings.parameters():
+            # for p in text_encoder.text_model.embeddings.parameters():
             #    p.requires_grad = False
 
         if unfreeze_last_n_layers >= num_layers:
-            parameters = itertools.chain(parameters, text_encoder.text_model.encoder.layers.named_parameters())
+            parameters = itertools.chain(
+                parameters, text_encoder.text_model.encoder.layers.named_parameters()
+            )
         else:
             # freeze the specified CLIP text encoder layers
             layers = text_encoder.text_model.encoder.layers
             first_layer_to_unfreeze = num_layers - unfreeze_last_n_layers
-            print(f" ❄️ freezing text encoder layers 1-{first_layer_to_unfreeze} out of {num_layers} layers total")
-            parameters = itertools.chain(parameters, layers[first_layer_to_unfreeze:].named_parameters())
+            print(
+                f" ❄️ freezing text encoder layers 1-{first_layer_to_unfreeze} out of {num_layers} layers total"
+            )
+            parameters = itertools.chain(
+                parameters, layers[first_layer_to_unfreeze:].named_parameters()
+            )
             for l in layers[:first_layer_to_unfreeze]:
                 for p in l.parameters():
                     p.requires_grad = False
 
         if unfreeze_final_layer_norm:
-            parameters = itertools.chain(parameters, text_encoder.text_model.final_layer_norm.named_parameters())
+            parameters = itertools.chain(
+                parameters, text_encoder.text_model.final_layer_norm.named_parameters()
+            )
         else:
             print(" ❄️ freezing final layer norm")
             for p in text_encoder.text_model.final_layer_norm.parameters():
                 p.requires_grad = False
 
-
         return parameters
 
-    def setup_lora_training(self, args, model: 'TrainingModel') -> tuple[dict[str, list], dict[str, list]]:
-
+    def setup_lora_training(
+        self, args, model: "TrainingModel"
+    ) -> tuple[dict[str, list], dict[str, list]]:
         if args.disable_textenc_training:
             text_encoder_params = []
         else:
             if not args.lora_resume:
-                if self.te_freeze_config.get("unfreeze_last_n_layers", None) is not None:
+                if (
+                    self.te_freeze_config.get("unfreeze_last_n_layers", None)
+                    is not None
+                ):
                     raise ValueError("Freezing not supported with LoRA training")
                 text_lora_config = LoraConfig(
                     r=args.lora_rank,
                     lora_alpha=args.lora_alpha,
                     init_lora_weights=True,
-                    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]
+                    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
                 )
-                #print("not adding lora for te")
+                # print("not adding lora for te")
                 model.text_encoder.add_adapter(text_lora_config)
                 if model.text_encoder_2 is not None:
                     model.text_encoder_2.add_adapter(text_lora_config)
-            text_encoder_params = list(filter(lambda p: p[1].requires_grad, model.text_encoder.named_parameters()))
+            text_encoder_params = list(
+                filter(
+                    lambda p: p[1].requires_grad, model.text_encoder.named_parameters()
+                )
+            )
             if model.text_encoder_2 is not None:
-                text_encoder_params += list(filter(lambda p: p[1].requires_grad, model.text_encoder_2.named_parameters()))
+                text_encoder_params += list(
+                    filter(
+                        lambda p: p[1].requires_grad,
+                        model.text_encoder_2.named_parameters(),
+                    )
+                )
 
         if args.disable_unet_training:
             unet_params = []
@@ -1274,45 +1647,62 @@ class EveryDreamOptimizer:
                     target_modules=["to_k", "to_q", "to_v", "to_out.0"],
                 )
                 model.unet.add_adapter(unet_lora_config)
-            unet_params = list(filter(lambda p: p[1].requires_grad, model.unet.named_parameters()))
+            unet_params = list(
+                filter(lambda p: p[1].requires_grad, model.unet.named_parameters())
+            )
 
-        return {'default': text_encoder_params}, {'default': unet_params}
+        return {"default": text_encoder_params}, {"default": unet_params}
 
 
-
-def log_optimizer(label: str, optimizer: torch.optim.Optimizer, betas, epsilon, weight_decay, lr):
+def log_optimizer(
+    label: str, optimizer: torch.optim.Optimizer, betas, epsilon, weight_decay, lr
+):
     """
     logs the optimizer settings
     """
-    all_params = sum([g['params'] for g in optimizer.param_groups], [])
+    all_params = sum([g["params"] for g in optimizer.param_groups], [])
     frozen_parameter_count = len([p for p in all_params if not p.requires_grad])
     total_parameter_count = len(all_params)
     if frozen_parameter_count > 0:
-        param_info = f"({total_parameter_count} parameters, {frozen_parameter_count} frozen)"
+        param_info = (
+            f"({total_parameter_count} parameters, {frozen_parameter_count} frozen)"
+        )
     else:
         param_info = f"({total_parameter_count} parameters)"
 
-    logging.info(f"{Fore.CYAN} * {label} optimizer: {optimizer.__class__.__name__} {param_info} *{Style.RESET_ALL}")
-    logging.info(f"{Fore.CYAN}    lr: {lr}, betas: {betas}, epsilon: {epsilon}, weight_decay: {weight_decay} *{Style.RESET_ALL}")
+    logging.info(
+        f"{Fore.CYAN} * {label} optimizer: {optimizer.__class__.__name__} {param_info} *{Style.RESET_ALL}"
+    )
+    logging.info(
+        f"{Fore.CYAN}    lr: {lr}, betas: {betas}, epsilon: {epsilon}, weight_decay: {weight_decay} *{Style.RESET_ALL}"
+    )
 
 
 def _get_grad_norm(parameters) -> float:
-    parameters = [
-        p for p in parameters if p.grad is not None and p.requires_grad
-    ]
+    parameters = [p for p in parameters if p.grad is not None and p.requires_grad]
     if len(parameters) == 0:
         return 0.0
     else:
         device = parameters[0].grad.device
         return torch.norm(
-            torch.stack(
-                [
-                    torch.norm(p.grad.detach()).to(device)
-                    for p in parameters
-                ]
-            ),
+            torch.stack([torch.norm(p.grad.detach()).to(device) for p in parameters]),
             2.0,
         ).item()
+
+
+def _get_optimizer_norm(optimizer, name: str) -> float | None:
+    with torch.no_grad():
+        norms = []
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p in optimizer.state:
+                    state = optimizer.state[p]
+                    if name in state:
+                        norms.append(torch.norm(state[name]).item() ** 2)
+        if len(norms) == 0:
+            return None
+        return sum(norms) ** 0.5
+
 
 def _get_moment_norms(optimizer) -> tuple[float, float]:
     if optimizer is None:
@@ -1321,24 +1711,25 @@ def _get_moment_norms(optimizer) -> tuple[float, float]:
         exp_avg_norms = []
         exp_avg_sq_norms = []
         for group in optimizer.param_groups:
-            for p in group['params']:
+            for p in group["params"]:
                 if p in optimizer.state:
                     state = optimizer.state[p]
-                    if 'exp_avg' in state and 'exp_avg_sq' in state:
-                        exp_avg_norms.append(torch.norm(state['exp_avg']).item() ** 2)
-                        exp_avg_sq_norms.append(torch.norm(state['exp_avg_sq']).item() ** 2)
+                    if "exp_avg" in state and "exp_avg_sq" in state:
+                        exp_avg_norms.append(torch.norm(state["exp_avg"]).item() ** 2)
+                        exp_avg_sq_norms.append(
+                            torch.norm(state["exp_avg_sq"]).item() ** 2
+                        )
 
         return sum(exp_avg_norms) ** 0.5, sum(exp_avg_sq_norms) ** 0.5
 
+
 def _get_findlr_scheduler(
-    optimizer: Optimizer,
-    min_lr: float,
-    base_lr: float,
-    num_warmup_steps: int
+    optimizer: Optimizer, min_lr: float, base_lr: float, num_warmup_steps: int
 ) -> LambdaLR:
     """
     Create a schedule with a learning rate that increases exponentially from min_lr to base_lr over num_warmup_steps.
     """
+
     def findlr_lambda(current_step: int):
         if current_step >= num_warmup_steps:
             # just use base_lr
@@ -1349,7 +1740,6 @@ def _get_findlr_scheduler(
         return (min_lr * (base_lr / min_lr) ** t) / base_lr
 
     return LambdaLR(optimizer, findlr_lambda)
-
 
 
 def _get_polynomial_decay_schedule_with_warmup_adj(
@@ -1406,18 +1796,24 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
         else:
             lr_range = lr_init - lr_end
             decay_steps = num_training_steps_cycle - num_warmup_steps_cycle
-            pct_remaining = 1 - (current_cycle_step - num_warmup_steps_cycle) / decay_steps
+            pct_remaining = (
+                1 - (current_cycle_step - num_warmup_steps_cycle) / decay_steps
+            )
             decay = lr_range * pct_remaining**power + lr_end
             return decay / lr_init  # as LambdaLR multiplies by lr_init
 
     def lr_lambda(current_step: int):
-        current_cycle_step = current_step % int(num_warmup_steps_cycle + num_training_steps_cycle)
+        current_cycle_step = current_step % int(
+            num_warmup_steps_cycle + num_training_steps_cycle
+        )
         return lr_lambda_cycleinternal(current_cycle_step)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def _extract_attention_parameter_group(parameters: list[tuple[str, torch.nn.Parameter]]) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+def _extract_attention_parameter_group(
+    parameters: list[tuple[str, torch.nn.Parameter]],
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     """
     Extracts the attention parameters from the given parameters list.
     Returns a tuple of two lists: regular parameters and attention parameters.
@@ -1427,9 +1823,78 @@ def _extract_attention_parameter_group(parameters: list[tuple[str, torch.nn.Para
 
     for name, param in parameters:
         name = name.lower()
-        if ("attn" in name or "attention" in name) and any(qk in name for qk in ["to_q", "to_k", "query", "key"]):
+        if ("attn" in name or "attention" in name) and any(
+            qk in name for qk in ["to_q", "to_k", "query", "key"]
+        ):
             attention_group.append((name, param))
         else:
             regular_group.append((name, param))
 
     return regular_group, attention_group
+
+
+def _should_freeze_from_regexes(regexes: str, name: str) -> bool:
+    # regex can be multi-command - separated by ;
+    # 1. split at ;
+    # 2. apply each rule in sequence, last match wins
+    should_freeze = False
+    rules = regexes.split(";")
+    for rule in rules:
+        rule = rule.strip()
+        if rule == "":
+            continue
+        if rule.startswith("#"):
+            # comment
+            continue
+        if rule.startswith("freeze "):
+            is_negative = False
+            pattern = rule.replace("freeze ", "", 1).strip()
+        elif rule.startswith("unfreeze "):
+            is_negative = True
+            pattern = rule.replace("unfreeze ", "", 1).strip()
+        else:
+            logging.warning(
+                f"* Parsing old-style unet_freeze_regex rule '{rule}' with ! for unfreeze - please use 'freeze'/'unfreeze' keywords instead"
+            )
+            if rule.startswith("!"):
+                is_negative = True
+                pattern = rule[1:].strip()
+            else:
+                is_negative = False
+                pattern = rule
+        if re.search(pattern, name):
+            should_freeze = not is_negative
+    return should_freeze
+
+
+def _log_grad_norms(optimizer, writer, optimizer_name, global_step):
+    for name in "exp_avg", "exp_avg_sq", "s":
+        norm = _get_optimizer_norm(optimizer, name)
+        if norm is not None:
+            writer.add_scalar(f"optimizer/{optimizer_name}_{name}", norm, global_step)
+
+    if type(optimizer) is Prodigy:
+        for group_idx, group in enumerate(optimizer.param_groups):
+            # Log the final d value (most important)
+            writer.add_scalar(f"optimizer/{optimizer_name}_prodigy_d_group_{group_idx}", group["d"], global_step)
+
+            # Log d_hat to see if clipping is occurring
+            writer.add_scalar(
+                f"optimizer/{optimizer_name}_prodigy_d_hat_group_{group_idx}", group.get("d_hat", group["d"]), global_step
+            )
+
+            # Optionally log the ratio to understand adaptation
+            if "d_numerator" in group and "d_denom" in group:
+                writer.add_scalar(
+                    f"optimizer/{optimizer_name}_prodigy_d_numerator_group_{group_idx}", group["d_numerator"], global_step
+                )
+                writer.add_scalar(
+                    f"optimizer/{optimizer_name}_prodigy_d_denom_group_{group_idx}", group["d_denom"], global_step
+                )
+
+                # Log the raw ratio
+                if group["d_denom"] > 0:
+                    raw_ratio = group["d_numerator"] / group["d_denom"]
+                    writer.add_scalar(
+                        f"optimizer/{optimizer_name}_prodigy_d_raw_ratio_group_{group_idx}", raw_ratio, global_step
+                    )

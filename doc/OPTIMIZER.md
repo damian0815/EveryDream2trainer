@@ -93,3 +93,10 @@ Recommended settings for SD2.1 are provided in `optimizerSD21.json`. Unfreezing 
 ## General Beta, weight decay, epsilon, etc tuning
 
 Betas, weight decay, and epsilon are documented in the [AdamW paper](https://arxiv.org/abs/1711.05101) and there is a wealth of information on the web, but consider those experimental to tweak.  
+
+
+# Freezing
+
+Recommended:
+
+--unet_freeze_regex "freeze .*; unfreeze .*.attentions..*.attn2.*; unfreeze .*.attentions..*.ff.*; unfreeze .*.attentions..*.norm[23]$"

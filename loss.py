@@ -106,13 +106,20 @@ def get_latents(image, model: TrainingModel, device, args):
         latents = latents[0].sample() * scaling_factor
         return latents
 
-def get_loss(model_pred, target, is_cond_dropout,
-             mask_img, timesteps, loss_scale,
-             noise_scheduler,
-             do_contrastive_learning,
-             contrastive_loss_scale,
-             args,
-             verbose=False):
+def get_loss(
+    model_pred,
+    target,
+    is_cond_dropout,
+    mask_img,
+    timesteps,
+    loss_scale,
+    noise_scheduler,
+    text_embeds: torch.Tensor,
+    do_contrastive_learning,
+    contrastive_loss_scale,
+    args,
+    verbose=False,
+):
 
     #logging.info(f"get_loss timesteps: {timesteps.detach().cpu().tolist()}")
     device = model_pred.device
@@ -316,8 +323,35 @@ def get_loss(model_pred, target, is_cond_dropout,
 
         return contrastive_loss_full
 
-    with torch.autocast('cuda'):
-        contrastive_loss = contrastive_loss_infonce(model_pred, target, is_cond_dropout, timesteps) if args.contrastive_loss_type == 'infonce' else contrastive_loss_delta(model_pred, target, is_cond_dropout)
+    with (torch.autocast('cuda')):
+        if args.contrastive_loss_type == 'infonce_with_text_similarity':
+            contrastive_loss = text_weighted_infonce_loss(
+                model_pred,
+                target,
+                text_embeddings=text_embeds,
+                is_dropped=is_cond_dropout,
+                temperature=args.contrastive_loss_temperature,
+                hard_negative_weight=args.contrastive_loss_hard_negative_weight,
+                use_text_similarity=True,
+            )
+        elif args.contrastive_loss_type == 'infonce_softrepa':
+            contrastive_loss = text_weighted_infonce_loss_with_softrepa(
+                model_pred,
+                target,
+                text_embeddings=text_embeds,
+                is_dropped=is_cond_dropout,
+                temperature=None,
+                sigma=args.contrastive_loss_softrepa_sigma,
+                hard_negative_weight=args.contrastive_loss_hard_negative_weight,
+                similarity_method='softrepa'
+            )
+        elif args.contrastive_loss_type == 'infonce':
+            contrastive_loss = contrastive_loss_infonce(model_pred, target, is_cond_dropout, timesteps)
+        elif args.contrastive_loss_type == 'delta':
+            contrastive_loss = contrastive_loss_delta(model_pred, target, is_cond_dropout)
+        else:
+            raise ValueError(f"Unrecognized contrastive loss type: {args.contrastive_loss_type}")
+
     contrastive_loss = contrastive_loss.view(-1, 1, 1, 1).expand_as(
         non_contrastive_loss
     )
@@ -336,6 +370,255 @@ def get_loss(model_pred, target, is_cond_dropout,
     ) * mask_img
     return total_loss
 
+
+# Asks "How aligned are the directions of the prediction and target vectors?" This is a measure of cosine similarity.
+def text_weighted_infonce_loss(
+    model_pred,
+    target,
+    text_embeddings,
+    is_dropped,
+    temperature=0.07,
+    hard_negative_weight=2.0,
+    use_text_similarity=True,
+):
+    """
+    InfoNCE with text-aware weighting:
+    - Harder penalties for similar captions (confusable)
+    - Can use text embeddings for semantic similarity
+
+    Args:
+        model_pred: [B, C, H, W]
+        target: [B, C, H, W]
+        text_embeddings: [B, T, D] pre-computed text embeddings (optional)
+        is_dropped: [B] boolean mask
+        temperature: scaling factor
+        hard_negative_weight: extra weight for similar captions
+        use_text_similarity: whether to weight by caption similarity
+
+    Returns:
+        per_sample_loss: [B] contrastive losses
+    """
+    B = model_pred.shape[0]
+    device = model_pred.device
+
+    # Identify valid samples
+    valid_mask = ~is_dropped
+
+    num_valid = valid_mask.sum()
+    if num_valid < 2:
+        return torch.zeros(B, device=device)
+
+    # Extract valid samples
+    pred_valid = model_pred[valid_mask]
+    target_valid = target[valid_mask]
+
+    # Flatten and normalize
+    pred_flat = pred_valid.reshape(num_valid, -1)
+    target_flat = target_valid.reshape(num_valid, -1)
+
+    pred_norm = F.normalize(pred_flat, p=2, dim=1)
+    target_norm = F.normalize(target_flat, p=2, dim=1)
+
+    # Compute similarity matrix
+    sim_matrix = (
+        torch.mm(pred_norm, target_norm.t()) / temperature
+    )  # [num_valid, num_valid]
+
+    # Text-based weighting
+    if use_text_similarity:
+        text_sim = text_embeddings_to_similarity(text_embeddings)
+
+        # Weight negatives by text similarity
+        # Similar captions = harder negatives = higher weight
+        # Create weight matrix: 1.0 for diagonal, hard_negative_weight for similar off-diagonal
+        weight_matrix = torch.ones_like(sim_matrix)
+
+        # Apply extra weight to similar captions (hard negatives)
+        for i in range(num_valid):
+            for j in range(num_valid):
+                if i != j:
+                    # Scale weight by text similarity
+                    # High text_sim → hard negative → higher weight
+                    weight_matrix[i, j] = (
+                        1.0 + (hard_negative_weight - 1.0) * text_sim[i, j]
+                    )
+
+        # Apply weights to similarity matrix (for negatives only)
+        mask = torch.eye(num_valid, device=device, dtype=torch.bool)
+        sim_matrix = torch.where(mask, sim_matrix, sim_matrix * weight_matrix)
+
+    # Standard InfoNCE, normalized by sqrt(batch_size) for stability
+    labels = torch.arange(num_valid, device=device)
+    loss_per_sample = F.cross_entropy(sim_matrix, labels, reduction="none") / math.sqrt(num_valid)
+
+    # Map back to full batch size with zeros for dropped samples
+    full_losses = torch.zeros(B, device=device)
+    full_losses[valid_mask] = loss_per_sample
+
+    return full_losses
+
+
+
+def text_weighted_infonce_loss_with_softrepa(
+    model_pred,
+    target,
+    text_embeddings,
+    is_dropped,
+    temperature=0.07,
+    sigma=1.0,
+    hard_negative_weight=2.0,
+    similarity_method: Literal['cosine', 'softrepa'] = 'softrepa',
+):
+    """
+    InfoNCE with text-aware weighting, using SoftREPA's error-based similarity.
+
+    Sigma for SoftREPA controls the sharpness of the similarity measure. A smaller sigma will make the logits more spread out (e.g., -10 vs -1000). This leads to a "sharper" softmax distribution, forcing the model to be more confident in its positive pair. A larger sigma will shrink the logits closer together, creating a "softer" distribution. You will need to tune sigma as a hyperparameter. A good starting point is 1.0.
+
+    Args:
+        model_pred: [B, C, H, W] (this is v_pred)
+        target: [B, C, H, W] (this is v_target)
+        text_embeddings: [B, T, D]
+        is_dropped: [B]
+        sigma: scaling factor for SoftREPA error-based logits
+        temperature: scaling factor for normalized cosine distance
+        hard_negative_weight: extra weight for similar captions
+        use_text_similarity: whether to weight by caption similarity
+
+    Returns:
+        per_sample_loss: [B] contrastive losses
+    """
+    B = model_pred.shape[0]
+    device = model_pred.device
+
+    # Identify valid samples
+    valid_mask = ~is_dropped
+
+    num_valid = valid_mask.sum()
+    if num_valid < 2:
+        return torch.zeros(B, device=device)
+
+    # Extract valid samples
+    pred_valid = model_pred[valid_mask]
+    target_valid = target[valid_mask]
+
+    # Flatten (but DO NOT normalize)
+    pred_flat = pred_valid.reshape(num_valid, -1)
+    target_flat = target_valid.reshape(num_valid, -1)
+
+    if similarity_method == 'softrepa':
+        # Error-based logits as per SoftREPA
+        # Asks "How small is the error between the prediction for image i and the target for image j?" It directly uses the model's primary objective (minimizing prediction error) as the basis for contrastive learning.
+        sim_matrix = calculate_softrepa_error_based_logits(pred_flat, target_flat, sigma=sigma)
+        # The output `sim_matrix` is a [num_valid, num_valid] matrix of logits.
+    elif similarity_method == 'cosine':
+        # cosine similarity between velocities
+        # Asks "How aligned are the directions of the prediction and target vectors?"
+        pred_norm = F.normalize(pred_flat, p=2, dim=1)
+        target_norm = F.normalize(target_flat, p=2, dim=1)
+
+        # Compute similarity matrix
+        sim_matrix = (
+            torch.mm(pred_norm, target_norm.t()) / temperature
+        )  # [num_valid, num_valid]
+    else:
+        raise ValueError(f"Unknown similarity_method: {similarity_method}")
+
+    text_sim = text_embeddings_to_similarity(text_embeddings)
+
+    # Weight negatives by text similarity
+    # Similar captions = harder negatives = higher weight
+    # Create weight matrix: 1.0 for diagonal, hard_negative_weight for similar off-diagonal
+    weight_matrix = torch.ones_like(sim_matrix)
+
+    # Apply extra weight to similar captions (hard negatives)
+    for i in range(num_valid):
+        for j in range(num_valid):
+            if i != j:
+                # Scale weight by text similarity
+                # High text_sim → hard negative → higher weight
+                weight_matrix[i, j] = (
+                    1.0 + (hard_negative_weight - 1.0) * text_sim[i, j]
+                )
+
+    # Apply weights to similarity matrix (for negatives only)
+    mask = torch.eye(num_valid, device=device, dtype=torch.bool)
+    sim_matrix = torch.where(mask, sim_matrix, sim_matrix * weight_matrix)
+
+    # Standard InfoNCE (THIS PART REMAINS EXACTLY THE SAME)
+    labels = torch.arange(num_valid, device=device)
+    loss_per_sample = F.cross_entropy(sim_matrix, labels, reduction="none") / math.sqrt(
+        num_valid
+    )
+
+    # Map back to full batch size with zeros for dropped samples
+    full_losses = torch.zeros(B, device=device)
+    full_losses[valid_mask] = loss_per_sample
+
+    return full_losses
+
+
+
+def text_embeddings_to_similarity(text_embeddings):
+    """
+    Convert [B, T, D] text embeddings to [B, B] similarity matrix.
+
+    Args:
+        text_embeddings: [B, 77, D] CLIP penultimate hidden states
+
+    Returns:
+        sim_matrix: [B, B] pairwise similarity
+    """
+    B, T, D = text_embeddings.shape
+
+    # Option 1: Mean pool over sequence dimension
+    pooled = text_embeddings.mean(dim=1)  # [B, D]
+
+    # Option 2: CLS token (first token) - often used with CLIP
+    # pooled = text_embeddings[:, 0, :]  # [B, D]
+
+    # Option 3: Max pool (take most salient features)
+    # pooled = text_embeddings.max(dim=1)[0]  # [B, D]
+
+    # Compute cosine similarity
+    pooled_norm = F.normalize(pooled, p=2, dim=1)
+    sim_matrix = torch.mm(pooled_norm, pooled_norm.t())
+
+    return sim_matrix
+
+
+
+def calculate_softrepa_error_based_logits(pred_flat, target_flat, sigma=1.0):
+    """
+    Calculates a similarity matrix based on negative squared error, as in SoftREPA.
+    The "similarity" is actually the logit for the contrastive loss.
+
+    Args:
+        pred_flat: [N, D] tensor of flattened model predictions (v_pred).
+        target_flat: [N, D] tensor of flattened targets (v_target).
+        sigma: A scaling parameter, similar to temperature. Controls the sharpness.
+
+    Returns:
+        logit_matrix: [N, N] matrix where entry (i, j) is -||pred_i - target_j||^2 / sigma.
+    """
+    # Use broadcasting to compute the pairwise squared error efficiently
+    # pred_flat:       [N, 1, D]
+    # target_flat:     [1, N, D]
+    # diff:            [N, N, D]
+    diff = pred_flat.unsqueeze(1) - target_flat.unsqueeze(0)
+
+    # Sum the squares over the feature dimension (D)
+    # This computes ||v_pred_i - v_target_j||^2 for all i, j
+    squared_error_matrix = torch.sum(diff**2, dim=2)  # Shape: [N, N]
+
+    D = pred_flat.shape[-1]
+    normalized_error = squared_error_matrix / D
+
+    # The logit is the negative squared error, scaled by sigma
+    # A small error -> large logit (good match)
+    # A large error -> small (very negative) logit (bad match)
+    logit_matrix = -normalized_error / sigma
+
+    return logit_matrix
 
 
 def contrastive_loss_old():
@@ -408,7 +691,7 @@ def _get_contrastive_v2_loss():
 def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: torch.Tensor,
                                     timesteps: torch.Tensor, model: TrainingModel,
                                     args=None, skip_contrastive: bool=False,
-                                    teacher_unet: UNet2DConditionModel|None=None,
+                                    teacher_model: TrainingModel|None=None,
                                     teacher_mask: torch.Tensor|None=None,
                                     teacher_conditioning: Conditioning|None=None,
                                     debug_fake: bool = False
@@ -431,10 +714,12 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                 model_pred = model.unet(noisy_latents, timesteps, conditioning.prompt_embeds).sample
 
     with torch.no_grad():
-        if teacher_unet is not None:
+        if teacher_model.unet is not None:
             if teacher_conditioning is None:
                 teacher_conditioning = conditioning
-            teacher_target = teacher_unet(noisy_latents.half(), timesteps, teacher_conditioning.prompt_embeds.half()).sample.float()
+
+            teacher_target = _get_teacher_target(teacher_model, teacher_conditioning, timesteps, noisy_latents, model.noise_scheduler.config.get('prediction_type', ''))
+
             target = (
                 teacher_target *  teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
                 +   target     * ~teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
@@ -443,33 +728,44 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
     model_pred_wrong_caption = None
     model_pred_wrong_caption_mask = None
 
-    if not skip_contrastive and args.contrastive_learning_info_nce_sample_count > 0:
-        def rotate_dim0(x, c):
-            return torch.cat([x[-c:], x[:-c]])
-        model_pred_wrong_caption = []
-        model_pred_wrong_caption_mask = []
-        for i in range(min(args.contrastive_learning_info_nce_sample_count, conditioning.prompt_embeds.shape[0]-1)):
-            # v_pred_positive = unet(z_t, t, c_positive).
-            # v_pred_negative_1 = unet(z_t, t, c_negative_1)
-            # v_pred_negative_2 = unet(z_t, t, c_negative_2)
-            with autocast(
-                enabled=args.amp,
-                dtype=torch.bfloat16 if model.is_sdxl else torch.float16,
-            ):
-                wrong_caption_i = rotate_dim0(conditioning.prompt_embeds, i + 1)
-                model_pred_wrong_caption_i = model.unet(noisy_latents, timesteps, wrong_caption_i).sample
-                model_pred_wrong_caption.append(model_pred_wrong_caption_i)
-                del wrong_caption_i, model_pred_wrong_caption_i
-        if len(model_pred_wrong_caption) > 0:
-            model_pred_wrong_caption = torch.stack(model_pred_wrong_caption)
-            model_pred_wrong_caption_mask = torch.tensor([True] * conditioning.prompt_embeds.shape[0],
-                                                              dtype=torch.bool, device=model_pred.device)
-        else:
-            model_pred_wrong_caption = torch.zeros_like(model_pred).unsqueeze(0)
-            model_pred_wrong_caption_mask = torch.tensor([False] * conditioning.prompt_embeds.shape[0],
-                                                              dtype=torch.bool, device=model_pred.device)
-
     return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask, noisy_latents
+
+
+def _get_teacher_target(teacher_model: TrainingModel, teacher_conditioning: Conditioning, timesteps: torch.Tensor, noisy_latents: torch.Tensor, training_model_prediction_type: str):
+    teacher_target = teacher_model.unet(noisy_latents.half(), timesteps,
+                                        teacher_conditioning.prompt_embeds.half()).sample.float()
+    teacher_prediction_type = teacher_model.noise_scheduler.config.get('prediction_type', '')
+    if teacher_prediction_type == training_model_prediction_type:
+        return teacher_target
+    elif teacher_prediction_type in ['v_prediction', 'v-prediction'] and training_model_prediction_type == 'epsilon':
+        # Convert v-prediction to epsilon
+        alpha_t = teacher_model.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).sqrt()
+        sigma_t = (1 - alpha_t ** 2).sqrt()
+
+        # First get x_0: x_0 = (α_t·x_t - σ_t·v) / (α_t² + σ_t²)^0.5
+        x_0_pred = (alpha_t * noisy_latents - sigma_t * teacher_target) / (alpha_t ** 2 + sigma_t ** 2).sqrt()
+
+        # Then epsilon: ε = (x_t - α_t·x_0) / σ_t
+        return (noisy_latents - alpha_t * x_0_pred) / sigma_t
+    elif teacher_prediction_type == 'epsilon' and training_model_prediction_type in ['v_prediction', 'v-prediction']:
+        # Convert epsilon to v-prediction
+        alpha_t = teacher_model.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).sqrt()
+        sigma_t = (1 - alpha_t ** 2).sqrt()
+        # First get x_0 from epsilon: x_0 = (x_t - σ_t·ε) / α_t
+        x_0_pred = (noisy_latents - sigma_t * teacher_target) / alpha_t
+        # Then compute v: v = α_t·ε - σ_t·x_0
+        return alpha_t * teacher_target - sigma_t * x_0_pred
+    elif training_model_prediction_type == 'flow_prediction' and teacher_prediction_type in ['v_prediction',
+                                                                                           'v-prediction']:
+        # Convert v-prediction to x_0 (clean image prediction)
+        alpha_t = teacher_model.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).sqrt()
+        sigma_t = (1 - alpha_t ** 2).sqrt()
+        x_0_pred = (alpha_t * noisy_latents - sigma_t * teacher_target) / (alpha_t ** 2 + sigma_t ** 2).sqrt()
+        # Flow velocity = target direction (x_0 - x_t for linear flow)
+        return x_0_pred - noisy_latents
+    else:
+        raise ValueError(
+            f"Cannot convert between teacher model prediction type {teacher_prediction_type} and training model prediction type {training_model_prediction_type}")
 
 
 def _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation):

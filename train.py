@@ -427,32 +427,55 @@ def main(args):
 
     if args.teacher is not None and args.teacher_p > 0:
         logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
-        teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher)
+        teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
         if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
             raise ValueError("Teacher and training model must use same prediction_type")
+
+        teacher_unet = teacher_pipeline.unet
+        teacher_unet.eval()
+
+        # check if we should use the teacher's text encoder
+        teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
+        base_te_sd = model.text_encoder.state_dict()
+        delta = 0
+        with torch.no_grad():
+            for k in teacher_te_sd.keys():
+                # may have different token counts
+                if k not in base_te_sd:
+                    delta += 1e3
+                    continue
+                a = teacher_te_sd[k]
+                b = base_te_sd[k]
+                if a.shape != b.shape:
+                    # different!
+                    delta += 1e3
+                    continue
+                delta += torch.mean(a - b)
+        epsilon = 1e-2
+        if delta > epsilon:
+            logging.info("* Teacher text encoder is different from base model -> using teacher text encoder too")
+            teacher_text_encoder = teacher_pipeline.text_encoder
+            teacher_text_encoder.eval()
+            teacher_text_encoder_2 = getattr(teacher_pipeline, 'text_encoder', None)
+            if teacher_text_encoder_2 is not None:
+                teacher_text_encoder_2.eval()
+        else:
+            logging.info("* Teacher text encoder is the same as base -> using base text encoder for teacher")
+            teacher_text_encoder = None
+            teacher_text_encoder_2 = None
+        del teacher_te_sd, base_te_sd, delta
+
         teacher_model = TrainingModel(
-            noise_scheduler=None,
-            unet=None,
-            text_encoder=None,
-            text_encoder_2=None,
-            tokenizer=None,
-            tokenizer_2=None,
+            noise_scheduler=teacher_pipeline.noise_scheduler,
+            unet=teacher_unet,
+            text_encoder=teacher_text_encoder,
+            text_encoder_2=teacher_text_encoder_2,
+            tokenizer=teacher_pipeline.tokenizer,
+            tokenizer_2=getattr(teacher_pipeline, 'tokenizer_2', None),
             vae=None,
             compel=None,
             yaml=None
         )
-        teacher_model.unet = teacher_pipeline.unet.to(device=device, dtype=torch.float16)
-        teacher_model.unet.eval()
-
-        teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
-        base_te_sd = model.text_encoder.state_dict()
-        delta = sum([torch.mean(torch.abs(teacher_te_sd[k] - base_te_sd[k])) for k in teacher_te_sd.keys()])
-        epsilon = 1e-2
-        if delta > epsilon:
-            teacher_model.text_encoder = teacher_pipeline.text_encoder.to(device=device, dtype=torch.float16)
-            teacher_model.text_encoder.eval()
-        del teacher_te_sd, base_te_sd, delta
-
         del teacher_pipeline
     else:
         teacher_model = None
@@ -828,9 +851,11 @@ def main(args):
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
-        validator.do_validation(model=model,
-                                global_step=0,
-                                get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper)
+        validator.do_validation(
+            model=model,
+            global_step=0,
+            get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper
+        )
 
     # the sample generator might be configured to generate samples before step 0
     if sample_generator.generate_pretrain_samples:
@@ -1188,9 +1213,8 @@ def main(args):
                                 if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
                                     teacher_encoder_hidden_states = None
                                 else:
-                                    assert not teacher_model.is_sdxl
                                     teacher_encoder_hidden_states, _, _ = get_text_conditioning(
-                                        tokens, None, caption_str, teacher_model, args
+                                        tokens, tokens_2, caption_str, teacher_model, args
                                     )
 
                                 if args.offload_text_encoder:
@@ -1200,6 +1224,7 @@ def main(args):
                             model_pred_wrong_all = []
                             model_pred_wrong_mask_all = []
                             target_all = []
+                            text_embeds_all = []
 
                             is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
                                                               for s in caption_str[0:batch_size]], device=model.unet.device, dtype=torch.bool)
@@ -1256,7 +1281,7 @@ def main(args):
                                         timesteps=timesteps_slice,
                                         model=model,
                                         args=args,
-                                        teacher_unet=teacher_model.unet if teacher_model else None,
+                                        teacher_model=teacher_model,
                                         teacher_mask=teacher_mask_slice,
                                         teacher_conditioning=teacher_conditioning,
                                     )
@@ -1271,6 +1296,7 @@ def main(args):
                                 model_pred_wrong_mask_all.append(model_pred_wrong_mask)
                                 target_all.append(target)
 
+                                text_embeds_all.append(conditioning.prompt_embeds)
                                 del conditioning
 
                             nibble_size_actual = min(slice_end, batch_size - runt_size)
@@ -1284,7 +1310,8 @@ def main(args):
                                 model_pred_wrong = None
                                 model_pred_wrong_mask = None
                             target = torch.cat(target_all)
-                            del model_pred_all, model_pred_wrong_all, model_pred_wrong_mask_all, target_all
+                            text_embeds = torch.cat(text_embeds_all)
+                            del model_pred_all, model_pred_wrong_all, model_pred_wrong_mask_all, target_all, text_embeds_all
 
                             loss = get_loss(model_pred,
                                             target,
@@ -1293,6 +1320,7 @@ def main(args):
                                             timesteps=timesteps[0:nibble_size_actual],
                                             loss_scale=loss_scale[0:nibble_size_actual],
                                             noise_scheduler=model.noise_scheduler,
+                                            text_embeds=text_embeds,
                                             do_contrastive_learning=full_batch["do_contrastive_learning"],
                                             contrastive_loss_scale = contrastive_loss_scale,
                                             verbose=(tv.global_step % 200 == 0),
@@ -1308,7 +1336,7 @@ def main(args):
                             #    f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
                             #)
                             log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
-                            del target, model_pred, model_pred_wrong, model_pred_wrong_mask
+                            del target, model_pred, model_pred_wrong, model_pred_wrong_mask, text_embeds
 
                             log_data.loss_log_step_cd.append(loss[is_cond_dropout].mean().detach().item())
                             log_data.loss_log_step_non_cd.append(loss[~is_cond_dropout].mean().detach().item())
@@ -1702,6 +1730,7 @@ if __name__ == "__main__":
                            help="source for cond dropout curriculum - timestep (high timestep (high noise)...low timestep), batch size (initial_batch_size...final_batch_size), or global_step")
     argparser.add_argument("--final_cond_dropout", type=float, default=None, help="if doing cond dropout curriculum, the final cond dropout (timestep=0)")
     argparser.add_argument("--loss_scale", type=float, default=1, help="additional loss scaling")
+    argparser.add_argument("--dropout", type=float, default=0, help="Dropout rate (def: 0.0)")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
@@ -1728,6 +1757,7 @@ if __name__ == "__main__":
     argparser.add_argument("--negative_loss_margin", type=float, default=0.05, help="maximum for negative loss scale repulsion")
     argparser.add_argument("--lr", type=float, default=None, help="Learning rate, if using scheduler is maximum LR at top of curve")
     argparser.add_argument("--lr_end", type=float, default=None, help="Final learning rate, if using scheduler is minimum LR at end of curve")
+    argparser.add_argument("--lr_d0", type=float, default=1e-6, help="d0 for adaptive optimizers")
     argparser.add_argument("--lr_decay_steps", type=int, default=0, help="Steps to reach minimum LR, default: automatically set")
     argparser.add_argument("--lr_scheduler", type=str, default="constant", help="LR scheduler, (default: constant)", choices=["constant", "linear", "cosine", "polynomial"])
     argparser.add_argument("--lr_warmup_steps", type=int, default=None, help="Steps to reach max LR during warmup (def: 0.02 of lr_decay_steps), non-functional for constant")
@@ -1739,7 +1769,7 @@ if __name__ == "__main__":
     argparser.add_argument("--no_prepend_last", action="store_true", help="Do not prepend 'last-' to the final checkpoint filename")
     argparser.add_argument("--no_save_ckpt", action="store_true", help="Save only diffusers files, not .safetensors files (save disk space if you do not need LDM-style checkpoints)" )
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
-    argparser.add_argument("--unet_freeze_regex", default=None, help="Unet freeze regex(es). Specify multiply matches by separating with `;`. Matches are applied in order. `!` specifies negative (unfreeze). Last match wins. eg: --unet_freeze_regex \"\\.*;!down_blocks\\.0\\..*attentions.*;.*\\.norm1\" -> freeze all, then unfreeze attention modules in down_block 0 except norm1 layers. Use --debug_unet_freeze_regex to apply rules and dump to console without actually training.")
+    argparser.add_argument("--unet_freeze_regex", default=None, help='Unet freeze regex(es). Specify multiply matches by separating with `;`. Matches are applied in order. `freeze` or `unfreeze` specifies what the match does. Last match wins. eg: --unet_freeze_regex "freeze .*; unfreeze down_blocks\\.0\\..*attentions.*; freeze .*\\.norm1" -> freeze all, then unfreeze attention modules in down_block 0 except norm1 layers. Use --debug_unet_freeze_regex to apply rules and dump result to console without actually training.')
     argparser.add_argument("--debug_unet_freeze_regex", action="store_true", help="If passed, apply unet freeze regex and dump results to console without training")
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
@@ -1804,19 +1834,11 @@ if __name__ == "__main__":
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")
     argparser.add_argument("--contrastive_loss_scale", type=float, default=1, help="Scaling factor for contrastive loss")
-    argparser.add_argument("--contrastive_loss_type", type=str, choices=['infonce', 'delta'], help="Type of contrastive loss (infonce or negative-delta)")
-    argparser.add_argument("--contrastive_loss_temperature", type=float, default=0.07, help="Temperature for infonce contrastive loss (lower=more aggressive)")
+    argparser.add_argument("--contrastive_loss_type", type=str, choices=['infonce', 'delta', 'infonce_with_text_similarity', 'infonce_softrepa'], help="Type of contrastive loss")
+    argparser.add_argument("--contrastive_loss_softrepa_sigma", type=float, default=1.0, help="Sigma value for SoftREPA infoNCE contrastive loss (only used if type == infonce_softrepa)")
+    argparser.add_argument("--contrastive_loss_temperature", type=float, default=0.07, help="Temperature for infonce contrastive loss (lower=more aggressive) (only used if type == infonce or infonce_with_text_similarity")
+    argparser.add_argument("--contrastive_loss_hard_negative_weight", type=float, default=2, help="weight factor for more difficult negative pairs when doing infoNCE (default=2.0)")
 
-    argparser.add_argument("--contrastive_learning_max_negative_loss", type=float, default=1, help="Loss clamp max for contrastive learning negative loss (default=1)")
-    argparser.add_argument("--contrastive_learning_use_l1_loss", action="store_true", help="use L1 loss instead of MSE for contrastive negative term")
-    argparser.add_argument("--contrastive_learning_no_average_negatives", action="store_true", help="do not average negative terms per batch")
-    argparser.add_argument("--contrastive_learning_save_on_cpu", action="store_true", help="Store grads on CPU (allows larger grad_accum sizes but slower)")
-    argparser.add_argument("--contrastive_learning_delta_loss_method", action="store_true", help="If passed, contrastive learning works with deltas from correct to incorrect targets / predictions")
-    argparser.add_argument("--contrastive_learning_delta_timestep_start", type=int, default=150, help="Where to start scaling delta negative loss")
-    argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="dropout probability for contrastive learning, 0..1")
-    argparser.add_argument("--contrastive_learning_curriculum_alpha", type=float, default=0, help="if passed, exponentially disable contrastive learning as training progresses")
-    argparser.add_argument("--contrastive_learning_info_nce_sample_count", type=int, default=0, help="If >0, do InfoNCE contrastive loss")
-    argparser.add_argument("--contrastive_learning_info_nce_temperature", type=float, default=1, help="Temperature for InfoNCE contrastive loss")
     argparser.add_argument("--everything_contrastive_learning_p", type=float, default=0, help="probability to run contrastive learning on everything, 0..1")
     argparser.add_argument("--everything_contrastive_learning_curriculum_alpha", type=float, default=0, help="if >0, attenuate everything_contrastive_learning_p to 0 using this alpha as timestep approaches 0")
     argparser.add_argument("--caption_variants", type=str, nargs="*", default=[], help="If passed, use only these caption variants from json captions")

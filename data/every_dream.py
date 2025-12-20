@@ -424,7 +424,7 @@ def collate_fn(batch):
     if dropped > 0:
         logging.warning(f"collate_fn: dropped {dropped} examples with None images")
         # duplicate last example to fill batch
-        while len(batch_no_none) < len(batch):
+        while len(batch_no_none) < len(batch) and batch_no_none:
             batch_no_none.append(batch_no_none[-1])
             batch[0]["runt_size"] += 1
         batch = batch_no_none
