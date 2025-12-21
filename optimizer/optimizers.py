@@ -889,9 +889,9 @@ class EveryDreamOptimizer:
                 )
 
         if optimizer_name is None or optimizer_name == "adamw8bit":
-            if not self.use_grad_scaler:
+            if not self.use_grad_scaler and self.unet.dtype != torch.bfloat16:
                 logging.warning(
-                    f"{Fore.YELLOW}** Using AdamW8bit without grad scaler is not recommended, consider enabling amp mode.{Style.RESET_ALL}"
+                    f"{Fore.YELLOW}** Using AdamW8bit without grad scaler on anything other than bfloat16 model dtype is not recommended.{Style.RESET_ALL}"
                 )
 
         if curr_lr is None:

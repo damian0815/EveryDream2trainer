@@ -194,6 +194,7 @@ class TrainingModel:
     def device(self):
         return self.unet.device
 
+
     noise_scheduler: SchedulerMixin|ConfigMixin
     text_encoder: CLIPTextModel
     text_encoder_2: CLIPTextModel|None
@@ -204,6 +205,20 @@ class TrainingModel:
 
     compel: Compel|None
     yaml: str|None
+
+    @staticmethod
+    def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
+        return TrainingModel(
+            noise_scheduler=pipe.scheduler,
+            text_encoder=pipe.text_encoder,
+            text_encoder_2=getattr(pipe, 'text_encoder_2', None),
+            tokenizer=pipe.tokenizer,
+            tokenizer_2=getattr(pipe, 'tokenizer_2', None),
+            unet=pipe.unet,
+            vae=pipe.vae,
+            compel=compel,
+            yaml=None,
+        )
 
     def load_vae_to_device(self, device):
         self.vae.to(device)

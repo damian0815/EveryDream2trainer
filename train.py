@@ -1,6 +1,3 @@
-from flow_match_model import TrainFlowMatchScheduler
-
-print("Hello")
 """
 Copyright [2022-2023] Victor C Hall
 
@@ -45,6 +42,7 @@ from compel.embeddings_provider import SplitLongTextMode
 from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline, AutoencoderKL
+from flow_match_model import TrainFlowMatchScheduler
 # from diffusers.models import AttentionBlock
 # from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -379,6 +377,30 @@ def load_train_json_from_file(args, report_load = False):
         raise
 
 
+def _make_conditioning_slice(
+    encoder_hidden_states: torch.Tensor,
+    encoder_2_hidden_states: torch.Tensor|None,
+    encoder_2_pooled_embeds: torch.Tensor|None,
+    add_time_ids: torch.Tensor|None,
+    slice_start, slice_end
+) -> Conditioning:
+    encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+    if encoder_2_hidden_states is not None:
+        encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
+        encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
+        add_time_ids_slice = add_time_ids[slice_start:slice_end]
+        return Conditioning.sdxl_conditioning(
+            text_encoder_hidden_states=encoder_hidden_states_slice,
+            text_encoder_2_hidden_states=encoder_2_hidden_states_slice,
+            text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
+            add_time_ids=add_time_ids_slice,
+        )
+    else:
+        return Conditioning.sd12_conditioning(
+            text_encoder_hidden_states=encoder_hidden_states_slice
+        )
+
+
 def main(args):
     """
     Main entry point
@@ -429,7 +451,7 @@ def main(args):
         logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
         teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
         if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
-            raise ValueError("Teacher and training model must use same prediction_type")
+            logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
 
         teacher_unet = teacher_pipeline.unet
         teacher_unet.eval()
@@ -438,25 +460,20 @@ def main(args):
         teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
         base_te_sd = model.text_encoder.state_dict()
         delta = 0
+        epsilon = 1e-2
         with torch.no_grad():
             for k in teacher_te_sd.keys():
                 # may have different token counts
-                if k not in base_te_sd:
-                    delta += 1e3
-                    continue
-                a = teacher_te_sd[k]
-                b = base_te_sd[k]
-                if a.shape != b.shape:
+                if k not in base_te_sd or base_te_sd[k].shape != teacher_te_sd[k].shape:
                     # different!
-                    delta += 1e3
-                    continue
-                delta += torch.mean(a - b)
-        epsilon = 1e-2
+                    delta = 1+epsilon
+                    break
+                delta += torch.mean(base_te_sd[k].cpu() - teacher_te_sd[k].cpu()) ** 2
         if delta > epsilon:
             logging.info("* Teacher text encoder is different from base model -> using teacher text encoder too")
             teacher_text_encoder = teacher_pipeline.text_encoder
             teacher_text_encoder.eval()
-            teacher_text_encoder_2 = getattr(teacher_pipeline, 'text_encoder', None)
+            teacher_text_encoder_2 = getattr(teacher_pipeline, 'text_encoder_2', None)
             if teacher_text_encoder_2 is not None:
                 teacher_text_encoder_2.eval()
         else:
@@ -466,7 +483,7 @@ def main(args):
         del teacher_te_sd, base_te_sd, delta
 
         teacher_model = TrainingModel(
-            noise_scheduler=teacher_pipeline.noise_scheduler,
+            noise_scheduler=teacher_pipeline.scheduler,
             unet=teacher_unet,
             text_encoder=teacher_text_encoder,
             text_encoder_2=teacher_text_encoder_2,
@@ -1168,7 +1185,7 @@ def main(args):
                                 tokens = []
                                 tokens_2 = []
                                 batch_size = batch["image"].shape[0]
-                                add_time_ids = batch["add_time_ids"].to(model.unet.device) if "add_time_ids" in batch else None
+                                add_time_ids = batch["add_time_ids"].to(model.unet.device) if 'add_time_ids' in batch else None
                                 for i in range(batch_size):
                                     this_caption_str = batch["captions"][
                                         caption_variant
@@ -1211,9 +1228,9 @@ def main(args):
                                     tokens, tokens_2, caption_str, model, args
                                 )
                                 if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
-                                    teacher_encoder_hidden_states = None
+                                    teacher_encoder_hidden_states, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = None, None, None
                                 else:
-                                    teacher_encoder_hidden_states, _, _ = get_text_conditioning(
+                                    teacher_encoder_hidden_states, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
                                         tokens, tokens_2, caption_str, teacher_model, args
                                     )
 
@@ -1235,11 +1252,6 @@ def main(args):
                             for slice_index, (slice_start, slice_end) in enumerate(slices):
                                 # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                                 latents_slice = latents[slice_start:slice_end]
-                                encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
-                                if teacher_encoder_hidden_states is None:
-                                    teacher_encoder_hidden_states_slice = None
-                                else:
-                                    teacher_encoder_hidden_states_slice = teacher_encoder_hidden_states[slice_start:slice_end]
                                 noise_slice = noise[slice_start:slice_end]
                                 timesteps_slice = timesteps[slice_start:slice_end]
                                 if teacher_mask is None:
@@ -1247,31 +1259,11 @@ def main(args):
                                 else:
                                     teacher_mask_slice = teacher_mask[slice_start:slice_end]
 
-                                if model.is_sdxl:
-                                    encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
-                                    encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
-                                    add_time_ids_slice = add_time_ids[slice_start:slice_end]
-                                    conditioning = Conditioning.sdxl_conditioning(
-                                        text_encoder_hidden_states=encoder_hidden_states_slice,
-                                        text_encoder_2_hidden_states=encoder_2_hidden_states_slice,
-                                        text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
-                                        add_time_ids = add_time_ids_slice
-                                    )
-                                    del encoder_2_hidden_states_slice, encoder_2_pooled_embeds_slice, add_time_ids_slice
+                                conditioning = _make_conditioning_slice(encoder_hidden_states, encoder_2_hidden_states,encoder_2_pooled_embeds, add_time_ids=add_time_ids, slice_start=slice_start, slice_end=slice_end)
+                                if teacher_encoder_hidden_states is None:
                                     teacher_conditioning = None
                                 else:
-                                    conditioning = Conditioning.sd12_conditioning(
-                                        text_encoder_hidden_states=encoder_hidden_states_slice
-                                    )
-                                    if teacher_encoder_hidden_states_slice is None:
-                                        teacher_conditioning = None
-                                    else:
-                                        teacher_conditioning = Conditioning.sd12_conditioning(
-                                            text_encoder_hidden_states=teacher_encoder_hidden_states_slice
-                                        )
-
-                                del encoder_hidden_states_slice
-                                del teacher_encoder_hidden_states_slice
+                                    teacher_conditioning = _make_conditioning_slice(teacher_encoder_hidden_states, teacher_encoder_2_hidden_states,teacher_encoder_2_pooled_embeds, add_time_ids=add_time_ids, slice_start=slice_start, slice_end=slice_end)
 
                                 try:
                                     model_pred, target, model_pred_wrong, model_pred_wrong_mask, noisy_latents = get_model_prediction_and_target(

@@ -212,8 +212,7 @@ class EveryDreamBatch(Dataset):
             print('train_item:', train_item)
             raise
 
-        if self.is_sdxl:
-            example["add_time_ids"] = train_item["add_time_ids"]
+        example["add_time_ids"] = train_item["add_time_ids"]
 
 
         example["runt_size"] = train_item["runt_size"]
@@ -252,13 +251,12 @@ class EveryDreamBatch(Dataset):
         example["timesteps_range"] = image_train_tmp.timesteps_range
         example["pathname"] = image_train_tmp.pathname
 
-        if self.is_sdxl:
-            example["add_time_ids"] = _get_add_time_ids(
-                original_size = (uncropped_h, uncropped_w),
-                target_size = (image_train_item.target_wh[1], image_train_item.target_wh[0]),
-                crops_coords_top_left = (crop_tl_y, crop_tl_x),
-                dtype=torch.float32
-            )
+        example["add_time_ids"] = _get_add_time_ids(
+            original_size = (uncropped_h, uncropped_w),
+            target_size = (image_train_item.target_wh[1], image_train_item.target_wh[0]),
+            crops_coords_top_left = (crop_tl_y, crop_tl_x),
+            dtype=torch.float32
+        )
 
         return example
 
@@ -437,10 +435,7 @@ def collate_fn(batch):
     # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     captions, tokens, tokens_2 = collapse_captions(batch)
 
-    if "add_time_ids" in batch[0]:
-        add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
-    else:
-        add_time_ids = None
+    add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
 
     runt_size = batch[0]["runt_size"]
 

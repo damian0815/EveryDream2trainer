@@ -4,13 +4,14 @@ import random
 from typing import Tuple, Optional, Literal
 
 import torch
+import torchvision
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
 from scipy.stats import beta as sp_beta
 
-from diffusers import SchedulerMixin, ConfigMixin, UNet2DConditionModel
+from diffusers import SchedulerMixin, ConfigMixin
 
 from flow_match_model import TrainFlowMatchScheduler
 from model.training_model import TrainingModel, Conditioning
@@ -94,7 +95,16 @@ def get_timestep_curriculum_range(progress_01,
     assert min_t <= max_t
     return int(min_t), int(max_t)
 
-
+def get_image_from_latents(latents, model: TrainingModel, args):
+    with torch.no_grad():
+        with autocast(enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16):
+            scaling_factor = 0.13025 if model.is_sdxl else 0.18215
+            latents = latents / scaling_factor
+            pixel_values = model.vae.decode(latents, return_dict=False)[0]
+        del latents
+        pixel_values = pixel_values.to(torch.float32)
+        pixel_values = torch.clamp((pixel_values + 1.0) / 2.0, 0.0, 1.0)
+        return pixel_values
 
 def get_latents(image, model: TrainingModel, device, args):
     with torch.no_grad():
@@ -694,10 +704,12 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                                     teacher_model: TrainingModel|None=None,
                                     teacher_mask: torch.Tensor|None=None,
                                     teacher_conditioning: Conditioning|None=None,
-                                    debug_fake: bool = False
+                                    debug_fake: bool = False,
+                                    log_writer=None
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     #logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
-    noisy_latents, target = _get_noisy_latents_and_target(latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation)
+    noisy_latents = _get_noisy_latents(latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation)
+    target = _get_target(latents, noise, model.noise_scheduler, timesteps)
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
@@ -713,12 +725,23 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                 # print(f"types: {type(noisy_latents)} {type(timesteps)} {type(encoder_hidden_states)}")
                 model_pred = model.unet(noisy_latents, timesteps, conditioning.prompt_embeds).sample
 
-    with torch.no_grad():
-        if teacher_model.unet is not None:
+    if teacher_mask is not None and teacher_mask.sum() > 0:
+        with (torch.no_grad()):
             if teacher_conditioning is None:
                 teacher_conditioning = conditioning
 
-            teacher_target = _get_teacher_target(teacher_model, teacher_conditioning, timesteps, noisy_latents, model.noise_scheduler.config.get('prediction_type', ''))
+            teacher_noisy_latents = _get_noisy_latents(latents, noise, teacher_model.noise_scheduler, timesteps, args.latents_perturbation)
+            teacher_target = _get_teacher_target(teacher_model, teacher_conditioning, timesteps, teacher_noisy_latents, model.noise_scheduler.config.prediction_type)
+
+            if log_writer is not None:
+                loss_preview_image_rgb = torchvision.utils.make_grid(
+                    log_data.loss_preview_image
+                )
+                log_writer.add_image(
+                    tag="loss/teacher target",
+                    img_tensor=loss_preview_image_rgb,
+                    global_step=global_step,
+                )
 
             target = (
                 teacher_target *  teacher_mask.view(-1, 1, 1, 1).expand_as(target).to(target.device)
@@ -731,45 +754,12 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
     return model_pred, target, model_pred_wrong_caption, model_pred_wrong_caption_mask, noisy_latents
 
 
-def _get_teacher_target(teacher_model: TrainingModel, teacher_conditioning: Conditioning, timesteps: torch.Tensor, noisy_latents: torch.Tensor, training_model_prediction_type: str):
-    teacher_target = teacher_model.unet(noisy_latents.half(), timesteps,
-                                        teacher_conditioning.prompt_embeds.half()).sample.float()
-    teacher_prediction_type = teacher_model.noise_scheduler.config.get('prediction_type', '')
-    if teacher_prediction_type == training_model_prediction_type:
-        return teacher_target
-    elif teacher_prediction_type in ['v_prediction', 'v-prediction'] and training_model_prediction_type == 'epsilon':
-        # Convert v-prediction to epsilon
-        alpha_t = teacher_model.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).sqrt()
-        sigma_t = (1 - alpha_t ** 2).sqrt()
-
-        # First get x_0: x_0 = (α_t·x_t - σ_t·v) / (α_t² + σ_t²)^0.5
-        x_0_pred = (alpha_t * noisy_latents - sigma_t * teacher_target) / (alpha_t ** 2 + sigma_t ** 2).sqrt()
-
-        # Then epsilon: ε = (x_t - α_t·x_0) / σ_t
-        return (noisy_latents - alpha_t * x_0_pred) / sigma_t
-    elif teacher_prediction_type == 'epsilon' and training_model_prediction_type in ['v_prediction', 'v-prediction']:
-        # Convert epsilon to v-prediction
-        alpha_t = teacher_model.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).sqrt()
-        sigma_t = (1 - alpha_t ** 2).sqrt()
-        # First get x_0 from epsilon: x_0 = (x_t - σ_t·ε) / α_t
-        x_0_pred = (noisy_latents - sigma_t * teacher_target) / alpha_t
-        # Then compute v: v = α_t·ε - σ_t·x_0
-        return alpha_t * teacher_target - sigma_t * x_0_pred
-    elif training_model_prediction_type == 'flow_prediction' and teacher_prediction_type in ['v_prediction',
-                                                                                           'v-prediction']:
-        # Convert v-prediction to x_0 (clean image prediction)
-        alpha_t = teacher_model.noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).sqrt()
-        sigma_t = (1 - alpha_t ** 2).sqrt()
-        x_0_pred = (alpha_t * noisy_latents - sigma_t * teacher_target) / (alpha_t ** 2 + sigma_t ** 2).sqrt()
-        # Flow velocity = target direction (x_0 - x_t for linear flow)
-        return x_0_pred - noisy_latents
-    else:
-        raise ValueError(
-            f"Cannot convert between teacher model prediction type {teacher_prediction_type} and training model prediction type {training_model_prediction_type}")
 
 
 def _get_noisy_latents(latents, noise, noise_scheduler, timesteps, latents_perturbation):
     #logging.info(f"get_noisy_latents timesteps: {timesteps.detach().cpu().tolist()}")
+    if not isinstance(noise_scheduler, TrainFlowMatchScheduler):
+        timesteps = timesteps.long()
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
     if latents_perturbation > 0:
         noisy_latents += torch.randn_like(noisy_latents) * latents_perturbation
@@ -985,3 +975,7 @@ def get_multirank_stratified_random_timesteps_beta(batch_size, device, alpha=2.0
     #    f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
     #)
     return timesteps
+
+
+
+
