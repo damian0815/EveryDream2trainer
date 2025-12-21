@@ -16,7 +16,6 @@ from diffusers import SchedulerMixin, ConfigMixin
 from flow_match_model import TrainFlowMatchScheduler
 from model.training_model import TrainingModel, Conditioning
 
-
 # from train import pyramid_noise_like, compute_snr
 
 def nibble_batch(batch, take_count):
@@ -705,7 +704,8 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
                                     teacher_mask: torch.Tensor|None=None,
                                     teacher_conditioning: Conditioning|None=None,
                                     debug_fake: bool = False,
-                                    log_writer=None
+                                    log_writer=None,
+                                    global_step: int = 0
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     #logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation)
@@ -730,12 +730,18 @@ def get_model_prediction_and_target(latents, conditioning: Conditioning, noise: 
             if teacher_conditioning is None:
                 teacher_conditioning = conditioning
 
-            teacher_noisy_latents = _get_noisy_latents(latents, noise, teacher_model.noise_scheduler, timesteps, args.latents_perturbation)
-            teacher_target = _get_teacher_target(teacher_model, teacher_conditioning, timesteps, teacher_noisy_latents, model.noise_scheduler.config.prediction_type)
+            teacher_target = get_teacher_target(
+                teacher_model=teacher_model,
+                teacher_conditioning=teacher_conditioning,
+                student_model=model,
+                student_timesteps=timesteps,
+                clean_image_latents=latents,
+                noise=noise
+            )
 
             if log_writer is not None:
                 loss_preview_image_rgb = torchvision.utils.make_grid(
-                    log_data.loss_preview_image
+                    teacher_target
                 )
                 log_writer.add_image(
                     tag="loss/teacher target",
@@ -979,3 +985,144 @@ def get_multirank_stratified_random_timesteps_beta(batch_size, device, alpha=2.0
 
 
 
+
+def get_teacher_target(
+    teacher_model: TrainingModel,
+    teacher_conditioning: Conditioning,
+    student_model: TrainingModel,
+    student_timesteps: torch.Tensor,
+    clean_image_latents: torch.Tensor,
+    noise: torch.Tensor
+):
+
+    teacher_prediction_type = teacher_model.noise_scheduler.config.prediction_type
+    student_prediction_type = student_model.noise_scheduler.config.prediction_type
+    if teacher_prediction_type in ['v_prediction', 'v-prediction'] and student_prediction_type == 'flow_prediction':
+        teacher_timesteps, teacher_noisy_latents = _remap_noise_v_pred_to_flow_matching(
+            teacher_model, student_model, student_timesteps, clean_image_latents, noise
+        )
+    else:
+        supported_prediction_types = {'epsilon', 'v_prediction', 'v-prediction'}
+        present_prediction_types = {teacher_prediction_type, student_prediction_type}
+        if supported_prediction_types.isdisjoint(present_prediction_types):
+            raise ValueError(f"Unsupported prediction type conversion: {teacher_prediction_type} to {student_prediction_type}")
+        teacher_timesteps = student_timesteps
+        teacher_noisy_latents = _get_noisy_latents(
+            clean_image_latents, noise, teacher_model.noise_scheduler, student_timesteps, latents_perturbation=0
+        )
+
+    teacher_model_output = teacher_model.unet(
+        teacher_noisy_latents.half(), teacher_timesteps, teacher_conditioning.prompt_embeds.half()
+    ).sample.float()
+
+    if teacher_prediction_type == student_prediction_type:
+        return teacher_model_output
+
+    return _convert_model_output(
+        noise=noise,
+        teacher_input=teacher_noisy_latents,
+        teacher_output=teacher_model_output,
+        teacher_scheduler=teacher_model.noise_scheduler,
+        teacher_timesteps=teacher_timesteps,
+        student_prediction_type=student_prediction_type,
+        student_timesteps=student_timesteps,
+    )
+
+
+def _convert_model_output(
+    noise: torch.Tensor,
+    teacher_input: torch.Tensor,
+    teacher_output: torch.Tensor,
+    teacher_scheduler: SchedulerMixin | ConfigMixin,
+    teacher_timesteps,
+    student_prediction_type,
+    student_timesteps,
+):
+    source_prediction_type = teacher_scheduler.config.prediction_type
+    if source_prediction_type in ['v_prediction', 'v-prediction']:
+        alpha_t = teacher_scheduler.alphas_cumprod[teacher_timesteps].view(-1, 1, 1, 1).sqrt()
+        sigma_t = (1 - alpha_t ** 2).sqrt().to(teacher_output.device)
+        # Solve for x_0 from v-prediction
+        x_0_pred = (alpha_t * teacher_input - sigma_t * teacher_output) / (alpha_t ** 2 + sigma_t ** 2).sqrt() # note that this denominator == 1 typically
+
+        if student_prediction_type == 'epsilon':
+            assert student_timesteps == teacher_timesteps
+            # Epsilon: ε = (x_t - α_t·x_0) / σ_t
+            return (teacher_input - alpha_t * x_0_pred) / sigma_t
+        elif student_prediction_type == 'flow_prediction':
+            return noise - x_0_pred
+
+    elif source_prediction_type == 'epsilon' and student_prediction_type in ['v_prediction', 'v-prediction']:
+        assert student_timesteps == teacher_timesteps
+        # Convert epsilon to v-prediction
+        alpha_t = teacher_scheduler.alphas_cumprod[teacher_timesteps].view(-1, 1, 1, 1).sqrt()
+        sigma_t = (1 - alpha_t ** 2).sqrt().to(teacher_output.device)
+        # First get x_0 from epsilon: x_0 = (x_t - σ_t·ε) / α_t
+        x_0_pred = (teacher_input - sigma_t * teacher_output) / alpha_t
+        # Then compute v: v = α_t·ε - σ_t·x_0
+        return alpha_t * teacher_output - sigma_t * x_0_pred
+    else:
+        raise ValueError(
+            f"Cannot convert between teacher model prediction type {source_prediction_type} and training model prediction type {student_prediction_type}")
+
+
+
+
+def _remap_noise_v_pred_to_flow_matching(
+    teacher_model, # v-pred
+    student_model, # flow matching
+    student_timesteps: torch.Tensor, # integer
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+):
+    if teacher_model.noise_scheduler.config.prediction_type not in ['v_prediction', 'v-prediction']:
+        raise ValueError("Teacher model must use v-prediction for SNR-based timestep remapping.")
+    if student_model.noise_scheduler.config.prediction_type != 'flow_prediction':
+        raise ValueError("Student model must use flow-matching for SNR-based timestep remapping.")
+
+    student_timesteps = student_timesteps.to(student_model.device)
+    teacher_timesteps = _get_ddpm_timesteps_for_flowmatch_timesteps(
+        flowmatch_timesteps=student_timesteps,
+        ddpm_scheduler=teacher_model.noise_scheduler,
+        flowmatch_scheduler=student_model.noise_scheduler
+    )
+
+    teacher_noisy_latents = _get_noisy_latents(
+        latents, noise,
+        teacher_model.noise_scheduler,
+        teacher_timesteps,
+        latents_perturbation=0.0
+    )
+
+    teacher_timesteps = teacher_timesteps.to(teacher_model.device)
+    return teacher_timesteps, teacher_noisy_latents
+
+
+def _get_ddpm_timesteps_for_flowmatch_timesteps(
+    flowmatch_timesteps: torch.Tensor,
+    ddpm_scheduler: SchedulerMixin,
+    flowmatch_scheduler: TrainFlowMatchScheduler,
+) -> torch.Tensor:
+    flowmatch_timesteps = flowmatch_timesteps.long()
+    t_flow = flowmatch_scheduler.sigmas[flowmatch_timesteps.cpu()]
+
+    snr_flow = t_flow**2 / (1 - t_flow)**2
+
+    # Find DDPM timestep where SNR matches
+    # SNR_ddpm = alpha_bar / (1 - alpha_bar)
+    # Solving: alpha_bar = SNR / (1 + SNR)
+    alpha_bar_target = snr_flow / (1 + snr_flow)
+
+    # Find the closest DDPM timestep
+    # scheduler.alphas_cumprod contains alpha_bar values for each timestep
+    alphas_cumprod = ddpm_scheduler.alphas_cumprod.cpu()
+
+    # Find timestep with closest alpha_bar
+    ddpm_timesteps = torch.argmin(torch.abs(alphas_cumprod - alpha_bar_target.unsqueeze(-1)), dim=-1)
+    #print(f"Flow t={t_flow} -> DDPM timestep={ddpm_timesteps}")
+
+    # For DDPM
+    #print(f"DDPM alpha_bar at t={ddpm_timesteps}: {ddpm_scheduler.alphas_cumprod[ddpm_timestep]}")
+    #print(f"DDPM sqrt(alpha_bar): {torch.sqrt(ddpm_scheduler.alphas_cumprod[ddpm_timestep])}")
+
+    return ddpm_timesteps
