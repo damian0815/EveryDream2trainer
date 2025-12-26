@@ -137,12 +137,17 @@ class EveryDreamOptimizer:
         plugin_runner: PluginRunner,
         log_writer=None,
     ):
+        self.num_optimizer_steps = 0
+        self.optimizer_step_interval = 1
+        self.last_optimizer_step_gs = 0
+
         if optimizer_config is None:
             raise ValueError("missing optimizer_config")
         if "doc" in optimizer_config:
             del optimizer_config["doc"]
         print("\n raw optimizer_config:")
         pprint.pprint(optimizer_config)
+
         self.epoch_len = epoch_len
         self.max_epochs = args.max_epochs
         self.unet = model.unet  # needed for weight norm logging, unet.parameters() has to be called again, Diffusers quirk
@@ -169,6 +174,7 @@ class EveryDreamOptimizer:
             "apply_grad_scaler_step_tweaks", True
         )
 
+
         if "use_grad_scaler" in optimizer_config:
             logging.warning(
                 "* Ignoring use_grad_scaler entry in optimizer config, will be set automatically"
@@ -179,14 +185,9 @@ class EveryDreamOptimizer:
         elif model.unet.dtype == torch.float16:
             self.use_grad_scaler = True
             logging.info("* float16 unet: using grad scaler")
-        elif self.base_config["optimizer"].endswith("8bit") or self.te_config[
-            "optimizer"
-        ].endswith("8bit"):
+        elif args.amp:
             self.use_grad_scaler = True
-            logging.info("* 8bit optimizer: using grad scaler")
-        elif model.unet.dtype != torch.float32:
-            self.use_grad_scaler = True
-            logging.info(f"* unet dtype = {model.unet.dtype}: using grad scaler")
+            logging.info(f"* AMP in use: using grad scaler")
         else:
             self.use_grad_scaler = False
             logging.info("* no grad scaler")
@@ -481,6 +482,13 @@ class EveryDreamOptimizer:
             for optimizer in self.optimizers:
                 self.scaler.step(optimizer)
             self.scaler.update()
+        self.num_optimizer_steps += 1
+
+        smoothing_alpha = 0.5 # 0-1, higher = smoother
+        self.optimizer_step_interval = self.optimizer_step_interval * smoothing_alpha + (global_step - self.last_optimizer_step_gs) * (1-smoothing_alpha)
+        self.last_optimizer_step_gs = global_step
+        if self.apply_grad_scaler_step_tweaks:
+            self._update_grad_scaler()
 
         if self.log_grad_norm and self.log_writer:
             log_action = lambda n, label: self.log_writer.add_scalar(
@@ -519,9 +527,6 @@ class EveryDreamOptimizer:
         self.lr_steering.apply_steering_if_necessary(self.lr_schedulers)
         for scheduler in self.lr_schedulers:
             scheduler.step()
-
-        if self.apply_grad_scaler_step_tweaks:
-            self._update_grad_scaler(global_step)
 
     def _zero_grad(self, set_to_none=False):
         for optimizer in self.optimizers:
@@ -770,29 +775,30 @@ class EveryDreamOptimizer:
             ret_val.append(lr_scheduler)
         return ret_val
 
-    def _update_grad_scaler(self, global_step):
+    def _update_grad_scaler(self):
         if self.scaler is None:
             return
-        if global_step == 500:
+
+        factor = None
+        interval = None
+        if self.num_optimizer_steps >= 500:
             factor = 1.8
+            interval = 100
+        elif self.num_optimizer_steps >= 1000:
+            factor = 1.6
+            interval = 200
+        elif self.num_optimizer_steps >= 2000:
+            factor = 1.3
+            interval = 500
+        elif self.num_optimizer_steps >= 4000/self.optimizer_step_interval:
+            factor = 1.15
+            interval = 2000
+        if factor is not None and self.scaler.get_growth_factor() != factor:
+            logging.info(f"* Adjusting grad scaler growth factor to {factor} at step {self.num_optimizer_steps}; next update interval {interval} optimizer steps")
             self.scaler.set_growth_factor(factor)
             self.scaler.set_backoff_factor(1 / factor)
             self.scaler.set_growth_interval(100)
-        if global_step == 1000:
-            factor = 1.6
-            self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1 / factor)
-            self.scaler.set_growth_interval(200)
-        if global_step == 2000:
-            factor = 1.3
-            self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1 / factor)
-            self.scaler.set_growth_interval(500)
-        if global_step == 4000:
-            factor = 1.15
-            self.scaler.set_growth_factor(factor)
-            self.scaler.set_backoff_factor(1 / factor)
-            self.scaler.set_growth_interval(2000)
+
 
     @staticmethod
     def _save_optimizer(optimizer, path: str, optimizer_type: str):

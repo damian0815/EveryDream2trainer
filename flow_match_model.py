@@ -46,6 +46,17 @@ class TrainFlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
         indices_reversed = self.config.num_train_timesteps - 1 - timestep_indices.cpu()
         return self.timesteps[indices_reversed]
 
+    def get_timestep_indices(self, exact_timesteps: torch.Tensor):
+        """ For incoming exact timesteps, get the corresponding timestep indices (from 0 to num_train_timesteps-1) """
+        assert exact_timesteps.min() >= self.timesteps.min() and exact_timesteps.max() <= self.timesteps.max(), \
+            f"Exact timesteps should be in [{self.timesteps.min()}, {self.timesteps.max()}] but got {exact_timesteps.min()} to {exact_timesteps.max()}"
+        # timestep indices goes from 0 to 999 but self.timesteps goes from 1000 to 1
+        # so we need to reverse the indices
+        exact_timesteps_cpu = exact_timesteps.cpu()
+        indices_reversed = torch.nonzero(self.timesteps[:, None] == exact_timesteps_cpu[None, :], as_tuple=False)[:, 0]
+        timestep_indices = self.config.num_train_timesteps - 1 - indices_reversed
+        return timestep_indices.to(exact_timesteps.device)
+
     @property
     def shift(self):
         return super().shift

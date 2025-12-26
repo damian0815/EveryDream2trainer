@@ -172,6 +172,8 @@ class DataLoaderMultiAspect():
         # so we shuffle them to mitigate this, using chunked_shuffle to keep batches with the same aspect ratio together
         items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size*grad_accum, randomizer=randomizer)
                              for k,v in items_by_batch_id.items()} 
+        if not items_by_batch_id:
+            raise RuntimeError("No images available after applying dropout and multipliers. Check your dataset and multiplier settings.")
         # paranoia: verify that this hasn't fucked up the aspect ratio batching
         for items in items_by_batch_id.values():
             batches = chunk_list(items, chunk_size=batch_size)

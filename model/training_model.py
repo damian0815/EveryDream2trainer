@@ -30,7 +30,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from peft.utils import get_peft_model_state_dict
 
 from flow_match_model import TrainFlowMatchScheduler
-from optimizer.optimizers import EveryDreamOptimizer
+from optimizer.optimizers import EveryDreamOptimizer, InfOrNanException
 from plugins.plugins import PluginRunner
 from utils.convert_diff_to_ckpt import convert as converter
 from utils.huggingface_downloader import try_download_model_from_hf
@@ -107,6 +107,8 @@ class TrainingVariables:
     desired_effective_batch_size: int|None = None
     interleave_bs1_bsN: bool = False
     interleaved_bs1_count: int|None = None
+    total_trained_samples_count: int = 0
+    total_trained_batches_count: int = 0
 
     cond_dropouts: list[float] = field(default_factory=list)
     cond_dropout_count = 0
@@ -125,10 +127,10 @@ class TrainingVariables:
     def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
 
         if loss.isnan().any():
-            logging.warning(f"NaN detected after processing {pathnames} @ {timesteps} ({captions} - skipping")
+            logging.warning(f"NaN detected after processing {pathnames} @ {timesteps} ({captions}) - skipping")
             logging.warning(f" - NaN detected (current accumulated {self.accumulated_pathnames} @ {self.accumulated_timesteps} ({self.accumulated_captions}) )")
             logging.warning(f" - NaN detected (prev was {self.prev_accumulated_pathnames} @ {self.prev_accumulated_timesteps} ({self.prev_accumulated_captions}) )")
-            assert False
+            raise InfOrNanException(f"NaN detected in loss after processing {pathnames} @ {timesteps} ({captions}) - skipping")
 
         self.accumulated_loss = (
             loss
@@ -139,6 +141,7 @@ class TrainingVariables:
         self.accumulated_pathnames.extend(pathnames)
         self.accumulated_captions.extend(captions)
         self.accumulated_timesteps.extend(timesteps)
+
 
     def clear_accumulated_loss(self):
         self.accumulated_loss = None
@@ -270,9 +273,11 @@ class Conditioning:
         else:
             return self._text_encoder_hidden_states
 
-    @property
-    def added_cond_kwargs(self) -> dict:
-        return {"text_embeds": self._text_encoder_2_pooled_embeds, "time_ids": self._add_time_ids}
+    def get_added_cond_kwargs(self, dtype) -> dict:
+        return {
+            "text_embeds": self._text_encoder_2_pooled_embeds.to(dtype=dtype),
+            "time_ids": self._add_time_ids.to(dtype=dtype)
+        }
 
     @staticmethod
     def sd12_conditioning(text_encoder_hidden_states: torch.Tensor):
@@ -291,6 +296,13 @@ class Conditioning:
                             _text_encoder_2_hidden_states=text_encoder_2_hidden_states,
                             _text_encoder_2_pooled_embeds=text_encoder_2_pooled_embeds,
                             _add_time_ids=add_time_ids)
+
+    def get_masked(self, mask: torch.Tensor) -> 'Conditioning':
+        return Conditioning(_text_encoder_hidden_states=self._text_encoder_hidden_states[mask],
+                            _text_encoder_2_hidden_states=self._text_encoder_2_hidden_states[mask] if self._text_encoder_2_hidden_states is not None else None,
+                            _text_encoder_2_pooled_embeds=self._text_encoder_2_pooled_embeds[mask] if self._text_encoder_2_pooled_embeds is not None else None,
+                            _add_time_ids=self._add_time_ids[mask] if self._add_time_ids is not None else None)
+
 
 
 def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor|None, torch.Tensor|None]:

@@ -107,12 +107,12 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
     if len(loss_log_step_cd) > 0:
         loss_step_cd = sum(loss_log_step_cd) / len(loss_log_step_cd)
         log_writer.add_scalar(tag="loss/log_step CD", scalar_value=loss_step_cd, global_step=global_step)
-        logs["loss/log_step CD"] = loss_step_cd
+        #logs["loss/log_step CD"] = loss_step_cd
     loss_log_step_non_cd = [l for l in log_data.loss_log_step_non_cd if math.isfinite(l)]
     if len(loss_log_step_non_cd) > 0:
         loss_step_non_cd = sum(loss_log_step_non_cd) / len(loss_log_step_non_cd)
         log_writer.add_scalar(tag="loss/log_step non-CD", scalar_value=loss_step_non_cd, global_step=global_step)
-        logs["loss/log_step non-CD"] = loss_step_non_cd
+        #logs["loss/log_step non-CD"] = loss_step_non_cd
     if log_data.loss_preview_image is not None:
         loss_preview_image_rgb = torchvision.utils.make_grid(
             log_data.loss_preview_image
@@ -177,7 +177,8 @@ def append_epoch_log(global_step: int, epoch_pbar, gpu, log_writer, **logs):
             epoch_mem_color = Fore.LIGHTBLUE_EX
 
         if logs is not None:
-            epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{global_step}")
+            # convert global_step to str to avoid tqdm auto-converting to scientific notation
+            epoch_pbar.set_postfix(**logs, vram=f"{epoch_mem_color}{gpu_used_mem}/{gpu_total_mem} MB{Style.RESET_ALL} gs:{str(global_step)}")
 
 
 def write_batch_schedule(log_folder: str, train_batch: EveryDreamBatch, epoch: int):
