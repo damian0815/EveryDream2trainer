@@ -33,6 +33,8 @@ class LogData:
     timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
     cumulative_timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
 
+    forward_size_coverage: Counter = dataclasses.field(default_factory=Counter)
+
     attention_activation_logger: ActivationLogger = None
 
 
@@ -155,6 +157,13 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         log_timestep_histogram("cumulative", log_data.cumulative_timestep_coverage)
 
         log_data.timestep_coverage.clear()
+
+    if log_data.forward_size_coverage:
+        values = []
+        for key, count in log_data.forward_size_coverage.items():
+            values.extend([key] * count)
+        log_writer.add_histogram('hyperparameter/forward size', np.array(values), global_step)
+        #log_data.forward_size_coverage.clear()
 
     return logs
 

@@ -711,8 +711,8 @@ def main(args):
                                        epoch_len,
                                        plugin_runner,
                                        log_writer)
-    ed_optimizer.register_unet_nan_hooks_simple()
-    ed_optimizer.register_unet_nan_hooks_full()
+    #ed_optimizer.register_unet_nan_hooks_simple()
+    #ed_optimizer.register_unet_nan_hooks_full()
 
     log_args(log_writer, args, optimizer_config, log_folder, log_time)
 
@@ -982,33 +982,34 @@ def main(args):
 
                     if not args.disable_backward_memsafe:
                         if gpu is not None:
-                            _, gpu_total_mem = gpu.get_gpu_memory()
+                            max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_size, is_sdxl=model.is_sdxl)
+                            if max_safe_forward_size == 0:
+                                # emergency backward
+                                with torch.cuda.amp.autocast(enabled=args.amp):
+                                    _optimizer_backward(ed_optimizer, tv, 'emergency backward: ')
+                                torch.cuda.empty_cache()
+                                gc.collect()
+                                max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_size, is_sdxl=model.is_sdxl)
+                                if max_safe_forward_size == 0:
+                                    logging.warning(" * Unable to free enough ram with emergency backward - probably OOM now")
+                                    max_safe_forward_size = 1
+                            if max_safe_forward_size < tv.forward_slice_size:
+                                logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
+                            tv.forward_slice_size = min([args.forward_slice_size, max_safe_forward_size])
                         else:
-                            gpu_total_mem = 0
+                            gpu_used_mem, gpu_total_mem = 0, 0
 
-                        if model.vae.dtype in [torch.float16, torch.bfloat16]:
-                            dtype_bytes = 2
-                        elif model.vae.dtype == torch.float32:
-                            dtype_bytes = 4
-                        else:
-                            raise ValueError(f"Unrecognized VAE dtype: {model.vae.dtype}")
-                        # discovered empirically
-                        def get_required_vae_vram_per_image(pixel_count):
-                            return dtype_bytes * (1e8 + 500 * pixel_count) + 600 * pixel_count
-
-                        # use the forward slice size @(512,512) as a ram baseline
-                        base_vae_vram_required = get_required_vae_vram_per_image(512*512) * tv.forward_slice_size
-                        accumulated_graph_estimate_vram_required = 128 * 1024 * 1024 * tv.accumulated_loss_images_count
-                        actual_vae_vram_required_per_image = get_required_vae_vram_per_image(image_size)
-                        safe_forward_size = math.floor((base_vae_vram_required + accumulated_graph_estimate_vram_required) / actual_vae_vram_required_per_image)
-                        def to_mb(b):
-                            return round(b / (1024*1024))
-                        logging.info(f" * base forward slice size {tv.forward_slice_size} @(512,512) needs {to_mb(base_vae_vram_required)}MB, plus we have graphs for {tv.accumulated_loss_images_count} images needing ~{to_mb(accumulated_graph_estimate_vram_required)}MB -> total {to_mb(base_vae_vram_required + accumulated_graph_estimate_vram_required)}MB")
-                        logging.info(
-                            f"    current batch @({full_batch['image'].shape[2]},{full_batch['image'].shape[3]}) needs {actual_vae_vram_required_per_image}MB per image"
-                        )
-                        logging.info(f"  -> safe forward slice size {safe_forward_size}")
-                        tv.forward_slice_size = min(tv.forward_slice_size, safe_forward_size)
+                        # accumulated_graph_estimate_vram_required = 128 * 1024 * 1024 * tv.accumulated_loss_images_count
+                        # actual_vae_vram_required_per_image = get_required_vae_vram_per_image(image_size)
+                        # safe_forward_size = math.floor((base_vae_vram_required + accumulated_graph_estimate_vram_required) / actual_vae_vram_required_per_image)
+                        # def to_mb(b):
+                        #     return round(b / (1024*1024))
+                        # logging.info(f" * base forward slice size {tv.forward_slice_size} @(512,512) needs {to_mb(base_vae_vram_required)}MB, plus we have graphs for {tv.accumulated_loss_images_count} images needing ~{to_mb(accumulated_graph_estimate_vram_required)}MB -> total {to_mb(base_vae_vram_required + accumulated_graph_estimate_vram_required)}MB")
+                        # logging.info(
+                        #     f"    current batch @({full_batch['image'].shape[2]},{full_batch['image'].shape[3]}) needs {to_mb(actual_vae_vram_required_per_image)}MB per image"
+                        # )
+                        # logging.info(f"  -> safe forward slice size {safe_forward_size}")
+                        # tv.forward_slice_size = min(tv.forward_slice_size, safe_forward_size)
 
                         #memory_comfort_image_count = (
                         #    1 if model.is_sdxl or gpu_total_mem < 25000 else 2
@@ -1041,7 +1042,7 @@ def main(args):
                     do_local_contrastive_flow_loss = (
                         random.random() < args.local_contrastive_flow_loss_p
                     )
-                    do_contrastive_flow_matching_loss = (
+                    do_contrastive_flow_matching_loss = not do_local_contrastive_flow_loss and (
                         random.random() < args.contrastive_flow_matching_loss_p
                     )
                     if do_local_contrastive_flow_loss:
@@ -1190,7 +1191,7 @@ def main(args):
 
                         with torch.no_grad():
                             noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
-                            noise = get_noise(noise_shape, device=model.unet.device, dtype=batch["image"].dtype,
+                            noise = get_noise(noise_shape, device=model.unet.device, dtype=train_dtype,
                                               pyramid_noise_discount=args.pyramid_noise_discount,
                                               zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                               batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise)
@@ -1222,7 +1223,7 @@ def main(args):
                                     raise
 
                             del pixel_values
-                            latents = torch.cat(latents_slices)
+                            latents = torch.cat(latents_slices).to(train_dtype)
                             if args.offload_vae:
                                 model.load_vae_to_device('cpu')
                             del latents_slices
@@ -1416,20 +1417,12 @@ def main(args):
                                             contrastive_loss_scale=contrastive_loss_scale,
                                             verbose=(tv.global_step % 200 == 0),
                                             args=args,
-                                            )
+                            ).to(dtype=train_dtype)
 
                             for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
                                 used_timestep_detached = int(used_timestep.detach().item())
                                 current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
-
-                            # take mean of all dimensions except batch, then divide through by a fixed batch size
-                            if args.loss_mean_over_full_effective_batch:
-                                # strictly more correct, but LR scaling becomes necessary
-                                loss_mean_divisor = max(1, tv.desired_effective_batch_size)
-                            else:
-                                loss_mean_divisor = 1
-                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / loss_mean_divisor
 
                             if do_local_contrastive_flow_loss:
                                 low_noise_timesteps_mask = (
@@ -1442,12 +1435,27 @@ def main(args):
                                     low_noise_timesteps_mask,
                                     temperature = args.local_contrastive_flow_temperature
                                 )
-                                loss_mean += loss_lcf
+                                loss += loss_lcf.to(dtype=loss_mean.dtype) * args.local_contrastive_flow_lambda
                                 del low_noise_timesteps_mask
 
                             if do_contrastive_flow_matching_loss:
-                                loss_cfm = get_contrastive_flow_matching_loss(target, model_pred)
-                                loss_mean += loss_cfm
+                                assert args.contrastive_flow_matching_loss_lambda * args.contrastive_flow_matching_loss_k < 1, (
+                                    "for stability, K*lambda_contrast must be < 1"
+                                )
+                                loss_cfm = get_contrastive_flow_matching_loss(
+                                    target,
+                                    model_pred,
+                                    K=args.contrastive_flow_matching_loss_k
+                                )
+                                loss += loss_cfm.to(dtype=loss_mean.dtype) * args.contrastive_flow_matching_loss_lambda
+
+                            # take mean of all dimensions except batch, then divide through by a fixed batch size
+                            if args.loss_mean_over_full_effective_batch:
+                                # strictly more correct, but LR scaling becomes necessary
+                                loss_mean_divisor = max(1, tv.desired_effective_batch_size)
+                            else:
+                                loss_mean_divisor = 1
+                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / loss_mean_divisor
 
                             #logging.info(
                             #    f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
@@ -1462,6 +1470,8 @@ def main(args):
 
                             log_data.loss_log_step_cd.append(loss[is_cond_dropout].mean().detach().item())
                             log_data.loss_log_step_non_cd.append(loss[~is_cond_dropout].mean().detach().item())
+
+                            log_data.forward_size_coverage[loss.shape[0]] += 1
 
                             del target, model_pred, model_pred_anchor, text_embeds
 
@@ -1480,6 +1490,7 @@ def main(args):
                             steps_pbar.set_postfix(
                                 {
                                     "loss/step": loss_step,
+                                    "f": tv.forward_slice_size,
                                     "l": loss.shape[0],
                                     "aN": tv.accumulated_loss_images_count,
                                     "aB": tv.backwarded_images_count,
@@ -1500,7 +1511,8 @@ def main(args):
                             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                                     tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
-                                _optimizer_backward(ed_optimizer, tv, 'regular backward: ')
+                                with torch.cuda.amp.autocast(enabled=args.amp):
+                                    _optimizer_backward(ed_optimizer, tv, 'regular backward: ')
 
                             #if tv.global_step >= 653 and tv.global_step < 656:
                             #    print("step:", tv.global_step, "caption:", caption_variant, " - batch:", [os.readlink(x) for x in batch["pathnames"]], batch["captions"][caption_variant], "; timestep slice:", consumed_timesteps)
@@ -1735,8 +1747,43 @@ def _get_step_timesteps(count: int, range: tuple, train_progress_01: float, mode
 
     return timesteps
 
+def _get_safe_forward_size(gpu, device, num_image_pixels: int, is_sdxl: bool) -> int:
+    gpu_used_mem_mb, gpu_total_mem_mb = gpu.get_gpu_memory()
+    #gpu_free_mem_b = (gpu_total_mem_mb - gpu_used_mem_mb) * (1024 ** 2)
 
-def _get_step_timesteps_internal(full_batch_size: int, full_batch_timesteps_range, train_progress_01: float, model: TrainingModel, tv: TrainingVariables, args) -> torch.Tensor:
+    # discovered empirically
+    #if vae_dtype in [torch.float16, torch.bfloat16]:
+    #    dtype_bytes = 2
+    #elif vae_dtype == torch.float32:
+    #    dtype_bytes = 4
+    #else:
+    #    raise ValueError(f"Unrecognized VAE dtype: {model.vae.dtype}")
+    #
+    #def get_required_vae_vram_per_image(pixel_count):
+    #    return dtype_bytes * (1e8 + 500 * pixel_count) + 600 * pixel_count
+    memory_allocated = torch.cuda.memory_allocated(
+        device=device
+    )
+    gpu_free_mem_b = gpu_total_mem_mb * 1024**2 - memory_allocated
+    # memory_cached = torch.cuda.memory_cached(device=model.device)
+
+    # each forward pass without backward increases vram peak use by ~130000 (230000 for sdxl) bytes per latent pixel
+    num_vae_channels = 4
+    vae_scale_factor = 8
+    num_latent_pixels_per_image = num_vae_channels * num_image_pixels // (vae_scale_factor ** 2)
+    memory_required_per_image = (230000 if is_sdxl else 130000) * num_latent_pixels_per_image
+    max_safe_forward_size = gpu_free_mem_b // memory_required_per_image
+    return max_safe_forward_size
+
+
+def _get_step_timesteps_internal(
+    full_batch_size: int,
+    full_batch_timesteps_range,
+    train_progress_01: float,
+    model: TrainingModel,
+    tv: TrainingVariables,
+    args,
+) -> torch.Tensor:
 
     if args.timesteps_multirank_stratified:
         # the point of multirank stratified is to spread timesteps evenly across the batch.
@@ -1958,8 +2005,11 @@ if __name__ == "__main__":
     argparser.add_argument("--local_contrastive_flow_timestep_threshold", type=int, default=200, help="Timesteps smaller than this (ie low noise timesteps) will be subject to local contrastive flow (LCF) loss")
     argparser.add_argument("--local_contrastive_flow_anchor_timestep", type=int, default=500, help="Anchor timestep (medium loss) for LCF loss")
     argparser.add_argument("--local_contrastive_flow_temperature", type=int, default=0.07, help="Temperature for LCF loss InfoNCE cross entropy computation (higher=smoother)")
+    argparser.add_argument("--local_contrastive_flow_lambda", type=int, default=0.1, help="Lambda scaling factor for Local Contrastive Flow loss")
 
     argparser.add_argument("--contrastive_flow_matching_loss_p", type=float, default=0, help="Probability that a given batch will have Contrastive Flow Matching loss (Stoica et al., June 2025) applied")
+    argparser.add_argument("--contrastive_flow_matching_loss_k", type=int, default=4, help="Number of contrastive samples to use for Contrastive Flow Matching loss. Ensure that K * lambda < 1")
+    argparser.add_argument("--contrastive_flow_matching_loss_lambda", type=float, default=0.05, help="Lambda scaling factor for Contrastive Flow Matching loss. Ensure that K * lambda < 1")
 
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")
     argparser.add_argument("--contrastive_loss_scale", type=float, default=1, help="Scaling factor for contrastive loss")

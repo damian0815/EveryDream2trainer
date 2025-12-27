@@ -83,7 +83,7 @@ def main(args):
 
                 inputs = processor(text=text, images=image, return_tensors="pt")
 
-                with torch.cuda.amp.autocast(enabled=args.dtype != "fp32", dtype=dtype):
+                with torch.amp.autocast('cuda', enabled=args.dtype != "fp32", dtype=dtype):
                     generated_ids = model.generate(
                         pixel_values=inputs["pixel_values"].cuda() if not args.cpu else inputs["pixel_values"],
                         input_ids=inputs["input_ids"].cuda() if not args.cpu else inputs["input_ids"],

@@ -880,13 +880,13 @@ def get_model_prediction_and_target(
     noisy_latents = _get_noisy_latents(
         latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation
     )
-    target = _get_target(latents, noise, model.noise_scheduler, timesteps)
+    target = _get_target(latents, noise, model.noise_scheduler, timesteps).to(dtype=model.unet.dtype)
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
         model_pred = model.unet(
-            noisy_latents.to(model.unet.dtype),
-            timesteps.to(model.unet.dtype),
+            noisy_latents.to(dtype=model.unet.dtype),
+            timesteps.to(dtype=model.unet.dtype),
             encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
             added_cond_kwargs=conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
             if model.is_sdxl
@@ -1393,7 +1393,7 @@ def get_local_contrastive_flow_loss(
 ) -> torch.Tensor:
     n_contrastive = low_noise_timesteps_mask.sum().item()
     if n_contrastive < 2:
-        return torch.tensor(0.0, device=model_pred.device)
+        return torch.tensor(0.0, device=model_pred.device, dtype=model_pred.dtype)
 
     # 3. Flatten spatial dimensions, then normalize for cosine similarity
     features_current = model_pred[low_noise_timesteps_mask].flatten(
@@ -1415,28 +1415,23 @@ def get_local_contrastive_flow_loss(
     # Positives are on the diagonal (same image at different noise levels)
     labels = torch.arange(n_contrastive, device=model_pred.device)
 
-    contrastive_loss = torch.nn.functional.cross_entropy(logits, labels)
-    return contrastive_loss
+    contrastive_losses = torch.nn.functional.cross_entropy(logits, labels, reduction='none')
+    return contrastive_losses
 
 
-def get_contrastive_flow_matching_loss(target, v_pred):
+def get_contrastive_flow_matching_loss(target, v_pred, K):
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
-    K = min(B, 4)  # number of negatives
+    K = min(B-1, K)  # number of negatives
 
-    if K < 2:
-        return torch.tensor(0.0, device=v_pred.device)
-
-    lambda_contrast = 0.05
-    assert lambda_contrast * K < 1, "for stability, K*lambda_contrast must be < 1"
-
-    contrastive_loss = 0
-    for k in range(K):
-        choices = [i for i in range(B) if i != k]
+    contrastive_losses = torch.zeros((B, ), device=v_pred.device, dtype=v_pred.dtype)
+    references = torch.randperm(B)
+    for _ in range(K):
+        ref_idx = references[k]
+        choices = [i for i in range(B) if i != ref_idx]
         neg_idx = random.choice(choices)
-        neg_dist = F.mse_loss(v_pred[k], target[neg_idx], reduction="none")
-        contrastive_loss += neg_dist.mean()
+        neg_dist = F.mse_loss(v_pred[ref_idx], target[neg_idx], reduction="mean")
+        contrastive_losses[ref_idx] += neg_dist
 
-    contrastive_loss /= K
-    return -contrastive_loss * lambda_contrast
+    return -contrastive_losses
