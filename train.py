@@ -41,7 +41,11 @@ from compel import Compel
 from compel.embeddings_provider import SplitLongTextMode
 from tqdm.auto import tqdm
 
-from diffusers import StableDiffusionPipeline, AutoencoderKL
+from diffusers import (
+    StableDiffusionPipeline,
+    AutoencoderKL,
+    FlowMatchEulerDiscreteScheduler,
+)
 from flow_match_model import TrainFlowMatchScheduler
 # from diffusers.models import AttentionBlock
 # from accelerate import Accelerator
@@ -979,9 +983,14 @@ def main(args):
 
                     image_size = full_batch["image"].shape[2] * full_batch["image"].shape[3]
                     enable_vae_attention_slicing = False
+                    batch_resolution = _get_best_match_resolution(
+                        args.resolution, image_size
+                    )
 
-                    if not args.disable_backward_memsafe:
+                    if not args.disable_backward_memsafe and batch_resolution not in args.disable_backward_memsafe_resolutions:
                         if gpu is not None:
+                            torch.cuda.empty_cache()
+                            gc.collect()
                             max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_size, is_sdxl=model.is_sdxl)
                             if max_safe_forward_size == 0:
                                 # emergency backward
@@ -991,40 +1000,13 @@ def main(args):
                                 gc.collect()
                                 max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_size, is_sdxl=model.is_sdxl)
                                 if max_safe_forward_size == 0:
-                                    logging.warning(" * Unable to free enough ram with emergency backward - probably OOM now")
+                                    logging.warning(" * Unable to free enough ram with emergency backward - possible OOM follows")
                                     max_safe_forward_size = 1
                             if max_safe_forward_size < tv.forward_slice_size:
                                 logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
                             tv.forward_slice_size = min([args.forward_slice_size, max_safe_forward_size])
                         else:
                             gpu_used_mem, gpu_total_mem = 0, 0
-
-                        # accumulated_graph_estimate_vram_required = 128 * 1024 * 1024 * tv.accumulated_loss_images_count
-                        # actual_vae_vram_required_per_image = get_required_vae_vram_per_image(image_size)
-                        # safe_forward_size = math.floor((base_vae_vram_required + accumulated_graph_estimate_vram_required) / actual_vae_vram_required_per_image)
-                        # def to_mb(b):
-                        #     return round(b / (1024*1024))
-                        # logging.info(f" * base forward slice size {tv.forward_slice_size} @(512,512) needs {to_mb(base_vae_vram_required)}MB, plus we have graphs for {tv.accumulated_loss_images_count} images needing ~{to_mb(accumulated_graph_estimate_vram_required)}MB -> total {to_mb(base_vae_vram_required + accumulated_graph_estimate_vram_required)}MB")
-                        # logging.info(
-                        #     f"    current batch @({full_batch['image'].shape[2]},{full_batch['image'].shape[3]}) needs {to_mb(actual_vae_vram_required_per_image)}MB per image"
-                        # )
-                        # logging.info(f"  -> safe forward slice size {safe_forward_size}")
-                        # tv.forward_slice_size = min(tv.forward_slice_size, safe_forward_size)
-
-                        #memory_comfort_image_count = (
-                        #    1 if model.is_sdxl or gpu_total_mem < 25000 else 2
-                        #)
-                        #if image_size > (1000)*(1000):
-                        #    if tv.accumulated_loss_images_count > memory_comfort_image_count:
-                        #        # "emergency" backward because we may OOM adding grads for an image of this size if we've already collected grads for other images
-                        #        _optimizer_backward(ed_optimizer, tv, 'emergency backward: ')
-                        #    if model.is_sdxl and gpu_total_mem < 25000:
-                        #        enable_vae_attention_slicing = model.is_sdxl
-                        #    tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count)
-                        #    tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count * 2)
-                        #elif image_size > (850)*(850):
-                        #    tv.forward_slice_size = min(tv.forward_slice_size, memory_comfort_image_count*2)
-                        #    tv.max_backward_slice_size = min(tv.max_backward_slice_size, memory_comfort_image_count*3)
 
                     if (tv.desired_effective_batch_size > 1
                             and args.everything_contrastive_learning_p > 0
@@ -1147,9 +1129,7 @@ def main(args):
                         loss_scale = args.loss_scale * batch["loss_scale"]
                         assert loss_scale.shape[0] == batch["image"].shape[0]
                         image_shape = batch["image"].shape
-                        reference_image_size = 512*512
                         # loss_scale = loss_scale.float() * (reference_image_size / image_size)
-                        batch_resolution = _get_best_match_resolution(args.resolution, image_size)
 
                         assert type(batch["captions"]) is dict
                         if args.all_caption_variants:
@@ -1396,10 +1376,13 @@ def main(args):
                                     raise
 
 
-                            nibble_size_actual = min(slice_end, batch_size - runt_size)
-                            mask_img = None if batch["mask"] is None else batch["mask"][0:nibble_size_actual]
 
                             model_pred = torch.cat(model_pred_all)
+                            assert model_pred.shape[0] == min(slice_end, batch_size - runt_size)
+                            assert timesteps.shape[0] == model_pred.shape[0]
+                            mask_img = None if batch["mask"] is None else batch["mask"][:model_pred.shape[0]]
+                            loss_scale = loss_scale[:model_pred.shape[0]]
+
                             model_pred_anchor = torch.cat(model_pred_anchor_all) if len(model_pred_anchor_all) > 0 else None
                             target = torch.cat(target_all)
                             text_embeds = torch.cat(text_embeds_all)
@@ -1409,8 +1392,8 @@ def main(args):
                                             target,
                                             is_cond_dropout=is_cond_dropout,
                                             mask_img=mask_img,
-                                            timesteps=timesteps[0:nibble_size_actual],
-                                            loss_scale=loss_scale[0:nibble_size_actual],
+                                            timesteps=timesteps,
+                                            negative_loss_mask=loss_scale < 0,
                                             noise_scheduler=model.noise_scheduler,
                                             text_embeds=text_embeds,
                                             do_contrastive_learning=full_batch["do_contrastive_learning"],
@@ -1419,14 +1402,14 @@ def main(args):
                                             args=args,
                             ).to(dtype=train_dtype)
 
-                            for i, used_timestep in enumerate(timesteps[0:nibble_size_actual]):
+                            for i, used_timestep in enumerate(timesteps):
                                 used_timestep_detached = int(used_timestep.detach().item())
                                 current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
                             if do_local_contrastive_flow_loss:
                                 low_noise_timesteps_mask = (
-                                    timesteps[0:nibble_size_actual] < args.local_contrastive_flow_timestep_threshold
+                                    timesteps < args.local_contrastive_flow_timestep_threshold
                                 )
                                 log_writer.add_scalar("loss/LCF sample count", low_noise_timesteps_mask.detach().sum().item(), global_step=tv.global_step)
                                 loss_lcf = get_local_contrastive_flow_loss(
@@ -1435,7 +1418,7 @@ def main(args):
                                     low_noise_timesteps_mask,
                                     temperature = args.local_contrastive_flow_temperature
                                 )
-                                loss += loss_lcf.to(dtype=loss_mean.dtype) * args.local_contrastive_flow_lambda
+                                loss += (loss_lcf.to(dtype=loss.dtype) * args.local_contrastive_flow_lambda).view(-1, 1, 1, 1).expand_as(loss)
                                 del low_noise_timesteps_mask
 
                             if do_contrastive_flow_matching_loss:
@@ -1445,9 +1428,14 @@ def main(args):
                                 loss_cfm = get_contrastive_flow_matching_loss(
                                     target,
                                     model_pred,
-                                    K=args.contrastive_flow_matching_loss_k
+                                    K=args.contrastive_flow_matching_loss_k,
+                                    loss_type=args.loss_type,
+                                    timesteps=timesteps,
+                                    noise_scheduler=model.noise_scheduler
                                 )
-                                loss += loss_cfm.to(dtype=loss_mean.dtype) * args.contrastive_flow_matching_loss_lambda
+                                loss += loss_cfm.to(dtype=loss.dtype) * args.contrastive_flow_matching_loss_lambda
+
+                            loss *= loss_scale.view(-1, 1, 1, 1).expand(loss.shape).to(loss.device)
 
                             # take mean of all dimensions except batch, then divide through by a fixed batch size
                             if args.loss_mean_over_full_effective_batch:
@@ -1476,11 +1464,11 @@ def main(args):
                             del target, model_pred, model_pred_anchor, text_embeds
 
                             loss_step = loss_mean.detach().item()
-                            nibble_timesteps_detached = timesteps[0:nibble_size_actual].detach().cpu().tolist()
+                            nibble_timesteps_detached = timesteps.detach().cpu().tolist()
                             try:
                                 tv.accumulate_loss(loss_mean,
-                                                   pathnames=batch["pathnames"][0:nibble_size_actual],
-                                                   captions=caption_str[0:nibble_size_actual],
+                                                   pathnames=batch["pathnames"][:timesteps.shape[0]],
+                                                   captions=caption_str[:timesteps.shape[0]],
                                                    timesteps=nibble_timesteps_detached)
                             except InfOrNanException as e:
                                 logging.error("Inf or NaN detected in loss, dropping this loss batch. ")
@@ -1912,9 +1900,11 @@ if __name__ == "__main__":
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1), use nvidia-smi to find your GPU ids")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
-    argparser.add_argument("--forward_slice_size", type=int, default=1, help="Slice forward step into chunks of <= this ")
-    argparser.add_argument("--max_backward_slice_size", type=int, default=None, help="Max number of samples to accumulate graph before doing backward (NOT optimizer step)")
-    argparser.add_argument("--disable_backward_memsafe", action="store_true", default=False, help="If passed, disable 'emergency' backward to avoid OOM with large backward slices")
+    argparser.add_argument("--forward_slice_size", type=int, default=None, help="If specified, subdivide forward pass (max --batch_size samples) into slices of <= this size to reduce VRAM usage (loss batch size is unaffected). Slices may be dynamically reduced under memory pressure - see also --disable_backward_memsafe .")
+    argparser.add_argument("--max_backward_slice_size", type=int, default=None, help="Max number of samples to accumulate graph before doing backward (NOT optimizer step).")
+    argparser.add_argument("--disable_backward_memsafe", action=argparse.BooleanOptionalAction, default=False, help="If passed, disable dynamic forward slice sizing")
+    argparser.add_argument("--disable_backward_memsafe_resolutions", type=int, nargs="*", default=[], help="If passed, disable dynamic forward slice sizing on these resolutions only")
+
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
     argparser.add_argument("--log_named_parameters_magnitudes", action='store_true', help="If passed, log the magnitudes of all named parameters")

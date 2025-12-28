@@ -88,10 +88,12 @@ class CaptionMungerPlugin(BasePlugin):
         return {variant: transformed_json[variant]}
 
     def _get_prepend(self) -> str:
-        prepend_p = self.config.get('prepend_p', 0.5)
+        prepend_p = self.config.get('prepend_p', 0.0)
         if prepend_p < random.random():
             return ""
-        prepend_word = random.choice(self.config.get('prepend', ['']))
+        prepend_word = random.choice(self.config.get('prepend', None))
+        if prepend_word is None:
+            return ""
         return prepend_word + ", "
 
     def _get_dropout(self) -> str | None:
