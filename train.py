@@ -225,6 +225,8 @@ def setup_args(args):
     if len(args.resolution_multiplier) > 0 and len(args.resolution_multiplier) != len(args.resolution):
         raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution {args.resolution} --resolution_multiplier {args.resolution_multiplier})")
 
+    if type(args.max_backward_slice_size) is not list:
+        args.max_backward_slice_size = [args.max_backward_slice_size]
     if len(args.max_backward_slice_size) != len(args.resolution):
         if len(args.max_backward_slice_size) > 1:
             raise ValueError(f"when using --max_backward_slice_size, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --max_backward_slice_size {args.max_backward_slice_size})")
@@ -232,7 +234,9 @@ def setup_args(args):
             # expand to one per resolution
             args.max_backward_slice_size = args.max_backward_slice_size * len(args.resolution)
 
-    if len(args.disable_backward_memsafe_resolutions) > 0 and any(r not in args.resolution for r in args.disable_backward_memsafe_resolutions):
+    if type(args.disable_backward_memsafe_resolutions) is not list:
+        args.disable_backward_memsafe_resolutions = [args.disable_backward_memsafe_resolutions]
+    if args.disable_backward_memsafe_resolutions and any(r not in args.resolution for r in args.disable_backward_memsafe_resolutions):
         raise ValueError("when using --disable_backward_memsafe_resolutions, all resolutions passed must be in --resolution (you passed: --resolution {args.resolution} --disable_backward_memsafe_resolutions {args.disable_backward_memsafe_resolutions})")
 
     return args
