@@ -72,6 +72,8 @@ class DataLoaderMultiAspect():
         """
         picked_images = []
         data_copy = copy.deepcopy(self.prepared_train_data) # deep copy to avoid modifying original multiplier property
+
+        # first, collect all images + duplicates for multiplier >= 1
         for iti in data_copy:
             while iti.multiplier >= 1:
                 picked_images.append(iti)
@@ -109,6 +111,8 @@ class DataLoaderMultiAspect():
         self.seed += 1
         randomizer = random.Random(self.seed)
 
+        self.prepared_train_data.sort(key=lambda img: img.pathname)
+        randomizer.shuffle(self.prepared_train_data)
         if dropout_fraction < 1.0:
             picked_images = self.__pick_random_subset(dropout_fraction, randomizer)
         else:
@@ -120,7 +124,12 @@ class DataLoaderMultiAspect():
         batch_size = self.batch_size
         grad_accum = self.grad_accum
 
-        def add_image_to_appropriate_bucket(image: ImageTrainItem, batch_id_override: str=None):
+        def _make_bucket_key(image, batch_id_override: str=None):
+            return (image.batch_id if batch_id_override is None else batch_id_override,
+                          image.target_wh[0],
+                          image.target_wh[1])
+
+        def _add_image_to_appropriate_bucket(image: ImageTrainItem, batch_id_override: str=None):
             #if all(image.caption)
             caption = image.caption.get_caption()
             if caption.startswith("<<json>>"):
@@ -128,15 +137,13 @@ class DataLoaderMultiAspect():
                 if all(v is None or len(v) == 0 for v in caption_data.values()):
                     print("Empty JSON caption detected, skipping image:", image.pathname)
                     return
-            bucket_key = (image.batch_id if batch_id_override is None else batch_id_override,
-                          image.target_wh[0],
-                          image.target_wh[1])
+            bucket_key = _make_bucket_key(image, batch_id_override)
             buckets[bucket_key].append(image)
 
         for image_caption_pair in picked_images:
             image_caption_pair.runt_size = 0
             batch_id_override = DEFAULT_BATCH_ID if randomizer.random() <= self.batch_id_dropout_p else None
-            add_image_to_appropriate_bucket(image_caption_pair, batch_id_override=batch_id_override)
+            _add_image_to_appropriate_bucket(image_caption_pair, batch_id_override=batch_id_override)
 
         # handled named batch runts by demoting them to the DEFAULT_BATCH_ID
         for key, bucket_contents in [(k, b) for k, b in buckets.items() if k[0] != DEFAULT_BATCH_ID]:
@@ -146,25 +153,40 @@ class DataLoaderMultiAspect():
             runts = bucket_contents[-runt_count:]
             del bucket_contents[-runt_count:]
             for r in runts:
-                add_image_to_appropriate_bucket(r, batch_id_override=DEFAULT_BATCH_ID)
+                _add_image_to_appropriate_bucket(r, batch_id_override=DEFAULT_BATCH_ID)
             if len(bucket_contents) == 0:
                 del buckets[key]
 
-        # handle remaining runts by randomly duplicating items
-        for bucket in buckets:
-            truncate_count = len(buckets[bucket]) % batch_size
-            if truncate_count > 0:
-                assert bucket[0] == DEFAULT_BATCH_ID, "there should be no more runts in named batches"
-                runt_bucket = buckets[bucket][-truncate_count:]
-                for item in runt_bucket:
-                    item.runt_size = truncate_count
-                while len(runt_bucket) < batch_size:
-                    runt_bucket.append(random.choice(runt_bucket))
+        # handle remaining runts by taking from unpicked items, and/or randomly duplicating picked items
+        for key, bucket_contents in buckets.items():
+            if len(bucket_contents) % batch_size != 0:
+                assert key[0] == DEFAULT_BATCH_ID, "there should be no more runts in named batches"
 
-                current_bucket_size = len(buckets[bucket])
+                picked_images_paths = {i.pathname for i in bucket_contents}
+                unpicked_images_preshuffled = [
+                    i
+                    for i in self.prepared_train_data
+                    if _make_bucket_key(i) == key and i.pathname not in picked_images_paths
+                ]
 
-                buckets[bucket] = buckets[bucket][:current_bucket_size - truncate_count]
-                buckets[bucket].extend(runt_bucket)
+                # fill what we can from unpicked images first
+                while unpicked_images_preshuffled and len(bucket_contents) % batch_size != 0:
+                    bucket_contents.append(unpicked_images_preshuffled.pop())
+
+                # still runts?
+                final_truncate_count = len(bucket_contents) % batch_size
+                if final_truncate_count > 0:
+                    # we weren't able to fill all runts from unpicked images, so duplicate existing items
+                    runt_bucket_start_offset = len(bucket_contents) - final_truncate_count
+                    non_runts = bucket_contents.copy()
+                    for _ in range(batch_size - final_truncate_count):
+                        bucket_contents.append(random.choice(non_runts))
+                    for i in range(batch_size):
+                        item = copy.deepcopy(bucket_contents[runt_bucket_start_offset + i])
+                        item.runt_size = final_truncate_count
+                        bucket_contents[runt_bucket_start_offset + i] = item
+            assert len(bucket_contents) % batch_size == 0
+            assert [i.target_wh == bucket_contents[0].target_wh for i in bucket_contents], "mixed aspect ratios in a bucket - this shouldn't happen"
 
         items_by_batch_id = collapse_buckets_by_batch_id(buckets)
         # at this point items have a partially deterministic order
@@ -230,7 +252,8 @@ class DataLoaderMultiAspect():
             ratings_summed.pop(pos)
             prepared_train_data.pop(pos)
 
-        return picked_images
+        unpicked_images = [i for i in self.prepared_train_data if i not in picked_images]
+        return picked_images, unpicked_images
 
     def __update_rating_sums(self):        
         self.rating_overall_sum: float = 0.0

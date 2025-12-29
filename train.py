@@ -475,145 +475,160 @@ def main(args):
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
 
-    try:
-        model = load_model(args)
-    except Exception as e:
-        traceback.print_exc()
-        logging.error(f" * Failed to load checkpoint: {repr(e)} * ")
-        raise
-
-    if args.teacher is not None and args.teacher_p > 0:
-        logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
-        teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
-        if type(teacher_pipeline.scheduler) == FlowMatchEulerDiscreteScheduler:
-            teacher_prediction_type = 'flow_prediction'
-            teacher_pipeline.scheduler.config.prediction_type = teacher_prediction_type
-        if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
-            logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
-
-        teacher_unet = teacher_pipeline.unet
-        teacher_unet.eval()
-
-        # check if we should use the teacher's text encoder
-        teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
-        base_te_sd = model.text_encoder.state_dict()
-        delta = 0
-        epsilon = 1e-2
-        with torch.no_grad():
-            for k in teacher_te_sd.keys():
-                # may have different token counts
-                if k not in base_te_sd or base_te_sd[k].shape != teacher_te_sd[k].shape:
-                    # different!
-                    delta = 1+epsilon
-                    break
-                delta += torch.mean(base_te_sd[k].cpu() - teacher_te_sd[k].cpu()) ** 2
-        if delta > epsilon:
-            logging.info("* Teacher text encoder is different from base model -> using teacher text encoder too")
-            teacher_text_encoder = teacher_pipeline.text_encoder
-            teacher_text_encoder.eval()
-            teacher_text_encoder_2 = getattr(teacher_pipeline, 'text_encoder_2', None)
-            if teacher_text_encoder_2 is not None:
-                teacher_text_encoder_2.eval()
-        else:
-            logging.info("* Teacher text encoder is the same as base -> using base text encoder for teacher")
-            teacher_text_encoder = None
-            teacher_text_encoder_2 = None
-        del teacher_te_sd, base_te_sd, delta
-
-        teacher_model = TrainingModel(
-            noise_scheduler=teacher_pipeline.scheduler,
-            unet=teacher_unet,
-            text_encoder=teacher_text_encoder,
-            text_encoder_2=teacher_text_encoder_2,
-            tokenizer=teacher_pipeline.tokenizer,
-            tokenizer_2=getattr(teacher_pipeline, 'tokenizer_2', None),
+    if args.debug_no_load_model:
+        logging.warning("--debug_no_load_model passed - not loading model!")
+        model = TrainingModel(
+            noise_scheduler=None,
+            text_encoder=None,
+            text_encoder_2=None,
+            tokenizer=None,
+            tokenizer_2=None,
+            unet=None,
             vae=None,
             compel=None,
-            yaml=None
+            yaml=None,
         )
-        del teacher_pipeline
-    else:
         teacher_model = None
-
-    compel = None
-    if args.use_compel:
-        compel = Compel(tokenizer=model.tokenizer,
-                        text_encoder=model.text_encoder,
-                        truncate_long_prompts=False,
-                        split_long_text_mode = SplitLongTextMode.SENTENCES,
-                        )
-
-    if args.gradient_checkpointing:
-        model.unet.enable_gradient_checkpointing()
-        model.text_encoder.gradient_checkpointing_enable()
-        if model.text_encoder_2:
-            model.text_encoder_2.gradient_checkpointing_enable()
-
-    if args.attn_type == "xformers":
-        if (args.amp and model.is_sd1attn) or (not model.is_sd1attn):
-            try:
-                model.unet.enable_xformers_memory_efficient_attention()
-                logging.info("Enabled xformers")
-            except Exception as ex:
-                logging.warning("failed to load xformers, using default SDP attention instead")
-                pass
-        elif (args.disable_amp and model.is_sd1attn):
-            logging.info("AMP is disabled but model is SD1.X, xformers is incompatible so using default attention")
-    elif args.attn_type == "slice":
-        model.unet.set_attention_slice("auto")
     else:
-        logging.info("* Using SDP attention *")
+        try:
+            model = load_model(args)
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(f" * Failed to load checkpoint: {repr(e)} * ")
+            raise
 
-    train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float32)
+        if args.teacher is not None and args.teacher_p > 0:
+            logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
+            teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
+            if type(teacher_pipeline.scheduler) == FlowMatchEulerDiscreteScheduler:
+                teacher_prediction_type = 'flow_prediction'
+                teacher_pipeline.scheduler.config.prediction_type = teacher_prediction_type
+            if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
+                logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
 
-    model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else train_dtype)
-    model.unet = model.unet.to(device, dtype=train_dtype)
-    if args.disable_textenc_training and args.amp:
-        model.text_encoder = model.text_encoder.to(device, dtype=torch.float16)
-        if model.text_encoder_2:
-            model.text_encoder_2 = model.text_encoder_2.to(device, dtype=torch.float16)
-    else:
-        model.text_encoder = model.text_encoder.to(device, dtype=train_dtype)
-        if model.text_encoder_2:
-            model.text_encoder_2 = model.text_encoder_2.to(device, dtype=train_dtype)
+            teacher_unet = teacher_pipeline.unet
+            teacher_unet.eval()
 
-    if get_use_ema_decay_training(args):
-        if model.unet_ema is None:
-            logging.info(f"EMA decay enabled, creating EMA model.")
-
+            # check if we should use the teacher's text encoder
+            teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
+            base_te_sd = model.text_encoder.state_dict()
+            delta = 0
+            epsilon = 1e-2
             with torch.no_grad():
-                if args.ema_device == device:
-                    unet_ema = deepcopy(model.unet)
-                    text_encoder_ema = deepcopy(model.text_encoder)
-                else:
-                    unet_ema_first = deepcopy(model.unet)
-                    text_encoder_ema_first = deepcopy(model.text_encoder)
-                    unet_ema = unet_ema_first.to(args.ema_device, dtype=model.unet.dtype)
-                    text_encoder_ema = text_encoder_ema_first.to(args.ema_device, dtype=model.text_encoder.dtype)
-                    del unet_ema_first
-                    del text_encoder_ema_first
+                for k in teacher_te_sd.keys():
+                    # may have different token counts
+                    if k not in base_te_sd or base_te_sd[k].shape != teacher_te_sd[k].shape:
+                        # different!
+                        delta = 1+epsilon
+                        break
+                    delta += torch.mean(base_te_sd[k].cpu() - teacher_te_sd[k].cpu()) ** 2
+            if delta > epsilon:
+                logging.info("* Teacher text encoder is different from base model -> using teacher text encoder too")
+                teacher_text_encoder = teacher_pipeline.text_encoder
+                teacher_text_encoder.eval()
+                teacher_text_encoder_2 = getattr(teacher_pipeline, 'text_encoder_2', None)
+                if teacher_text_encoder_2 is not None:
+                    teacher_text_encoder_2.eval()
+            else:
+                logging.info("* Teacher text encoder is the same as base -> using base text encoder for teacher")
+                teacher_text_encoder = None
+                teacher_text_encoder_2 = None
+            del teacher_te_sd, base_te_sd, delta
+
+            teacher_model = TrainingModel(
+                noise_scheduler=teacher_pipeline.scheduler,
+                unet=teacher_unet,
+                text_encoder=teacher_text_encoder,
+                text_encoder_2=teacher_text_encoder_2,
+                tokenizer=teacher_pipeline.tokenizer,
+                tokenizer_2=getattr(teacher_pipeline, 'tokenizer_2', None),
+                vae=None,
+                compel=None,
+                yaml=None
+            )
+            del teacher_pipeline
         else:
-            # Make sure correct types are used for models
-            unet_ema = model.unet_ema.to(args.ema_device, dtype=model.unet.dtype)
-            text_encoder_ema = model.text_encoder_ema.to(args.ema_device, dtype=model.text_encoder.dtype)
-    else:
-        unet_ema = None
-        text_encoder_ema = None
+            teacher_model = None
 
-    # Update model with EMA models if available
-    model.unet_ema = unet_ema
-    model.text_encoder_ema = text_encoder_ema
+        compel = None
+        if args.use_compel:
+            compel = Compel(tokenizer=model.tokenizer,
+                            text_encoder=model.text_encoder,
+                            truncate_long_prompts=False,
+                            split_long_text_mode = SplitLongTextMode.SENTENCES,
+                            )
 
-    try:
-        print()
-        # currently broken on most systems?
-        # unet = torch.compile(unet, mode="max-autotune")
-        # text_encoder = torch.compile(text_encoder, mode="max-autotune")
-        # vae = torch.compile(vae, mode="max-autotune")
-        # logging.info("Successfully compiled models")
-    except Exception as ex:
-        logging.warning(f"Failed to compile model, continuing anyway, ex: {ex}")
-        pass
+        if args.gradient_checkpointing:
+            model.unet.enable_gradient_checkpointing()
+            model.text_encoder.gradient_checkpointing_enable()
+            if model.text_encoder_2:
+                model.text_encoder_2.gradient_checkpointing_enable()
+
+        if args.attn_type == "xformers":
+            if (args.amp and model.is_sd1attn) or (not model.is_sd1attn):
+                try:
+                    model.unet.enable_xformers_memory_efficient_attention()
+                    logging.info("Enabled xformers")
+                except Exception as ex:
+                    logging.warning("failed to load xformers, using default SDP attention instead")
+                    pass
+            elif (args.disable_amp and model.is_sd1attn):
+                logging.info("AMP is disabled but model is SD1.X, xformers is incompatible so using default attention")
+        elif args.attn_type == "slice":
+            model.unet.set_attention_slice("auto")
+        else:
+            logging.info("* Using SDP attention *")
+
+        train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float32)
+
+        model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else train_dtype)
+        model.unet = model.unet.to(device, dtype=train_dtype)
+        if args.disable_textenc_training and args.amp:
+            model.text_encoder = model.text_encoder.to(device, dtype=torch.float16)
+            if model.text_encoder_2:
+                model.text_encoder_2 = model.text_encoder_2.to(device, dtype=torch.float16)
+        else:
+            model.text_encoder = model.text_encoder.to(device, dtype=train_dtype)
+            if model.text_encoder_2:
+                model.text_encoder_2 = model.text_encoder_2.to(device, dtype=train_dtype)
+
+        if get_use_ema_decay_training(args):
+            if model.unet_ema is None:
+                logging.info(f"EMA decay enabled, creating EMA model.")
+
+                with torch.no_grad():
+                    if args.ema_device == device:
+                        unet_ema = deepcopy(model.unet)
+                        text_encoder_ema = deepcopy(model.text_encoder)
+                    else:
+                        unet_ema_first = deepcopy(model.unet)
+                        text_encoder_ema_first = deepcopy(model.text_encoder)
+                        unet_ema = unet_ema_first.to(args.ema_device, dtype=model.unet.dtype)
+                        text_encoder_ema = text_encoder_ema_first.to(args.ema_device, dtype=model.text_encoder.dtype)
+                        del unet_ema_first
+                        del text_encoder_ema_first
+            else:
+                # Make sure correct types are used for models
+                unet_ema = model.unet_ema.to(args.ema_device, dtype=model.unet.dtype)
+                text_encoder_ema = model.text_encoder_ema.to(args.ema_device, dtype=model.text_encoder.dtype)
+        else:
+            unet_ema = None
+            text_encoder_ema = None
+
+        # Update model with EMA models if available
+        model.unet_ema = unet_ema
+        model.text_encoder_ema = text_encoder_ema
+
+        try:
+            # currently broken on most systems?
+            # unet = torch.compile(unet, mode="max-autotune")
+            # text_encoder = torch.compile(text_encoder, mode="max-autotune")
+            # vae = torch.compile(vae, mode="max-autotune")
+            # logging.info("Successfully compiled models")
+            pass
+        except Exception as ex:
+            logging.warning(f"Failed to compile model, continuing anyway, ex: {ex}")
+            pass
 
     try:
         torch.set_float32_matmul_precision('high')
@@ -2063,6 +2078,8 @@ if __name__ == "__main__":
     argparser.add_argument("--offload_vae", action="store_true", help="If passed, offload VAE to CPU when not in use, saves VRAM but is slower")
     argparser.add_argument("--offload_text_encoder", action="store_true", help="If passed, offload text encoder(s) to CPU when not in use, saves VRAM but is slower")
     argparser.add_argument("--no_save_on_error", action="store_true", help="If passed, do not save model on error/ctrl-c")
+
+    argparser.add_argument("--debug_no_load_model", action="store_true", help="If passed, do not load model weights (for testing purposes only)")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)

@@ -41,11 +41,11 @@ class EveryDreamBatch(Dataset):
     """
     def __init__(self,
                  data_loader: DataLoaderMultiAspect,
+                 tokenizer,
                  debug_level=0,
                  conditional_dropout=0.02,
                  crop_jitter=0.02,
                  seed=555,
-                 tokenizer=None,
                  tokenizer_2=None,
                  shuffle_tags=False,
                  keep_tags=0,
@@ -60,8 +60,6 @@ class EveryDreamBatch(Dataset):
                  cond_dropout_noise_p=0,
                  ):
 
-        if tokenizer is None:
-            raise ValueError("must pass tokenizer")
         if plugin_runner is None:
             print("EveryDreamBatch using empty PluginRunner")
             plugin_runner = PluginRunner()
@@ -75,7 +73,7 @@ class EveryDreamBatch(Dataset):
         self.unloaded_to_idx = 0
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
-        self.max_token_length = self.tokenizer.model_max_length
+        self.max_token_length = None
         self.shuffle_tags = shuffle_tags
         self.keep_tags = keep_tags
         self.normalize_image = normalize_image
@@ -95,18 +93,22 @@ class EveryDreamBatch(Dataset):
         num_images = len(self.image_train_items)
         logging.info(f" ** Dataset '{name}': {num_images / self.batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
 
-        self.cond_dropout_caption = ' '
-        self.cond_dropout_tokens = torch.tensor(self.tokenizer(self.cond_dropout_caption,
-                                        truncation=True,
-                                        padding="max_length",
-                                        max_length=self.tokenizer.model_max_length,
-                                        ).input_ids)
-        if self.tokenizer_2 is not None:
-            self.cond_dropout_tokens_2 = torch.tensor(self.tokenizer_2(self.cond_dropout_caption,
+        if self.tokenizer is None:
+            logging.info(f" ** Dataset '{name}': No tokenizer provided! You will crash on training.")
+        else:
+            self.max_token_length = self.tokenizer.model_max_length
+            self.cond_dropout_caption = ' '
+            self.cond_dropout_tokens = torch.tensor(self.tokenizer(self.cond_dropout_caption,
                                             truncation=True,
                                             padding="max_length",
-                                            max_length=self.tokenizer_2.model_max_length,
+                                            max_length=self.tokenizer.model_max_length,
                                             ).input_ids)
+            if self.tokenizer_2 is not None:
+                self.cond_dropout_tokens_2 = torch.tensor(self.tokenizer_2(self.cond_dropout_caption,
+                                                truncation=True,
+                                                padding="max_length",
+                                                max_length=self.tokenizer_2.model_max_length,
+                                                ).input_ids)
 
     @property
     def is_sdxl(self):
