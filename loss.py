@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from scipy.stats import beta as sp_beta
 
-from diffusers import SchedulerMixin, ConfigMixin
+from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
 
 from flow_match_model import TrainFlowMatchScheduler
 from loss_softrepa import (
@@ -589,7 +589,7 @@ def _get_noisy_latents(
     latents, noise, noise_scheduler, timesteps, latents_perturbation
 ):
     # logging.info(f"get_noisy_latents timesteps: {timesteps.detach().cpu().tolist()}")
-    if not isinstance(noise_scheduler, TrainFlowMatchScheduler):
+    if not isinstance(noise_scheduler, FlowMatchEulerDiscreteScheduler):
         timesteps = timesteps.long()
     if hasattr(noise_scheduler, "add_noise"):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -1039,11 +1039,25 @@ def get_local_contrastive_flow_loss(
     model_pred: torch.Tensor,
     model_pred_anchor: torch.Tensor,
     low_noise_timesteps_mask: torch.Tensor,
+    unique_identifiers: list[str],
     temperature,
 ) -> torch.Tensor:
+
+    low_noise_timesteps_count = low_noise_timesteps_mask.sum().item()
+    # remove duplicate uids from low_noise_timesteps_mask
+    for i in torch.nonzero(low_noise_timesteps_mask):
+        uid = unique_identifiers[i.item()]
+        for j in range(i.item() + 1, len(unique_identifiers)):
+            if unique_identifiers[j] == uid:
+                low_noise_timesteps_mask[j] = False
+    if low_noise_timesteps_count > low_noise_timesteps_mask.sum().item():
+        logging.warning(
+            f" * get_local_contrastive_flow_loss: removed {low_noise_timesteps_count - low_noise_timesteps_mask.sum().item()} duplicate unique_identifiers from low_noise_timesteps_mask - had {low_noise_timesteps_count} now {low_noise_timesteps_mask.sum().item()}"
+        )
+
     contrastive_losses_full = torch.zeros(model_pred.shape[0], device=model_pred.device, dtype=model_pred.dtype)
 
-    # can only do contrstive if >1 samples
+    # can only do contrastive if >1 samples
     n_contrastive = low_noise_timesteps_mask.sum().item()
     if n_contrastive >= 2:
         # 3. Flatten spatial dimensions, then normalize for cosine similarity
@@ -1071,7 +1085,7 @@ def get_local_contrastive_flow_loss(
     return contrastive_losses_full
 
 
-def get_contrastive_flow_matching_loss(target, v_pred, K, loss_type, timesteps, noise_scheduler):
+def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, K, loss_type, timesteps, noise_scheduler):
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
@@ -1079,9 +1093,12 @@ def get_contrastive_flow_matching_loss(target, v_pred, K, loss_type, timesteps, 
 
     contrastive_losses = torch.zeros_like(v_pred)
     # pick K random reference indices
-    references = torch.randperm(B).tolist()[:K]
+    references = torch.randperm(B).tolist()
+    contrastive_losses_count = 0
     for ref_idx in references:
-        choices = [i for i in range(B) if i != ref_idx]
+        choices = [i for i in range(B) if i != ref_idx and unique_identifiers[i] != unique_identifiers[ref_idx]]
+        if len(choices) == 0:
+            continue
         neg_idx = random.choice(choices)
         neg_dist = compute_basic_loss(
             loss_type,
@@ -1091,5 +1108,9 @@ def get_contrastive_flow_matching_loss(target, v_pred, K, loss_type, timesteps, 
             noise_scheduler=noise_scheduler,
         )
         contrastive_losses[ref_idx] += neg_dist.squeeze(0)
+        # we are not always able to get K negatives (e.g. duplicate images), so count only when we do
+        contrastive_losses_count += 1
+        if contrastive_losses_count >= K:
+            break
 
     return -contrastive_losses

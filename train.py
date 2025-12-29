@@ -223,7 +223,17 @@ def setup_args(args):
         args.resolution = [args.resolution]
 
     if len(args.resolution_multiplier) > 0 and len(args.resolution_multiplier) != len(args.resolution):
-        raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution: {args.resolution}, --resolution_multiplier: {args.resolution_multiplier})")
+        raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution {args.resolution} --resolution_multiplier {args.resolution_multiplier})")
+
+    if len(args.max_backward_slice_size) != len(args.resolution):
+        if len(args.max_backward_slice_size) > 1:
+            raise ValueError(f"when using --max_backward_slice_size, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --max_backward_slice_size {args.max_backward_slice_size})")
+        elif len(args.max_backward_slice_size) == 1:
+            # expand to one per resolution
+            args.max_backward_slice_size = args.max_backward_slice_size * len(args.resolution)
+
+    if len(args.disable_backward_memsafe_resolutions) > 0 and any(r not in args.resolution for r in args.disable_backward_memsafe_resolutions):
+        raise ValueError("when using --disable_backward_memsafe_resolutions, all resolutions passed must be in --resolution (you passed: --resolution {args.resolution} --disable_backward_memsafe_resolutions {args.disable_backward_memsafe_resolutions})")
 
     return args
 
@@ -341,11 +351,17 @@ def update_ema(model, ema_model, decay, default_device, ema_device: str):
         if need_to_delete_original:
             del(original_model_on_proper_device)
 
-def _choose_backward_slice_size(args, tv: TrainingVariables):
+def _choose_backward_slice_size(args, tv: TrainingVariables, batch_resolution):
+    if args.max_backward_slice_size:
+        resolution_index = args.resolution.index(batch_resolution)
+        backward_slice_size = args.max_backward_slice_size[resolution_index]
+    else:
+        backward_slice_size = args.batch_size
+
     return max(
         1,
         min(
-            args.max_backward_slice_size or args.batch_size,
+            backward_slice_size,
             tv.desired_effective_batch_size
             #- tv.backwarded_images_count,
         ),
@@ -377,7 +393,6 @@ def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, l
 
         # reset slice sizes
         tv.forward_slice_size = args.forward_slice_size or args.batch_size
-        tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
 
 def load_train_json_from_file(args, report_load = False):
     try:
@@ -466,6 +481,9 @@ def main(args):
     if args.teacher is not None and args.teacher_p > 0:
         logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
         teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
+        if type(teacher_pipeline.scheduler) == FlowMatchEulerDiscreteScheduler:
+            teacher_prediction_type = 'flow_prediction'
+            teacher_pipeline.scheduler.config.prediction_type = teacher_prediction_type
         if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
             logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
 
@@ -908,7 +926,6 @@ def main(args):
 
         needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
-        tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
         tv.remaining_stratified_timesteps = None
         tv.shared_timestep = None
 
@@ -953,7 +970,6 @@ def main(args):
             )
 
             tv.forward_slice_size = args.forward_slice_size or args.batch_size
-            tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
 
             step = 0
             timesteps = None
@@ -986,6 +1002,10 @@ def main(args):
                     batch_resolution = _get_best_match_resolution(
                         args.resolution, image_size
                     )
+                    tv.max_backward_slice_size = _choose_backward_slice_size(args, tv, batch_resolution)
+                    if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
+                        # do backward now
+                        _optimizer_backward(ed_optimizer, tv, 'truncated backward: ')
 
                     if not args.disable_backward_memsafe and batch_resolution not in args.disable_backward_memsafe_resolutions:
                         if gpu is not None:
@@ -1101,6 +1121,7 @@ def main(args):
 
                     batch = None
                     remaining_batch = full_batch
+
                     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
                         def get_nibble_size() -> int:
                             if tv.desired_effective_batch_size - tv.backwarded_images_count <= 0:
@@ -1412,10 +1433,14 @@ def main(args):
                                     timesteps < args.local_contrastive_flow_timestep_threshold
                                 )
                                 log_writer.add_scalar("loss/LCF sample count", low_noise_timesteps_mask.detach().sum().item(), global_step=tv.global_step)
+                                pathnames_resolved = [
+                                    os.path.realpath(p) for p in batch["pathnames"]
+                                ]
                                 loss_lcf = get_local_contrastive_flow_loss(
                                     model_pred,
                                     model_pred_anchor,
                                     low_noise_timesteps_mask,
+                                    unique_identifiers=pathnames_resolved,
                                     temperature = args.local_contrastive_flow_temperature
                                 )
                                 loss += (loss_lcf.to(dtype=loss.dtype) * args.local_contrastive_flow_lambda).view(-1, 1, 1, 1).expand_as(loss)
@@ -1425,9 +1450,12 @@ def main(args):
                                 assert args.contrastive_flow_matching_loss_lambda * args.contrastive_flow_matching_loss_k < 1, (
                                     "for stability, K*lambda_contrast must be < 1"
                                 )
+                                pathnames_resolved = [os.path.realpath(p)
+                                                      for p in batch['pathnames']]
                                 loss_cfm = get_contrastive_flow_matching_loss(
                                     target,
                                     model_pred,
+                                    unique_identifiers=pathnames_resolved,
                                     K=args.contrastive_flow_matching_loss_k,
                                     loss_type=args.loss_type,
                                     timesteps=timesteps,
@@ -1901,9 +1929,9 @@ if __name__ == "__main__":
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
     argparser.add_argument("--forward_slice_size", type=int, default=None, help="If specified, subdivide forward pass (max --batch_size samples) into slices of <= this size to reduce VRAM usage (loss batch size is unaffected). Slices may be dynamically reduced under memory pressure - see also --disable_backward_memsafe .")
-    argparser.add_argument("--max_backward_slice_size", type=int, default=None, help="Max number of samples to accumulate graph before doing backward (NOT optimizer step).")
+    argparser.add_argument("--max_backward_slice_size", type=int, default=[], nargs="+", help="Max number of samples to accumulate graph before doing backward (NOT optimizer step). Pass multiple values to set per-resolution.")
     argparser.add_argument("--disable_backward_memsafe", action=argparse.BooleanOptionalAction, default=False, help="If passed, disable dynamic forward slice sizing")
-    argparser.add_argument("--disable_backward_memsafe_resolutions", type=int, nargs="*", default=[], help="If passed, disable dynamic forward slice sizing on these resolutions only")
+    argparser.add_argument("--disable_backward_memsafe_resolutions", type=int, nargs="+", default=[], help="If passed, disable dynamic forward slice sizing on these resolutions only")
 
     argparser.add_argument("--logdir", type=str, default="logs", help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25, help="How often to log training stats, def: 25, recommend default!")
