@@ -234,10 +234,19 @@ def setup_args(args):
             # expand to one per resolution
             args.max_backward_slice_size = args.max_backward_slice_size * len(args.resolution)
 
+    if type(args.forward_slice_size) is not list:
+        args.forward_slice_size = [args.forward_slice_size]
+    if len(args.forward_slice_size) != len(args.resolution):
+        if len(args.forward_slice_size) > 1:
+            raise ValueError(f"when using --forward_slice_size, you must pass exactly 1 forward slice size per resolution (you passed: --resolution {args.resolution} --forward_slice_size {args.forward_slice_size})")
+        elif len(args.forward_slice_size) == 1:
+            # expand to one per resolution
+            args.forward_slice_size = args.forward_slice_size * len(args.resolution)
+
     if type(args.disable_backward_memsafe_resolutions) is not list:
         args.disable_backward_memsafe_resolutions = [args.disable_backward_memsafe_resolutions]
     if args.disable_backward_memsafe_resolutions and any(r not in args.resolution for r in args.disable_backward_memsafe_resolutions):
-        raise ValueError("when using --disable_backward_memsafe_resolutions, all resolutions passed must be in --resolution (you passed: --resolution {args.resolution} --disable_backward_memsafe_resolutions {args.disable_backward_memsafe_resolutions})")
+        raise ValueError(f"when using --disable_backward_memsafe_resolutions, all resolutions passed must be in --resolution (you passed: --resolution {args.resolution} --disable_backward_memsafe_resolutions {args.disable_backward_memsafe_resolutions})")
 
     return args
 
@@ -374,6 +383,13 @@ def update_ema(model, ema_model, decay, default_device, ema_device: str):
         if need_to_delete_original:
             del(original_model_on_proper_device)
 
+def _get_default_forward_slice_size(args, batch_resolution):
+    if args.forward_slice_size:
+        resolution_index = args.resolution.index(batch_resolution)
+        return args.forward_slice_size[resolution_index]
+    else:
+        return args.batch_size
+
 def _choose_backward_slice_size(args, tv: TrainingVariables, batch_resolution):
     if args.max_backward_slice_size:
         resolution_index = args.resolution.index(batch_resolution)
@@ -414,8 +430,6 @@ def _optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, l
 
         tv.clear_accumulated_loss()
 
-        # reset slice sizes
-        tv.forward_slice_size = args.forward_slice_size or args.batch_size
 
 def load_train_json_from_file(args, report_load = False):
     try:
@@ -699,7 +713,7 @@ def main(args):
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
         validator = EveryDreamValidator(args.validation_config,
-                                        default_batch_size=args.forward_slice_size or args.batch_size,
+                                        default_batch_size=args.forward_slice_size[0] if args.forward_slice_size else args.batch_size,
                                         resolution=args.resolution[0],
                                         log_writer=log_writer,
                                         approx_epoch_length=sum([i.multiplier for i in image_train_items])/args.batch_size
@@ -1007,8 +1021,6 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
-            tv.forward_slice_size = args.forward_slice_size or args.batch_size
-
             step = 0
             timesteps = None
             #logging.info("fetching batch...")
@@ -1040,6 +1052,7 @@ def main(args):
                     batch_resolution = _get_best_match_resolution(
                         args.resolution, image_size
                     )
+                    tv.forward_slice_size = _get_default_forward_slice_size(args, batch_resolution)
                     tv.max_backward_slice_size = _choose_backward_slice_size(args, tv, batch_resolution)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
                         # do backward now
@@ -1060,9 +1073,9 @@ def main(args):
                                 if max_safe_forward_size == 0:
                                     logging.warning(" * Unable to free enough ram with emergency backward - possible OOM follows")
                                     max_safe_forward_size = 1
-                            if max_safe_forward_size < tv.forward_slice_size:
-                                logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
-                            tv.forward_slice_size = min([args.forward_slice_size, max_safe_forward_size])
+                            #if max_safe_forward_size < _get_default_forward_slice_size(args, batch_resolution):
+                            #    logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
+                            tv.forward_slice_size = min([_get_default_forward_slice_size(args, batch_resolution), max_safe_forward_size])
                         else:
                             gpu_used_mem, gpu_total_mem = 0, 0
 
@@ -1966,7 +1979,7 @@ if __name__ == "__main__":
     argparser.add_argument("--gpuid", type=int, default=0, help="id of gpu to use for training, (def: 0) (ex: 1 to use GPU_ID 1), use nvidia-smi to find your GPU ids")
     argparser.add_argument("--gradient_checkpointing", action="store_true", default=False, help="enable gradient checkpointing to reduce VRAM use, may reduce performance (def: False)")
     argparser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation factor (def: 1), (ex, 2)")
-    argparser.add_argument("--forward_slice_size", type=int, default=None, help="If specified, subdivide forward pass (max --batch_size samples) into slices of <= this size to reduce VRAM usage (loss batch size is unaffected). Slices may be dynamically reduced under memory pressure - see also --disable_backward_memsafe .")
+    argparser.add_argument("--forward_slice_size", type=int, default=[], nargs="+", help="If specified, subdivide forward pass (max --batch_size samples) into slices of <= this size to reduce VRAM usage (loss batch size is unaffected). Pass multiple values to specify per-resolution. Slices may be dynamically reduced under memory pressure - see also --disable_backward_memsafe .")
     argparser.add_argument("--max_backward_slice_size", type=int, default=[], nargs="+", help="Max number of samples to accumulate graph before doing backward (NOT optimizer step). Pass multiple values to set per-resolution.")
     argparser.add_argument("--disable_backward_memsafe", action=argparse.BooleanOptionalAction, default=False, help="If passed, disable dynamic forward slice sizing")
     argparser.add_argument("--disable_backward_memsafe_resolutions", type=int, nargs="+", default=[], help="If passed, disable dynamic forward slice sizing on these resolutions only")
