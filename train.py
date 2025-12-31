@@ -316,11 +316,30 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, glo
 
     # drop undersized, if requested
     if args.skip_undersized_images:
-        full_count = len(resolved_items)
+        pre_count = len(resolved_items)
         resolved_items = [i for i in resolved_items if not i.is_undersized]
         post_drop_undersize_count = len(resolved_items)
-        if full_count != post_drop_undersize_count:
-            logging.info(f" * From {full_count} images, dropped {full_count - post_drop_undersize_count} undersized images ({post_drop_undersize_count} remaining). Remove --skip_undersized_images to log which ones.")
+        if pre_count != post_drop_undersize_count:
+            logging.info(f" * From {pre_count} images, dropped {pre_count - post_drop_undersize_count} undersized images ({post_drop_undersize_count} remaining). Remove --skip_undersized_images to log which ones.")
+
+    # drop empty JSON captions
+    drop_empty_json_captions = True
+    if drop_empty_json_captions:
+        non_empty_json_captions = []
+        for item in resolved_items:
+            caption = item.caption.get_caption()
+            if caption.startswith("<<json>>"):
+                caption_data = json.loads(caption.replace("<<json>>", ""))
+                if caption_data is None or all(v is None or len(v.strip()) == 0 for v in caption_data.values()):
+                    #print("Empty JSON caption detected, skipping image:", item.pathname)
+                    continue
+            non_empty_json_captions.append(item)
+        pre_count = len(resolved_items)
+        resolved_items = non_empty_json_captions
+        post_count = len(resolved_items)
+        logging.info(
+            f" * From {pre_count} images, dropped {pre_count - post_count} images with empty JSON captions ({post_count} remaining)."
+        )
 
     print (f" * Found {len(resolved_items)} items in '{args.data_root}'")
 

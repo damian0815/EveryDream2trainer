@@ -131,12 +131,6 @@ class DataLoaderMultiAspect():
 
         def _add_image_to_appropriate_bucket(image: ImageTrainItem, batch_id_override: str=None):
             #if all(image.caption)
-            caption = image.caption.get_caption()
-            if caption.startswith("<<json>>"):
-                caption_data = json.loads(caption.replace("<<json>>", ""))
-                if all(v is None or len(v) == 0 for v in caption_data.values()):
-                    print("Empty JSON caption detected, skipping image:", image.pathname)
-                    return
             bucket_key = _make_bucket_key(image, batch_id_override)
             buckets[bucket_key].append(image)
 

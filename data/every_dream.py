@@ -193,22 +193,23 @@ class EveryDreamBatch(Dataset):
         #    example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
 
         try:
-            example["caption"] = {k: caption_dict.get(k, None) or caption_dict[self.random_instance.choice(caption_dict.keys())]
-                                  for k in caption_dict.keys()}
+            caption_keys = list(caption_dict.keys())
+            example["caption"] = {k: caption_dict.get(k, None) or caption_dict[self.random_instance.choice(caption_keys)]
+                                  for k in caption_keys}
             example["tokens"] = {k: torch.tensor(self.tokenizer(example["caption"][k],
                                                 truncation=True,
                                                 padding="max_length",
                                                 max_length=self.tokenizer.model_max_length,
                                               ).input_ids)
-                                 for k in caption_dict.keys()}
+                                 for k in caption_keys}
             if self.is_sdxl:
                 example["tokens_2"] = {k: torch.tensor(self.tokenizer_2(example["caption"][k],
                                                     truncation=True,
                                                     padding="max_length",
                                                     max_length=self.tokenizer_2.model_max_length,
                                                   ).input_ids)
-                                     for k in caption_dict.keys()}
-        except ValueError as e:
+                                     for k in caption_keys}
+        except (ValueError, TypeError) as e:
             traceback.print_exc()
             print('caption_dict:', caption_dict)
             print('train_item:', train_item)
@@ -316,7 +317,7 @@ class DataLoaderWithFixedBuffer(torch.utils.data.DataLoader):
 
 def build_torch_dataloader(dataset, batch_size, num_workers=None) -> torch.utils.data.DataLoader:
     num_workers = num_workers if num_workers is not None else min(batch_size, os.cpu_count())
-    logging.info(f"* num dataloader workers: {num_workers}")
+    logging.info(f"* building torch DataLoader with num dataloader workers num_workers={num_workers}")
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size= batch_size,
