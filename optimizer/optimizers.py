@@ -794,10 +794,10 @@ class EveryDreamOptimizer:
             factor = 1.15
             interval = 2000
         if factor is not None and self.scaler.get_growth_factor() != factor:
-            logging.info(f"* Adjusting grad scaler growth factor to {factor} at step {self.num_optimizer_steps}; next update interval {interval} optimizer steps")
+            logging.info(f"* Adjusting grad scaler growth factor to {factor} after {self.num_optimizer_steps} optimizer steps; next update interval {interval} optimizer steps")
             self.scaler.set_growth_factor(factor)
             self.scaler.set_backoff_factor(1 / factor)
-            self.scaler.set_growth_interval(100)
+            self.scaler.set_growth_interval(interval)
 
 
     @staticmethod

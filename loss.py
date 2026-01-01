@@ -24,7 +24,7 @@ from model.training_model import TrainingModel, Conditioning
 # from train import pyramid_noise_like, compute_snr
 
 
-def nibble_batch(batch, take_count):
+def nibble_batch(batch, take_count) -> tuple[dict, dict]:
     runt_size = batch["runt_size"]
     current_batch_size = batch["image"].shape[0]
     non_runt_size = current_batch_size - runt_size
@@ -542,16 +542,24 @@ def get_model_prediction_and_target(
         latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation
     )
     target = _get_target(latents, noise, model.noise_scheduler, timesteps).to(dtype=model.unet.dtype)
+
+    if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler):
+        unet_timesteps = TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=model.noise_scheduler.timesteps)
+    else:
+        unet_timesteps = timesteps
+
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
         model_pred = model.unet(
             noisy_latents.to(dtype=model.unet.dtype),
-            timesteps.to(dtype=model.unet.dtype),
+            unet_timesteps.to(model.unet.device, dtype=model.unet.dtype),
             encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
-            added_cond_kwargs=conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
-            if model.is_sdxl
-            else None,
+            added_cond_kwargs=(
+                conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
+                if model.is_sdxl
+                else None
+            ),
         ).sample
 
     if teacher_mask is not None and teacher_mask.sum() > 0:
@@ -563,7 +571,8 @@ def get_model_prediction_and_target(
                 teacher_model=teacher_model,
                 teacher_conditioning=teacher_conditioning,
                 student_model=model,
-                student_timesteps=timesteps,
+                timesteps=timesteps,
+                student_unet_timesteps=unet_timesteps,
                 clean_image_latents=latents,
                 noise=noise,
             )
@@ -589,12 +598,11 @@ def _get_noisy_latents(
     latents, noise, noise_scheduler, timesteps, latents_perturbation
 ):
     # logging.info(f"get_noisy_latents timesteps: {timesteps.detach().cpu().tolist()}")
-    if not isinstance(noise_scheduler, FlowMatchEulerDiscreteScheduler):
-        timesteps = timesteps.long()
     if hasattr(noise_scheduler, "add_noise"):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-    elif hasattr(noise_scheduler, "scale_noise"):
-        noisy_latents = noise_scheduler.scale_noise(latents, timesteps, noise)
+    elif isinstance(noise_scheduler, FlowMatchEulerDiscreteScheduler):
+        shifted_timesteps = TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=noise_scheduler.timesteps)
+        noisy_latents = noise_scheduler.scale_noise(latents, shifted_timesteps, noise)
     else:
         raise RuntimeError("Noise scheduler has no method to add noise to latents (tried .add_noise() and .scale_noise())")
     if latents_perturbation > 0:
@@ -641,10 +649,7 @@ def get_timesteps(
     )
     if batch_share_timesteps:
         timesteps = timesteps[:1].repeat((batch_size,))
-    if isinstance(scheduler, TrainFlowMatchScheduler):
-        timesteps = scheduler.get_exact_timesteps(timesteps).to(device)
-    else:
-        timesteps = timesteps.long()
+    timesteps = timesteps.long()
     # logging.info(f"get_timesteps: {timesteps.detach().cpu().tolist()} from ranges: {timesteps_ranges}")
     return timesteps
 
@@ -782,7 +787,7 @@ def get_multirank_stratified_random_timesteps(
     batch_size,
     device,
     distribution: Literal[
-        "beta", "mode", "boundary-oversampling", "lognormal"
+        "uniform", "beta", "mode", "boundary-oversampling", "lognormal"
     ] = "beta",
     alpha=2,
     beta=1.6,
@@ -798,6 +803,12 @@ def get_multirank_stratified_random_timesteps(
     """
     if distribution == "boundary-oversampling":
         sigmas = _get_boundary_oversampling_sigmas(batch_size, lambda_=1e3)
+    elif distribution == "uniform":
+        u = torch.rand(batch_size)
+        if stratify:
+            indices = torch.arange(0, batch_size, dtype=torch.float64)
+            u = (indices + u) / batch_size
+        sigmas = u
     elif distribution == "lognormal":
         std = 1
         mean = 0
@@ -818,8 +829,6 @@ def get_multirank_stratified_random_timesteps(
     # shuffle
     timesteps = timesteps[torch.randperm(timesteps.shape[0])]
     timesteps = timesteps.long().clamp(min=0, max=999)
-    if isinstance(scheduler, TrainFlowMatchScheduler):
-        timesteps = scheduler.get_exact_timesteps(timesteps).to(device)
 
     # logging.info(
     #    f"get_multirank_stratified_random_timesteps: {timesteps.detach().cpu().tolist()} for batch size {batch_size} alpha {alpha} beta {beta}"
@@ -857,7 +866,8 @@ def get_teacher_target(
     teacher_model: TrainingModel,
     teacher_conditioning: Conditioning,
     student_model: TrainingModel,
-    student_timesteps: torch.Tensor,
+    timesteps: torch.Tensor,
+    student_unet_timesteps: torch.Tensor,
     clean_image_latents: torch.Tensor,
     noise: torch.Tensor,
 ):
@@ -867,8 +877,10 @@ def get_teacher_target(
         teacher_prediction_type in ["v_prediction", "v-prediction"]
         and student_prediction_type == "flow_prediction"
     ):
-        teacher_timesteps, teacher_noisy_latents = _remap_noise_v_pred_to_flow_matching(
-            teacher_model, student_model, student_timesteps, clean_image_latents, noise
+        raise NotImplementedError("SNR-based timestep remapping implementation not correct for new flowmap timestep scheduling.")
+        #@todo use student_noisy_timesteps to compute teacher timesteps based on SNR matching
+        teacher_unet_timesteps, teacher_noisy_latents = _remap_noise_v_pred_to_flow_matching(
+            teacher_model, student_model, timesteps, clean_image_latents, noise
         )
     else:
         if teacher_prediction_type != student_prediction_type:
@@ -881,32 +893,44 @@ def get_teacher_target(
                 raise ValueError(
                     f"Unsupported prediction type conversion: {teacher_prediction_type} to {student_prediction_type}"
                 )
-        teacher_timesteps = student_timesteps
+
+        # _get_noise_latents uses non-shifted integer timesteps (indices)
         teacher_noisy_latents = _get_noisy_latents(
             clean_image_latents,
             noise,
             teacher_model.noise_scheduler,
-            student_timesteps,
+            timesteps,
             latents_perturbation=0,
         )
+        # student_unet_timesteps are already shifted
+        teacher_unet_timesteps = student_unet_timesteps
 
     teacher_model_output = teacher_model.unet(
-        teacher_noisy_latents.half(),
-        teacher_timesteps,
-        teacher_conditioning.prompt_embeds.half(),
+        teacher_noisy_latents.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+        teacher_unet_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+        teacher_conditioning.prompt_embeds.to(
+            teacher_model.device, dtype=teacher_model.unet.dtype
+        ),
+        added_cond_kwargs=(
+            teacher_conditioning.get_added_cond_kwargs(dtype=teacher_model.unet.dtype)
+            if teacher_model.is_sdxl
+            else None
+        ),
     ).sample.float()
 
     if teacher_prediction_type == student_prediction_type:
         return teacher_model_output
 
+    if student_prediction_type == 'flow_prediction' or teacher_prediction_type == 'flow_prediction':
+        raise NotImplementedError("conversion to/from flow_prediction is untested due to unet_timesteps handling")
     return _convert_model_output(
         noise=noise,
         teacher_input=teacher_noisy_latents,
         teacher_output=teacher_model_output,
         teacher_scheduler=teacher_model.noise_scheduler,
-        teacher_timesteps=teacher_timesteps,
+        teacher_unet_timesteps=teacher_unet_timesteps,
         student_prediction_type=student_prediction_type,
-        student_timesteps=student_timesteps,
+        student_unet_timesteps=student_unet_timesteps,
     )
 
 
@@ -915,14 +939,14 @@ def _convert_model_output(
     teacher_input: torch.Tensor,
     teacher_output: torch.Tensor,
     teacher_scheduler: SchedulerMixin | ConfigMixin,
-    teacher_timesteps,
+    teacher_unet_timesteps,
     student_prediction_type,
     student_timesteps,
 ):
     source_prediction_type = teacher_scheduler.config.prediction_type
     if source_prediction_type in ["v_prediction", "v-prediction"]:
         alpha_t = (
-            teacher_scheduler.alphas_cumprod[teacher_timesteps].view(-1, 1, 1, 1).sqrt()
+            teacher_scheduler.alphas_cumprod[teacher_unet_timesteps].view(-1, 1, 1, 1).sqrt()
         )
         sigma_t = (1 - alpha_t**2).sqrt().to(teacher_output.device)
         # Solve for x_0 from v-prediction
@@ -931,7 +955,7 @@ def _convert_model_output(
         ).sqrt()  # note that this denominator == 1 typically
 
         if student_prediction_type == "epsilon":
-            assert student_timesteps == teacher_timesteps
+            assert student_timesteps == teacher_unet_timesteps
             # Epsilon: ε = (x_t - α_t·x_0) / σ_t
             return (teacher_input - alpha_t * x_0_pred) / sigma_t
         elif student_prediction_type == "flow_prediction":
@@ -941,10 +965,10 @@ def _convert_model_output(
         "v_prediction",
         "v-prediction",
     ]:
-        assert student_timesteps == teacher_timesteps
+        assert student_timesteps == teacher_unet_timesteps
         # Convert epsilon to v-prediction
         alpha_t = (
-            teacher_scheduler.alphas_cumprod[teacher_timesteps].view(-1, 1, 1, 1).sqrt()
+            teacher_scheduler.alphas_cumprod[teacher_unet_timesteps].view(-1, 1, 1, 1).sqrt()
         )
         sigma_t = (1 - alpha_t**2).sqrt().to(teacher_output.device)
         # First get x_0 from epsilon: x_0 = (x_t - σ_t·ε) / α_t

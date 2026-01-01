@@ -533,9 +533,9 @@ def main(args):
         if args.teacher is not None and args.teacher_p > 0:
             logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
             teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
-            if type(teacher_pipeline.scheduler) == FlowMatchEulerDiscreteScheduler:
+            if isinstance(teacher_pipeline.scheduler, FlowMatchEulerDiscreteScheduler):
+                teacher_pipeline.scheduler = TrainFlowMatchScheduler(shift=args.flow_match_shift)
                 teacher_prediction_type = 'flow_prediction'
-                teacher_pipeline.scheduler.config.prediction_type = teacher_prediction_type
             if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
                 logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
 
@@ -901,7 +901,6 @@ def main(args):
             extra_info: str = ""
             torch.cuda.empty_cache()
 
-            # Pass model instead of individual fields
             inference_pipe = sample_generator.create_inference_pipe(
                 model_being_trained=model,
                 diffusers_scheduler_config=model.noise_scheduler.config
@@ -1126,8 +1125,6 @@ def main(args):
                             share_timesteps=full_batch["do_contrastive_learning"] or args.batch_share_timesteps,
                             args=args
                         )
-                    if isinstance(model.noise_scheduler, TrainFlowMatchScheduler):
-                        full_batch["timesteps"] = full_batch["timesteps"].to(model.unet.dtype)
                     #print('timesteps: ', full_batch["timesteps"].detach().clone().cpu().tolist())
 
                     # apply cond dropout
@@ -1543,17 +1540,22 @@ def main(args):
                             del target, model_pred, model_pred_anchor, text_embeds
 
                             loss_step = loss_mean.detach().item()
-                            nibble_timesteps_detached = timesteps.detach().cpu().tolist()
                             try:
                                 tv.accumulate_loss(loss_mean,
                                                    pathnames=batch["pathnames"][:timesteps.shape[0]],
                                                    captions=caption_str[:timesteps.shape[0]],
-                                                   timesteps=nibble_timesteps_detached)
+                                                   timesteps=timesteps.detach().cpu().tolist())
                             except InfOrNanException as e:
                                 logging.error("Inf or NaN detected in loss, dropping this loss batch. ")
 
-                            for t in nibble_timesteps_detached:
-                                log_data.timestep_coverage[t] += 1
+                            timesteps_to_log = (
+                                TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=model.noise_scheduler.timesteps)
+                                if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler)
+                                else timesteps
+                            )
+                            for t in timesteps_to_log:
+                                log_data.timestep_coverage[t.item()] += 1
+
                             steps_pbar.set_postfix(
                                 {
                                     "loss/step": loss_step,
@@ -1718,7 +1720,7 @@ def main(args):
                         current_timesteps = timesteps
                     except NameError:
                         current_timesteps = None
-                    logging.error(f"step {tv.global_step} failed. full_batch: {full_batch}, current batch: {current_batch},")
+                    logging.error(f"step {tv.global_step} failed. full batch idx0: {nibble_batch(full_batch, 1)},")
                     logging.error(f"  timesteps: {current_timesteps}, training values: {dataclasses.asdict(tv)}")
                     raise
 
@@ -1842,6 +1844,7 @@ def _get_safe_forward_size(gpu, device, num_image_pixels: int, is_sdxl: bool) ->
     max_safe_forward_size = gpu_free_mem_b // memory_required_per_image
     return max_safe_forward_size
 
+_has_checked_bad_distribution = False
 
 def _get_step_timesteps_internal(
     full_batch_size: int,
@@ -1853,9 +1856,18 @@ def _get_step_timesteps_internal(
 ) -> torch.Tensor:
 
     if args.timesteps_multirank_stratified:
+        global _has_checked_bad_distribution
+        if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler) and not _has_checked_bad_distribution:
+            distribution = args.timesteps_multirank_stratified_distribution
+            alpha = args.timesteps_multirank_stratified_alpha
+            beta = args.timesteps_multirank_stratified_beta
+            if distribution != 'uniform' and not (distribution == 'beta' and alpha == 0 or beta == 0):
+                logging.warning(" * Using FlowMatchEulerDiscreteScheduler with --timesteps_multirank_stratified_distribution != 'uniform' is not recommended - use the --flow_match_shift to control the distribution (recommended == 3)")
+            _has_checked_bad_distribution = True
+
         # the point of multirank stratified is to spread timesteps evenly across the batch.
         # so we need to do a dance here to make sure that we're actually spreading across the
-        # desired_effective_batch_size - which will be "nibbled" below in chunks
+        # desired_effective_batch_size - which will be "nibbled" later in chunks
         while tv.remaining_stratified_timesteps is None or tv.remaining_stratified_timesteps.shape[0] < max(full_batch_size,
                                                                                                             tv.desired_effective_batch_size):
             next_timesteps = get_multirank_stratified_random_timesteps(
@@ -2029,7 +2041,7 @@ if __name__ == "__main__":
     argparser.add_argument("--timestep_start", type=int, default=0, help="Noising timestep minimum (def: 0)")
     argparser.add_argument("--timestep_end", type=int, default=1000, help="Noising timestep (def: 1000)")
     argparser.add_argument("--timesteps_multirank_stratified", action=argparse.BooleanOptionalAction, default=False, help="use multirank stratified timesteps (recommended: disable min_snr_gamma")
-    argparser.add_argument("--timesteps_multirank_stratified_distribution", type=str, choices=['beta', 'mode', 'boundary-oversampling', 'lognormal'], default='beta', help="multirank stratified timesteps distribution model. for 'beta', uses alpha and beta params; for 'mode', uses mode_scale param")
+    argparser.add_argument("--timesteps_multirank_stratified_distribution", type=str, choices=['uniform', 'beta', 'mode', 'boundary-oversampling', 'lognormal'], default='beta', help="multirank stratified timesteps distribution model. for 'beta', uses alpha and beta params; for 'mode', uses mode_scale param")
     argparser.add_argument("--timesteps_multirank_stratified_stratify", action=argparse.BooleanOptionalAction, default=True, help="whether to stratify timestep distribution, or just leave to chance")
     argparser.add_argument("--timesteps_multirank_stratified_alpha", type=float, default=1.5, help="multirank stratified timesteps PPF alpha")
     argparser.add_argument("--timesteps_multirank_stratified_beta", type=float, default=2, help="multirank stratified timesteps PPF beta")
