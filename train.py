@@ -75,6 +75,7 @@ from loss import (
     get_multirank_stratified_random_timesteps,
     get_local_contrastive_flow_loss,
     get_contrastive_flow_matching_loss,
+    apply_hinge_negative_loss
 )
 from optimizer.attention_activation_control import ActivationLogger
 from model.training_model import (
@@ -308,11 +309,28 @@ def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem
                             f"of {effective_multiplier}, which may cause problems. Consider adding {runt_size} or "
                             f"more images with aspect ratio {aspect_ratio_description}{batch_id_description}, or reducing your batch_size.")
 
+def apply_per_path_multiplier(resolved_items: list[ImageTrainItem], per_path_multiplier_json: str):
+    applied = 0
+    missing = 0
+    with open(per_path_multiplier_json, "rt") as f:
+        per_path_multipliers = json.load(f)
+    for item in tqdm(resolved_items, desc="applying per-path multiplier"):
+        realpath = os.path.realpath(item.pathname)
+        try:
+            item.multiplier *= per_path_multipliers[realpath]
+            applied += 1
+        except KeyError:
+            missing += 1
+    logging.info(f" Applied {applied} multipliers ({missing} missing) from {per_path_multiplier_json}")
+
 def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, global_multiplier: float=1) -> list[ImageTrainItem]:
     logging.info(f"* DLMA resolution {resolution}, buckets: {aspects}")
     logging.info(" Preloading images...")
 
     resolved_items = resolver.resolve(args.data_root, args, resolution, aspects)
+
+    if args.data_multiplier_per_path:
+        apply_per_path_multiplier(resolved_items, args.data_multiplier_per_path)
 
     # Remove erroneous items
     for item in resolved_items:
@@ -939,7 +957,7 @@ def main(args):
                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                           batch_share_noise=False)
 
-        model_pred, target, _ = get_model_prediction_and_target(
+        model_pred, target, _, _ = get_model_prediction_and_target(
             latents,
             conditioning,
             noise,
@@ -1361,6 +1379,7 @@ def main(args):
                             model_pred_all = []
                             model_pred_anchor_all = []
                             target_all = []
+                            teacher_target_all = []
                             text_embeds_all = []
 
                             is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
@@ -1387,7 +1406,7 @@ def main(args):
                                         teacher_conditioning_slice = _make_conditioning_slice(teacher_encoder_hidden_states, teacher_encoder_2_hidden_states,teacher_encoder_2_pooled_embeds, add_time_ids=add_time_ids, slice_start=slice_start, slice_end=slice_end)
 
                                 try:
-                                    model_pred, target, noisy_latents = get_model_prediction_and_target(
+                                    model_pred, target, teacher_target, noisy_latents = get_model_prediction_and_target(
                                         latents=latents_slice,
                                         conditioning=conditioning_slice,
                                         noise=noise_slice,
@@ -1411,7 +1430,7 @@ def main(args):
                                         )
                                         with torch.no_grad():
                                             # anchors don't need grads
-                                            model_pred_anchor, _, _ = (
+                                            model_pred_anchor, _, _, _ = (
                                                 get_model_prediction_and_target(
                                                     latents=latents_slice,
                                                     conditioning=conditioning_slice,
@@ -1430,8 +1449,9 @@ def main(args):
 
                                     model_pred_all.append(model_pred)
                                     target_all.append(target)
+                                    teacher_target_all.append(teacher_target)
                                     text_embeds_all.append(conditioning_slice.prompt_embeds)
-                                    del model_pred, target, conditioning_slice
+                                    del model_pred, target, teacher_target, conditioning_slice
 
                                 except (
                                     torch.cuda.OutOfMemoryError,
@@ -1454,8 +1474,12 @@ def main(args):
 
                             model_pred_anchor = torch.cat(model_pred_anchor_all) if len(model_pred_anchor_all) > 0 else None
                             target = torch.cat(target_all)
+                            if teacher_mask is None:
+                                teacher_target = None
+                            else:
+                                teacher_target = torch.cat(teacher_target_all)
                             text_embeds = torch.cat(text_embeds_all)
-                            del model_pred_all, model_pred_anchor_all, target_all, text_embeds_all
+                            del model_pred_all, model_pred_anchor_all, target_all, teacher_target_all, text_embeds_all
 
                             loss = get_loss(model_pred,
                                             target,
@@ -1470,6 +1494,25 @@ def main(args):
                                             verbose=(tv.global_step % 200 == 0),
                                             args=args,
                             ).to(dtype=train_dtype)
+                            if teacher_mask is not None:
+                                teacher_loss = get_loss(
+                                    model_pred,
+                                    teacher_target,
+                                    is_cond_dropout=is_cond_dropout,
+                                    mask_img=mask_img,
+                                    timesteps=timesteps,
+                                    negative_loss_mask=loss_scale < 0,
+                                    noise_scheduler=model.noise_scheduler,
+                                    text_embeds=text_embeds,
+                                    do_contrastive_learning=False,
+                                    contrastive_loss_scale=0,
+                                    verbose=(tv.global_step % 200 == 0),
+                                    args=args,
+                                ).to(dtype=train_dtype)
+                                # only the masked entries
+                                teacher_loss[~teacher_mask] = 0
+                                loss += teacher_loss * args.teacher_lambda
+                                del teacher_loss
 
                             for i, used_timestep in enumerate(timesteps):
                                 used_timestep_detached = int(used_timestep.detach().item())
@@ -1477,22 +1520,22 @@ def main(args):
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
 
                             if do_local_contrastive_flow_loss:
-                                low_noise_timesteps_mask = (
+                                mask = (loss_scale >= 0).to(model.device) & (
                                     timesteps < args.local_contrastive_flow_timestep_threshold
                                 )
-                                log_writer.add_scalar("loss/LCF sample count", low_noise_timesteps_mask.detach().sum().item(), global_step=tv.global_step)
+                                log_writer.add_scalar("loss/LCF sample count", mask.detach().sum().item(), global_step=tv.global_step)
                                 pathnames_resolved = [
                                     os.path.realpath(p) for p in batch["pathnames"]
                                 ]
                                 loss_lcf = get_local_contrastive_flow_loss(
                                     model_pred,
                                     model_pred_anchor,
-                                    low_noise_timesteps_mask,
+                                    low_noise_timesteps_mask=mask,
                                     unique_identifiers=pathnames_resolved,
-                                    temperature = args.local_contrastive_flow_temperature
+                                    temperature=args.local_contrastive_flow_temperature
                                 )
                                 loss += (loss_lcf.to(dtype=loss.dtype) * args.local_contrastive_flow_lambda).view(-1, 1, 1, 1).expand_as(loss)
-                                del low_noise_timesteps_mask
+                                del mask
 
                             if do_contrastive_flow_matching_loss:
                                 assert args.contrastive_flow_matching_loss_lambda * args.contrastive_flow_matching_loss_k < 1, (
@@ -1507,11 +1550,19 @@ def main(args):
                                     K=args.contrastive_flow_matching_loss_k,
                                     loss_type=args.loss_type,
                                     timesteps=timesteps,
-                                    noise_scheduler=model.noise_scheduler
+                                    noise_scheduler=model.noise_scheduler,
+                                    mask=loss_scale >= 0
                                 )
                                 loss += loss_cfm.to(dtype=loss.dtype) * args.contrastive_flow_matching_loss_lambda
 
-                            loss *= loss_scale.view(-1, 1, 1, 1).expand(loss.shape).to(loss.device)
+                            # finally: apply loss scale
+                            loss_scale = loss_scale.view(-1, 1, 1, 1).expand(loss.shape).to(loss.device)
+
+                            # apply any hinge negative loss modification
+                            loss = apply_hinge_negative_loss(loss, loss_scale, margin=args.negative_loss_margin)
+                            loss_scale = loss_scale.abs()
+
+                            loss *= loss_scale
 
                             # take mean of all dimensions except batch, then divide through by a fixed batch size
                             if args.loss_mean_over_full_effective_batch:
@@ -1720,8 +1771,14 @@ def main(args):
                         current_timesteps = timesteps
                     except NameError:
                         current_timesteps = None
-                    logging.error(f"step {tv.global_step} failed. full batch idx0: {nibble_batch(full_batch, 1)},")
-                    logging.error(f"  timesteps: {current_timesteps}, training values: {dataclasses.asdict(tv)}")
+                    try:
+                        batch_idx0 = nibble_batch(full_batch, 1)[0]
+                        image_shape = batch_idx0['image'].shape
+                    except NameError:
+                        batch_idx0 = {}
+                        image_shape = []
+                    logging.error(f"step {tv.global_step} failed. image shape {image_shape}, full batch idx0: {batch_idx0}")
+                    logging.error(f"  timesteps: {current_timesteps}, training values: {pprint.pformat(tv)}")
                     raise
 
                 #logging.info("fetching...")
@@ -1979,6 +2036,7 @@ if __name__ == "__main__":
     argparser.add_argument("--loss_scale", type=float, default=1, help="additional loss scaling")
     argparser.add_argument("--dropout", type=float, default=0, help="Dropout rate (def: 0.0)")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
+    argparser.add_argument("--data_multiplier_per_path", type=str, default=None, help="optional json file mapping real image paths (symlinks resolved) to an additional multiplier factor")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
     argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
@@ -2080,6 +2138,7 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
     argparser.add_argument("--teacher_p", type=float, default=0.5, help="Probability of teacher model being used as target")
+    argparser.add_argument("--teacher_lambda", type=float, default=1.0, help="When teacher is used, the scale factor for teacher loss when added to regular loss")
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
 
     argparser.add_argument("--local_contrastive_flow_loss_p", type=float, default=0, help="Probability that a given batch will have Local Contrastive Flow loss (Zeng & Yan, 'Flow Matching in the Low-Noise Regime: Pathologies and a Contrastive Remedy', Sept 2025) applied. Suggested value=0.2 - LCF forces all timesteps to <200 for the batch in question. Timestep stratification is applied (alpha/beta are truncated to <200). The value 200 can be overriden with --local_contrastive_flow_timestep_threshold .")

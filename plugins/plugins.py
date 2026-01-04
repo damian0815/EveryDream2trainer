@@ -22,7 +22,7 @@ class BasePlugin:
         pass
     def on_step_end(self, **kwargs):
         pass
-    def transform_caption(self, caption:str):
+    def transform_caption(self, caption:str, pathname: str):
         return caption
     def transform_pil_image(self, img:Image):
         return img
@@ -108,10 +108,10 @@ class PluginRunner:
             with Timer(warn_seconds=self.step_warn_seconds, label=f'{plugin.__class__.__name__}'):
                 plugin.on_step_end(**kwargs)
     
-    def run_transform_caption(self, caption):
+    def run_transform_caption(self, caption, pathname):
         with Timer(warn_seconds=self.step_warn_seconds, label="plugin.transform_caption"):
             for plugin in self.plugins:
-                caption = plugin.transform_caption(caption)
+                caption = plugin.transform_caption(caption, pathname)
         return caption
 
     def run_transform_pil_image(self, img):

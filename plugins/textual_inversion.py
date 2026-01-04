@@ -234,7 +234,7 @@ class TextualInversionPlugin(BasePlugin):
             embeddings.weight.data = offset_weights.data
             self.embedding_offsets_individual.data = torch.zeros_like(self.embedding_offsets_individual.data)
 
-    def transform_caption(self, caption:str):
+    def transform_caption(self, caption:str, pathname: str):
         if len(caption.strip()) == 0:
             imagenet_caption = self.make_imagenet_caption()
             #print('made caption:', imagenet_caption)

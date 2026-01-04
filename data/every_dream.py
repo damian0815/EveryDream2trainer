@@ -174,7 +174,7 @@ class EveryDreamBatch(Dataset):
         else:
             example["mask"] = None
         example["untransformed_caption"] = example["caption"]
-        example["caption"] = self.plugin_runner.run_transform_caption(example["caption"])
+        example["caption"] = self.plugin_runner.run_transform_caption(example["caption"], pathname=example["pathname"])
         if type(example["caption"]) is dict:
             caption_dict = example["caption"]
         else:

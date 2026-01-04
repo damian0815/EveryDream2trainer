@@ -1,9 +1,11 @@
 import json
 import logging
 import random
+import re
 import time
 import os
 
+from tqdm.auto import tqdm
 from transformers import CLIPTokenizer
 
 from plugins.plugins import BasePlugin
@@ -39,6 +41,8 @@ class CaptionMungerPlugin(BasePlugin):
 
     tokenizer: CLIPTokenizer|None = None
     config: dict
+    per_file_prepend_append: dict[str, str] = {}
+    per_file_prepend_append_p: float = 0.5
 
     def on_training_start(self, **kwargs):
         if os.path.exists(config_path):
@@ -48,6 +52,29 @@ class CaptionMungerPlugin(BasePlugin):
         else:
             logging.info(" * CaptionMungerPlugin: no config found at " + config_path + ", using defaults")
             self.config = {}
+        self.per_file_prepend_append = {}
+        self.per_file_prepend_append_p = self.config.get('per_file_prepend_append_p', 0.5)
+        if 'per_file_prepend_append_root_folder' in self.config:
+            append_prepend_root = self.config['per_file_prepend_append_root_folder']
+            logging.info(f" * CaptionMungerPlugin: loading per-file prepend/append from {append_prepend_root}")
+            with tqdm(desc="Loading per-file prepend/append", unit=" paths") as pbar:
+                for dir, _, files in os.walk(append_prepend_root):
+                    for file in files:
+                        if file.endswith('.txt'):
+                            continue
+                        pbar.update(1)
+                        reference_file = os.path.join(dir, file)
+                        try:
+                            insert_file = os.path.splitext(reference_file)[0] + '.txt'
+                            with open(insert_file, 'rt') as f:
+                                insert_str_raw = f.readline().strip()
+                                if len(insert_str_raw) > 0:
+                                    self.per_file_prepend_append[os.path.realpath(reference_file)] = insert_str_raw
+                        except Exception as e:
+                            logging.error(f"CaptionMungerPlugin: unable to load per-file prepend/append from {insert_file} (will continue): {e}")
+                            continue
+
+            logging.info(f" * CaptionMungerPlugin: loaded per-file prepend/append for {len(self.per_file_prepend_append)} files")
 
 
     def on_model_load(self, **kwargs):
@@ -67,13 +94,13 @@ class CaptionMungerPlugin(BasePlugin):
         return ", ".join(parts)
 
 
-    def transform_caption_json_raw(self, captions_json) -> dict[str,str]:
+    def transform_caption_json_raw(self, captions_json, pathname) -> dict[str,str]:
         try:
             d = json.loads(captions_json)
         except Exception as e:
             logging.error(f"unable to load json from {captions_json}: {e}")
             raise
-        transformed_json = {k.lower(): (self.transform_caption(v)
+        transformed_json = {k.lower(): (self.transform_caption(v, pathname=pathname)
                                           if (v and len(v.strip())>0)
                                           else None)
                 for k, v in d.items()}
@@ -102,12 +129,15 @@ class CaptionMungerPlugin(BasePlugin):
             return None
         return random.choice(self.config.get("dropout", ['']))
 
-    def transform_caption(self, caption_in:str) -> str | dict[str, str]:
+    def transform_caption(self, caption_in:str, pathname: str=None) -> str | dict[str, str]:
         caption = caption_in
         if caption.startswith("<<json>>"):
             return self.transform_caption_json_raw(
-                caption.replace("<<json>>", "")
+                caption.replace("<<json>>", ""), pathname=pathname
             )
+
+        if random.random() < self.per_file_prepend_append_p:
+            caption = self._process_per_file_append_prepend(caption, pathname)
 
         dropout = self._get_dropout()
         if dropout is not None:
@@ -162,6 +192,51 @@ class CaptionMungerPlugin(BasePlugin):
             out_caption += "."
 
         return out_caption
+
+    def _process_per_file_append_prepend(self, caption, pathname):
+        real_abs_path = os.path.realpath(pathname)
+        try:
+            insert_str_raw = self.per_file_prepend_append[real_abs_path]
+        except KeyError:
+            return caption
+
+        insert_str_raw = insert_str_raw.split("<<shufbreak>>")
+        insert_str = ""
+        for i, part in enumerate(insert_str_raw):
+            if i > 0:
+                insert_str += "<<shufbreak>>" if random.random() < 0.3 else "||"
+            insert_str += part
+
+        # find indices of '<<shufbreak>>' and '.' in caption
+        possible_insert_matches = list(re.finditer(r"(<<shufbreak>>|\.)", caption))
+        if len(possible_insert_matches) == 0:
+            # no suitable insertion point, just prepend or append
+            if random.random() < 0.3:
+                return insert_str + ". " + caption
+            else:
+                return caption + ". " + insert_str
+
+        chosen_match = random.choice(possible_insert_matches)
+
+        match_pos = chosen_match.start()
+        match_str = chosen_match.group()
+        insert_pos = match_pos + len(match_str)
+        if match_str == "<<shufbreak>>":
+            return (
+                caption[0:insert_pos]
+                + insert_str
+                + "<<shufbreak>>"
+                + caption[insert_pos:]
+            )
+        else:  # match_str == '.'
+            insert_str = handle_shufbreak(
+                insert_str,
+                keep_first_sentence_p=0,
+                shuffle_sentences_p=1,
+                truncate_sentences_p=0.5,
+            )
+            return caption[0:insert_pos] + " " + insert_str + "." + caption[insert_pos:]
+
 
 def _get_tokens_full(caption_with_shufbreaks, prefix, suffix, tokenizer: CLIPTokenizer) -> list[str]:
     full_caption = ''

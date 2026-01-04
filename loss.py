@@ -189,7 +189,6 @@ def get_loss(
     else:
         mask_img = torch.ones_like(target).to(device)
 
-    assert sum(negative_loss_mask) == 0, "negative loss not implemented yet"
     non_contrastive_loss = compute_basic_loss(args.loss_type, model_pred, target, timesteps, noise_scheduler)
     non_contrastive_loss *= get_timestep_weight(timesteps,
                                                 loss_shape=non_contrastive_loss.shape,
@@ -198,9 +197,11 @@ def get_loss(
                                                 noise_scheduler=noise_scheduler,
                                                 ).to(device)
 
-    num_valid_contrastive_samples = (~is_cond_dropout).sum()
+    num_valid_contrastive_samples = (~is_cond_dropout.cpu() & ~negative_loss_mask.cpu()).sum()
     if not do_contrastive_learning or num_valid_contrastive_samples <= 1:
         return non_contrastive_loss * mask_img
+
+    assert negative_loss_mask.sum() == 0, "negative loss not implemented"
 
     def contrastive_loss_delta(model_pred, target, is_cond_dropout):
         """
@@ -484,9 +485,10 @@ def get_model_prediction_and_target(
     log_writer=None,
     global_step: int = 0,
     mask=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
+    Returns model_pred, target, teacher_target (None if teacher_mask is None), noisy_latents
     """
 
     if mask is not None:
@@ -497,12 +499,15 @@ def get_model_prediction_and_target(
         target = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
+        teacher_target = None if teacher_mask is None else torch.zeros_like(
+            latents, dtype=model.unet.dtype, device=model.unet.device
+        )
         noisy_latents = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         if mask.sum() == 0:
             # early out for empty mask
-            return model_pred, target, noisy_latents
+            return model_pred, target, teacher_target, noisy_latents
 
         latents_masked = latents[mask]
         conditioning_masked = conditioning.get_masked(mask)
@@ -514,7 +519,7 @@ def get_model_prediction_and_target(
             else None
         )
         timesteps_masked = timesteps[mask]
-        model_pred_masked, target_masked, noisy_latents_masked = (
+        model_pred_masked, target_masked, teacher_target_masked, noisy_latents_masked = (
             get_model_prediction_and_target(
                 latents=latents_masked,
                 conditioning=conditioning_masked,
@@ -534,8 +539,10 @@ def get_model_prediction_and_target(
         )
         model_pred[mask] += model_pred_masked
         target[mask] += target_masked
+        if teacher_mask is not None:
+            teacher_target[mask] += teacher_target_masked
         noisy_latents[mask] += noisy_latents_masked
-        return model_pred, target, noisy_latents
+        return model_pred, target, teacher_target, noisy_latents
 
     # logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(
@@ -562,36 +569,43 @@ def get_model_prediction_and_target(
             ),
         ).sample
 
-    if teacher_mask is not None and teacher_mask.sum() > 0:
-        with torch.no_grad():
-            if teacher_conditioning is None:
-                teacher_conditioning = conditioning
-
-            teacher_target = get_teacher_target(
-                teacher_model=teacher_model,
-                teacher_conditioning=teacher_conditioning,
-                student_model=model,
-                timesteps=timesteps,
-                student_unet_timesteps=unet_timesteps,
-                clean_image_latents=latents,
-                noise=noise,
+    if teacher_mask is None:
+        teacher_target = None
+    else:
+        if teacher_mask.sum() == 0:
+            teacher_target = torch.zeros_like(
+                latents, dtype=model.unet.dtype, device=model.unet.device
             )
+        else:
+            with torch.no_grad():
+                if teacher_conditioning is None:
+                    teacher_conditioning = conditioning
 
-            if log_writer is not None:
-                loss_preview_image_rgb = torchvision.utils.make_grid(teacher_target)
-                log_writer.add_image(
-                    tag="loss/teacher target",
-                    img_tensor=loss_preview_image_rgb,
-                    global_step=global_step,
+                teacher_target = get_teacher_target(
+                    teacher_model=teacher_model,
+                    teacher_conditioning=teacher_conditioning,
+                    student_model=model,
+                    timesteps=timesteps,
+                    student_unet_timesteps=unet_timesteps,
+                    clean_image_latents=latents,
+                    noise=noise,
                 )
 
-            target = teacher_target * teacher_mask.view(-1, 1, 1, 1).expand_as(
-                target
-            ).to(target.device) + target * ~teacher_mask.view(-1, 1, 1, 1).expand_as(
-                target
-            ).to(target.device)
+                if log_writer is not None:
+                    loss_preview_image_rgb = torchvision.utils.make_grid(teacher_target)
+                    log_writer.add_image(
+                        tag="loss/teacher target",
+                        img_tensor=loss_preview_image_rgb,
+                        global_step=global_step,
+                    )
 
-    return model_pred, target, noisy_latents
+                #target = teacher_target * teacher_mask.view(-1, 1, 1, 1).expand_as(
+                #    target
+                #).to(target.device) + target * ~teacher_mask.view(-1, 1, 1, 1).expand_as(
+                #    target
+                #).to(target.device)
+
+    return model_pred, target, teacher_target, noisy_latents
 
 
 def _get_noisy_latents(
@@ -1108,19 +1122,32 @@ def get_local_contrastive_flow_loss(
         contrastive_losses_full[low_noise_timesteps_mask] = contrastive_losses_masked
     return contrastive_losses_full
 
+def apply_hinge_negative_loss(loss: torch.Tensor, loss_scale: torch.Tensor, margin):
+    assert loss.shape == loss_scale.shape
+    # where loss_scale < 0, apply a "hinge" negative loss
+    # hinge_loss=max(0,m−loss)
+    return torch.where(
+        loss_scale < 0,
+        torch.clamp(margin - loss, min=0.0),
+        loss,
+    )
 
-def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, K, loss_type, timesteps, noise_scheduler):
+
+def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, K, loss_type, timesteps, noise_scheduler, mask):
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
-    K = min(B-1, K)  # number of negatives
+    K = min((~mask).sum()-1, K)  # number of negatives
 
     contrastive_losses = torch.zeros_like(v_pred)
     # pick K random reference indices
     references = torch.randperm(B).tolist()
     contrastive_losses_count = 0
     for ref_idx in references:
-        choices = [i for i in range(B) if i != ref_idx and unique_identifiers[i] != unique_identifiers[ref_idx]]
+        if not mask[ref_idx].item():
+            continue
+        choices = [i for i in range(B)
+                   if i != ref_idx and not mask[i].item() and unique_identifiers[i] != unique_identifiers[ref_idx]]
         if len(choices) == 0:
             continue
         neg_idx = random.choice(choices)
