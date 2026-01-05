@@ -314,7 +314,7 @@ def apply_per_path_multiplier(resolved_items: list[ImageTrainItem], per_path_mul
     missing = 0
     with open(per_path_multiplier_json, "rt") as f:
         per_path_multipliers = json.load(f)
-    for item in tqdm(resolved_items, desc="applying per-path multiplier"):
+    for item in tqdm(resolved_items, desc=f"applying per-path multiplier {os.path.basename(per_path_multiplier_json)}"):
         realpath = os.path.realpath(item.pathname)
         try:
             item.multiplier *= per_path_multipliers[realpath]
@@ -329,17 +329,21 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, glo
 
     resolved_items = resolver.resolve(args.data_root, args, resolution, aspects)
 
-    if args.data_multiplier_per_path:
-        apply_per_path_multiplier(resolved_items, args.data_multiplier_per_path)
-
     # Remove erroneous items
     for item in resolved_items:
         if item.error is not None:
             logging.error(f"{Fore.LIGHTRED_EX} *** Error opening {Fore.LIGHTYELLOW_EX}{item.pathname}{Fore.LIGHTRED_EX} to get metadata. File may be corrupt and will be skipped.{Style.RESET_ALL}")
             logging.error(f" *** exception: {item.error}")
     resolved_items = [item for item in resolved_items if item.error is None]
+
     for i in resolved_items:
         i.multiplier *= global_multiplier
+
+    if args.data_multiplier_per_path:
+        # expand single str to list
+        paths = [args.data_multiplier_per_path] if type(args.data_multiplier_per_path) is str else args.data_multiplier_per_path
+        for p in paths:
+            apply_per_path_multiplier(resolved_items, p)
 
     # drop undersized, if requested
     if args.skip_undersized_images:
@@ -2036,7 +2040,7 @@ if __name__ == "__main__":
     argparser.add_argument("--loss_scale", type=float, default=1, help="additional loss scaling")
     argparser.add_argument("--dropout", type=float, default=0, help="Dropout rate (def: 0.0)")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
-    argparser.add_argument("--data_multiplier_per_path", type=str, default=None, help="optional json file mapping real image paths (symlinks resolved) to an additional multiplier factor")
+    argparser.add_argument("--data_multiplier_per_path", type=str, nargs="+", default=[], help="optional json file(s) mapping real image paths (symlinks resolved) to an additional multiplier factor. You may pass multiple files.")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
     argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
