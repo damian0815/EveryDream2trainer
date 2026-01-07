@@ -312,6 +312,7 @@ def report_image_train_item_problems(log_folder: str, items: list[ImageTrainItem
 def apply_per_path_multiplier(resolved_items: list[ImageTrainItem], per_path_multiplier_json: str):
     applied = 0
     missing = 0
+    first_missing = []
     with open(per_path_multiplier_json, "rt") as f:
         per_path_multipliers = json.load(f)
     for item in tqdm(resolved_items, desc=f"applying per-path multiplier {os.path.basename(per_path_multiplier_json)}"):
@@ -321,7 +322,9 @@ def apply_per_path_multiplier(resolved_items: list[ImageTrainItem], per_path_mul
             applied += 1
         except KeyError:
             missing += 1
-    logging.info(f" Applied {applied} multipliers ({missing} missing) from {per_path_multiplier_json}")
+            if len(first_missing) < 5:
+                first_missing.append(item.pathname)
+    logging.info(f" Applied {applied} multipliers ({missing} missing) from {per_path_multiplier_json}. First 5 missing: {first_missing}")
 
 def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, global_multiplier: float=1) -> list[ImageTrainItem]:
     logging.info(f"* DLMA resolution {resolution}, buckets: {aspects}")
@@ -1229,7 +1232,7 @@ def main(args):
                                 for image_index in range(len(batch["captions"][k])):
                                     if batch["captions"][k][image_index] is not None:
                                         caption_counter[k] += 1
-                            #print("caption variants for this batch of:", image_shape[0], "images:", caption_counter)
+                            print("caption variants for this batch of:", image_shape[0], "images:", caption_counter)
                             caption_variants = list(caption_counter.keys())
                         else:
                             caption_candidates = []
@@ -1522,6 +1525,11 @@ def main(args):
                                 used_timestep_detached = int(used_timestep.detach().item())
                                 current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
                                 log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (current + loss[i].mean().detach().item(), count + 1)
+
+                                pathname = os.path.realpath(batch["pathnames"][i])
+                                if pathname not in log_data.loss_per_image_and_timestep[batch_resolution]:
+                                    log_data.loss_per_image_and_timestep[batch_resolution][pathname] = []
+                                log_data.loss_per_image_and_timestep[batch_resolution][pathname].append((used_timestep_detached, loss[i].mean().detach().item()))
 
                             if do_local_contrastive_flow_loss:
                                 mask = (loss_scale >= 0).to(model.device) & (

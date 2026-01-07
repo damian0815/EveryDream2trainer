@@ -25,7 +25,9 @@ class LogData:
     loss_log_step_non_cd = []
     loss_preview_image: torch.Tensor | None = None
     loss_per_timestep: dict[int, dict[int, tuple[float, int]]] = dataclasses.field(
-        default_factory=lambda: defaultdict(dict))
+        default_factory=lambda: defaultdict(dict)) # batch_resolution -> timestep -> (loss sum, count)
+    loss_per_image_and_timestep: dict[int, dict[str, list[tuple[float, float]]]] = dataclasses.field(
+        default_factory=lambda: defaultdict(dict)) # batch_resolution -> image_path -> list of (timestep, loss)
 
     loss_epoch = []
     images_per_sec = []
@@ -97,6 +99,9 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
     }
     with open(os.path.join(log_folder, "loss_sums_and_counts_per_timestep.pt"), "wb") as f:
         torch.save(loss_sums_and_counts, f)
+    with open(os.path.join(log_folder, "loss_per_image_and_timestep.pt"), "wb") as f:
+        torch.save(log_data.loss_per_image_and_timestep, f)
+
     # for batch_resolution in args.resolution:
     #    #image = _create_bar_chart_image(loss_per_timestep[batch_resolution])
     #    loss_sums_and_counts = [loss_per_timestep[batch_resolution].get(timestep, (0, 1))

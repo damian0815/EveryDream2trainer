@@ -268,6 +268,7 @@ class Dataset:
 
             if len(config.main_prompts) < 1:
                 logging.warning(f" *** No main_prompts for image {image}")
+                continue
 
             tags = []
             tag_weights = []
