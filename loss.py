@@ -6,6 +6,7 @@ from typing import Tuple, Optional, Literal
 import torch
 import torchvision
 from diffusers.training_utils import compute_loss_weighting_for_sd3
+from torch import Tensor
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
@@ -1133,11 +1134,11 @@ def apply_hinge_negative_loss(loss: torch.Tensor, loss_scale: torch.Tensor, marg
     )
 
 
-def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, K, loss_type, timesteps, noise_scheduler, mask):
+def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_type, timesteps, noise_scheduler, mask):
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
-    K = min((~mask).sum()-1, K)  # number of negatives
+    K = (~mask).sum()  # number of negatives
 
     contrastive_losses = torch.zeros_like(v_pred)
     # pick K random reference indices

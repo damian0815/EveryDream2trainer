@@ -1550,16 +1550,12 @@ def main(args):
                                 del mask
 
                             if do_contrastive_flow_matching_loss:
-                                assert args.contrastive_flow_matching_loss_lambda * args.contrastive_flow_matching_loss_k < 1, (
-                                    "for stability, K*lambda_contrast must be < 1"
-                                )
                                 pathnames_resolved = [os.path.realpath(p)
                                                       for p in batch['pathnames']]
                                 loss_cfm = get_contrastive_flow_matching_loss(
                                     target,
                                     model_pred,
                                     unique_identifiers=pathnames_resolved,
-                                    K=args.contrastive_flow_matching_loss_k,
                                     loss_type=args.loss_type,
                                     timesteps=timesteps,
                                     noise_scheduler=model.noise_scheduler,
@@ -2160,7 +2156,6 @@ if __name__ == "__main__":
     argparser.add_argument("--local_contrastive_flow_lambda", type=int, default=0.1, help="Lambda scaling factor for Local Contrastive Flow loss")
 
     argparser.add_argument("--contrastive_flow_matching_loss_p", type=float, default=0, help="Probability that a given batch will have Contrastive Flow Matching loss (Stoica et al., June 2025) applied")
-    argparser.add_argument("--contrastive_flow_matching_loss_k", type=int, default=4, help="Number of contrastive samples to use for Contrastive Flow Matching loss. Ensure that K * lambda < 1")
     argparser.add_argument("--contrastive_flow_matching_loss_lambda", type=float, default=0.05, help="Lambda scaling factor for Contrastive Flow Matching loss. Ensure that K * lambda < 1")
 
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")
