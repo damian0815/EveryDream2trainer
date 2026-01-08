@@ -1166,3 +1166,100 @@ def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_
             break
 
     return -contrastive_losses
+
+def get_contrastive_class_loss(clean_latents, noise, model_pred, timesteps,
+                               noise_scheduler, class_labels: list[dict[str, set[str]]],
+                               top_k: int=2, loss_type: str="mse") -> torch.Tensor:
+    """
+    Compute class-wise contrastive loss. Each model_pred is pushed away from the freshly-computed velocity of other samples in contrasting classes.
+
+    Classes are defined by class_labels, a list of dicts - one per sample - containing maps of class category -> labels. eg for samples a, b, c, class_labels could be:
+    [
+        {"object": {"dog"}, "color": {"black", "brown"}},
+        {"object": {"house"}, "color": {"white"}},
+        {"lighting": {"high contrast", "saturated"}, "color": {"white"}}
+    ]
+
+    For each sample, score the other samples by summing the number of class categories where there is no label overlap, then subtracting the number of label overlaps. Samples with higher scores are considered more contrasting. The top N most contrasting samples are selected as negatives for contrastive loss computation.
+    """
+    assert isinstance(noise_scheduler, FlowMatchEulerDiscreteScheduler), "class-based contrastive loss is only implemented for flow-matching currently."
+
+    B = model_pred.shape[0]
+
+    if B < 2:
+        # Need at least 2 samples for contrastive learning
+        return torch.zeros_like(model_pred)
+
+    contrast_scores = _compute_contrast_scores(class_labels)
+
+    # For each sample, select top-k most contrasting samples as negatives
+    contrastive_losses = torch.zeros_like(model_pred)
+
+    for i in range(B):
+        # Get top-k most contrasting samples
+        _, top_k_indices = torch.topk(contrast_scores[i], min(top_k, B - 1))
+
+        # Compute contrastive targets for selected negatives
+        neg_losses = []
+        for j in top_k_indices:
+            if contrast_scores[i, j] <= 0:
+                continue
+
+            j = j.item()
+            # Create incorrect target: noise[i] - clean_latents[j]
+            neg_target = noise[i] - clean_latents[j]
+
+            # Compute loss pushing model_pred away from this negative target
+            neg_loss = compute_basic_loss(
+                loss_type,
+                model_pred[i].unsqueeze(0),
+                neg_target.unsqueeze(0),
+                timesteps[i].unsqueeze(0),
+                noise_scheduler,
+            )
+            neg_loss = neg_loss * torch.tanh(contrast_scores[i, j])
+            neg_losses.append(neg_loss)
+
+        if len(neg_losses) > 0:
+            # Average over selected negatives and negate (we want to maximize distance)
+            contrastive_losses[i] = -torch.stack(neg_losses).mean(dim=0).squeeze(0)
+
+    return contrastive_losses
+
+
+def _compute_contrast_scores(class_labels: list[dict[str, set[str]]]) -> torch.Tensor:
+    B = len(class_labels)
+    # Compute contrast scores between all pairs of samples
+    contrast_scores = torch.zeros((B, B))
+
+    for i in range(B):
+        for j in range(B):
+            if i == j:
+                contrast_scores[i, j] = -float('inf')  # Don't use self as negative
+                continue
+
+            labels_i = class_labels[i]
+            labels_j = class_labels[j]
+
+            # Get all class categories
+            all_categories = set(labels_i.keys()).union(set(labels_j.keys()))
+
+            score = 0
+            for category in all_categories:
+                labels_i_cat = labels_i.get(category, set())
+                labels_j_cat = labels_j.get(category, set())
+
+                # Count overlapping labels
+                overlap = len(labels_i_cat.intersection(labels_j_cat))
+
+                if len(labels_i_cat) > 0 and len(labels_j_cat) > 0:
+                    if overlap == 0:
+                        # No overlap in this category - samples are contrasting
+                        score += 1
+                    else:
+                        # Has overlap - penalize
+                        score -= overlap
+
+            contrast_scores[i, j] = score
+    return contrast_scores
+

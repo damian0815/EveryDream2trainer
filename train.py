@@ -249,6 +249,16 @@ def setup_args(args):
     if args.disable_backward_memsafe_resolutions and any(r not in args.resolution for r in args.disable_backward_memsafe_resolutions):
         raise ValueError(f"when using --disable_backward_memsafe_resolutions, all resolutions passed must be in --resolution (you passed: --resolution {args.resolution} --disable_backward_memsafe_resolutions {args.disable_backward_memsafe_resolutions})")
 
+    if args.optimizer_batch_size is not None:
+        if args.initial_batch_size is None:
+            args.initial_batch_size = args.optimizer_batch_size
+        else:
+            logging.info(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.final_batch_sze}")
+        if args.final_batch_size is None:
+            args.final_batch_size = args.optimizer_batch_size
+        else:
+            logging.info(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --final_batch_size {args.final_batch_size}")
+
     return args
 
 
@@ -1175,10 +1185,13 @@ def main(args):
                         else:
                             raise ValueError("Unrecognized value for --cond_dropout_curriculum_source")
                         final_cond_dropout = args.cond_dropout if args.final_cond_dropout is None else args.final_cond_dropout
-                        this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
+                        if args.cond_dropout_curriculum_alpha:
+                            this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
                                                                            initial_value=args.cond_dropout,
                                                                            final_value=final_cond_dropout,
                                                                            alpha=args.cond_dropout_curriculum_alpha)
+                        else:
+                            this_cond_dropout_p = args.cond_dropout
                         tv.cond_dropouts.append(this_cond_dropout_p)
                         if train_batch.random_instance.random() <= this_cond_dropout_p:
                             # drop all captions for this sample
@@ -2031,6 +2044,7 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_size_curriculum_alpha", type=float, default=0.5, help="curriculum alpha, default=0.5 (rapid (squared) falloff from initial)")
     argparser.add_argument("--interleave_batch_size_1", action='store_true', help="If passed, toggle between batches of BS1 and batches of current_batch_size")
     argparser.add_argument("--interleave_batch_size_1_alpha", type=float, default=0, help="How many BS1 batches to run when interleaving, as a factor of the current batch size (0=1 batch, 1=same as current batch size, 0.5=sqrt of current batch size etc)")
+    argparser.add_argument("--optimizer_batch_size", type=int, default=None, help="If specified, step optimizer every this many samples. overriden by --initial_batch_size and --final_batch_size.")
     argparser.add_argument("--initial_batch_size", type=int, default=None, help="initial batch size for curriculum")
     argparser.add_argument("--final_batch_size", type=int, default=None, help="final batch size for curriculum")
     argparser.add_argument("--ckpt_every_n_minutes", type=int, default=None, help="Save checkpoint every n minutes, def: 20")

@@ -138,8 +138,8 @@ class EveryDreamOptimizer:
         log_writer=None,
     ):
         self.num_optimizer_steps = 0
-        self.optimizer_step_interval = 1
-        self.last_optimizer_step_gs = 0
+        #self.optimizer_step_interval = 1
+        #self.last_optimizer_step_gs = 0
 
         if optimizer_config is None:
             raise ValueError("missing optimizer_config")
@@ -484,9 +484,9 @@ class EveryDreamOptimizer:
             self.scaler.update()
         self.num_optimizer_steps += 1
 
-        smoothing_alpha = 0.5 # 0-1, higher = smoother
-        self.optimizer_step_interval = self.optimizer_step_interval * smoothing_alpha + (global_step - self.last_optimizer_step_gs) * (1-smoothing_alpha)
-        self.last_optimizer_step_gs = global_step
+        #smoothing_alpha = 0.5 # 0-1, higher = smoother
+        #self.optimizer_step_interval = self.optimizer_step_interval * smoothing_alpha + (global_step - self.last_optimizer_step_gs) * (1-smoothing_alpha)
+        #self.last_optimizer_step_gs = global_step
         if self.apply_grad_scaler_step_tweaks:
             self._update_grad_scaler()
 
@@ -790,7 +790,7 @@ class EveryDreamOptimizer:
         elif self.num_optimizer_steps >= 2000:
             factor = 1.3
             interval = 500
-        elif self.num_optimizer_steps >= 4000/self.optimizer_step_interval:
+        elif self.num_optimizer_steps >= 4000:
             factor = 1.15
             interval = 2000
         if factor is not None and self.scaler.get_growth_factor() != factor:
