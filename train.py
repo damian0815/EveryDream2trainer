@@ -1166,7 +1166,7 @@ def main(args):
                                 for image_index in range(len(batch["captions"][k])):
                                     if batch["captions"][k][image_index] is not None:
                                         caption_counter[k] += 1
-                            print("caption variants for this batch of", image_shape[0], "images:", caption_counter)
+                            logging.info(f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
                             caption_variants = list(caption_counter.keys())
                         else:
                             caption_candidates = []
