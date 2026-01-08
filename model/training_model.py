@@ -1,5 +1,3 @@
-import contextlib
-import gc
 import logging
 
 import diffusers
@@ -8,7 +6,6 @@ import os
 import shutil
 from argparse import Namespace
 from dataclasses import dataclass, field
-import random
 
 import safetensors.torch
 import torch
@@ -29,7 +26,7 @@ from diffusers.utils import convert_state_dict_to_diffusers
 from transformers import CLIPTextModel, CLIPTokenizer
 from peft.utils import get_peft_model_state_dict
 
-from flow_match_model import TrainFlowMatchScheduler
+from core.flow_match_model import TrainFlowMatchScheduler
 from optimizer.optimizers import EveryDreamOptimizer, InfOrNanException
 from plugins.plugins import PluginRunner
 from utils.convert_diff_to_ckpt import convert as converter
@@ -95,6 +92,9 @@ def convert_to_hf(ckpt_path):
 class TrainingVariables:
 
     global_step: int = None
+
+    max_backward_slice_size: int = None
+    forward_slice_size: int = None
 
     last_effective_batch_size: int = 0
     effective_backward_size: int = 0
@@ -195,8 +195,13 @@ class TrainingModel:
 
     @property
     def device(self):
+        # assumption: we're always training the unet
         return self.unet.device
 
+    @property
+    def dtype(self):
+        # assumption: we're always training the unet
+        return self.unet.dtype
 
     noise_scheduler: SchedulerMixin|ConfigMixin
     text_encoder: CLIPTextModel
@@ -208,6 +213,10 @@ class TrainingModel:
 
     compel: Compel|None
     yaml: str|None
+
+    cond_dropout_caption: str = ' '
+    cond_dropout_tokens: torch.Tensor|None = None
+    cond_dropout_tokens_2: torch.Tensor|None = None
 
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':

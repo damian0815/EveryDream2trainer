@@ -26,16 +26,15 @@ from diffusers import (
     StableDiffusionXLPipeline,
 )
 
-from torch import FloatTensor
 from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm.auto import tqdm
-from compel import Compel, ReturnedEmbeddingsType, CompelForSDXL, CompelForSD
+from compel import CompelForSD
 import traceback
 
 from model.training_model import TrainingModel
-from semaphore_files import check_semaphore_file_and_unlink
+from core.semaphore_files import check_semaphore_file_and_unlink
 from .sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
 
 _INTERRUPT_SAMPLES_SEMAPHORE_FILE = 'no_more_samples.semaphore'

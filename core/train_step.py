@@ -1,0 +1,920 @@
+import argparse
+import contextlib
+import logging
+import os
+import random
+from argparse import Namespace
+from collections import Counter
+
+import math
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
+from torch.cuda.amp import autocast
+from torch.utils.tensorboard import SummaryWriter
+
+from flow_match_model import TrainFlowMatchScheduler
+from log import LogData
+from loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
+    get_local_contrastive_flow_loss, apply_hinge_negative_loss, get_contrastive_flow_matching_loss
+from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
+from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
+
+
+def train_step(
+    full_batch: dict,
+    model: TrainingModel,
+    teacher_model: TrainingModel|None,
+    tv: TrainingVariables,
+    train_progress_01: float,
+    ed_optimizer: EveryDreamOptimizer,
+
+    log_writer: SummaryWriter,
+    log_data: LogData,
+    steps_pbar,
+
+    args: argparse.Namespace,
+):
+    remaining_batch = full_batch
+
+    while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
+        batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size(training_variables=tv))
+        assert batch["runt_size"] == 0
+
+        if args.contrastive_learning_curriculum_alpha == 0:
+            contrastive_loss_scale = args.contrastive_loss_scale
+        else:
+            contrastive_loss_scale = get_exponential_scaled_value(train_progress_01,
+                                                                  initial_value=args.contrastive_learning_negative_loss_scale,
+                                                                  final_value=0,
+                                                                  alpha=args.contrastive_learning_curriculum_alpha)
+            # print('contrastive learning negative loss scale:', contrastive_loss_scale)
+
+        loss_scale = args.loss_scale * batch["loss_scale"]
+        assert loss_scale.shape[0] == batch["image"].shape[0]
+        image_shape = batch["image"].shape
+        # loss_scale = loss_scale.float() * (reference_image_size / image_size)
+
+        assert type(batch["captions"]) is dict
+        if args.all_caption_variants:
+            caption_counter = Counter()
+            for k in batch["captions"].keys():
+                for image_index in range(len(batch["captions"][k])):
+                    if batch["captions"][k][image_index] is not None:
+                        caption_counter[k] += 1
+            logging.info(
+                f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
+            caption_variants = list(caption_counter.keys())
+        else:
+            caption_candidates = []
+            available_non_default = [k for k in batch["captions"].keys() if k != "default"]
+
+            if args.caption_variants:
+                available_requested = list(set(available_non_default).intersection(set(args.caption_variants)))
+                if '*' in args.caption_variants:
+                    available_requested.append('*')
+
+                if available_requested:
+                    requested_choice = random.choice(available_requested)
+                    if requested_choice == '*':
+                        caption_candidates = available_non_default
+                    else:
+                        caption_candidates = [requested_choice]
+            else:
+                caption_candidates = available_non_default
+
+            if len(caption_candidates) == 0:
+                caption_candidates.append("default")
+                if "default" not in batch["captions"]:
+                    logging.info(
+                        f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']}")
+                    # train_batch here is a constant provider
+                    batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
+                    batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
+            caption_variants = [random.choice(caption_candidates)]
+            # print('picked caption variant: ', caption_variants)
+
+        batch_size = image_shape[0]
+        batch_resolution = get_best_match_resolution(args.resolutions, image_shape[2] * image_shape[3])
+
+        with torch.no_grad():
+            noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
+            noise = get_noise(noise_shape, device=model.device, dtype=model.dtype,
+                              pyramid_noise_discount=args.pyramid_noise_discount,
+                              zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                              batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise)
+                              )
+        assert batch["runt_size"] == 0 # _encode_latents assumption
+        model.vae.to(model.device)
+        latents = _encode_latents(model=model, image=batch["image"], amp=args.amp, tv=tv, batch_resolution=batch_resolution)
+        if args.offload_vae:
+            model.load_vae_to_device('cpu')
+
+        for caption_variant in caption_variants:
+
+            do_local_contrastive_flow_loss = (
+                random.random() < args.local_contrastive_flow_loss_p
+            )
+            do_contrastive_flow_matching_loss = (
+                random.random() < args.contrastive_flow_matching_loss_p
+            )
+
+            batch["timesteps"] = _get_step_timesteps(
+                count=batch["image"].shape[0],
+                timesteps_range=batch["timesteps_range"],
+                train_progress_01=train_progress_01,
+                model=model,
+                tv=tv,
+                share_timesteps=batch["do_contrastive_learning"] or args.batch_share_timesteps,
+                args=args
+            )
+
+            _apply_cond_dropout(batch=batch, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
+
+            teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=batch["timesteps"], teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
+
+            with (
+                torch.no_grad()
+                if args.disable_textenc_training
+                else contextlib.nullcontext()
+            ):
+                # todo move this logic to the dataloader
+                caption_str = []
+                tokens = []
+                tokens_2 = []
+                batch_size = batch["image"].shape[0]
+                add_time_ids = batch["add_time_ids"].to(model.unet.device) if 'add_time_ids' in batch else None
+                for i in range(batch_size):
+                    this_caption_str = batch["captions"][
+                        caption_variant
+                    ][i]
+                    assert this_caption_str is not None
+
+                    this_tokens = batch["tokens"][caption_variant][i]
+
+                    assert this_caption_str is not None
+                    caption_str.append(this_caption_str)
+
+                    assert this_tokens is not None
+                    tokens.append(this_tokens)
+
+                    if model.is_sdxl:
+                        this_tokens_2 = batch["tokens_2"][
+                            caption_variant
+                        ][i]
+                        assert this_tokens_2 is not None
+                        tokens_2.append(this_tokens_2)
+
+                tokens = torch.stack(tokens)
+                if model.is_sdxl:
+                    tokens_2 = torch.stack(tokens_2)
+                model.load_textenc_to_device(model.device)
+                encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                    tokens, tokens_2, caption_str, model, args
+                )
+                if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
+                    teacher_encoder_hidden_states, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = None, None, None
+                else:
+                    with torch.no_grad():
+                        teacher_encoder_hidden_states, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
+                            tokens, tokens_2, caption_str, teacher_model, args
+                        )
+
+                if args.offload_text_encoder:
+                    model.load_textenc_to_device('cpu')
+
+            model_pred_all = []
+            model_pred_anchor_all = []
+            target_all = []
+            teacher_target_all = []
+            text_embeds_all = []
+
+            is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
+                                            for s in caption_str[0:batch_size]], device=model.unet.device,
+                                           dtype=torch.bool)
+            tv.cond_dropout_count += torch.sum(is_cond_dropout)
+            tv.non_cond_dropout_count += torch.sum(~is_cond_dropout)
+
+            slices = list(get_slices(batch_size, tv.forward_slice_size))
+            timesteps = batch["timesteps"]
+            for slice_index, (slice_start, slice_end) in enumerate(slices):
+                # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
+                latents_slice = latents[slice_start:slice_end]
+                noise_slice = noise[slice_start:slice_end]
+                timesteps_slice = timesteps[slice_start:slice_end]
+                if teacher_mask is None:
+                    teacher_mask_slice = None
+                else:
+                    teacher_mask_slice = teacher_mask[slice_start:slice_end]
+
+                conditioning_slice = make_conditioning_slice(encoder_hidden_states, encoder_2_hidden_states,
+                                                             encoder_2_pooled_embeds, add_time_ids=add_time_ids,
+                                                             slice_start=slice_start, slice_end=slice_end)
+                if teacher_encoder_hidden_states is None:
+                    teacher_conditioning_slice = None
+                else:
+                    with torch.no_grad():
+                        teacher_conditioning_slice = make_conditioning_slice(teacher_encoder_hidden_states,
+                                                                             teacher_encoder_2_hidden_states,
+                                                                             teacher_encoder_2_pooled_embeds,
+                                                                             add_time_ids=add_time_ids,
+                                                                             slice_start=slice_start,
+                                                                             slice_end=slice_end)
+
+                try:
+                    model_pred, target, teacher_target, noisy_latents = get_model_prediction_and_target(
+                        latents=latents_slice,
+                        conditioning=conditioning_slice,
+                        noise=noise_slice,
+                        timesteps=timesteps_slice,
+                        model=model,
+                        args=args,
+                        teacher_model=teacher_model,
+                        teacher_mask=teacher_mask_slice,
+                        teacher_conditioning=teacher_conditioning_slice,
+                    )
+
+                    if do_local_contrastive_flow_loss:
+                        low_noise_timesteps_mask_slice = (
+                            timesteps_slice
+                            < args.local_contrastive_flow_timestep_threshold
+                        )
+                        t_anchor_slice = torch.full(
+                            size=timesteps_slice.shape,
+                            fill_value=args.local_contrastive_flow_anchor_timestep,
+                            device=model.device,
+                        )
+                        with torch.no_grad():
+                            # anchors don't need grads
+                            model_pred_anchor, _, _, _ = (
+                                get_model_prediction_and_target(
+                                    latents=latents_slice,
+                                    conditioning=conditioning_slice,
+                                    noise=noise_slice,
+                                    timesteps=t_anchor_slice,
+                                    model=model,
+                                    args=args,
+                                    teacher_model=teacher_model,
+                                    teacher_mask=teacher_mask_slice,
+                                    teacher_conditioning=teacher_conditioning_slice,
+                                    mask=low_noise_timesteps_mask_slice
+                                )
+                            )
+                        model_pred_anchor_all.append(model_pred_anchor)
+                        del model_pred_anchor
+
+                    model_pred_all.append(model_pred)
+                    target_all.append(target)
+                    teacher_target_all.append(teacher_target)
+                    text_embeds_all.append(conditioning_slice.prompt_embeds)
+                    del model_pred, target, teacher_target, conditioning_slice
+
+                except (
+                        torch.cuda.OutOfMemoryError,
+                        torch.OutOfMemoryError,
+                ):
+                    logging.error(
+                        f"OOM step {tv.global_step} in unet forward slice size {tv.forward_slice_size} from latents "
+                        f"of shape {latents_slice.shape}, from {slice_start} to {slice_end} of {batch_size}. "
+                        f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.readlink(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant]}, timesteps: {timesteps_slice.detach().cpu().tolist()}"
+                    )
+                    raise
+
+            model_pred = torch.cat(model_pred_all)
+            assert model_pred.shape[0] == min(slice_end, batch_size)
+            assert timesteps.shape[0] == model_pred.shape[0]
+            mask_img = None if batch["mask"] is None else batch["mask"][:model_pred.shape[0]]
+            loss_scale = loss_scale[:model_pred.shape[0]]
+
+            model_pred_anchor = torch.cat(model_pred_anchor_all) if len(model_pred_anchor_all) > 0 else None
+            target = torch.cat(target_all)
+            if teacher_mask is None:
+                teacher_target = None
+            else:
+                teacher_target = torch.cat(teacher_target_all)
+            text_embeds = torch.cat(text_embeds_all)
+            del model_pred_all, model_pred_anchor_all, target_all, teacher_target_all, text_embeds_all
+
+            loss = get_loss(model_pred,
+                            target,
+                            is_cond_dropout=is_cond_dropout,
+                            mask_img=mask_img,
+                            timesteps=timesteps,
+                            negative_loss_mask=loss_scale < 0,
+                            noise_scheduler=model.noise_scheduler,
+                            text_embeds=text_embeds,
+                            do_contrastive_learning=full_batch["do_contrastive_learning"],
+                            contrastive_loss_scale=contrastive_loss_scale,
+                            verbose=(tv.global_step % 200 == 0),
+                            args=args,
+                            ).to(dtype=model.dtype)
+            if teacher_mask is not None:
+                teacher_loss = get_loss(
+                    model_pred,
+                    teacher_target,
+                    is_cond_dropout=is_cond_dropout,
+                    mask_img=mask_img,
+                    timesteps=timesteps,
+                    negative_loss_mask=loss_scale < 0,
+                    noise_scheduler=model.noise_scheduler,
+                    text_embeds=text_embeds,
+                    do_contrastive_learning=False,
+                    contrastive_loss_scale=0,
+                    verbose=(tv.global_step % 200 == 0),
+                    args=args,
+                ).to(dtype=model.dtype)
+                # only the masked entries
+                teacher_loss[~teacher_mask] = 0
+                loss += teacher_loss * args.teacher_lambda
+                del teacher_loss
+
+            for i, used_timestep in enumerate(timesteps):
+                used_timestep_detached = int(used_timestep.detach().item())
+                current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
+                log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (
+                    current + loss[i].mean().detach().item(), count + 1)
+
+                pathname = os.path.realpath(batch["pathnames"][i])
+                if pathname not in log_data.loss_per_image_and_timestep[batch_resolution]:
+                    log_data.loss_per_image_and_timestep[batch_resolution][pathname] = []
+                log_data.loss_per_image_and_timestep[batch_resolution][pathname].append(
+                    (used_timestep_detached, loss[i].mean().detach().item()))
+
+            if do_local_contrastive_flow_loss:
+                mask = (loss_scale >= 0).to(model.device) & (
+                    timesteps < args.local_contrastive_flow_timestep_threshold
+                )
+                log_writer.add_scalar("loss/LCF sample count", mask.detach().sum().item(), global_step=tv.global_step)
+                pathnames_resolved = [
+                    os.path.realpath(p) for p in batch["pathnames"]
+                ]
+                loss_lcf = get_local_contrastive_flow_loss(
+                    model_pred,
+                    model_pred_anchor,
+                    low_noise_timesteps_mask=mask,
+                    unique_identifiers=pathnames_resolved,
+                    temperature=args.local_contrastive_flow_temperature
+                )
+                loss += (loss_lcf.to(dtype=loss.dtype) * args.local_contrastive_flow_lambda).view(-1, 1, 1,
+                                                                                                  1).expand_as(loss)
+                del mask
+
+            if do_contrastive_flow_matching_loss:
+                pathnames_resolved = [os.path.realpath(p)
+                                      for p in batch['pathnames']]
+                loss_cfm = get_contrastive_flow_matching_loss(
+                    target,
+                    model_pred,
+                    unique_identifiers=pathnames_resolved,
+                    loss_type=args.loss_type,
+                    timesteps=timesteps,
+                    noise_scheduler=model.noise_scheduler,
+                    mask=loss_scale >= 0
+                )
+                loss += loss_cfm.to(dtype=loss.dtype) * args.contrastive_flow_matching_loss_lambda
+
+            log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
+
+            # reduce from [B, C, H, W] to [B] with mean
+            loss = loss.mean(dim=list(range(1, len(loss.shape))))
+
+            # apply any hinge negative loss modification
+            loss = apply_hinge_negative_loss(loss, loss_scale.to(loss.device), margin=args.negative_loss_margin)
+            loss = loss * loss_scale.abs().to(loss.device)
+
+            # take mean of all dimensions except batch, then divide through by a fixed batch size
+            if args.loss_mean_over_full_effective_batch:
+                # strictly more correct, but LR scaling becomes necessary
+                loss_mean_divisor = max(1, tv.desired_effective_batch_size)
+            else:
+                loss_mean_divisor = 1
+            loss_mean = loss.sum() / loss_mean_divisor
+
+            # logging.info(
+            #    f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
+            # )
+            # logging.info(
+            #    f"target has NaN: {torch.isnan(target).any()} inf: {torch.isinf(target).any()} range: [{target.min():.4f}, {target.max():.4f}]"
+            # )
+            # logging.info(
+            #    f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
+            # )
+
+            log_data.loss_log_step_cd.append(loss[is_cond_dropout].mean().detach().item())
+            log_data.loss_log_step_non_cd.append(loss[~is_cond_dropout].mean().detach().item())
+
+            log_data.forward_size_coverage[loss.shape[0]] += 1
+
+            del target, model_pred, model_pred_anchor, text_embeds
+
+            loss_step = loss_mean.detach().item()
+            try:
+                tv.accumulate_loss(loss_mean,
+                                   pathnames=batch["pathnames"][:timesteps.shape[0]],
+                                   captions=caption_str[:timesteps.shape[0]],
+                                   timesteps=timesteps.detach().cpu().tolist())
+            except InfOrNanException:
+                logging.error("Inf or NaN detected in loss, dropping this loss batch. ")
+
+            timesteps_to_log = (
+                TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps,
+                                                              timestep_values=model.noise_scheduler.timesteps)
+                if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler)
+                else timesteps
+            )
+            for t in timesteps_to_log:
+                log_data.timestep_coverage[t.item()] += 1
+
+            steps_pbar.set_postfix(
+                {
+                    "loss/step": loss_step,
+                    "_f": tv.forward_slice_size,
+                    "_l": loss.shape[0],
+                    "l": tv.accumulated_loss_images_count,
+                    "b": tv.backwarded_images_count,
+                    "os": str(tv.optimizer_step),
+                    "N": str(tv.total_trained_samples_count),
+                    "gs": str(tv.global_step),  # string conversion sidesteps scientific notation
+                }
+            )
+
+            del loss, loss_mean
+            log_data.loss_log_step.append(loss_step)
+            log_data.loss_epoch.append(loss_step)
+
+            should_step_optimizer = (
+                                        (tv.backwarded_images_count + tv.accumulated_loss_images_count)
+                                        >= tv.desired_effective_batch_size
+                                    ) or tv.interleaved_bs1_count is not None
+            if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
+                tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
+                # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    optimizer_backward(ed_optimizer, tv, 'regular backward: ')
+
+            # if tv.global_step >= 653 and tv.global_step < 656:
+            #    print("step:", tv.global_step, "caption:", caption_variant, " - batch:", [os.readlink(x) for x in batch["pathnames"]], batch["captions"][caption_variant], "; timestep slice:", consumed_timesteps)
+
+            if should_step_optimizer:
+                if tv.backwarded_images_count == 0:
+                    print("Batch has 0 images, not stepping optimizer")
+                else:
+                    # print(f'\nstepping optimizer - backwarded_images_count '
+                    #      f'{tv.backwarded_images_count}, '
+                    #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
+
+                    ed_optimizer.step_optimizer(tv.global_step, tv)
+
+                    tv.last_effective_batch_size = tv.backwarded_images_count
+                    tv.total_trained_samples_count += tv.backwarded_images_count
+                    tv.optimizer_step += 1
+                    tv.backwarded_images_count = 0
+
+                    # if we are interleaving BS1, increment counter
+                    if tv.interleaved_bs1_count is not None:
+                        tv.interleaved_bs1_count += 1
+
+                    # if we are *not* interleaving BS1, or we've reached the end of interleaving BS1, then step and perhaps toggle interleave BS1
+                    if tv.interleaved_bs1_count is None or tv.interleaved_bs1_count >= max(1,
+                                                                                           tv.desired_effective_batch_size ** args.interleave_batch_size_1_alpha):
+                        tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                        if args.interleave_batch_size_1:
+                            if tv.interleaved_bs1_count is None:
+                                tv.interleaved_bs1_count = 0
+                            else:
+                                tv.interleaved_bs1_count = None
+
+
+def _apply_cond_dropout(batch: dict, model: TrainingModel, tv: TrainingVariables, train_progress_01: float,
+                        args: Namespace):
+    # apply cond dropout
+    initial_batch_size = args.batch_size if args.initial_batch_size is None else args.initial_batch_size
+    final_batch_size = args.batch_size if args.final_batch_size is None else args.final_batch_size
+    if final_batch_size == initial_batch_size:
+        cdp_01_bs = 0
+    else:
+        cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
+                               / (final_batch_size - initial_batch_size)))
+    for sample_index in range(batch["timesteps"].shape[0]):
+        cdp_01_ts = 1 - (batch["timesteps"][
+                             sample_index].cpu().item() / model.noise_scheduler.config.num_train_timesteps)
+        if args.cond_dropout_curriculum_source == 'timestep':
+            cdp_01 = cdp_01_ts
+        elif args.cond_dropout_curriculum_source == 'batch_size':
+            assert args.final_batch_size != args.initial_batch_size
+            cdp_01 = cdp_01_bs
+        elif args.cond_dropout_curriculum_source == 'global_step':
+            cdp_01 = train_progress_01
+        elif args.cond_dropout_curriculum_source == 'batch_size_and_timestep':
+            assert args.final_batch_size != args.initial_batch_size
+            cdp_01 = cdp_01_bs * cdp_01_ts
+        else:
+            raise ValueError("Unrecognized value for --cond_dropout_curriculum_source")
+        final_cond_dropout = args.cond_dropout if args.final_cond_dropout is None else args.final_cond_dropout
+        if args.cond_dropout_curriculum_alpha:
+            this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
+                                                               initial_value=args.cond_dropout,
+                                                               final_value=final_cond_dropout,
+                                                               alpha=args.cond_dropout_curriculum_alpha)
+        else:
+            this_cond_dropout_p = args.cond_dropout
+        tv.cond_dropouts.append(this_cond_dropout_p)
+        if random.random() <= this_cond_dropout_p:
+            # drop all captions for this sample
+            for k in batch["captions"].keys():
+                if batch["captions"][k][sample_index] is None:
+                    continue
+                batch["tokens"][k][sample_index] = model.cond_dropout_tokens
+                if model.is_sdxl:
+                    batch["tokens_2"][k][sample_index] = model.cond_dropout_tokens_2
+                batch["captions"][k][sample_index] = model.cond_dropout_caption
+            if random.random() <= args.cond_dropout_noise_p:
+                batch["image"][sample_index] = torch.randn_like(
+                    batch["image"][sample_index])
+
+
+def get_nibble_size(training_variables: TrainingVariables) -> int:
+    if training_variables.desired_effective_batch_size - training_variables.backwarded_images_count <= 0:
+        raise ValueError(f"get_nibble_size: no nibble left? desired effective batch size {training_variables.desired_effective_batch_size} - current accumulated backward images count {training_variables.backwarded_images_count}")
+    if training_variables.interleaved_bs1_count is not None:
+        return 1
+
+    permitted_until_optimizer_step = training_variables.desired_effective_batch_size - (training_variables.accumulated_loss_images_count + training_variables.backwarded_images_count)
+    permitted_until_backward_step = training_variables.max_backward_slice_size - training_variables.accumulated_loss_images_count
+    #print(f'ebs {training_variables.desired_effective_batch_size}, acc loss {training_variables.accumulated_loss_images_count} -> permitted until optimizer step: {permitted_until_optimizer_step}')
+    #print(f'curr acc bwd {training_variables.backwarded_images_count}, max bwd slice {training_variables.max_backward_slice_size} -> permitted until backward step: {permitted_until_backward_step}')
+    return max(1, min(permitted_until_optimizer_step, permitted_until_backward_step))
+
+
+def nibble_batch(batch, take_count) -> tuple[dict, dict]:
+    runt_size = batch["runt_size"]
+    current_batch_size = batch["image"].shape[0]
+    non_runt_size = current_batch_size - runt_size
+    assert non_runt_size > 0
+
+    nibble_size = min(non_runt_size, take_count)
+    nibble = _subdivide_batch_part(batch, 0, nibble_size)
+    nibble["runt_size"] = 0
+
+    remaining_size = non_runt_size - nibble_size
+    if remaining_size == 0:
+        remainder = None
+    else:
+        remainder = _subdivide_batch_part(batch, nibble_size, non_runt_size)
+        remainder["runt_size"] = 0
+    return nibble, remainder
+
+
+def subdivide_batch(batch, current_batch_size, desired_batch_size):
+    if desired_batch_size >= current_batch_size:
+        yield batch
+        return
+    runt_size = batch["runt_size"]
+    non_runt_size = current_batch_size - runt_size
+    for i, offset in enumerate(range(0, non_runt_size, desired_batch_size)):
+        sub_batch = _subdivide_batch_part(batch, offset, offset + desired_batch_size)
+        end = min(current_batch_size, offset + desired_batch_size)
+        sub_batch["runt_size"] = max(0, end - non_runt_size)
+        yield sub_batch
+
+
+def _subdivide_batch_part(part, start, end):
+    if type(part) is list or type(part) is torch.Tensor:
+        return part[start:end]
+    elif type(part) is dict:
+        return {k: _subdivide_batch_part(v, start, end) for k, v in part.items()}
+    else:
+        return part
+
+
+def choose_effective_batch_size(args, train_progress_01):
+    return max(
+        1,
+        round(
+            get_exponential_scaled_value(
+                train_progress_01,
+                initial_value=args.batch_size
+                if args.initial_batch_size is None
+                else args.initial_batch_size,
+                final_value=args.batch_size
+                if args.final_batch_size is None
+                else args.final_batch_size,
+                alpha=args.batch_size_curriculum_alpha,
+            )
+        ),
+    )
+
+
+def compute_train_process_01(
+    epoch, step, steps_per_epoch, max_epochs, max_global_steps
+):
+    total_steps = steps_per_epoch * max_epochs
+    if max_global_steps is not None:
+        total_steps = min(total_steps, max_global_steps)
+    steps_completed = steps_per_epoch * epoch + step
+    return min(1, steps_completed / total_steps)
+
+
+def get_exponential_scaled_value(progress_01, initial_value, final_value, alpha=3.0):
+    # Apply non-linear scaling with alpha (higher alpha = faster early descent)
+    scaled_progress = 1.0 - (1.0 - progress_01) ** alpha
+    return initial_value + scaled_progress * (final_value - initial_value)
+
+
+def get_timestep_curriculum_range(
+    progress_01,
+    t_min_initial=800,
+    t_max_initial=1000,
+    t_min_final=0,
+    t_max_final=400,
+    alpha=3.0,
+):
+    # Interpolate boundaries
+    min_t = min(
+        1000,
+        max(
+            0,
+            get_exponential_scaled_value(
+                progress_01, t_min_initial, t_min_final, alpha=alpha
+            ),
+        ),
+    )
+    max_t = min(
+        1000,
+        max(
+            0,
+            get_exponential_scaled_value(
+                progress_01, t_max_initial, t_max_final, alpha=alpha
+            ),
+        ),
+    )
+
+    assert min_t <= max_t
+    return int(min_t), int(max_t)
+
+
+def get_image_from_latents(latents, model: TrainingModel, args):
+    with torch.no_grad():
+        with autocast(
+            enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16
+        ):
+            scaling_factor = 0.13025 if model.is_sdxl else 0.18215
+            latents = latents / scaling_factor
+            pixel_values = model.vae.decode(latents, return_dict=False)[0]
+        del latents
+        pixel_values = pixel_values.to(torch.float32)
+        pixel_values = torch.clamp((pixel_values + 1.0) / 2.0, 0.0, 1.0)
+        return pixel_values
+
+
+def get_slices(batch_size, slice_size):
+    num_slices = math.ceil(batch_size / slice_size)
+    for slice_index in range(num_slices):
+        slice_start = slice_index * slice_size
+        slice_end = min(slice_start + slice_size, batch_size)
+        if slice_end <= slice_start:
+            break
+        yield slice_start, slice_end
+
+
+def get_best_match_resolution(resolutions: list[int], image_pixel_count: int) -> int:
+    error = [image_pixel_count / (r*r) for r in resolutions]
+    best_resolution_index = min([i for i in range(len(resolutions))], key=lambda i: abs(math.log(error[i])))
+    return resolutions[best_resolution_index]
+
+
+def make_conditioning_slice(
+    encoder_hidden_states: torch.Tensor,
+    encoder_2_hidden_states: torch.Tensor|None,
+    encoder_2_pooled_embeds: torch.Tensor|None,
+    add_time_ids: torch.Tensor|None,
+    slice_start, slice_end
+) -> Conditioning:
+    encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+    if encoder_2_hidden_states is not None:
+        encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
+        encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
+        add_time_ids_slice = add_time_ids[slice_start:slice_end]
+        return Conditioning.sdxl_conditioning(
+            text_encoder_hidden_states=encoder_hidden_states_slice,
+            text_encoder_2_hidden_states=encoder_2_hidden_states_slice,
+            text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
+            add_time_ids=add_time_ids_slice,
+        )
+    else:
+        return Conditioning.sd12_conditioning(
+            text_encoder_hidden_states=encoder_hidden_states_slice
+        )
+
+
+
+def get_uniform_timesteps(
+    batch_size, batch_share_timesteps, device, timesteps_ranges, scheduler
+):
+    """if continuous_float_timesteps is True, return float timestamps (continuous), otherwise return int timestamps (discrete)"""
+    timesteps = torch.cat(
+        [torch.randint(a, b, size=(1,), device=device) for a, b in timesteps_ranges]
+    )
+    if batch_share_timesteps:
+        timesteps = timesteps[:1].repeat((batch_size,))
+    timesteps = timesteps.long()
+    # logging.info(f"get_timesteps: {timesteps.detach().cpu().tolist()} from ranges: {timesteps_ranges}")
+    return timesteps
+
+
+
+def _get_step_timesteps(count: int, timesteps_range: tuple, train_progress_01: float, model: TrainingModel, tv: TrainingVariables, share_timesteps: bool, args):
+    timesteps = _get_step_timesteps_internal(
+        count,
+        full_batch_timesteps_range=timesteps_range,
+        train_progress_01=train_progress_01,
+        model=model,
+        tv=tv,
+        args=args,
+    )
+    # share timestep?
+    if share_timesteps:
+        timestep_index = torch.randint(count, size=(1,))[0]
+        timesteps = timesteps[timestep_index].unsqueeze(0).repeat(count)
+
+    return timesteps
+
+def _get_step_timesteps_internal(
+    full_batch_size: int,
+    full_batch_timesteps_range,
+    train_progress_01: float,
+    model: TrainingModel,
+    tv: TrainingVariables,
+    args,
+) -> torch.Tensor:
+
+    if args.timesteps_multirank_stratified:
+        global _has_checked_bad_distribution
+        if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler) and not _has_checked_bad_distribution:
+            distribution = args.timesteps_multirank_stratified_distribution
+            alpha = args.timesteps_multirank_stratified_alpha
+            beta = args.timesteps_multirank_stratified_beta
+            if distribution != 'uniform' and not (distribution == 'beta' and alpha == 0 or beta == 0):
+                logging.warning(" * Using FlowMatchEulerDiscreteScheduler with --timesteps_multirank_stratified_distribution != 'uniform' is not recommended - use the --flow_match_shift to control the distribution (recommended == 3)")
+            _has_checked_bad_distribution = True
+
+        # the point of multirank stratified is to spread timesteps evenly across the batch.
+        # so we need to do a dance here to make sure that we're actually spreading across the
+        # desired_effective_batch_size - which will be "nibbled" later in chunks
+        while tv.remaining_stratified_timesteps is None or tv.remaining_stratified_timesteps.shape[0] < max(full_batch_size,
+                                                                                                            tv.desired_effective_batch_size):
+            next_timesteps = get_multirank_stratified_random_timesteps(
+                tv.desired_effective_batch_size,
+                device=model.unet.device,
+                distribution=args.timesteps_multirank_stratified_distribution,
+                alpha=args.timesteps_multirank_stratified_alpha,
+                beta=args.timesteps_multirank_stratified_beta,
+                mode_scale=args.timesteps_multirank_stratified_mode_scale,
+                scheduler=model.noise_scheduler,
+                stratify=args.timesteps_multirank_stratified_stratify,
+            )
+            tv.remaining_stratified_timesteps = next_timesteps if tv.remaining_stratified_timesteps is None else torch.cat(
+                [tv.remaining_stratified_timesteps, next_timesteps])
+        timesteps: torch.Tensor = tv.remaining_stratified_timesteps[:full_batch_size]
+        tv.remaining_stratified_timesteps = tv.remaining_stratified_timesteps[full_batch_size:]
+        return timesteps
+    else:
+        if full_batch_timesteps_range is not None:
+            timesteps_ranges_base = full_batch_timesteps_range
+        else:
+            if args.timestep_curriculum_alpha == 0:
+                timestep_range = (args.timestep_start, args.timestep_end)
+            else:
+                t_min_initial = args.timestep_initial_start
+                t_max_initial = args.timestep_initial_end
+                t_min_final = args.timestep_start
+                t_max_final = args.timestep_end
+                timestep_range = get_timestep_curriculum_range(progress_01=train_progress_01,
+                                                               t_min_initial=t_min_initial,
+                                                               t_max_initial=t_max_initial,
+                                                               t_min_final=t_min_final,
+                                                               t_max_final=t_max_final,
+                                                               alpha=args.timestep_curriculum_alpha)
+                print('timestep range:', timestep_range)
+            timesteps_ranges_base = [timestep_range] * full_batch_size
+
+        # randomly expand
+        num_train_timesteps = model.noise_scheduler.config.num_train_timesteps
+
+        def lerp(x, in_min, in_max, out_min, out_max):
+            if (in_max - in_min) == 0:
+                return in_min
+            pct = (x - in_min) / (in_max - in_min)
+            return out_min + pct * (out_max - out_min)
+
+        timesteps_ranges_expanded = [(
+            # maybe make 8 a CLI arg?
+            min(num_train_timesteps,
+                max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[0], 0)))),
+            min(num_train_timesteps,
+                max(0, round(lerp(pow(random.random(), 8), 0, 1, tsr[1], num_train_timesteps)))),
+        ) for tsr in timesteps_ranges_base]
+
+        timesteps: torch.LongTensor = get_uniform_timesteps(
+            batch_size=full_batch_size,
+            batch_share_timesteps=False,
+            device=model.device,
+            timesteps_ranges=timesteps_ranges_expanded,
+            scheduler=model.noise_scheduler,
+        )
+
+        return timesteps
+
+
+
+def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, log_hint=''):
+    if tv.accumulated_loss_images_count == 0:
+        logging.warning("no accumulated loss images, not doing backward")
+    else:
+        optimizer.backward(tv.accumulated_loss)
+        try:
+            if not optimizer.use_grad_scaler:
+                # if we have a grad scaler it suppresses NaN/Inf for us.
+                # otherwise, we have to suppress NaN/Inf manually
+                optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
+            tv.effective_backward_size = tv.accumulated_loss_images_count
+            tv.backwarded_images_count += tv.accumulated_loss_images_count
+            # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
+            #      f"backward accumulated {tv.backwarded_images_count}")
+            tv.clear_accumulated_loss()
+        except InfOrNanException as e:
+            logging.error(
+                "* Caught Inf or NaN during backward pass, clearing accumulated loss and resetting optimizer"
+            )
+            optimizer._zero_grad(set_to_none=True)
+            tv.backwarded_images_count = 0
+
+        tv.clear_accumulated_loss()
+
+
+def _encode_latents(
+    model: TrainingModel,
+    image: torch.Tensor,
+    amp: bool,
+    batch_resolution: int,
+    tv: TrainingVariables
+):
+    forward_slice_size = tv.forward_slice_size
+    batch_size = image.shape[0]
+    pixel_values = image.to(memory_format=torch.contiguous_format).to(model.unet.device)
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp):
+        successfully_encoded_latents = False
+        while not successfully_encoded_latents:
+            latents_slices = []
+            try:
+                for slice_start, slice_end in get_slices(batch_size, forward_slice_size):
+                    if enable_vae_attention_slicing:
+                        model.vae.enable_slicing()
+                    try:
+                        latents_slice = model.vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
+                    except Exception:
+                        logging.error(
+                            f"vae.encode failed for batch slice [{slice_start}:{slice_end}] @resolution {batch_resolution}. pixel_values shape is {pixel_values.shape}")
+                        raise
+                    model.vae.disable_slicing()
+                    vae_scaling_factor = 0.13025 if model.is_sdxl else 0.18215
+                    latents_slice = latents_slice[0].sample() * vae_scaling_factor
+                    latents_slices.append(latents_slice)
+                    del latents_slice
+                successfully_encoded_latents = True
+            except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
+                logging.error(
+                    f"OOM step {tv.global_step} in vae.encode encoding slice size {forward_slice_size} from pixel values "
+                    f"of shape {pixel_values.shape}, from {slice_start} to {slice_end} of {batch_size}. "
+                    f"loss images accumulated: {tv.accumulated_loss_images_count}")
+                if forward_slice_size > 1:
+                    forward_slice_size = forward_slice_size // 2
+                    logging.info(f" -> Trying again with forward slice size {forward_slice_size}")
+                elif not enable_vae_attention_slicing:
+                    enable_vae_attention_slicing = True
+                    logging.info(f" -> Trying again with vae attention slicing enabled")
+                else:
+                    logging.error(
+                        " -> Already at forward slice size 1 with vae attention slicing enabled, cannot reduce further")
+                    raise
+
+        del pixel_values
+        latents = torch.cat(latents_slices).to(model.unet.dtype)
+        del latents_slices
+        return latents
+
+def _generate_teacher_mask_or_none(teacher_model: TrainingModel|None, timesteps: torch.Tensor, teacher_p, teacher_timestep_max) -> torch.Tensor|None:
+    if teacher_model is None:
+        return None
+
+    if teacher_timestep_max is not None:
+        # scale teacher_p based on timesteps
+        # 1000...args.teacher_timestep_max: p = 0
+        # args.teacher_timestep_max...0: ramp from 0 to args.teacher_p
+        scale = torch.maximum(
+            teacher_timestep_max - timesteps.float(),
+            torch.zeros([1])
+        ) / teacher_timestep_max
+        teacher_p = teacher_p * scale
+
+    batch_size = timesteps.shape[0]
+    return (torch.rand(batch_size) < teacher_p).to(teacher_model.unet.device)

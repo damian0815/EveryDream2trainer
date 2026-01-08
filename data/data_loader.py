@@ -72,6 +72,7 @@ class DataLoaderMultiAspect():
         """
         picked_images = []
         data_copy = copy.deepcopy(self.prepared_train_data) # deep copy to avoid modifying original multiplier property
+        randomizer.shuffle(data_copy)
 
         # first, collect all images + duplicates for multiplier >= 1
         for iti in data_copy:
@@ -80,9 +81,9 @@ class DataLoaderMultiAspect():
                 iti.multiplier -= 1
 
         remaining = self.expected_epoch_size - len(picked_images)
-
         assert remaining >= 0, "Something went wrong with the multiplier calculation"
 
+        randomizer.shuffle(remaining)
         # resolve fractional parts, ensure each is only added max once
         while remaining > 0:
             for iti in data_copy:
@@ -112,7 +113,6 @@ class DataLoaderMultiAspect():
         randomizer = random.Random(self.seed)
 
         self.prepared_train_data.sort(key=lambda img: img.pathname)
-        randomizer.shuffle(self.prepared_train_data)
         if dropout_fraction < 1.0:
             picked_images = self.__pick_random_subset(dropout_fraction, randomizer)
         else:

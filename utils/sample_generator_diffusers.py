@@ -1,5 +1,4 @@
 import json
-import os
 from collections import defaultdict
 from dataclasses import dataclass
 import re
@@ -13,15 +12,14 @@ from diffusers import (
     FlowMatchEulerDiscreteScheduler
 )
 from diffusers import StableDiffusionPipeline
-from compel import CompelForSD, CompelForSDXL
+from compel import CompelForSD
 from PIL import Image, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
-import hashlib
 import math
 
 from tqdm.auto import tqdm
 
-from semaphore_files import check_semaphore_file_and_unlink, _INTERRUPT_SAMPLES_SEMAPHORE_FILE
+from core.semaphore_files import check_semaphore_file_and_unlink, _INTERRUPT_SAMPLES_SEMAPHORE_FILE
 
 _RE_COMBINE_WHITESPACE = re.compile(r"\s+")
 

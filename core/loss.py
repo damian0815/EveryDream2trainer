@@ -6,7 +6,6 @@ from typing import Tuple, Optional, Literal
 import torch
 import torchvision
 from diffusers.training_utils import compute_loss_weighting_for_sd3
-from torch import Tensor
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
@@ -21,77 +20,7 @@ from loss_softrepa import (
 )
 from model.training_model import TrainingModel, Conditioning
 
-
 # from train import pyramid_noise_like, compute_snr
-
-
-def nibble_batch(batch, take_count) -> tuple[dict, dict]:
-    runt_size = batch["runt_size"]
-    current_batch_size = batch["image"].shape[0]
-    non_runt_size = current_batch_size - runt_size
-    assert non_runt_size > 0
-
-    nibble_size = min(non_runt_size, take_count)
-    nibble = _subdivide_batch_part(batch, 0, nibble_size)
-    nibble["runt_size"] = 0
-
-    remaining_size = non_runt_size - nibble_size
-    if remaining_size == 0:
-        remainder = None
-    else:
-        remainder = _subdivide_batch_part(batch, nibble_size, non_runt_size)
-        remainder["runt_size"] = 0
-    return nibble, remainder
-
-
-def subdivide_batch(batch, current_batch_size, desired_batch_size):
-    if desired_batch_size >= current_batch_size:
-        yield batch
-        return
-    runt_size = batch["runt_size"]
-    non_runt_size = current_batch_size - runt_size
-    for i, offset in enumerate(range(0, non_runt_size, desired_batch_size)):
-        sub_batch = _subdivide_batch_part(batch, offset, offset + desired_batch_size)
-        end = min(current_batch_size, offset + desired_batch_size)
-        sub_batch["runt_size"] = max(0, end - non_runt_size)
-        yield sub_batch
-
-
-def _subdivide_batch_part(part, start, end):
-    if type(part) is list or type(part) is torch.Tensor:
-        return part[start:end]
-    elif type(part) is dict:
-        return {k: _subdivide_batch_part(v, start, end) for k, v in part.items()}
-    else:
-        return part
-
-
-def choose_effective_batch_size(args, train_progress_01):
-    return max(
-        1,
-        round(
-            get_exponential_scaled_value(
-                train_progress_01,
-                initial_value=args.batch_size
-                if args.initial_batch_size is None
-                else args.initial_batch_size,
-                final_value=args.batch_size
-                if args.final_batch_size is None
-                else args.final_batch_size,
-                alpha=args.batch_size_curriculum_alpha,
-            )
-        ),
-    )
-
-
-def compute_train_process_01(
-    epoch, step, steps_per_epoch, max_epochs, max_global_steps
-):
-    total_steps = steps_per_epoch * max_epochs
-    if max_global_steps is not None:
-        total_steps = min(total_steps, max_global_steps)
-    steps_completed = steps_per_epoch * epoch + step
-    return min(1, steps_completed / total_steps)
 
 
 """
@@ -99,58 +28,6 @@ alpha=2-4: Slow advance (spread hugs initial_value)
 alpha=1: Linear progression
 alpha<1: Quick advance (spread hugs final_value)
 """
-
-
-def get_exponential_scaled_value(progress_01, initial_value, final_value, alpha=3.0):
-    # Apply non-linear scaling with alpha (higher alpha = faster early descent)
-    scaled_progress = 1.0 - (1.0 - progress_01) ** alpha
-    return initial_value + scaled_progress * (final_value - initial_value)
-
-
-def get_timestep_curriculum_range(
-    progress_01,
-    t_min_initial=800,
-    t_max_initial=1000,
-    t_min_final=0,
-    t_max_final=400,
-    alpha=3.0,
-):
-    # Interpolate boundaries
-    min_t = min(
-        1000,
-        max(
-            0,
-            get_exponential_scaled_value(
-                progress_01, t_min_initial, t_min_final, alpha=alpha
-            ),
-        ),
-    )
-    max_t = min(
-        1000,
-        max(
-            0,
-            get_exponential_scaled_value(
-                progress_01, t_max_initial, t_max_final, alpha=alpha
-            ),
-        ),
-    )
-
-    assert min_t <= max_t
-    return int(min_t), int(max_t)
-
-
-def get_image_from_latents(latents, model: TrainingModel, args):
-    with torch.no_grad():
-        with autocast(
-            enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16
-        ):
-            scaling_factor = 0.13025 if model.is_sdxl else 0.18215
-            latents = latents / scaling_factor
-            pixel_values = model.vae.decode(latents, return_dict=False)[0]
-        del latents
-        pixel_values = pixel_values.to(torch.float32)
-        pixel_values = torch.clamp((pixel_values + 1.0) / 2.0, 0.0, 1.0)
-        return pixel_values
 
 
 def get_latents(image, model: TrainingModel, device, args):
@@ -654,19 +531,6 @@ def _get_noisy_latents_and_target(
 
     return noisy_latents, target
 
-
-def get_timesteps(
-    batch_size, batch_share_timesteps, device, timesteps_ranges, scheduler
-):
-    """if continuous_float_timesteps is True, return float timestamps (continuous), otherwise return int timestamps (discrete)"""
-    timesteps = torch.cat(
-        [torch.randint(a, b, size=(1,), device=device) for a, b in timesteps_ranges]
-    )
-    if batch_share_timesteps:
-        timesteps = timesteps[:1].repeat((batch_size,))
-    timesteps = timesteps.long()
-    # logging.info(f"get_timesteps: {timesteps.detach().cpu().tolist()} from ranges: {timesteps_ranges}")
-    return timesteps
 
 
 def get_noise(
