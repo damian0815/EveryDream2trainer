@@ -1126,85 +1126,6 @@ def main(args):
                             everything_contrastive_learning_p = args.everything_contrastive_learning_p
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
-                    do_local_contrastive_flow_loss = (
-                        random.random() < args.local_contrastive_flow_loss_p
-                    )
-                    do_contrastive_flow_matching_loss = not do_local_contrastive_flow_loss and (
-                        random.random() < args.contrastive_flow_matching_loss_p
-                    )
-                    if do_local_contrastive_flow_loss:
-                        # collect only low-noise timesteps
-                        low_noise_timesteps = []
-                        num_timesteps_needed = full_batch["image"].shape[0]
-                        while len(low_noise_timesteps) < num_timesteps_needed:
-                            candidates = get_multirank_stratified_random_timesteps(
-                                100,
-                                device=model.device,
-                                scheduler=model.noise_scheduler,
-                                distribution='beta',
-                                alpha=args.timesteps_multirank_stratified_alpha,
-                                beta=args.timesteps_multirank_stratified_beta
-                            )
-                            for t in candidates:
-                                if t < args.local_contrastive_flow_timestep_threshold:
-                                    low_noise_timesteps.append(t)
-                        full_batch["timesteps"] = torch.tensor(low_noise_timesteps[:num_timesteps_needed], device=model.device)
-                        #logging.info(f" * built LCF batch timesteps: {full_batch['timesteps'].detach().clone().cpu().tolist()}")
-                    else:
-                        full_batch["timesteps"] = _get_step_timesteps(
-                            count=full_batch["image"].shape[0],
-                            range=full_batch["timesteps_range"],
-                            train_progress_01=train_progress_01,
-                            model=model,
-                            tv=tv,
-                            share_timesteps=full_batch["do_contrastive_learning"] or args.batch_share_timesteps,
-                            args=args
-                        )
-                    #print('timesteps: ', full_batch["timesteps"].detach().clone().cpu().tolist())
-
-                    # apply cond dropout
-                    initial_batch_size = args.batch_size if args.initial_batch_size is None else args.initial_batch_size
-                    final_batch_size = args.batch_size if args.final_batch_size is None else args.final_batch_size
-                    if final_batch_size == initial_batch_size:
-                        cdp_01_bs = 0
-                    else:
-                        cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
-                                           / (final_batch_size - initial_batch_size)))
-                    for sample_index in range(full_batch["timesteps"].shape[0]):
-                        cdp_01_ts = 1 - (full_batch["timesteps"][sample_index].cpu().item() / model.noise_scheduler.config.num_train_timesteps)
-                        if args.cond_dropout_curriculum_source == 'timestep':
-                            cdp_01 = cdp_01_ts
-                        elif args.cond_dropout_curriculum_source == 'batch_size':
-                            assert args.final_batch_size != args.initial_batch_size
-                            cdp_01 = cdp_01_bs
-                        elif args.cond_dropout_curriculum_source == 'global_step':
-                            cdp_01 = train_progress_01
-                        elif args.cond_dropout_curriculum_source == 'batch_size_and_timestep':
-                            assert args.final_batch_size != args.initial_batch_size
-                            cdp_01 = cdp_01_bs * cdp_01_ts
-                        else:
-                            raise ValueError("Unrecognized value for --cond_dropout_curriculum_source")
-                        final_cond_dropout = args.cond_dropout if args.final_cond_dropout is None else args.final_cond_dropout
-                        if args.cond_dropout_curriculum_alpha:
-                            this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
-                                                                           initial_value=args.cond_dropout,
-                                                                           final_value=final_cond_dropout,
-                                                                           alpha=args.cond_dropout_curriculum_alpha)
-                        else:
-                            this_cond_dropout_p = args.cond_dropout
-                        tv.cond_dropouts.append(this_cond_dropout_p)
-                        if train_batch.random_instance.random() <= this_cond_dropout_p:
-                            # drop all captions for this sample
-                            for k in full_batch["captions"].keys():
-                                if full_batch["captions"][k][sample_index] is None:
-                                    continue
-                                full_batch["tokens"][k][sample_index] = train_batch.cond_dropout_tokens
-                                if model.is_sdxl:
-                                    full_batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens_2
-                                full_batch["captions"][k][sample_index] = train_batch.cond_dropout_caption
-                            if train_batch.random_instance.random() <= args.cond_dropout_noise_p:
-                                full_batch["image"][sample_index] = torch.randn_like(full_batch["image"][sample_index])
-
                     batch = None
                     remaining_batch = full_batch
 
@@ -1283,7 +1204,6 @@ def main(args):
                                               zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                                               batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise)
                                               )
-                        timesteps = batch["timesteps"]
                         runt_size = batch["runt_size"]
                         with torch.no_grad(), torch.cuda.amp.autocast(enabled=args.amp):
                             latents_slices = []
@@ -1317,6 +1237,87 @@ def main(args):
 
                         for caption_variant in caption_variants:
 
+                            do_local_contrastive_flow_loss = (
+                                random.random() < args.local_contrastive_flow_loss_p
+                            )
+                            do_contrastive_flow_matching_loss = not do_local_contrastive_flow_loss and (
+                                random.random() < args.contrastive_flow_matching_loss_p
+                            )
+                            if do_local_contrastive_flow_loss:
+                                # collect only low-noise timesteps
+                                low_noise_timesteps = []
+                                num_timesteps_needed = batch["image"].shape[0]
+                                while len(low_noise_timesteps) < num_timesteps_needed:
+                                    candidates = get_multirank_stratified_random_timesteps(
+                                        100,
+                                        device=model.device,
+                                        scheduler=model.noise_scheduler,
+                                        distribution='beta',
+                                        alpha=args.timesteps_multirank_stratified_alpha,
+                                        beta=args.timesteps_multirank_stratified_beta
+                                    )
+                                    for t in candidates:
+                                        if t < args.local_contrastive_flow_timestep_threshold:
+                                            low_noise_timesteps.append(t)
+                                batch["timesteps"] = torch.tensor(low_noise_timesteps[:num_timesteps_needed],
+                                                                       device=model.device)
+                                # logging.info(f" * built LCF batch timesteps: {full_batch['timesteps'].detach().clone().cpu().tolist()}")
+                            else:
+                                batch["timesteps"] = _get_step_timesteps(
+                                    count=batch["image"].shape[0],
+                                    range=batch["timesteps_range"],
+                                    train_progress_01=train_progress_01,
+                                    model=model,
+                                    tv=tv,
+                                    share_timesteps=batch["do_contrastive_learning"] or args.batch_share_timesteps,
+                                    args=args
+                                )
+
+                            # apply cond dropout
+                            initial_batch_size = args.batch_size if args.initial_batch_size is None else args.initial_batch_size
+                            final_batch_size = args.batch_size if args.final_batch_size is None else args.final_batch_size
+                            if final_batch_size == initial_batch_size:
+                                cdp_01_bs = 0
+                            else:
+                                cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
+                                                       / (final_batch_size - initial_batch_size)))
+                            for sample_index in range(batch["timesteps"].shape[0]):
+                                cdp_01_ts = 1 - (batch["timesteps"][
+                                                     sample_index].cpu().item() / model.noise_scheduler.config.num_train_timesteps)
+                                if args.cond_dropout_curriculum_source == 'timestep':
+                                    cdp_01 = cdp_01_ts
+                                elif args.cond_dropout_curriculum_source == 'batch_size':
+                                    assert args.final_batch_size != args.initial_batch_size
+                                    cdp_01 = cdp_01_bs
+                                elif args.cond_dropout_curriculum_source == 'global_step':
+                                    cdp_01 = train_progress_01
+                                elif args.cond_dropout_curriculum_source == 'batch_size_and_timestep':
+                                    assert args.final_batch_size != args.initial_batch_size
+                                    cdp_01 = cdp_01_bs * cdp_01_ts
+                                else:
+                                    raise ValueError("Unrecognized value for --cond_dropout_curriculum_source")
+                                final_cond_dropout = args.cond_dropout if args.final_cond_dropout is None else args.final_cond_dropout
+                                if args.cond_dropout_curriculum_alpha:
+                                    this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
+                                                                                       initial_value=args.cond_dropout,
+                                                                                       final_value=final_cond_dropout,
+                                                                                       alpha=args.cond_dropout_curriculum_alpha)
+                                else:
+                                    this_cond_dropout_p = args.cond_dropout
+                                tv.cond_dropouts.append(this_cond_dropout_p)
+                                if train_batch.random_instance.random() <= this_cond_dropout_p:
+                                    # drop all captions for this sample
+                                    for k in batch["captions"].keys():
+                                        if batch["captions"][k][sample_index] is None:
+                                            continue
+                                        batch["tokens"][k][sample_index] = train_batch.cond_dropout_tokens
+                                        if model.is_sdxl:
+                                            batch["tokens_2"][k][sample_index] = train_batch.cond_dropout_tokens_2
+                                        batch["captions"][k][sample_index] = train_batch.cond_dropout_caption
+                                    if train_batch.random_instance.random() <= args.cond_dropout_noise_p:
+                                        batch["image"][sample_index] = torch.randn_like(
+                                            batch["image"][sample_index])
+
                             if teacher_model is None:
                                 teacher_mask = None
                             else:
@@ -1326,7 +1327,7 @@ def main(args):
                                     # 1000...args.teacher_timestep_max: p = 0
                                     # args.teacher_timestep_max...0: ramp from 0 to args.teacher_p
                                     scale = torch.maximum(
-                                        args.teacher_timestep_max - full_batch["timesteps"].float(),
+                                        args.teacher_timestep_max - batch["timesteps"].float(),
                                         torch.zeros([1])
                                     ) / args.teacher_timestep_max
                                     teacher_p = args.teacher_p * scale
@@ -1395,6 +1396,7 @@ def main(args):
                             tv.non_cond_dropout_count += torch.sum(~is_cond_dropout)
 
                             slices = list(get_slices(batch_size, tv.forward_slice_size, runt_size=runt_size))
+                            timesteps = batch["timesteps"]
                             for slice_index, (slice_start, slice_end) in enumerate(slices):
                                 # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
                                 latents_slice = latents[slice_start:slice_end]
