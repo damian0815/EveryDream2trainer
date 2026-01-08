@@ -108,7 +108,7 @@ class TrainingVariables:
     interleave_bs1_bsN: bool = False
     interleaved_bs1_count: int|None = None
     total_trained_samples_count: int = 0
-    total_trained_batches_count: int = 0
+    optimizer_step: int = 0
 
     cond_dropouts: list[float] = field(default_factory=list)
     cond_dropout_count = 0

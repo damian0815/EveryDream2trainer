@@ -1245,7 +1245,7 @@ def main(args):
                                 for image_index in range(len(batch["captions"][k])):
                                     if batch["captions"][k][image_index] is not None:
                                         caption_counter[k] += 1
-                            print("caption variants for this batch of:", image_shape[0], "images:", caption_counter)
+                            print("caption variants for this batch of", image_shape[0], "images:", caption_counter)
                             caption_variants = list(caption_counter.keys())
                         else:
                             caption_candidates = []
@@ -1348,22 +1348,9 @@ def main(args):
                                     this_caption_str = batch["captions"][
                                         caption_variant
                                     ][i]
-                                    if this_caption_str is not None:
-                                        tokens_variant = caption_variant
-                                    else:
-                                        # pick a random caption variant to replace it
-                                        tokens_variant = train_batch.random_instance.choice(
-                                            [
-                                                k
-                                                for k, v in batch["captions"].items()
-                                                if v[i] is not None
-                                            ]
-                                        )
-                                        this_caption_str = batch["captions"][
-                                            tokens_variant
-                                        ][i]
+                                    assert this_caption_str is not None
 
-                                    this_tokens = batch["tokens"][tokens_variant][i]
+                                    this_tokens = batch["tokens"][caption_variant][i]
 
                                     assert this_caption_str is not None
                                     caption_str.append(this_caption_str)
@@ -1373,7 +1360,7 @@ def main(args):
 
                                     if model.is_sdxl:
                                         this_tokens_2 = batch["tokens_2"][
-                                            tokens_variant
+                                            caption_variant
                                         ][i]
                                         assert this_tokens_2 is not None
                                         tokens_2.append(this_tokens_2)
@@ -1576,14 +1563,14 @@ def main(args):
                                 )
                                 loss += loss_cfm.to(dtype=loss.dtype) * args.contrastive_flow_matching_loss_lambda
 
-                            # finally: apply loss scale
-                            loss_scale = loss_scale.view(-1, 1, 1, 1).expand(loss.shape).to(loss.device)
+                            log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
+
+                            # reduce from [B, C, H, W] to [B] with mean
+                            loss = loss.mean(dim=list(range(1, len(loss.shape))))
 
                             # apply any hinge negative loss modification
-                            loss = apply_hinge_negative_loss(loss, loss_scale, margin=args.negative_loss_margin)
-                            loss_scale = loss_scale.abs()
-
-                            loss *= loss_scale
+                            loss = apply_hinge_negative_loss(loss, loss_scale.to(loss.device), margin=args.negative_loss_margin)
+                            loss = loss * loss_scale.abs().to(loss.device)
 
                             # take mean of all dimensions except batch, then divide through by a fixed batch size
                             if args.loss_mean_over_full_effective_batch:
@@ -1591,7 +1578,7 @@ def main(args):
                                 loss_mean_divisor = max(1, tv.desired_effective_batch_size)
                             else:
                                 loss_mean_divisor = 1
-                            loss_mean = loss.mean(dim=list(range(1, len(loss.shape)))).sum() / loss_mean_divisor
+                            loss_mean = loss.sum() / loss_mean_divisor
 
                             #logging.info(
                             #    f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
@@ -1602,7 +1589,6 @@ def main(args):
                             #logging.info(
                             #    f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
                             #)
-                            log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
 
                             log_data.loss_log_step_cd.append(loss[is_cond_dropout].mean().detach().item())
                             log_data.loss_log_step_non_cd.append(loss[~is_cond_dropout].mean().detach().item())
@@ -1631,12 +1617,12 @@ def main(args):
                             steps_pbar.set_postfix(
                                 {
                                     "loss/step": loss_step,
-                                    "f": tv.forward_slice_size,
-                                    "l": loss.shape[0],
-                                    "aN": tv.accumulated_loss_images_count,
-                                    "aB": tv.backwarded_images_count,
-                                    "tN": str(tv.total_trained_samples_count),
-                                    "tB": str(tv.total_trained_batches_count),
+                                    "_f": tv.forward_slice_size,
+                                    "_l": loss.shape[0],
+                                    "l": tv.accumulated_loss_images_count,
+                                    "b": tv.backwarded_images_count,
+                                    "os": str(tv.optimizer_step),
+                                    "N": str(tv.total_trained_samples_count),
                                     "gs": str(tv.global_step), # string conversion sidesteps scientific notation
                                 }
                             )
@@ -1670,7 +1656,7 @@ def main(args):
 
                                     tv.last_effective_batch_size = tv.backwarded_images_count
                                     tv.total_trained_samples_count += tv.backwarded_images_count
-                                    tv.total_trained_batches_count += 1
+                                    tv.optimizer_step += 1
                                     tv.backwarded_images_count = 0
 
                                     # if we are interleaving BS1, increment counter

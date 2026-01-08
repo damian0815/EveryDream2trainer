@@ -13,12 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import copy
 import logging
 import os
 import statistics
 import traceback
 from collections import defaultdict, Counter
 
+import math
 import torch
 from torch.utils.data import Dataset
 from data.data_loader import DataLoaderMultiAspect
@@ -415,6 +417,93 @@ def collapse_captions(batch):
     return captions, tokens, tokens_2
 
 
+def collapse_captions_v2(batch):
+
+    #runt_size = batch[0]["runt_size"]
+    #runt_offset = len(batch) - runt_size
+    #print("runt size:", runt_size, "runt offset:", runt_offset)
+
+    caption_counts_per_category = Counter([k for b in batch
+                              for k, v in b["caption"].items()])
+    assert len(caption_counts_per_category) > 0
+    keys_in_count_order_desc = [k for k, _ in caption_counts_per_category.most_common()]
+    #print("category counts:", caption_counts_per_category)
+    keys_in_count_order_asc = list(reversed(keys_in_count_order_desc))
+
+    #target_category_count = math.ceil(median(caption_counts_per_category.values()))
+    #print(caption_counts_per_category, target_category_count)
+    #target_category_count = 5
+    caption_counts_per_example = [sum(1 for v in b["caption"].values()
+                                     if v is not None and len(v.strip())>0)
+                                  for b in batch]
+    total_caption_counts = sum(caption_counts_per_example)
+    target_category_count = math.ceil((statistics.median(caption_counts_per_example) + total_caption_counts/len(batch))/2)
+    #print("counts:", caption_counts_per_example, ", target category count:", target_category_count)
+
+    all_available_captions = [{k for k, v in b["caption"].items()
+                               if v is not None and len(v.strip())>0}
+                              for b in batch]
+    for i, v in enumerate(all_available_captions):
+        if len(v) == 0:
+            logging.warning(f"Warning: no captions at all for {batch[i]['pathname']}. Inserting 'an image' as default caption")
+            key = keys_in_count_order_desc[0]
+            batch[i]["caption"][key] = "an image"
+            all_available_captions[i] = {key}
+
+    remaining_captions = copy.deepcopy(all_available_captions)
+
+    caption_source_map = {}
+    #print("keys in count order desc:", keys_in_count_order_desc)
+    for category in keys_in_count_order_desc[:target_category_count]:
+        caption_source_map[category] = {}
+        for i, example in enumerate(batch):
+            if category in remaining_captions[i]:
+                caption_source_map[category][i] = category
+                remaining_captions[i].remove(category)
+            else:
+                caption_source_map[category][i] = None
+
+    # backfill Nones with remaining
+    for category in keys_in_count_order_desc:
+        if category not in caption_source_map:
+            continue
+        source_map = caption_source_map[category]
+        for i in range(len(batch)):
+            if source_map[i] is None:
+                if not remaining_captions[i]:
+                    # ran out of captions, refill
+                    remaining_captions[i] = all_available_captions[i].copy()
+                    assert remaining_captions[i], f"example {i} has no available captions to refill from, this should not happen"
+                if random.random() < 0.5:
+                    # populate starting from least common captions
+                    chosen = next(k for k in keys_in_count_order_asc
+                              if k in remaining_captions[i])
+                else:
+                    # pick at random
+                    chosen = random.choice(list(remaining_captions[i]))
+                remaining_captions[i].remove(chosen)
+                source_map[i] = chosen
+
+    captions = {}
+    tokens = {}
+    tokens_2 = {} if "tokens_2" in batch[0] else None
+    # map from caption variant to source caption per example
+    for k, source_map in caption_source_map.items():
+        #print("k:", k, "source_map:", source_map)
+        sourced_captions = [example["caption"].get(source_map.get(i, None), None)
+                       for i, example in enumerate(batch)]
+        #print(sourced_captions)
+        if all(c is None for c in sourced_captions):
+            continue
+        captions[k] = sourced_captions
+        tokens[k] = [example["tokens"].get(source_map.get(i, None), None)
+                     for i, example in enumerate(batch)]
+        if tokens_2 is not None:
+            tokens_2[k] = [example["tokens_2"].get(source_map.get(i, None), None)
+                            for i, example in enumerate(batch)]
+
+    return captions, tokens, tokens_2
+
 
 def collate_fn(batch):
     """
@@ -436,7 +525,7 @@ def collate_fn(batch):
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
 
     # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
-    captions, tokens, tokens_2 = collapse_captions(batch)
+    captions, tokens, tokens_2 = collapse_captions_v2(batch)
 
     add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
 
