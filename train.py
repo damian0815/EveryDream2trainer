@@ -61,7 +61,7 @@ from core.loss import (
     get_model_prediction_and_target,
     get_latents
 )
-from core.train_step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
+from core.step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
     get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward
 from optimizer.attention_activation_control import ActivationLogger
 from model.training_model import (

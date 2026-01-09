@@ -1002,7 +1002,7 @@ def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
-    K = (~mask).sum()  # number of negatives
+    K = mask.sum()-1  # number of negatives
 
     contrastive_losses = torch.zeros_like(v_pred)
     # pick K random reference indices

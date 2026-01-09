@@ -428,17 +428,20 @@ def collapse_captions_v2(batch):
     target_category_count = math.ceil((statistics.median(caption_counts_per_example) + total_caption_counts/len(batch))/2)
     #print("counts:", caption_counts_per_example, ", target category count:", target_category_count)
 
-    all_available_captions = [{k for k, v in b["caption"].items()
-                               if v is not None and len(v.strip())>0}
-                              for b in batch]
-    for i, v in enumerate(all_available_captions):
+    available_caption_categories_per_example = [
+        {k for k, v in b["caption"].items()
+         if v is not None}
+        for b in batch
+    ]
+    for i, v in enumerate(available_caption_categories_per_example):
+        v: set[str]
         if len(v) == 0:
-            logging.warning(f"Warning: no captions at all for {batch[i]['pathname']}. Inserting 'an image' as default caption")
+            logging.warning(f"Warning: no captions at all for {batch[i]['pathname']} (not even emptystring). Inserting 'an image' as default caption")
             key = keys_in_count_order_desc[0]
             batch[i]["caption"][key] = "an image"
-            all_available_captions[i] = {key}
+            available_caption_categories_per_example[i] = {key}
 
-    remaining_captions = copy.deepcopy(all_available_captions)
+    remaining_captions = copy.deepcopy(available_caption_categories_per_example)
 
     caption_source_map = {}
     #print("keys in count order desc:", keys_in_count_order_desc)
@@ -460,7 +463,7 @@ def collapse_captions_v2(batch):
             if source_map[i] is None:
                 if not remaining_captions[i]:
                     # ran out of captions, refill
-                    remaining_captions[i] = all_available_captions[i].copy()
+                    remaining_captions[i] = available_caption_categories_per_example[i].copy()
                     assert remaining_captions[i], f"example {i} has no available captions to refill from, this should not happen"
                 if random.random() < 0.5:
                     # populate starting from least common captions

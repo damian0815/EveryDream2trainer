@@ -405,7 +405,7 @@ class EveryDreamOptimizer:
 
     def check_for_inf_or_nan(self, tv: "TrainingVariables", log_hint: str):
         if self.unet_grads_have_inf_or_nan(log_hint):
-            logging.error("Dumping training vars:")
+            logging.error("InF or NaN detected in unet grads - dumping training vars:")
             logging.error(f" - Timesteps: {tv.accumulated_timesteps}")
             logging.error(f" - Paths: {tv.accumulated_pathnames}")
             logging.error(f" - Captions: {tv.accumulated_captions}")
