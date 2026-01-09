@@ -35,7 +35,7 @@ import traceback
 
 from model.training_model import TrainingModel
 from core.semaphore_files import check_semaphore_file_and_unlink
-from .sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
+from utils.sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
 
 _INTERRUPT_SAMPLES_SEMAPHORE_FILE = 'no_more_samples.semaphore'
 

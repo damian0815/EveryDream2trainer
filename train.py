@@ -217,7 +217,7 @@ def setup_args(args):
         if len(value) != len(args.resolution):
             if len(value) > 1:
                 raise ValueError(
-                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join(value)})")
+                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join([str(v) for f in value])})")
             elif len(value) == 1:
                 # expand to one per resolution
                 value = value * len(args.resolution)

@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import gc
 import logging
 import os
 import random
@@ -137,24 +138,28 @@ def train_step(
             tv.cond_dropout_count += torch.sum(is_cond_dropout)
             tv.non_cond_dropout_count += torch.sum(~is_cond_dropout)
 
-            model_pred, model_pred_anchor, target, teacher_target = _do_model_forward(
-                model=model,
+            model_forward_slice_size = tv.forward_slice_size
 
-                batch=batch,
-                latents=latents,
-                noise=noise,
-                conditioning=conditioning,
+            model_pred, model_pred_anchor, target, teacher_target = repeat_with_oom_handling(initial_slice_size=tv.forward_slice_size, callback=lambda slice_size: _do_model_forward(
+                        model=model,
 
-                timesteps=timesteps,
-                caption_variant=caption_variant,
+                        batch=batch,
+                        latents=latents,
+                        noise=noise,
+                        conditioning=conditioning,
 
-                teacher_model=teacher_model,
-                teacher_mask=teacher_mask,
-                teacher_conditioning=teacher_conditioning,
+                        timesteps=timesteps,
+                        caption_variant=caption_variant,
 
-                tv=tv,
-                args=args
-            )
+                        teacher_model=teacher_model,
+                        teacher_mask=teacher_mask,
+                        teacher_conditioning=teacher_conditioning,
+
+                        forward_slice_size=slice_size,
+                        tv=tv,
+                        args=args
+                    ), oom_log_info=f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} for full batch size {batch_size}. "
+                f"loss images accumulated: {tv.accumulated_loss_images_count}")
 
             loss_scale = loss_scale[:model_pred.shape[0]]
 
@@ -767,6 +772,7 @@ def _do_model_forward(
     batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning,
     timesteps: torch.Tensor, caption_variant: str,
     teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
+    forward_slice_size: int,
     tv: TrainingVariables, args: Namespace
 ):
     batch_size = timesteps.shape[0]
@@ -777,7 +783,7 @@ def _do_model_forward(
     target_all = []
     teacher_target_all = []
 
-    slices = list(get_slices(batch_size, tv.forward_slice_size))
+    slices = list(get_slices(batch_size, forward_slice_size))
     for slice_index, (slice_start, slice_end) in enumerate(slices):
         # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
         latents_slice = latents[slice_start:slice_end]
@@ -857,6 +863,7 @@ def _do_model_forward(
     del model_pred_all, model_pred_anchor_all, target_all, teacher_target_all
 
     return model_pred, model_pred_anchor, target, teacher_target
+
 
 
 def _do_loss(
@@ -955,3 +962,25 @@ def _do_loss(
     loss = loss.mean(dim=list(range(1, len(loss.shape))))
 
     return loss
+
+def repeat_with_oom_handling(initial_slice_size: int, callback, oom_log_info: str):
+    slice_size = initial_slice_size
+    while True:
+        try:
+            return callback(slice_size)
+        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
+            logging.error(
+                oom_log_info + ": Slice size {slice_size} caused OOM."
+            )
+            if slice_size > 1:
+                slice_size = slice_size // 2
+                logging.info(f" -> Trying again with slice size {slice_size}")
+                torch.cuda.empty_cache()
+                gc.collect()
+            else:
+                logging.error(
+                    " -> Already at slice size 1, cannot reduce further"
+                )
+                raise
+
+
