@@ -163,7 +163,7 @@ def setup_args(args):
         # find the last checkpoint in the logdir
         args.resume_ckpt = find_last_checkpoint(args.logdir)
 
-    if (args.ema_resume_model != None) and (args.ema_resume_model == "findlast"):
+    if (args.ema_resume_model is not None) and (args.ema_resume_model == "findlast"):
         logging.info(f"{Fore.LIGHTCYAN_EX} Finding last EMA decay checkpoint in logdir: {args.logdir}{Style.RESET_ALL}")
 
         args.ema_resume_model = find_last_checkpoint(args.logdir, is_ema=True)
@@ -211,23 +211,20 @@ def setup_args(args):
     if len(args.resolution_multiplier) > 0 and len(args.resolution_multiplier) != len(args.resolution):
         raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution {args.resolution} --resolution_multiplier {args.resolution_multiplier})")
 
-    if type(args.max_backward_slice_size) is not list:
-        args.max_backward_slice_size = [args.max_backward_slice_size]
-    if len(args.max_backward_slice_size) != len(args.resolution):
-        if len(args.max_backward_slice_size) > 1:
-            raise ValueError(f"when using --max_backward_slice_size, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --max_backward_slice_size {args.max_backward_slice_size})")
-        elif len(args.max_backward_slice_size) == 1:
-            # expand to one per resolution
-            args.max_backward_slice_size = args.max_backward_slice_size * len(args.resolution)
+    def force_to_resolution_mapped_list_and_validate(value, name):
+        if type(value) is not list:
+            value = [value]
+        if len(value) != len(args.resolution):
+            if len(value) > 1:
+                raise ValueError(
+                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join(value)})")
+            elif len(value) == 1:
+                # expand to one per resolution
+                value = value * len(args.resolution)
+        return value
 
-    if type(args.forward_slice_size) is not list:
-        args.forward_slice_size = [args.forward_slice_size]
-    if len(args.forward_slice_size) != len(args.resolution):
-        if len(args.forward_slice_size) > 1:
-            raise ValueError(f"when using --forward_slice_size, you must pass exactly 1 forward slice size per resolution (you passed: --resolution {args.resolution} --forward_slice_size {args.forward_slice_size})")
-        elif len(args.forward_slice_size) == 1:
-            # expand to one per resolution
-            args.forward_slice_size = args.forward_slice_size * len(args.resolution)
+    args.max_backward_slice_size = force_to_resolution_mapped_list_and_validate(args.max_backward_slice_size, "max_backward_slice_size")
+    args.forward_slice_size = force_to_resolution_mapped_list_and_validate(args.forward_slice_size, "forward_slice_size")
 
     if type(args.disable_backward_memsafe_resolutions) is not list:
         args.disable_backward_memsafe_resolutions = [args.disable_backward_memsafe_resolutions]
@@ -492,18 +489,6 @@ def main(args):
             compel=None,
             yaml=None,
         )
-        model.cond_dropout_tokens = torch.tensor(model.tokenizer(model.cond_dropout_caption,
-                                                               truncation=True,
-                                                               padding="max_length",
-                                                               max_length=model.tokenizer.model_max_length,
-                                                               ).input_ids)
-        if model.tokenizer_2 is not None:
-            model.cond_dropout_tokens_2 = torch.tensor(model.tokenizer_2(model.cond_dropout_caption,
-                                                                       truncation=True,
-                                                                       padding="max_length",
-                                                                       max_length=model.tokenizer_2.model_max_length,
-                                                                       ).input_ids)
-
         teacher_model = None
     else:
         try:
@@ -565,6 +550,18 @@ def main(args):
             del teacher_pipeline
         else:
             teacher_model = None
+
+        model.cond_dropout_tokens = torch.tensor(model.tokenizer(model.cond_dropout_caption,
+                                                               truncation=True,
+                                                               padding="max_length",
+                                                               max_length=model.tokenizer.model_max_length,
+                                                               ).input_ids)
+        if model.tokenizer_2 is not None:
+            model.cond_dropout_tokens_2 = torch.tensor(model.tokenizer_2(model.cond_dropout_caption,
+                                                                       truncation=True,
+                                                                       padding="max_length",
+                                                                       max_length=model.tokenizer_2.model_max_length,
+                                                                       ).input_ids)
 
         compel = None
         if args.use_compel:
@@ -911,7 +908,6 @@ def main(args):
                                           batch_share_timesteps=False,
                                           device=model.unet.device,
                                           timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
-                                          scheduler=model.noise_scheduler
                                           )
         model.load_vae_to_device(device)
         latents = get_latents(image, model, device=model.unet.device, args=args)
@@ -962,6 +958,7 @@ def main(args):
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
         tv.remaining_stratified_timesteps = None
         tv.shared_timestep = None
+        step = 0
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1003,7 +1000,6 @@ def main(args):
                 else validator.get_validation_step_indices(epoch, len(train_dataloader))
             )
 
-            step = 0
             timesteps = None
             #logging.info("fetching batch...")
             for step, full_batch in enumerate(train_dataloader):

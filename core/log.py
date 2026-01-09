@@ -13,7 +13,6 @@ from colorama import Style, Fore
 from data.every_dream import EveryDreamBatch
 from data.image_train_item import ImageTrainItem
 
-from loss import vae_preview
 from model.training_model import TrainingModel, TrainingVariables
 
 from optimizer.attention_activation_control import ActivationLogger

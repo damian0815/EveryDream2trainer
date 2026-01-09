@@ -13,8 +13,8 @@ from scipy.stats import beta as sp_beta
 
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
 
-from flow_match_model import TrainFlowMatchScheduler
-from loss_softrepa import (
+from core.flow_match_model import TrainFlowMatchScheduler
+from core.loss_softrepa import (
     text_weighted_infonce_loss,
     text_weighted_infonce_loss_with_softrepa,
 )
@@ -53,7 +53,7 @@ def get_loss(
     timesteps,
     negative_loss_mask,
     noise_scheduler,
-    text_embeds: torch.Tensor,
+    prompt_embeds: torch.Tensor,
     do_contrastive_learning,
     contrastive_loss_scale,
     args,
@@ -177,7 +177,7 @@ def get_loss(
             contrastive_loss = text_weighted_infonce_loss(
                 model_pred,
                 target,
-                text_embeddings=text_embeds,
+                text_embeddings=prompt_embeds,
                 is_dropped=is_cond_dropout,
                 temperature=args.contrastive_loss_temperature,
                 hard_negative_weight=args.contrastive_loss_hard_negative_weight,
@@ -187,7 +187,7 @@ def get_loss(
             contrastive_loss = text_weighted_infonce_loss_with_softrepa(
                 model_pred,
                 target,
-                text_embeddings=text_embeds,
+                text_embeddings=prompt_embeds,
                 is_dropped=is_cond_dropout,
                 temperature=None,
                 sigma=args.contrastive_loss_softrepa_sigma,

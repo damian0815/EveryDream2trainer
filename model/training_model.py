@@ -312,6 +312,33 @@ class Conditioning:
                             _text_encoder_2_pooled_embeds=self._text_encoder_2_pooled_embeds[mask] if self._text_encoder_2_pooled_embeds is not None else None,
                             _add_time_ids=self._add_time_ids[mask] if self._add_time_ids is not None else None)
 
+    def slice(self, slice_start: int, slice_end: int) -> 'Conditioning':
+        return _make_conditioning_slice(self._text_encoder_hidden_states, self._text_encoder_2_hidden_states,
+                                                     self._text_encoder_2_pooled_embeds, add_time_ids=self._add_time_ids,
+                                                     slice_start=slice_start, slice_end=slice_end)
+
+def _make_conditioning_slice(
+    encoder_hidden_states: torch.Tensor,
+    encoder_2_hidden_states: torch.Tensor|None,
+    encoder_2_pooled_embeds: torch.Tensor|None,
+    add_time_ids: torch.Tensor|None,
+    slice_start, slice_end
+) -> Conditioning:
+    encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+    if encoder_2_hidden_states is not None:
+        encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
+        encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
+        add_time_ids_slice = add_time_ids[slice_start:slice_end]
+        return Conditioning.sdxl_conditioning(
+            text_encoder_hidden_states=encoder_hidden_states_slice,
+            text_encoder_2_hidden_states=encoder_2_hidden_states_slice,
+            text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
+            add_time_ids=add_time_ids_slice,
+        )
+    else:
+        return Conditioning.sd12_conditioning(
+            text_encoder_hidden_states=encoder_hidden_states_slice
+        )
 
 
 def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor|None, torch.Tensor|None]:

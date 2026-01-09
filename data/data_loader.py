@@ -83,7 +83,7 @@ class DataLoaderMultiAspect():
         remaining = self.expected_epoch_size - len(picked_images)
         assert remaining >= 0, "Something went wrong with the multiplier calculation"
 
-        randomizer.shuffle(remaining)
+        randomizer.shuffle(data_copy)
         # resolve fractional parts, ensure each is only added max once
         while remaining > 0:
             for iti in data_copy:
