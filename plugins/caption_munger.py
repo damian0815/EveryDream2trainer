@@ -29,6 +29,9 @@ shuffle_phrases_within_sentences_p = 0.01
 keep_first_phrase_p = 1
 keep_first_sentence_p = 0.98
 
+rotate_sentences_p = 0.02
+too_long_caption_rotate_sentences_p = 0.75
+
 truncate_sentences_p = 0
 ending_dot_p = 0.5
 replace_dots_with_commas_p = 0.02
@@ -164,16 +167,24 @@ class CaptionMungerPlugin(BasePlugin):
             caption = "<<shufbreak>>".join(parts[:-1])
 
         tokens = _get_tokens_full(caption, prefix, suffix, self.tokenizer)
-        if len(tokens) > 75:
-            actual_shuffle_sentences_p = too_long_caption_shuffle_sentences_p
-        else:
+        if len(tokens) <= 75:
             actual_shuffle_sentences_p = shuffle_sentences_p
+            actual_rotate_sentences_p = rotate_sentences_p
+        else:
+            # long captions get slightly different handling
+            if too_long_caption_rotate_sentences_p > random.random():
+                actual_shuffle_sentences_p = shuffle_sentences_p
+                actual_rotate_sentences_p = 1
+            else:
+                actual_shuffle_sentences_p = too_long_caption_shuffle_sentences_p
+                actual_rotate_sentences_p = 0
 
         out_caption = handle_shufbreak(
             caption,
             keep_first_sentence_p=0 if len(prefix.strip()) > 0 else keep_first_sentence_p,
             shuffle_sentences_p=actual_shuffle_sentences_p,
             truncate_sentences_p=truncate_sentences_p,
+            rotate_sentences_p=actual_rotate_sentences_p,
         )
 
         if replace_dots_with_commas_p > random.random():
@@ -272,7 +283,8 @@ def shuffle_on_doublebar(sentence: str) -> str:
 def handle_shufbreak(caption: str,
                      keep_first_sentence_p,
                      shuffle_sentences_p,
-                     truncate_sentences_p) -> str:
+                     truncate_sentences_p,
+                     rotate_sentences_p=0) -> str:
     # split to sentences
     in_sentences = [s.strip() for s in caption.split("<<shufbreak>>")]
     # remove zero-length sentences (multiple . and trailing .)
@@ -280,6 +292,10 @@ def handle_shufbreak(caption: str,
     if len(in_sentences) == 0:
         # empty string
         return caption
+
+    if rotate_sentences_p > random.random():
+        rotate_pivot = random.randint(0, len(in_sentences)-1)
+        in_sentences = in_sentences[rotate_pivot:] + in_sentences[:rotate_pivot]
 
     out_sentences = []
 

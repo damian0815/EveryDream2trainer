@@ -405,15 +405,31 @@ def collapse_captions(batch):
     return captions, tokens, tokens_2
 
 
+def _build_caption_counts_per_category(batch) -> Counter:
+    return Counter([k
+                    for b in batch
+                    for k, v in b["caption"].items()])
+
+def _replace_default_with_most_common(batch):
+    caption_counts_per_category = _build_caption_counts_per_category(batch)
+    # rename 'default' to the most common category
+    for b in batch:
+        if "default" in b["caption"]:
+            replacement = next((k for k, _ in caption_counts_per_category.most_common()
+                               if k != "default" and k not in b["caption"]), None)
+            if replacement is not None:
+                b["caption"][replacement] = b["caption"]["default"]
+                b["tokens"][replacement] = b["tokens"]["default"]
+                del b["caption"]["default"], b["tokens"]["default"]
+                if "tokens_2" in b:
+                    b["tokens_2"][replacement] = b["tokens_2"]["default"]
+                    del b["tokens_2"]["default"]
+
 def collapse_captions_v2(batch):
-
-    #runt_size = batch[0]["runt_size"]
-    #runt_offset = len(batch) - runt_size
-    #print("runt size:", runt_size, "runt offset:", runt_offset)
-
-    caption_counts_per_category = Counter([k for b in batch
-                              for k, v in b["caption"].items()])
+    _replace_default_with_most_common(batch)
+    caption_counts_per_category = _build_caption_counts_per_category(batch)
     assert len(caption_counts_per_category) > 0
+
     keys_in_count_order_desc = [k for k, _ in caption_counts_per_category.most_common()]
     #print("category counts:", caption_counts_per_category)
     keys_in_count_order_asc = list(reversed(keys_in_count_order_desc))
@@ -516,6 +532,7 @@ def collate_fn(batch):
     do_contrastive_learning = all(example["do_contrastive_learning"] for example in batch)
 
     # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
+    # replace all 'default' with the most common
     captions, tokens, tokens_2 = collapse_captions_v2(batch)
 
     add_time_ids = torch.cat([example["add_time_ids"] for example in batch])

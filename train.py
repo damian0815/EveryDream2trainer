@@ -79,7 +79,7 @@ from core.semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_
     _WANT_VALIDATION_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
-from optimizer.optimizers import EveryDreamOptimizer, InfOrNanException
+from optimizer.optimizers import EveryDreamOptimizer
 from copy import deepcopy
 
 if torch.cuda.is_available():
@@ -217,7 +217,7 @@ def setup_args(args):
         if len(value) != len(args.resolution):
             if len(value) > 1:
                 raise ValueError(
-                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join([str(v) for f in value])})")
+                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join([str(v) for v in value])})")
             elif len(value) == 1:
                 # expand to one per resolution
                 value = value * len(args.resolution)
@@ -407,9 +407,9 @@ def _get_default_forward_slice_size(args, batch_resolution):
     else:
         return args.batch_size
 
-def _choose_backward_slice_size(args, tv: TrainingVariables, batch_resolution):
+def _choose_backward_slice_size(args, tv: TrainingVariables):
     if args.max_backward_slice_size:
-        resolution_index = args.resolution.index(batch_resolution)
+        resolution_index = args.resolution.index(tv.batch_resolution)
         backward_slice_size = args.max_backward_slice_size[resolution_index]
     else:
         backward_slice_size = args.batch_size
@@ -954,7 +954,6 @@ def main(args):
     try:
         plugin_runner.run_on_training_start(log_folder=log_folder, project_name=args.project_name, max_epochs=args.max_epochs, ed_state=make_current_ed_state(),)
 
-        needs_samples = False
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
         tv.remaining_stratified_timesteps = None
         tv.shared_timestep = None
@@ -1026,16 +1025,16 @@ def main(args):
                     #        print('a caption was already empty before cond dropout. paths:', full_batch['pathnames'], 'captions:', full_batch['captions'])
 
                     image_pixel_count = full_batch["image"].shape[2] * full_batch["image"].shape[3]
-                    batch_resolution = get_best_match_resolution(
+                    tv.batch_resolution = get_best_match_resolution(
                         args.resolution, image_pixel_count=image_pixel_count
                     )
-                    tv.forward_slice_size = _get_default_forward_slice_size(args, batch_resolution)
-                    tv.max_backward_slice_size = _choose_backward_slice_size(args, tv, batch_resolution)
+                    tv.forward_slice_size = _get_default_forward_slice_size(args, tv.batch_resolution)
+                    tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
                         # do backward now
                         optimizer_backward(ed_optimizer, tv, 'truncated backward: ')
 
-                    if not args.disable_backward_memsafe and batch_resolution not in args.disable_backward_memsafe_resolutions:
+                    if not args.disable_backward_memsafe and tv.batch_resolution not in args.disable_backward_memsafe_resolutions:
                         if gpu is not None:
                             torch.cuda.empty_cache()
                             gc.collect()
@@ -1050,9 +1049,9 @@ def main(args):
                                 if max_safe_forward_size == 0:
                                     logging.warning(" * Unable to free enough ram with emergency backward - possible OOM follows")
                                     max_safe_forward_size = 1
-                            #if max_safe_forward_size < _get_default_forward_slice_size(args, batch_resolution):
+                            #if max_safe_forward_size < _get_default_forward_slice_size(args, tv.batch_resolution):
                             #    logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
-                            tv.forward_slice_size = min([_get_default_forward_slice_size(args, batch_resolution), max_safe_forward_size])
+                            tv.forward_slice_size = min([_get_default_forward_slice_size(args, tv.batch_resolution), max_safe_forward_size])
                         else:
                             gpu_used_mem, gpu_total_mem = 0, 0
 
@@ -1079,13 +1078,14 @@ def main(args):
                         log_writer=log_writer,
                         log_data=log_data,
                         steps_pbar=steps_pbar,
+                        did_step_optimizer_cb=None,
                         args=args,
                     )
 
                     ed_optimizer.step_schedulers(tv.global_step)
 
-                    if sample_generator.should_generate_samples(tv.global_step, local_step=step):
-                        needs_samples = True
+                    if sample_generator.should_generate_samples(tv.global_step, local_step=step) or check_semaphore_file_and_unlink(_WANT_SAMPLES_SEMAPHORE_FILE):
+                        generate_samples(global_step=tv.global_step, batch=full_batch)
 
                     if args.ema_decay_rate != None:
                         if ((tv.global_step + 1) % args.ema_update_interval) == 0:
@@ -1101,9 +1101,6 @@ def main(args):
                             # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
                             # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
-                    if needs_samples or check_semaphore_file_and_unlink(_WANT_SAMPLES_SEMAPHORE_FILE):
-                        generate_samples(global_step=tv.global_step, batch=full_batch)
-                        needs_samples = False
 
                     steps_pbar.update(1)
 
@@ -1190,7 +1187,7 @@ def main(args):
                         batch_idx0 = {}
                         image_shape = []
                     logging.error(f"step {tv.global_step} failed. image shape {image_shape}, full batch idx0: {batch_idx0}")
-                    logging.error(f"  timesteps: {current_timesteps}, training values: {pprint.pformat(tv)}")
+                    logging.error(f"  timesteps: {current_timesteps}, training values: {pprint.pformat(tv.filtered_for_log())}")
                     raise
 
                 #logging.info("fetching...")

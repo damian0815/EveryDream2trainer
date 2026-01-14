@@ -1,3 +1,4 @@
+import copy
 import logging
 
 import diffusers
@@ -92,6 +93,7 @@ def convert_to_hf(ckpt_path):
 class TrainingVariables:
 
     global_step: int = None
+    batch_resolution: int = None
 
     max_backward_slice_size: int = None
     forward_slice_size: int = None
@@ -173,6 +175,10 @@ class TrainingVariables:
 
         # Note: global_step is NOT reset - it continues incrementing across cycles
 
+    def filtered_for_log(self) -> 'TrainingVariables':
+        filtered = copy.copy(self)
+        filtered.cond_dropouts = []
+        return filtered
 
 
 @dataclass

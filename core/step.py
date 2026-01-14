@@ -6,6 +6,7 @@ import os
 import random
 from argparse import Namespace
 from collections import Counter
+from typing import Callable
 
 import math
 import torch
@@ -33,8 +34,11 @@ def train_step(
     log_data: LogData,
     steps_pbar,
 
+    did_step_optimizer_cb: Callable|None,
     args: argparse.Namespace,
 ):
+    if did_step_optimizer_cb is None:
+        did_step_optimizer_cb = lambda: True
     remaining_batch = full_batch
 
     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
@@ -59,6 +63,8 @@ def train_step(
         if args.all_caption_variants:
             caption_counter = Counter()
             for k in batch["captions"].keys():
+                if len(batch["captions"].keys()) > 0 and k == "default":
+                    continue
                 for image_index in range(len(batch["captions"][k])):
                     if batch["captions"][k][image_index] is not None:
                         caption_counter[k] += 1
@@ -88,14 +94,12 @@ def train_step(
                 if "default" not in batch["captions"]:
                     logging.info(
                         f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']}")
-                    # train_batch here is a constant provider
                     batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
                     batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
             caption_variants = [random.choice(caption_candidates)]
             # print('picked caption variant: ', caption_variants)
 
         batch_size = image_shape[0]
-        batch_resolution = get_best_match_resolution(args.resolution, image_shape[2] * image_shape[3])
 
         with torch.no_grad():
             noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
@@ -106,11 +110,16 @@ def train_step(
                               )
         assert batch["runt_size"] == 0 # _encode_latents assumption
         model.vae.to(model.device)
-        latents = _encode_latents(model=model, image=batch["image"], amp=args.amp, tv=tv, batch_resolution=batch_resolution)
+        latents = _encode_latents(model=model, image=batch["image"], amp=args.amp, tv=tv)
         if args.offload_vae:
             model.load_vae_to_device('cpu')
 
         for caption_variant in caption_variants:
+
+            # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
+            if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] >= tv.max_backward_slice_size:
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    optimizer_backward(ed_optimizer, tv, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
 
             timesteps = _get_step_timesteps(
                 count=batch["image"].shape[0],
@@ -183,14 +192,14 @@ def train_step(
 
             for i, used_timestep in enumerate(timesteps):
                 used_timestep_detached = int(used_timestep.detach().item())
-                current, count = log_data.loss_per_timestep[batch_resolution].get(used_timestep_detached, (0, 0))
-                log_data.loss_per_timestep[batch_resolution][used_timestep_detached] = (
+                current, count = log_data.loss_per_timestep[tv.batch_resolution].get(used_timestep_detached, (0, 0))
+                log_data.loss_per_timestep[tv.batch_resolution][used_timestep_detached] = (
                     current + loss_1d[i].mean().detach().item(), count + 1)
 
                 pathname = os.path.realpath(batch["pathnames"][i])
-                if pathname not in log_data.loss_per_image_and_timestep[batch_resolution]:
-                    log_data.loss_per_image_and_timestep[batch_resolution][pathname] = []
-                log_data.loss_per_image_and_timestep[batch_resolution][pathname].append(
+                if pathname not in log_data.loss_per_image_and_timestep[tv.batch_resolution]:
+                    log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname] = []
+                log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname].append(
                     (used_timestep_detached, loss_1d[i].mean().detach().item()))
 
             # apply any hinge negative loss modification
@@ -298,6 +307,8 @@ def train_step(
                                 tv.interleaved_bs1_count = 0
                             else:
                                 tv.interleaved_bs1_count = None
+
+                did_step_optimizer_cb()
 
 
 def _get_cond_dropout_mask(caption_str) -> torch.Tensor:
@@ -634,7 +645,11 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, lo
     if tv.accumulated_loss_images_count == 0:
         logging.warning("no accumulated loss images, not doing backward")
     else:
-        optimizer.backward(tv.accumulated_loss)
+        try:
+            optimizer.backward(tv.accumulated_loss)
+        except torch.OutOfMemoryError:
+            logging.error(f"OOM step {tv.global_step} during optimizer.backward of {tv.accumulated_loss_images_count} accumulated loss images @resolution {tv.batch_resolution}")
+            raise
         try:
             if not optimizer.use_grad_scaler:
                 # if we have a grad scaler it suppresses NaN/Inf for us.
@@ -659,7 +674,6 @@ def _encode_latents(
     model: TrainingModel,
     image: torch.Tensor,
     amp: bool,
-    batch_resolution: int,
     tv: TrainingVariables
 ):
     forward_slice_size = tv.forward_slice_size
@@ -678,7 +692,7 @@ def _encode_latents(
                         latents_slice = model.vae.encode(pixel_values[slice_start:slice_end], return_dict=False)
                     except Exception:
                         logging.error(
-                            f"vae.encode failed for batch slice [{slice_start}:{slice_end}] @resolution {batch_resolution}. pixel_values shape is {pixel_values.shape}")
+                            f"vae.encode failed for batch slice [{slice_start}:{slice_end}] @resolution {tv.batch_resolution}. pixel_values shape is {pixel_values.shape}")
                         raise
                     model.vae.disable_slicing()
                     vae_scaling_factor = 0.13025 if model.is_sdxl else 0.18215
@@ -844,8 +858,8 @@ def _do_model_forward(
                 torch.OutOfMemoryError,
         ):
             logging.error(
-                f"OOM step {tv.global_step} in unet forward slice size {tv.forward_slice_size} from latents "
-                f"of shape {latents_slice.shape}, from {slice_start} to {slice_end} of {batch_size}. "
+                f"OOM step {tv.global_step} in unet forward @resolution {tv.batch_resolution} slice size {tv.forward_slice_size}, from latents "
+                f"of shape {latents_slice.shape} (samples {slice_start} to {slice_end} of {batch_size}). "
                 f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.readlink(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant]}, timesteps: {timesteps_slice.detach().cpu().tolist()}"
             )
             raise
@@ -970,7 +984,7 @@ def repeat_with_oom_handling(initial_slice_size: int, callback, oom_log_info: st
             return callback(slice_size)
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
             logging.error(
-                oom_log_info + ": Slice size {slice_size} caused OOM."
+                oom_log_info + f": Slice size {slice_size} caused OOM."
             )
             if slice_size > 1:
                 slice_size = slice_size // 2

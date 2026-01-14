@@ -188,7 +188,11 @@ class ImageTrainItem:
 
     @property
     def pathname_mask(self):
-        return self.pathname + ".mask.png"
+        for extension in [".png", ".jpg", ".jpeg", ".bmp", ".jfif", ".webp"]:
+            candidate = self.pathname + f".mask{extension}"
+            if os.path.exists(candidate):
+                return candidate
+        return None
 
     def load_image(self) -> PIL.Image:
         try:
@@ -202,7 +206,7 @@ class ImageTrainItem:
         return image
 
     def load_mask(self) -> PIL.Image:
-        if not os.path.exists(self.pathname_mask):
+        if self.pathname_mask is None:
             return None
         try:
             mask = PIL.Image.open(self.pathname_mask).convert('L')
