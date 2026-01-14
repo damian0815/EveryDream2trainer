@@ -63,7 +63,7 @@ def train_step(
         if args.all_caption_variants:
             caption_counter = Counter()
             for k in batch["captions"].keys():
-                if len(batch["captions"].keys()) > 0 and k == "default":
+                if len(batch["captions"].keys()) > 1 and k == "default":
                     continue
                 for image_index in range(len(batch["captions"][k])):
                     if batch["captions"][k][image_index] is not None:
@@ -189,6 +189,7 @@ def train_step(
                 args=args,
                 verbose=(tv.global_step % 200 == 0)
             )
+            del target, model_pred, model_pred_anchor
 
             for i, used_timestep in enumerate(timesteps):
                 used_timestep_detached = int(used_timestep.detach().item())
@@ -229,7 +230,6 @@ def train_step(
 
             log_data.forward_size_coverage[loss_1d.shape[0]] += 1
 
-            del target, model_pred, model_pred_anchor
 
             loss_step = loss_mean.detach().item()
             try:
