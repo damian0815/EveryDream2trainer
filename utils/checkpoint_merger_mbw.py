@@ -556,7 +556,7 @@ if __name__ == "__main__":
     parser.add_argument("--sdxl", action='store_true', help="if passed, merge only SDXL UNet blocks (for SDXL models); block merge disabled")
     parser.add_argument("--num_intermediates", type=int, default=1, help="number of intermediates to use, default 1 means no intermediates. >1 uses extra disk space to save intermediates")
     parser.add_argument("--half", action='store_true', help="save fp16 rather than fp32")
-    parser.add_argument("--algorithm", type=str, default='weighted_sum', help="merging algorithm: weighted_sum, sigmoid, inv_sigmoid, add_diff, reset_and_perturb")
+    parser.add_argument("--algorithm", type=str, default='weighted_sum', help="merging algorithm: weighted_sum, sigmoid, inv_sigmoid, add_diff, reset_and_perturb, NEON")
     parser.add_argument("--not_only_unet", action="store_true", help="If passed, merge all components, otherwise just merge the unet")
 
     args = parser.parse_args()
@@ -572,6 +572,13 @@ if __name__ == "__main__":
         if len(args.repo_ids_or_paths) != 3:
             raise ValueError("add_diff requires 3 repos")
         merged = merge_add_diff(args.repo_ids_or_paths[0], args.repo_ids_or_paths[1], args.repo_ids_or_paths[2], args.alphas[0], unet_only=not args.not_only_unet)
+    elif args.algorithm == 'NEON':
+        if len(args.repo_ids_or_paths) != 2:
+            raise ValueError("NEON requires 2 repos")
+        # NEON is add_diff with negative alpha
+        if args.alphas[0] >= 0:
+            raise ValueError("NEON requires negative alpha")
+        merged = merge_add_diff(args.repo_ids_or_paths[0], args.repo_ids_or_paths[1], args.repo_ids_or_paths[0], args.alphas[0], unet_only=not args.not_only_unet)
     else:
         if len(args.repo_ids_or_paths) != len(args.alphas):
             raise ValueError(f"must pass one alpha for each model ({len(args.repo_ids_or_paths)} models)")

@@ -27,7 +27,7 @@ from diffusers.utils import convert_state_dict_to_diffusers
 from transformers import CLIPTextModel, CLIPTokenizer
 from peft.utils import get_peft_model_state_dict
 
-from core.flow_match_model import TrainFlowMatchScheduler
+from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from optimizer.optimizers import EveryDreamOptimizer, InfOrNanException
 from plugins.plugins import PluginRunner
 from utils.convert_diff_to_ckpt import convert as converter
@@ -48,7 +48,7 @@ def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=No
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "flow-matching":
         logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        noise_scheduler = TrainFlowMatchScheduler(shift=flow_match_shift)
+        noise_scheduler = TrainFlowMatchEulerDiscreteScheduler(shift=flow_match_shift)
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
         noise_scheduler = DDPMScheduler.from_config(scheduler.config,
@@ -238,6 +238,10 @@ class TrainingModel:
             yaml=None,
         )
 
+    def set_noise_scheduler_shift(self, shift):
+        assert isinstance(self.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler), "Noise scheduler is not TrainFlowMatchEulerDiscreteScheduler"
+        self.noise_scheduler = TrainFlowMatchEulerDiscreteScheduler(shift=shift)
+
     def load_vae_to_device(self, device):
         self.vae.to(device)
 
@@ -270,6 +274,7 @@ class TrainingModel:
                 requires_safety_checker=None, # avoid nag
                 feature_extractor=None, # must be None if no safety checker
             )
+
 
 
 @dataclass
@@ -485,7 +490,7 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if plugin_runner is not None:
         plugin_runner.run_on_model_save(ed_state=ed_state, save_path=save_path)
 
-    noise_scheduler = diffusers.FlowMatchEulerDiscreteScheduler.from_config(ed_state.model.noise_scheduler.config) if isinstance(ed_state.model.noise_scheduler, TrainFlowMatchScheduler) else ed_state.model.noise_scheduler
+    noise_scheduler = diffusers.FlowMatchEulerDiscreteScheduler.from_config(ed_state.model.noise_scheduler.config) if isinstance(ed_state.model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler) else ed_state.model.noise_scheduler
 
     if ed_state.model.is_sdxl:
         pipeline = StableDiffusionXLPipeline(

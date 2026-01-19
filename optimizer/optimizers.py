@@ -1517,8 +1517,9 @@ class EveryDreamOptimizer:
                     lr_scale = unet_component_lr_config.get(
                         f"{component}_lr_scale", 1.0
                     )
+                    param_count = sum(p.numel() for p in params)
                     print(
-                        f"  {component}: {len(params)} parameters (LR scale: {lr_scale}x)"
+                        f"  {component}: {len(params)} parameters ({param_count} floats) (LR scale: {lr_scale}x)"
                     )
 
             return component_groups
@@ -1669,12 +1670,14 @@ def log_optimizer(
     all_params = sum([g["params"] for g in optimizer.param_groups], [])
     frozen_parameter_count = len([p for p in all_params if not p.requires_grad])
     total_parameter_count = len(all_params)
+    frozen_float_count = sum(p.numel() for p in all_params if not p.requires_grad)
+    total_float_count = sum(p.numel() for p in all_params)
     if frozen_parameter_count > 0:
         param_info = (
-            f"({total_parameter_count} parameters, {frozen_parameter_count} frozen)"
+            f"({total_parameter_count}[{total_float_count}] parameters, {frozen_parameter_count} [{frozen_float_count}] frozen)"
         )
     else:
-        param_info = f"({total_parameter_count} parameters)"
+        param_info = f"({total_parameter_count} parameters, {total_float_count} floats)"
 
     logging.info(
         f"{Fore.CYAN} * {label} optimizer: {optimizer.__class__.__name__} {param_info} *{Style.RESET_ALL}"

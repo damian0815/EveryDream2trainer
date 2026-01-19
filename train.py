@@ -42,7 +42,7 @@ from diffusers import (
     StableDiffusionPipeline,
     FlowMatchEulerDiscreteScheduler,
 )
-from core.flow_match_model import TrainFlowMatchScheduler
+from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 # from diffusers.models import AttentionBlock
 # from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -51,10 +51,11 @@ import wandb
 import webbrowser
 from torch.utils.tensorboard import SummaryWriter
 from data.data_loader import DataLoaderMultiAspect
+from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
 from data.every_dream_validation import EveryDreamValidator
-from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
+from data.image_train_item import ImageTrainItem, ImageCaption, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
 from core.loss import (
     get_noise,
@@ -235,7 +236,7 @@ def setup_args(args):
         if args.initial_batch_size is None:
             args.initial_batch_size = args.optimizer_batch_size
         else:
-            logging.info(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.final_batch_sze}")
+            logging.info(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.final_batch_size}")
         if args.final_batch_size is None:
             args.final_batch_size = args.optimizer_batch_size
         else:
@@ -323,6 +324,25 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, glo
     logging.info(" Preloading images...")
 
     resolved_items = resolver.resolve(args.data_root, args, resolution, aspects)
+    """if args.explode_caption_dicts:
+        exploded_items = []
+        for item in resolved_items:
+            if not item.caption.startswith('<<json>>'):
+                exploded_items.append(item)
+            else:
+                dict = json.loads(item.caption.replace('<<json>>', ''))
+                for value in dict.values():
+                    new_item = deepcopy(item)
+                    new_item.caption = ImageCaption(
+                        main_prompt=value,
+                        rating=1.0,
+                        tags=[],
+                        tag_weights=[],
+                        max_target_length=DEFAULT_MAX_CAPTION_LENGTH,
+                        use_weights=False)
+                    exploded_items.append(new_item)
+        resolved_items = exploded_items
+    """
 
     # Remove erroneous items
     for item in resolved_items:
@@ -502,7 +522,7 @@ def main(args):
             logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
             teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
             if isinstance(teacher_pipeline.scheduler, FlowMatchEulerDiscreteScheduler):
-                teacher_pipeline.scheduler = TrainFlowMatchScheduler(shift=args.flow_match_shift)
+                teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler(shift=args.flow_match_shift)
                 teacher_prediction_type = 'flow_prediction'
             if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
                 logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
@@ -741,6 +761,7 @@ def main(args):
         contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
         cond_dropout_noise_p=args.cond_dropout_noise_p,
         use_masks=args.use_masks,
+        invert_masks=args.invert_masks,
     )
 
     torch.cuda.benchmark = False
@@ -1033,6 +1054,12 @@ def main(args):
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
                         # do backward now
                         optimizer_backward(ed_optimizer, tv, 'truncated backward: ')
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                    safe_backward_size = _get_safe_backward_size(gpu, model.device, image_pixel_count // 64)
+                    if safe_backward_size > tv.max_backward_slice_size and safe_backward_size:
+                        logging.info(f"at resolution {tv.batch_resolution} you could probably do backward={safe_backward_size} (you requested max {tv.max_backward_slice_size})")
 
                     if not args.disable_backward_memsafe and tv.batch_resolution not in args.disable_backward_memsafe_resolutions:
                         if gpu is not None:
@@ -1067,6 +1094,12 @@ def main(args):
                         else:
                             everything_contrastive_learning_p = args.everything_contrastive_learning_p
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
+
+                    if args.flow_match_shift_dynamic and type(model.noise_scheduler) == TrainFlowMatchEulerDiscreteScheduler:
+                        shift = 1.0 + 2.0 * (tv.batch_resolution / 1024) ** 2
+                        model.set_noise_scheduler_shift(shift)
+                        if teacher_model:
+                            teacher_model.set_noise_scheduler_shift(shift)
 
                     train_step(
                         full_batch=full_batch,
@@ -1266,6 +1299,29 @@ def main(args):
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
 
 
+def _get_safe_backward_size(gpu, device, num_latent_pixels: int) -> int:
+
+    # every forward latent pixel needs 0.4 MB to store graph
+    graph_bytes_per_latent_pixel = 0.4 * 1024**2
+    graph_bytes_per_sample = graph_bytes_per_latent_pixel * num_latent_pixels
+
+    _, gpu_total_mem_mb = gpu.get_gpu_memory()
+    memory_allocated = torch.cuda.memory_allocated(
+        device=device
+    )
+    gpu_free_mem_b = gpu_total_mem_mb * 1024**2 - memory_allocated
+
+    # observed empirically, backward() needs at least 2.2GB
+    # this appears to be independent of any freezing
+    # let's say 2.4 to be safe
+    backward_safety_margin = 2400 * 1024**2
+
+    graph_bytes_available = gpu_free_mem_b - backward_safety_margin
+    max_backward_size = graph_bytes_available // graph_bytes_per_sample
+    return max_backward_size
+
+
+
 def _get_safe_forward_size(gpu, device, num_image_pixels: int, is_sdxl: bool) -> int:
     gpu_used_mem_mb, gpu_total_mem_mb = gpu.get_gpu_memory()
     #gpu_free_mem_b = (gpu_total_mem_mb - gpu_used_mem_mb) * (1024 ** 2)
@@ -1375,8 +1431,8 @@ if __name__ == "__main__":
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
     argparser.add_argument("--resolution", type=int, nargs='+', default=[512], help="resolution(s) to train", choices=aspects.get_supported_resolutions())
     argparser.add_argument("--resolution_multiplier", type=float, nargs='+', default=[], help="multipliers to apply per-resolution (specify one per resolution, like --resolution_multiply <multiplier> [<multiplier>] ...)")
-    argparser.add_argument("--keep_same_sample_at_different_resolutions_together", action='store_true', help="if passed, re-order batches to put samples with the same path but different resolutions near to each other")
-    argparser.add_argument("--no_normalize_images", action='store_true', help="if passed, do not normalize image pixels")
+    argparser.add_argument("--keep_same_sample_at_different_resolutions_together", action=argparse.BooleanOptionalAction, help="if passed, re-order batches to put samples with the same path but different resolutions near to each other")
+    argparser.add_argument("--no_normalize_images", action=argparse.BooleanOptionalAction, help="if passed, do not normalize image pixels")
     argparser.add_argument("--resume_ckpt", type=str, required=not ('resume_ckpt' in args), default="sd_v1-5_vae.ckpt", help="The checkpoint to resume from, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1 ")
     argparser.add_argument("--resume_ckpt_variant", type=str, required=False, default=None, help="For Hugging Face repo resume_ckpts, the variant (eg fp16) - required for some models")
     argparser.add_argument("--run_name", type=str, required=False, default=None, help="Run name for wandb (child of project name), and comment for tensorboard, (def: None)")
@@ -1403,6 +1459,8 @@ if __name__ == "__main__":
     argparser.add_argument("--train_sampler", type=str, default="ddpm",
                            help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim", "flow-matching"])
     argparser.add_argument("--flow_match_shift", type=float, default=1.0, help="For flow-matching train sampler, the noise shift parameter (def: 1.0)")
+    argparser.add_argument("--flow_match_shift_dynamic", action=argparse.BooleanOptionalAction, default=False, help="If passed, set flow-matching shift dynamically based on resolution (target shift=3 @ 1024x1024)")
+
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
     argparser.add_argument("--validation_config", default=None, help="Path to a JSON configuration file for the validator.  Default is no validation.")
@@ -1453,7 +1511,7 @@ if __name__ == "__main__":
     argparser.add_argument("--everything_contrastive_learning_p", type=float, default=0, help="probability to run contrastive learning on everything, 0..1")
     argparser.add_argument("--everything_contrastive_learning_curriculum_alpha", type=float, default=0, help="if >0, attenuate everything_contrastive_learning_p to 0 using this alpha as timestep approaches 0")
     argparser.add_argument("--caption_variants", type=str, nargs="*", default=[], help="If passed, use only these caption variants from json captions")
-    argparser.add_argument("--all_caption_variants", action='store_true', help='if passed, use ALL caption variants every step')
+    argparser.add_argument("--all_caption_variants", action=argparse.BooleanOptionalAction, help='if passed, use ALL caption variants every step')
     argparser.add_argument("--use_compel", action='store_true', help='if passed, use Compel to process prompts with long-prompt support')
 
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
@@ -1461,6 +1519,8 @@ if __name__ == "__main__":
 
     argparser.add_argument("--jacobian_descent", action='store_true', help="Do Jacobian Descent (see torchjd). Uses more VRAM.")
     argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg.mask.png in the data folder and use as mask for the loss")
+    argparser.add_argument("--invert_masks", action=argparse.BooleanOptionalAction, help="If passed, invert the masks (white<->black)")
+    argparser.add_argument("--use_both_mask_sides_contrastive", action='store_true', help="If passed, when using masks, do contrastive learning between mask and inverted mask with negative loss (use --negative_loss_margin to control clamping)")
 
     argparser.add_argument("--lora", action='store_true', help="If passed, do LoRA training")
     argparser.add_argument("--lora_save_every_n_epochs", type=int, default=1)

@@ -14,10 +14,10 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 
-from core.flow_match_model import TrainFlowMatchScheduler
+from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import LogData
 from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
-    get_local_contrastive_flow_loss, apply_hinge_negative_loss, get_contrastive_flow_matching_loss
+    get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 
@@ -60,34 +60,43 @@ def train_step(
         # loss_scale = loss_scale.float() * (reference_image_size / image_size)
 
         assert type(batch["captions"]) is dict
+        caption_candidates = []
+        available_non_default = [k for k in batch["captions"].keys() if k != "default"]
+        if args.caption_variants:
+            available_requested = list(set(available_non_default).intersection(set(args.caption_variants)))
+            # add wildcards for each missing - this takes care of '*' as variant too
+            missing = max(0, len(args.caption_variants) - len(available_requested))
+            for _ in range(missing):
+                remaining = list(set(available_non_default) - set(available_requested))
+                if not remaining:
+                    break
+                available_requested.append(random.choice(remaining))
+            caption_candidates = available_requested
+        else:
+            caption_candidates = available_non_default
+
         if args.all_caption_variants:
             caption_counter = Counter()
+            # add requested captions
             for k in batch["captions"].keys():
-                if len(batch["captions"].keys()) > 1 and k == "default":
-                    continue
-                for image_index in range(len(batch["captions"][k])):
-                    if batch["captions"][k][image_index] is not None:
-                        caption_counter[k] += 1
+                if k in caption_candidates or (
+                    # only add 'default' if it's the only caption
+                    k == 'default'
+                    and len(batch["captions"].keys()) == 1
+                ):
+                    for image_index in range(len(batch["captions"][k])):
+                        if batch["captions"][k][image_index] is not None:
+                            caption_counter[k] += 1
             logging.info(
                 f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
             caption_variants = list(caption_counter.keys())
         else:
-            caption_candidates = []
-            available_non_default = [k for k in batch["captions"].keys() if k != "default"]
-
-            if args.caption_variants:
-                available_requested = list(set(available_non_default).intersection(set(args.caption_variants)))
-                if '*' in args.caption_variants:
-                    available_requested.append('*')
-
-                if available_requested:
-                    requested_choice = random.choice(available_requested)
-                    if requested_choice == '*':
-                        caption_candidates = available_non_default
-                    else:
-                        caption_candidates = [requested_choice]
-            else:
-                caption_candidates = available_non_default
+            if caption_candidates:
+                requested_choice = random.choice(caption_candidates)
+                if requested_choice == '*':
+                    caption_candidates = available_non_default
+                else:
+                    caption_candidates = [requested_choice]
 
             if len(caption_candidates) == 0:
                 caption_candidates.append("default")
@@ -204,7 +213,7 @@ def train_step(
                     (used_timestep_detached, loss_1d[i].mean().detach().item()))
 
             # apply any hinge negative loss modification
-            loss_1d = apply_hinge_negative_loss(loss_1d, loss_scale.to(loss_1d.device), margin=args.negative_loss_margin)
+            loss_1d = apply_negative_loss_hinge(loss_1d, (loss_scale < 0).to(loss_1d.device), margin=args.negative_loss_margin)
             loss_1d = loss_1d * loss_scale.abs().to(loss_1d.device)
 
             # take mean of all dimensions except batch, then divide through by a fixed batch size
@@ -241,13 +250,13 @@ def train_step(
                 logging.error("Inf or NaN detected in loss, dropping this loss batch. ")
 
             timesteps_to_log = (
-                TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps,
-                                                              timestep_values=model.noise_scheduler.timesteps)
+                TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timestep_indices=timesteps,
+                                                                           timestep_values=model.noise_scheduler.timesteps)
                 if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler)
                 else timesteps
             )
             for t in timesteps_to_log:
-                log_data.timestep_coverage[t.item()] += 1
+                log_data.timestep_coverage[int(t.item())] += 1
 
             steps_pbar.set_postfix(
                 {
@@ -646,11 +655,9 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, lo
         logging.warning("no accumulated loss images, not doing backward")
     else:
         try:
+            gc.collect()
+            torch.cuda.empty_cache()
             optimizer.backward(tv.accumulated_loss)
-        except torch.OutOfMemoryError:
-            logging.error(f"OOM step {tv.global_step} during optimizer.backward of {tv.accumulated_loss_images_count} accumulated loss images @resolution {tv.batch_resolution}")
-            raise
-        try:
             if not optimizer.use_grad_scaler:
                 # if we have a grad scaler it suppresses NaN/Inf for us.
                 # otherwise, we have to suppress NaN/Inf manually
@@ -666,6 +673,9 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, lo
             )
             optimizer._zero_grad(set_to_none=True)
             tv.backwarded_images_count = 0
+        except torch.OutOfMemoryError:
+            logging.error(f"OOM step {tv.global_step} during optimizer.backward of {tv.accumulated_loss_images_count} accumulated loss images @resolution {tv.batch_resolution}")
+            logging.error(f" -> dropping this batch of {tv.accumulated_loss_images_count} accumulated loss images")
 
         tv.clear_accumulated_loss()
 

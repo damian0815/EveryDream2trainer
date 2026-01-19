@@ -13,7 +13,7 @@ from scipy.stats import beta as sp_beta
 
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
 
-from core.flow_match_model import TrainFlowMatchScheduler
+from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.loss_softrepa import (
     text_weighted_infonce_loss,
     text_weighted_infonce_loss_with_softrepa,
@@ -62,11 +62,6 @@ def get_loss(
     # logging.info(f"get_loss timesteps: {timesteps.detach().cpu().tolist()}")
     device = model_pred.device
 
-    if mask_img is not None:
-        mask_img = mask_img.repeat(1, target.shape[1], 1, 1).to(device)
-    else:
-        mask_img = torch.ones_like(target).to(device)
-
     non_contrastive_loss = compute_basic_loss(args.loss_type, model_pred, target, timesteps, noise_scheduler)
     non_contrastive_loss *= get_timestep_weight(timesteps,
                                                 loss_shape=non_contrastive_loss.shape,
@@ -77,7 +72,7 @@ def get_loss(
 
     num_valid_contrastive_samples = (~is_cond_dropout.cpu() & ~negative_loss_mask.cpu()).sum()
     if not do_contrastive_learning or num_valid_contrastive_samples <= 1:
-        return non_contrastive_loss * mask_img
+        return _apply_mask_image(non_contrastive_loss, mask_img, both_sides=args.use_both_mask_sides_contrastive, hinge_negative_margin=args.negative_loss_margin)
 
     assert negative_loss_mask.sum() == 0, "negative loss not implemented"
 
@@ -225,10 +220,23 @@ def get_loss(
             f" - contrastive loss: {contrastive_loss.mean(dim=(1, 2, 3)).detach().cpu().tolist()} mean: {contrastive_loss.mean()}\n"
             f" - non-contrastive loss: {non_contrastive_loss.mean(dim=(1, 2, 3)).detach().cpu().tolist()} mean: {non_contrastive_loss.mean()}\n"
         )
-    total_loss = (
+    total_loss = _apply_mask_image(
         non_contrastive_loss + contrastive_loss * contrastive_loss_scale
-    ) * mask_img
+    , mask_img, both_sides=args.use_both_mask_sides_contrastive, hinge_negative_margin=args.negative_loss_margin)
     return total_loss
+
+
+def _apply_mask_image(loss: torch.Tensor, mask_img: torch.Tensor|None, both_sides: bool=False, hinge_negative_margin=None) -> torch.Tensor:
+    if mask_img is None:
+        return loss
+    # expand from single channel to RGB
+    mask_img = mask_img.repeat(1, loss.shape[1], 1, 1).to(loss.device)
+    if both_sides:
+        #print("applying both sides mask with hinge negative loss")
+        negative_loss = apply_negative_loss_hinge(loss, mask=torch.ones_like(loss).bool(), margin=hinge_negative_margin)
+        return loss * mask_img + negative_loss * (1 - mask_img)
+    else:
+        return loss * mask_img
 
 
 def compute_basic_loss(
@@ -267,7 +275,9 @@ def compute_basic_loss(
 
     elif loss_type.startswith("sd3-"):
         # SD3 loss weight
-        sigmas = timesteps / noise_scheduler.config.num_train_timesteps
+        if not isinstance(noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+            raise NotImplementedError("SD3 loss weighting only implemented for TrainFlowMatchEulerDiscreteScheduler")
+        sigmas = TrainFlowMatchEulerDiscreteScheduler.get_shifted_sigmas(timestep_indices=timesteps, timestep_values=noise_scheduler.timesteps)
         if loss_type == "sd3-cosmap":
             weighting_scheme = "cosmap"
         elif loss_type == "sd3-sigma_sqrt":
@@ -310,7 +320,7 @@ def get_timestep_weight(
     timesteps: torch.Tensor, loss_shape, min_snr_gamma, loss_mode_scale, noise_scheduler
 ) -> torch.Tensor:
     if min_snr_gamma is not None and min_snr_gamma > 0:
-        if type(noise_scheduler) is TrainFlowMatchScheduler:
+        if type(noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
             t = timesteps / noise_scheduler.config.num_train_timesteps
             snr = (1 - t) / (t + 1e-8)  # Linear approximation
             snr_weight = torch.minimum(snr, torch.tensor(min_snr_gamma)) / (
@@ -428,17 +438,17 @@ def get_model_prediction_and_target(
     )
     target = _get_target(latents, noise, model.noise_scheduler, timesteps).to(dtype=model.unet.dtype)
 
-    if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler):
-        unet_timesteps = TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=model.noise_scheduler.timesteps)
-    else:
-        unet_timesteps = timesteps
+    #if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler):
+    #    unet_timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=model.noise_scheduler.timesteps)
+    #else:
+    #    unet_timesteps = timesteps
 
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
         model_pred = model.unet(
             noisy_latents.to(dtype=model.unet.dtype),
-            unet_timesteps.to(model.unet.device, dtype=model.unet.dtype),
+            timesteps.to(model.unet.device, dtype=model.unet.dtype),
             encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
             added_cond_kwargs=(
                 conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
@@ -464,7 +474,7 @@ def get_model_prediction_and_target(
                     teacher_conditioning=teacher_conditioning,
                     student_model=model,
                     timesteps=timesteps,
-                    student_unet_timesteps=unet_timesteps,
+                    student_unet_timesteps=timesteps,
                     clean_image_latents=latents,
                     noise=noise,
                 )
@@ -493,7 +503,7 @@ def _get_noisy_latents(
     if hasattr(noise_scheduler, "add_noise"):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
     elif isinstance(noise_scheduler, FlowMatchEulerDiscreteScheduler):
-        shifted_timesteps = TrainFlowMatchScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=noise_scheduler.timesteps)
+        shifted_timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=noise_scheduler.timesteps)
         noisy_latents = noise_scheduler.scale_noise(latents, shifted_timesteps, noise)
     else:
         raise RuntimeError("Noise scheduler has no method to add noise to latents (tried .add_noise() and .scale_noise())")
@@ -901,7 +911,7 @@ def _remap_noise_v_pred_to_flow_matching(
 def _get_ddpm_timesteps_for_flowmatch_timesteps(
     flowmatch_timesteps: torch.Tensor,
     ddpm_scheduler: SchedulerMixin,
-    flowmatch_scheduler: TrainFlowMatchScheduler,
+    flowmatch_scheduler: TrainFlowMatchEulerDiscreteScheduler,
 ) -> torch.Tensor:
     assert flowmatch_timesteps.dtype not in [
         torch.int64,
@@ -987,12 +997,12 @@ def get_local_contrastive_flow_loss(
         contrastive_losses_full[low_noise_timesteps_mask] = contrastive_losses_masked
     return contrastive_losses_full
 
-def apply_hinge_negative_loss(loss: torch.Tensor, loss_scale: torch.Tensor, margin):
-    assert loss.shape == loss_scale.shape
+def apply_negative_loss_hinge(loss: torch.Tensor, mask: torch.Tensor, margin):
+    assert loss.shape == mask.shape
     # where loss_scale < 0, apply a "hinge" negative loss
     # hinge_loss=max(0,m−loss)
     return torch.where(
-        loss_scale < 0,
+        mask,
         torch.clamp(margin - loss, min=0.0),
         loss,
     )

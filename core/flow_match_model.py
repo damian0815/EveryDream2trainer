@@ -6,8 +6,7 @@ import torch
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
 from diffusers.configuration_utils import register_to_config
 
-
-class TrainFlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
+class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
     @classmethod
     def from_pretrained(
@@ -46,6 +45,16 @@ class TrainFlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
         # so we need to reverse the indices
         indices_reversed = len(timestep_values) - 1 - timestep_indices.cpu()
         return timestep_values[indices_reversed]
+
+    @staticmethod
+    def get_shifted_sigmas(timestep_indices, timestep_values):
+        """ For incoming timestep indices (from 0 to num_train_timesteps-1), get the sigmas incorporating any shift """
+        assert timestep_indices.min() >= 0 and timestep_indices.max() < len(timestep_values), \
+            f"Timestep indices should be >=0, <{len(timestep_values)} but got min {timestep_indices.min()} max {timestep_indices.max()}"
+
+        indices_reversed = len(timestep_values) - 1 - timestep_indices.cpu()
+        return timestep_values[indices_reversed] / len(timestep_values)
+
 
     def get_timestep_indices(self, exact_timesteps: torch.Tensor):
         """ For incoming exact timesteps, get the corresponding timestep indices (from 0 to num_train_timesteps-1) """

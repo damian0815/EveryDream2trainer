@@ -511,3 +511,5 @@ def get_generate_step_indices(epoch, epoch_length_steps, every_n_epochs: float, 
         # if an epoch has eg 100 steps and num_divisions is 2, then validation should occur after steps 49 and 99
         generate_every_n_steps = epoch_length_steps / num_divisions
         return [offset + math.ceil((i+1)*generate_every_n_steps) - 1 for i in range(num_divisions)]
+
+

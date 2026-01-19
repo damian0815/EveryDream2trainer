@@ -334,7 +334,7 @@ class ImageTrainItem:
             logging.error(f"fatal error trimming image {self.pathname}: {e}")
             raise e
 
-    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, return_crop_info=False
+    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, invert_mask=False, return_crop_info=False
                 ) -> typing.Union['ImageTrainItem',
                                   tuple['ImageTrainItem', tuple[int, int, int, int]]]:
         try:
@@ -394,6 +394,8 @@ class ImageTrainItem:
 
         if self.mask is not None:
             self.mask = np.array(self.mask.convert('L')).astype(np.float32) / 255
+            if invert_mask:
+                self.mask = 1 - self.mask
             if np.count_nonzero(self.mask) == 0:
                 logging.warning(f"mask for {self.pathname} has no non-black pixels - setting to None")
                 self.mask = None
