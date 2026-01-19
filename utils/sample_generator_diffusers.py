@@ -19,6 +19,7 @@ import math
 
 from tqdm.auto import tqdm
 
+from core.flow_match_model import SDPipelineInferenceFlowMatchEulerDiscreteScheduler
 from core.semaphore_files import check_semaphore_file_and_unlink, _INTERRUPT_SAMPLES_SEMAPHORE_FILE
 
 _RE_COMBINE_WHITESPACE = re.compile(r"\s+")
@@ -231,11 +232,7 @@ def create_scheduler(name, scheduler_config: dict):
     elif scheduler == 'kdpm_2_a':
         return KDPM2AncestralDiscreteScheduler.from_config(scheduler_config)
     elif scheduler == "flow-matching":
-        scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
-        # hack for StableDiffusionPipeline support
-        scheduler.init_noise_sigma = 1
-        scheduler.scale_model_input = lambda x, t: x
-        return scheduler
+        return SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
     else:
 
         raise ValueError(f"unknown scheduler '{scheduler}'")

@@ -23,7 +23,7 @@ from diffusers import (
     DPMSolverSDEScheduler,
     DPMSolverSinglestepScheduler,
     FlowMatchEulerDiscreteScheduler,
-    StableDiffusionXLPipeline,
+    StableDiffusionXLPipeline, FlowMatchHeunDiscreteScheduler,
 )
 
 from torch.cuda.amp import autocast
@@ -33,6 +33,7 @@ from tqdm.auto import tqdm
 from compel import CompelForSD
 import traceback
 
+from core.flow_match_model import SDPipelineInferenceFlowMatchEulerDiscreteScheduler
 from model.training_model import TrainingModel
 from core.semaphore_files import check_semaphore_file_and_unlink
 from utils.sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
@@ -287,6 +288,15 @@ class SampleGenerator:
                                 (prompts, negative_prompts) if conditioning is None else (None, None)
                             )
 
+                            resolution_dynamic_shift = True
+                            if resolution_dynamic_shift and isinstance(pipe.scheduler, SDPipelineInferenceFlowMatchEulerDiscreteScheduler):
+                                image_pixel_count = size[0] * size[1]
+                                # for exponential shift, we go from 0 to 3 over 1 megapixel
+                                shift = 3.0 * (image_pixel_count / 1024**2)
+                                pipe.scheduler.set_shift(shift)
+                                #pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
+                                print("updated scheduler with shift", shift, " -> timesteps", pipe.scheduler.timesteps_with_shift)
+
                             images = pipe(
                                 prompt=prompt,
                                 prompt_embeds=embeds,
@@ -407,12 +417,7 @@ class SampleGenerator:
             scheduler = 'ddim'
 
         if scheduler == 'flow-matching':
-            scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
-            # hack for StableDiffusionPipeline support
-            scheduler.init_noise_sigma = 1
-            scheduler.scale_model_input = lambda x, t: x
-            return scheduler
-
+            return SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
         elif scheduler == 'ddim':
             return DDIMScheduler.from_config(scheduler_config)
         elif scheduler == 'dpm++_2s':

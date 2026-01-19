@@ -48,7 +48,7 @@ def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=No
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "flow-matching":
         logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        noise_scheduler = TrainFlowMatchEulerDiscreteScheduler(shift=flow_match_shift)
+        noise_scheduler = TrainFlowMatchEulerDiscreteScheduler()
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
         noise_scheduler = DDPMScheduler.from_config(scheduler.config,
@@ -209,7 +209,7 @@ class TrainingModel:
         # assumption: we're always training the unet
         return self.unet.dtype
 
-    noise_scheduler: SchedulerMixin|ConfigMixin
+    noise_scheduler: SchedulerMixin|ConfigMixin|TrainFlowMatchEulerDiscreteScheduler
     text_encoder: CLIPTextModel
     text_encoder_2: CLIPTextModel|None
     tokenizer: CLIPTokenizer
@@ -240,7 +240,9 @@ class TrainingModel:
 
     def set_noise_scheduler_shift(self, shift):
         assert isinstance(self.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler), "Noise scheduler is not TrainFlowMatchEulerDiscreteScheduler"
-        self.noise_scheduler = TrainFlowMatchEulerDiscreteScheduler(shift=shift)
+        self.noise_scheduler.set_timesteps(num_inference_steps=self.noise_scheduler.config.num_train_timesteps,
+                                           mu=shift)
+        print("set noise scheduler shift to", shift, " -> timesteps:", self.noise_scheduler.timesteps)
 
     def load_vae_to_device(self, device):
         self.vae.to(device)
@@ -695,6 +697,7 @@ def load_model(args) -> TrainingModel:
         yaml=yaml,
         compel=compel
     )
+    model_being_trained.set_noise_scheduler_shift(args.flow_match_shift)
     return model_being_trained
 
 

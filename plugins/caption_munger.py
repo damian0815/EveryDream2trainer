@@ -43,11 +43,12 @@ config_path = 'caption_munger_config.json'
 class CaptionMungerPlugin(BasePlugin):
 
     tokenizer: CLIPTokenizer|None = None
-    config: dict
+    config: dict = {}
     per_file_prepend_append: dict[str, str] = {}
     per_file_prepend_append_p: float = 0.5
 
-    def on_training_start(self, **kwargs):
+    def __init__(self):
+        super().__init__()
         if os.path.exists(config_path):
             logging.info(" * CaptionMungerPlugin: loading config from " + config_path)
             with open(config_path, 'r') as f:
@@ -79,6 +80,9 @@ class CaptionMungerPlugin(BasePlugin):
 
             logging.info(f" * CaptionMungerPlugin: loaded per-file prepend/append for {len(self.per_file_prepend_append)} files")
 
+
+    def on_training_start(self, **kwargs):
+        pass
 
     def on_model_load(self, **kwargs):
         self.tokenizer = kwargs['tokenizer']

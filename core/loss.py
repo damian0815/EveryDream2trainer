@@ -1019,10 +1019,10 @@ def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_
     references = torch.randperm(B).tolist()
     contrastive_losses_count = 0
     for ref_idx in references:
-        if not mask[ref_idx].item():
+        if mask[ref_idx].item():
             continue
         choices = [i for i in range(B)
-                   if i != ref_idx and not mask[i].item() and unique_identifiers[i] != unique_identifiers[ref_idx]]
+                   if i != ref_idx and mask[i].item() and unique_identifiers[i] != unique_identifiers[ref_idx]]
         if len(choices) == 0:
             continue
         neg_idx = random.choice(choices)

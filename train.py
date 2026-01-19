@@ -522,8 +522,7 @@ def main(args):
             logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
             teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
             if isinstance(teacher_pipeline.scheduler, FlowMatchEulerDiscreteScheduler):
-                teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler(shift=args.flow_match_shift)
-                teacher_prediction_type = 'flow_prediction'
+                teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler()
             if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
                 logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
 
@@ -1096,7 +1095,8 @@ def main(args):
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
                     if args.flow_match_shift_dynamic and type(model.noise_scheduler) == TrainFlowMatchEulerDiscreteScheduler:
-                        shift = 1.0 + 2.0 * (tv.batch_resolution / 1024) ** 2
+                        shift = 1.0 + 2.0 * (image_pixel_count / 1024**2)
+                        print('at resolution', image_pixel_count ** 0.5, ', shift is ', shift)
                         model.set_noise_scheduler_shift(shift)
                         if teacher_model:
                             teacher_model.set_noise_scheduler_shift(shift)

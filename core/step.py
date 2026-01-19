@@ -843,15 +843,20 @@ def _do_model_forward(
             del target, teacher_target
 
             if do_local_contrastive_flow_loss:
-                mask = (timesteps_slice < args.local_contrastive_flow_timestep_threshold)
+                if type(model.noise_scheduler) is not TrainFlowMatchEulerDiscreteScheduler:
+                    raise NotImplementedError("Local Contrastive Flow loss only works with flow matching scheduler")
+                lcf_timestep_threshold = model.noise_scheduler.get_best_timestep_for_sigma(0.2)
+                mask = (timesteps_slice < lcf_timestep_threshold)
                 if torch.sum(mask) == 0:
                     model_pred_anchor = torch.zeros_like(model_pred)
                 else:
+                    anchor_timestep = model.noise_scheduler.get_best_timestep_for_sigma(0.5)
+                    anchor_timesteps_slice = torch.full_like(timesteps_slice, anchor_timestep)
                     model_pred_anchor, _, _, _ = get_model_prediction_and_target(
                         latents=noisy_latents,
                         conditioning=conditioning_slice,
                         noise=noise_slice,
-                        timesteps=timesteps_slice,
+                        timesteps=anchor_timesteps_slice,
                         model=model,
                         args=args,
                         teacher_model=None,
@@ -948,8 +953,9 @@ def _do_loss(
 
     if model_pred_anchor is not None:
         # doing local contrastive flow loss
+        lcf_timestep_threshold = model.noise_scheduler.get_best_timestep_for_sigma(0.2)
         mask = (~negative_loss_mask).to(model.device) & (
-            timesteps < args.local_contrastive_flow_timestep_threshold
+            timesteps < lcf_timestep_threshold
         )
         log_writer.add_scalar("loss/LCF sample count", mask.detach().sum().item(), global_step=tv.global_step)
         pathnames_resolved = [
