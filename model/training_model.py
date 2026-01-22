@@ -242,7 +242,7 @@ class TrainingModel:
         assert isinstance(self.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler), "Noise scheduler is not TrainFlowMatchEulerDiscreteScheduler"
         self.noise_scheduler.set_timesteps(num_inference_steps=self.noise_scheduler.config.num_train_timesteps,
                                            mu=shift)
-        print("set noise scheduler shift to", shift, " -> timesteps:", self.noise_scheduler.timesteps)
+        #print("set noise scheduler shift to", shift, " -> timesteps:", self.noise_scheduler.timesteps)
 
     def load_vae_to_device(self, device):
         self.vae.to(device)

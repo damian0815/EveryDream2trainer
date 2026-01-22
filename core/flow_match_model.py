@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Callable, Optional, Union
 from typing_extensions import Self
@@ -36,6 +37,7 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(self, **kwargs):
         # 'exponential' time shift matches SD3
         super().__init__(**kwargs, shift=1, use_dynamic_shifting=True, time_shift_type='exponential')
+        assert self.config.use_dynamic_shifting, "use_dynamic_shifting must be true"
         print('__init__ shift saved:', super().shift)
         self.config.prediction_type = "flow_prediction"
 
@@ -91,16 +93,28 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
 class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
-    def __init__(self, **kwargs):
-        kwargs.pop('shift', None)
+    @classmethod
+    def from_config(cls, config, **kwargs):
+        config = dict(config)  # Make a copy to avoid mutating the original
+        config['shift'] = 1
+        config['use_dynamic_shifting'] = True
+        config['time_shift_type'] = 'exponential'
         kwargs.pop('use_dynamic_shifting', None)
+        kwargs.pop('shift', None)
         kwargs.pop('time_shift_type', None)
-        time_shift_type = 'exponential' # don't change without matching training
-        super().__init__(**kwargs, shift=1, use_dynamic_shifting=True, time_shift_type=time_shift_type)
+        # call base config mixin using my class
+        return ConfigMixin.from_config.__func__(
+            cls, config, **kwargs
+        )
+
+    @register_to_config
+    def __init__(self, use_dynamic_shifting=True, time_shift_type='exponential', shift=1, **kwargs):
+        assert use_dynamic_shifting, "use_dynamic_shifting must be true"
+        assert time_shift_type == 'exponential', "only 'exponential' time_shift_type is supported"
+        super().__init__(use_dynamic_shifting=use_dynamic_shifting, time_shift_type=time_shift_type, shift=shift, **kwargs)
         self.shift_to_hack_in = 1
         self.timesteps_no_shift = None   # populated in set_timesteps
         self.timesteps_with_shift = None # populated in set_timesteps
-        self.set_timesteps(self.config.num_train_timesteps, device='cpu')
 
     @property
     def init_noise_sigma(self):
@@ -114,6 +128,7 @@ class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteS
         self.shift_to_hack_in = shift
 
     def add_noise(self, latents, noise, timesteps):
+        assert self.config.use_dynamic_shifting, "use_dynamic_shifting must be true"
         print("timesteps input: ", timesteps.cpu().tolist())
         print("schedule for unet: ", self.timesteps_no_shift)
         indices_reversed = torch.nonzero(self.timesteps_no_shift.cpu() == timesteps.cpu(), as_tuple=False)[:, 0]
@@ -126,7 +141,9 @@ class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteS
 
     def set_timesteps(self, num_inference_steps, device, **kwargs):
         if 'mu' in kwargs:
+            logging.warning("Overriding mu in set_timesteps is not supported in SDPipelineInferenceFlowMatchEulerDiscreteScheduler")
             del kwargs['mu']
+        assert self.config.use_dynamic_shifting, "use_dynamic_shifting must be true"
         # construct timesteps with and without shift.
         # during inference, we need to use the shifted timesteps in the step and add_noise functions
         # however the unet forward must be passed the unshifted timesteps.
@@ -141,7 +158,7 @@ class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteS
              sample: torch.FloatTensor, **kwargs
     ):
         # During inference, apply shift
-        print('in overridden step(), timestep=', timestep, 'kwargs', kwargs)
+        #print('in overridden step(), timestep=', timestep, 'kwargs', kwargs)
         if not isinstance(timestep, torch.Tensor):
             timestep = torch.tensor(timestep)
         if timestep.ndim == 0:
@@ -156,11 +173,11 @@ class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteS
         super().set_timesteps(len(self.timesteps), device=sample.device, mu=self.shift_to_hack_in)
         # adjust input timestep
         shifted_timestep = self.timesteps[timestep_index].squeeze(0)
-        print('shifted from', timestep, 'via', timestep_index, 'to', shifted_timestep)
+        #print('shifted from', timestep, 'via', timestep_index, 'to', shifted_timestep)
 
         # do step with shifted timesteps
         result = super().step(model_output, timestep=shifted_timestep, sample=sample, **kwargs)
-        print(' -> next step index', self.step_index, "next sigma", self.sigmas[self.step_index])
+        #print(' -> next step index', self.step_index, "next sigma", self.sigmas[self.step_index])
 
         # revert timesteps to unshifted
         super().set_timesteps(len(self.timesteps), device=sample.device, mu=0)

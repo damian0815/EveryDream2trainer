@@ -311,6 +311,18 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                 cfgs = [p0.cfg] + extra_cfgs
                 for cfg in cfgs:
                     generator = [torch.Generator(device=generator_device).manual_seed(p.seed) for p in batch]
+
+                    resolution_dynamic_shift = True
+                    if resolution_dynamic_shift and isinstance(pipe.scheduler,
+                                                               SDPipelineInferenceFlowMatchEulerDiscreteScheduler):
+                        image_pixel_count = p0.width * p0.height
+                        # for exponential shift, we go from 0 to 3 over 1 megapixel
+                        shift = 3.0 * (image_pixel_count / 1024 ** 2)
+                        pipe.scheduler.set_shift(shift)
+                        # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
+                        print("updated scheduler with shift", shift, " -> timesteps",
+                              pipe.scheduler.timesteps_with_shift)
+
                     images = pipe(prompt=prompt,
                                   prompt_embeds=embeds,
                                   pooled_prompt_embeds=pooled_embeds,

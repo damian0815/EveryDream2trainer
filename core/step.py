@@ -873,9 +873,9 @@ def _do_model_forward(
                 torch.OutOfMemoryError,
         ):
             logging.error(
-                f"OOM step {tv.global_step} in unet forward @resolution {tv.batch_resolution} slice size {tv.forward_slice_size}, from latents "
+                f"OOM step {tv.global_step} in unet forward @resolution {tv.batch_resolution} slice size {tv.forward_slice_size}, from latents " 
                 f"of shape {latents_slice.shape} (samples {slice_start} to {slice_end} of {batch_size}). "
-                f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.readlink(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant]}, timesteps: {timesteps_slice.detach().cpu().tolist()}"
+                f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.path.realpath(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant]}, timesteps: {timesteps_slice.detach().cpu().tolist()}"
             )
             raise
 
@@ -983,8 +983,9 @@ def _do_loss(
             timesteps=timesteps,
             noise_scheduler=model.noise_scheduler,
             mask=~negative_loss_mask,
+            amount=args.contrastive_flow_matching_loss_lambda
         )
-        loss += loss_cfm.to(dtype=loss.dtype) * args.contrastive_flow_matching_loss_lambda
+        loss += loss_cfm.to(dtype=loss.dtype)
 
     log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
 

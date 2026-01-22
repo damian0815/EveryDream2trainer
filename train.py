@@ -1095,8 +1095,8 @@ def main(args):
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
                     if args.flow_match_shift_dynamic and type(model.noise_scheduler) == TrainFlowMatchEulerDiscreteScheduler:
-                        shift = 1.0 + 2.0 * (image_pixel_count / 1024**2)
-                        print('at resolution', image_pixel_count ** 0.5, ', shift is ', shift)
+                        shift = 3.0 * (image_pixel_count / 1024**2)
+                        #print('at resolution', image_pixel_count ** 0.5, ', shift is ', shift)
                         model.set_noise_scheduler_shift(shift)
                         if teacher_model:
                             teacher_model.set_noise_scheduler_shift(shift)

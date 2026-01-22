@@ -1008,11 +1008,11 @@ def apply_negative_loss_hinge(loss: torch.Tensor, mask: torch.Tensor, margin):
     )
 
 
-def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_type, timesteps, noise_scheduler, mask):
+def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_type, timesteps, noise_scheduler, mask, amount: float):
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
-    K = mask.sum()-1  # number of negatives
+    K = min(mask.sum()-1, 1/amount)  # number of negatives - cap by lambda to avoid to much negative influence
 
     contrastive_losses = torch.zeros_like(v_pred)
     # pick K random reference indices
@@ -1039,7 +1039,7 @@ def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_
         if contrastive_losses_count >= K:
             break
 
-    return -contrastive_losses
+    return -contrastive_losses * amount
 
 def get_contrastive_class_loss(clean_latents, noise, model_pred, timesteps,
                                noise_scheduler, class_labels: list[dict[str, set[str]]],

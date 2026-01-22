@@ -1,0 +1,39 @@
+#! /bin/bash
+
+base_tsp=$(which tsp)
+max_used_gb=190
+tsp_state_file="$HOME/tsp_state"
+
+# Wrap task spooler executions in vastai space safety checks and store tsp state
+
+# check if args start with 'python' or 'bash'
+if [[ "$1" != "python"* && "$1" != "bash"* ]]; then
+    # just call base tsp
+    $base_tsp "$@"
+    exit $?
+fi
+
+# save tsp state
+
+if [[ "$1" == "python"* ]]; then
+    echo "Checking that disk usage is < $max_used_gb GB before queuing python task..."
+    # check disk usage
+    used_bytes=$(du / --max-depth=0 -B1 | cut -f1)
+    used_gb=$((used_bytes / 1024 / 1024 / 1024))
+    if [[ $used_gb -gt $max_used_gb ]]; then
+        echo "Disk usage is above $max_used_gb GB ($used_gb GB). Please clean up some space before running new tasks."
+        exit 1
+    fi
+    echo "Disk usage is $used_gb GB, which is below the limit of $max_used_gb GB. Proceeding to queue task."
+fi
+
+# backup
+cp "$tsp_state_file.bak" "$tsp_state_file.bak2"
+cp "$tsp_state_file" "$tsp_state_file.bak"
+
+$base_tsp "$@"
+echo "tsp state saved to $tsp_state_file"
+
+# save state after execution
+$base_tsp -l > "$tsp_state_file"
+
