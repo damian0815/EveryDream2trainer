@@ -60,7 +60,6 @@ def train_step(
         # loss_scale = loss_scale.float() * (reference_image_size / image_size)
 
         assert type(batch["captions"]) is dict
-        caption_candidates = []
         available_non_default = [k for k in batch["captions"].keys() if k != "default"]
         if args.caption_variants:
             available_requested = list(set(available_non_default).intersection(set(args.caption_variants)))
@@ -87,8 +86,8 @@ def train_step(
                     for image_index in range(len(batch["captions"][k])):
                         if batch["captions"][k][image_index] is not None:
                             caption_counter[k] += 1
-            logging.info(
-                f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
+            #logging.info(
+            #    f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
             caption_variants = list(caption_counter.keys())
         else:
             if caption_candidates:
@@ -139,6 +138,9 @@ def train_step(
                 share_timesteps=batch["do_contrastive_learning"] or args.batch_share_timesteps,
                 args=args
             )
+            # apply shift
+            if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+                timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
 
             _apply_cond_dropout(batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
             teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=timesteps, teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
@@ -249,14 +251,13 @@ def train_step(
             except InfOrNanException:
                 logging.error("Inf or NaN detected in loss, dropping this loss batch. ")
 
-            timesteps_to_log = (
-                TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timestep_indices=timesteps,
-                                                                           timestep_values=model.noise_scheduler.timesteps)
-                if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler)
-                else timesteps
-            )
-            for t in timesteps_to_log:
+            for t in timesteps:
                 log_data.timestep_coverage[int(t.item())] += 1
+                log_data.cumulative_timestep_coverage[int(t.item())] += 1
+            #timesteps_shifted = model.noise_scheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
+            #for t in timesteps_shifted:
+            #    log_data.cumulative_timestep_shifted_coverage[int(t.item())] += 1
+            #del timesteps_shifted
 
             steps_pbar.set_postfix(
                 {
@@ -954,7 +955,7 @@ def _do_loss(
     if model_pred_anchor is not None:
         # doing local contrastive flow loss
         lcf_timestep_threshold = model.noise_scheduler.get_best_timestep_for_sigma(0.2)
-        mask = (~negative_loss_mask).to(model.device) & (
+        mask = (~negative_loss_mask).to(timesteps.device) & (
             timesteps < lcf_timestep_threshold
         )
         log_writer.add_scalar("loss/LCF sample count", mask.detach().sum().item(), global_step=tv.global_step)

@@ -288,11 +288,11 @@ class SampleGenerator:
                                 (prompts, negative_prompts) if conditioning is None else (None, None)
                             )
 
-                            resolution_dynamic_shift = True
-                            if resolution_dynamic_shift and isinstance(pipe.scheduler, SDPipelineInferenceFlowMatchEulerDiscreteScheduler):
+                            if isinstance(pipe.scheduler, SDPipelineInferenceFlowMatchEulerDiscreteScheduler) and pipe.scheduler.config.use_dynamic_shifting:
                                 image_pixel_count = size[0] * size[1]
-                                # for exponential shift, we go from 0 to 3 over 1 megapixel
-                                shift = 3.0 * (image_pixel_count / 1024**2)
+                                # for linear shift, we go from 1 to 3 over 1 megapixel
+                                assert pipe.scheduler.config.time_shift_type == 'linear'
+                                shift = 1.0 + 2.0 * (image_pixel_count / 1024 ** 2)
                                 pipe.scheduler.set_shift(shift)
                                 #pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                                 print("updated scheduler with shift", shift)
@@ -365,7 +365,9 @@ class SampleGenerator:
                         invokeai_info_dicts = json.load(f)
                     self.generate_invokeai_samples(invokeai_info_dicts, pipe=pipe,
                                                    global_step=global_step, extra_info=extra_info,
-                                                   index_offset=len(self.sample_requests))
+                                                   index_offset=len(self.sample_requests),
+                                                   flow_match_shift=pipe.scheduler.config.get('shift', 1),
+                                                   flow_match_shift_dynamic=pipe.scheduler.config.get('use_dynamic_shifting', False))
 
             except Exception as e:
                     print(traceback.format_exc())
@@ -396,11 +398,11 @@ class SampleGenerator:
         del tfimage
 
     @torch.no_grad()
-    def create_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config: dict=None, **kwargs) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
+    def create_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config, flow_match_shift=1, flow_match_shift_dynamic=False) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
         """
         creates a pipeline for SD inference
         """
-        scheduler = self._create_scheduler(diffusers_scheduler_config)
+        scheduler = self._create_scheduler(diffusers_scheduler_config, flow_match_shift, flow_match_shift_dynamic)
         pipe = model_being_trained.build_inference_pipeline(scheduler=scheduler)
         if self.use_xformers:
             pipe.enable_xformers_memory_efficient_attention()
@@ -408,7 +410,7 @@ class SampleGenerator:
 
 
     @torch.no_grad()
-    def _create_scheduler(self, scheduler_config: dict):
+    def _create_scheduler(self, scheduler_config: dict, flow_match_shift: int, flow_match_shift_dynamic: bool):
         scheduler = self.scheduler
         if scheduler not in ['ddim', 'pndm', 'ddpm', 'lms', 'euler', 'euler_a', 'kdpm2', 'dpm++',
                              'dpm++_2s', 'dpm++_2m', 'dpm++_sde', 'dpm++_2m_sde',
@@ -417,7 +419,8 @@ class SampleGenerator:
             scheduler = 'ddim'
 
         if scheduler == 'flow-matching':
-            return SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+            return SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(
+                scheduler_config, shift=flow_match_shift, use_dynamic_shifting=flow_match_shift_dynamic, time_shift_type='linear')
         elif scheduler == 'ddim':
             return DDIMScheduler.from_config(scheduler_config)
         elif scheduler == 'dpm++_2s':
@@ -451,7 +454,7 @@ class SampleGenerator:
         else:
             raise ValueError(f"unknown scheduler '{scheduler}'")
 
-    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0):
+    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0, flow_match_shift=1, flow_match_shift_dynamic=False):
 
         params = [ImageGenerationParams.from_invokeai_metadata(d)
                   for d in sample_invokeai_info_dicts]
@@ -466,7 +469,9 @@ class SampleGenerator:
                                   batch_size=self.batch_size,
                                   image_save_cb=save_image,
                                   extra_cfgs=self.cfgs[1:],
-                                  index_offset=index_offset)
+                                  index_offset=index_offset,
+                                  flow_match_shift=flow_match_shift,
+                                  flow_match_shift_dynamic=flow_match_shift_dynamic)
 
 
     def on_epoch_start(self, epoch: int, global_step: int, epoch_length: int):

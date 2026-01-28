@@ -1,45 +1,55 @@
 import logging
 import os
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, Dict, Any, Tuple
 from typing_extensions import Self
 
 import torch
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
-from diffusers.configuration_utils import register_to_config
-
-
+from diffusers.configuration_utils import register_to_config, FrozenDict
 
 
 class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]] = None,
-        subfolder: Optional[str] = None,
-        return_unused_kwargs=False,
-        **kwargs,
-    ) -> Self:
-        scheduler_ref = FlowMatchEulerDiscreteScheduler.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path,
-                                                                    subfolder=subfolder,
-                                                                    return_unused_kwargs=False,
-                                                                    **kwargs)
-        print("TrainFlowMatchEulerDiscreteScheduler.from_pretrained: shift=", scheduler_ref.shift)
-        (scheduler, unused_kwargs) = cls.from_config(scheduler_ref.config,
-                                                     return_unused_kwargs=True,
-                                                     **kwargs)
-        scheduler.config.prediction_type = 'flow_prediction'
-        if return_unused_kwargs:
-            return (scheduler, unused_kwargs)
-        else:
-            return scheduler
+    #@classmethod
+    #def from_pretrained(
+    #    cls,
+    #    pretrained_model_name_or_path: Optional[Union[str, os.PathLike]] = None,
+    #    subfolder: Optional[str] = None,
+    #    return_unused_kwargs=False,
+    #    **kwargs,
+    #) -> Self:
+    #    scheduler_ref = FlowMatchEulerDiscreteScheduler.from_pretrained(#pretrained_model_name_or_path=pretrained_model_name_or_path,
+    #                                                                subfolder=subfolder,
+    #                                                                return_unused_kwargs=False,
+    #                                                                **kwargs)
+    #    print("TrainFlowMatchEulerDiscreteScheduler.from_pretrained: shift=", scheduler_ref.shift)
+    #    (scheduler, unused_kwargs) = cls.from_config(scheduler_ref.config,
+    #                                                 return_unused_kwargs=True,
+    #                                                 **kwargs)
+    #    scheduler.config.prediction_type = 'flow_prediction'
+    #    if return_unused_kwargs:
+    #        return (scheduler, unused_kwargs)
+    #    else:
+    #        return scheduler
 
-    def __init__(self, **kwargs):
-        # 'exponential' time shift matches SD3
-        super().__init__(**kwargs, shift=1, use_dynamic_shifting=True, time_shift_type='exponential')
-        assert self.config.use_dynamic_shifting, "use_dynamic_shifting must be true"
-        print('__init__ shift saved:', super().shift)
-        self.config.prediction_type = "flow_prediction"
+    #@classmethod
+    #def from_config(
+    #    cls, config: Union[FrozenDict, Dict[str, Any]] = None, return_unused_kwargs=False, **kwargs
+    #) -> Union[Self, Tuple[Self, Dict[str, Any]]]:
+    #    model, unused_kwargs = ConfigMixin.from_config.__func__(cls, config, return_unused_kwargs=True, **kwargs)
+    #    model.config.prediction_type = 'flow_prediction'
+    #    print(f'from_config shift saved: {super().shift}, dynamic: {model.config.use_dynamic_shifting}, #type: {model.config.time_shift_type}')
+    #    if return_unused_kwargs:
+    #        return model, unused_kwargs
+    #    else:
+    #        return model
+
+
+    #def __init__(self, **kwargs):
+    #    super().__init__(**kwargs)
+    #    print(f'__init__ shift saved: {super().shift}, dynamic: {self.config.use_dynamic_shifting}, type: {self.config.time_shift_type}')
+    #   self.config.prediction_type = "flow_prediction"
+
 
     @staticmethod
     def get_shifted_timesteps(timestep_indices, timestep_values):
@@ -52,69 +62,28 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         indices_reversed = len(timestep_values) - 1 - timestep_indices.cpu()
         return timestep_values[indices_reversed]
 
-    @staticmethod
-    def get_shifted_sigmas(timestep_indices, timestep_values):
-        """ For incoming timestep indices (from 0 to num_train_timesteps-1), get the sigmas incorporating any shift """
-        assert timestep_indices.min() >= 0 and timestep_indices.max() < len(timestep_values), \
-            f"Timestep indices should be >=0, <{len(timestep_values)} but got min {timestep_indices.min()} max {timestep_indices.max()}"
 
-        indices_reversed = len(timestep_values) - 1 - timestep_indices.cpu()
-        return timestep_values[indices_reversed] / len(timestep_values)
+    def get_sigmas_for_timesteps(self, timesteps: torch.Tensor):
+        """ For the given timesteps, get the corresponding sigmas """
+        indices = (timesteps[:, None] == self.timesteps[None, :]).nonzero(as_tuple=True)[1]
+        return self.sigmas[indices]
+
 
     def get_best_timestep_for_sigma(self, sigma: float):
         delta = (self.sigmas - sigma).abs()
-        index_reversed = torch.argmin(delta).item()
-        return self.config.num_train_timesteps - 1 - index_reversed
+        index = torch.argmin(delta).item()
+        return self.timesteps[index]
 
-    def get_timestep_indices(self, exact_timesteps: torch.Tensor):
-        """ For incoming exact timesteps, get the corresponding timestep indices (from 0 to num_train_timesteps-1) """
-        assert exact_timesteps.min() >= self.timesteps.min() and exact_timesteps.max() <= self.timesteps.max(), \
-            f"Exact timesteps should be in [{self.timesteps.min()}, {self.timesteps.max()}] but got {exact_timesteps.min()} to {exact_timesteps.max()}"
-        # timestep indices goes from 0 to 999 but self.timesteps goes from 1000 to 1
-        # so we need to reverse the indices
-        exact_timesteps_cpu = exact_timesteps.cpu()
-        indices_reversed = torch.nonzero(self.timesteps[:, None] == exact_timesteps_cpu[None, :], as_tuple=False)[:, 0]
-        timestep_indices = self.config.num_train_timesteps - 1 - indices_reversed
-        return timestep_indices.to(exact_timesteps.device)
 
     @property
     def shift(self):
         return super().shift
 
     def add_noise(self, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        timesteps_shifted = type(self).get_shifted_timesteps(timestep_indices=timesteps, timestep_values=self.timesteps)
-        #print("shifted: ", timesteps.cpu().tolist(), "->", timesteps_shifted.cpu().tolist())
-        return self.scale_noise(latents, timesteps_shifted, noise)
-        #alpha = (timesteps / self.config.num_train_timesteps).view(-1, 1, 1, 1)
-        #x_t = alpha*noise + (1-alpha)*latents
-        #return x_t
-
+        return self.scale_noise(latents, timesteps, noise)
 
 
 class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
-
-    @classmethod
-    def from_config(cls, config, **kwargs):
-        config = dict(config)  # Make a copy to avoid mutating the original
-        config['shift'] = 1
-        config['use_dynamic_shifting'] = True
-        config['time_shift_type'] = 'exponential'
-        kwargs.pop('use_dynamic_shifting', None)
-        kwargs.pop('shift', None)
-        kwargs.pop('time_shift_type', None)
-        # call base config mixin using my class
-        return ConfigMixin.from_config.__func__(
-            cls, config, **kwargs
-        )
-
-    @register_to_config
-    def __init__(self, use_dynamic_shifting=True, time_shift_type='exponential', shift=1, **kwargs):
-        assert use_dynamic_shifting, "use_dynamic_shifting must be true"
-        assert time_shift_type == 'exponential', "only 'exponential' time_shift_type is supported"
-        super().__init__(use_dynamic_shifting=use_dynamic_shifting, time_shift_type=time_shift_type, shift=shift, **kwargs)
-        self.shift_to_hack_in = 1
-        self.timesteps_no_shift = None   # populated in set_timesteps
-        self.timesteps_with_shift = None # populated in set_timesteps
 
     @property
     def init_noise_sigma(self):
@@ -123,62 +92,16 @@ class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteS
     def scale_model_input(self, x, t):
         return x
 
-    def set_shift(self, shift):
-        # override super behaviour
-        self.shift_to_hack_in = shift
-
     def add_noise(self, latents, noise, timesteps):
-        assert self.config.use_dynamic_shifting, "use_dynamic_shifting must be true"
-        print("timesteps input: ", timesteps.cpu().tolist())
-        print("schedule for unet: ", self.timesteps_no_shift)
-        indices_reversed = torch.nonzero(self.timesteps_no_shift.cpu() == timesteps.cpu(), as_tuple=False)[:, 0]
-        print("indices reversed: ", indices_reversed.tolist())
-        timesteps_shifted = self.timesteps[indices_reversed]
+        return self.scale_noise(latents, timesteps, noise)
 
-        # timesteps_shifted = type(self).get_shifted_timesteps(timestep_indices=timesteps, timestep_values=self.timesteps)
-        print("timesteps input: ", timesteps.cpu().tolist(), "-> shifted", timesteps_shifted.cpu().tolist())
-        return self.scale_noise(latents, timesteps_shifted, noise)
-
-    def set_timesteps(self, num_inference_steps, device, **kwargs):
-        if 'mu' in kwargs:
-            logging.warning("Overriding mu in set_timesteps is not supported in SDPipelineInferenceFlowMatchEulerDiscreteScheduler")
-            del kwargs['mu']
-        assert self.config.use_dynamic_shifting, "use_dynamic_shifting must be true"
-        # construct timesteps with and without shift.
-        # during inference, we need to use the shifted timesteps in the step and add_noise functions
-        # however the unet forward must be passed the unshifted timesteps.
-        super().set_timesteps(num_inference_steps, device, mu=self.shift_to_hack_in, **kwargs)
-        self.timesteps_with_shift = self.timesteps.clone()
-        super().set_timesteps(num_inference_steps, device, mu=0, **kwargs)
-        self.timesteps_no_shift = self.timesteps.clone()
-
-    def step(self,
-             model_output: torch.FloatTensor,
-             timestep: Union[float, torch.FloatTensor],
-             sample: torch.FloatTensor, **kwargs
+    def set_timesteps(
+        self,
+        num_inference_steps: Optional[int]=None,
+        device: Union[str, torch.device] = None,
+        **kwargs
     ):
-        # During inference, apply shift
-        #print('in overridden step(), timestep=', timestep, 'kwargs', kwargs)
-        if not isinstance(timestep, torch.Tensor):
-            timestep = torch.tensor(timestep)
-        if timestep.ndim == 0:
-            timestep = timestep.unsqueeze(0)
-
-        # timesteps should be unshifted
-        assert (self.timesteps - self.timesteps_no_shift).abs().sum() == 0, "timesteps should be unshifted at the start of step()"
-        if self.config.time_shift_type != 'exponential':
-            raise NotImplementedError('todo: mu=0 must be changed to=1 for "linear" shift type')
-        timestep_index = torch.nonzero(self.timesteps == timestep, as_tuple=False)[:, 0]
-        # shift timesteps
-        super().set_timesteps(len(self.timesteps), device=sample.device, mu=self.shift_to_hack_in)
-        # adjust input timestep
-        shifted_timestep = self.timesteps[timestep_index].squeeze(0)
-        #print('shifted from', timestep, 'via', timestep_index, 'to', shifted_timestep)
-
-        # do step with shifted timesteps
-        result = super().step(model_output, timestep=shifted_timestep, sample=sample, **kwargs)
-        #print(' -> next step index', self.step_index, "next sigma", self.sigmas[self.step_index])
-
-        # revert timesteps to unshifted
-        super().set_timesteps(len(self.timesteps), device=sample.device, mu=0)
-        return result
+        if self.config.use_dynamic_shifting and 'mu' not in kwargs:
+            kwargs['mu'] = self.shift
+        super().set_timesteps(num_inference_steps=num_inference_steps, device=device, **kwargs)
+        print(f'timesteps ({num_inference_steps}):', self.timesteps)

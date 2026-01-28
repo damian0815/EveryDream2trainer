@@ -20,7 +20,7 @@ import math
 from tqdm.auto import tqdm
 
 from core.flow_match_model import SDPipelineInferenceFlowMatchEulerDiscreteScheduler
-from core.semaphore_files import check_semaphore_file_and_unlink, _INTERRUPT_SAMPLES_SEMAPHORE_FILE
+from core.semaphore_files import check_semaphore_file_and_unlink, INTERRUPT_SAMPLES_SEMAPHORE_FILE
 
 _RE_COMBINE_WHITESPACE = re.compile(r"\s+")
 
@@ -187,7 +187,7 @@ def update_metadata(md_template, model_node_data, params):
     })
     return md
 
-def create_scheduler(name, scheduler_config: dict):
+def create_scheduler(name, scheduler_config: dict, flow_match_shift: int, flow_match_shift_dynamic: bool):
     scheduler_config = dict(scheduler_config)
     scheduler = name.lower()
 
@@ -232,7 +232,10 @@ def create_scheduler(name, scheduler_config: dict):
     elif scheduler == 'kdpm_2_a':
         return KDPM2AncestralDiscreteScheduler.from_config(scheduler_config)
     elif scheduler == "flow-matching":
-        return SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
+        return SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(scheduler_config,
+                                                                              shift=flow_match_shift,
+                                                                              time_shift_type='linear',
+                                                                              use_dynamic_shifting=flow_match_shift_dynamic)
     else:
 
         raise ValueError(f"unknown scheduler '{scheduler}'")
@@ -248,7 +251,9 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                               pbar_update_cb=None,
                               pbar_desc=None,
                               extra_cfgs=None,
-                              index_offset=0
+                              index_offset=0,
+                              flow_match_shift=1,
+                              flow_match_shift_dynamic=False,
                               ):
     extra_cfgs = extra_cfgs or []
     all_params = sorted(all_params, key=lambda x: get_critical_params(x))
@@ -274,7 +279,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
         base_sample_index = index_offset
 
         for k, params in itertools.groupby(all_params, lambda x: get_critical_params(x)):
-            if check_semaphore_file_and_unlink(_INTERRUPT_SAMPLES_SEMAPHORE_FILE):
+            if check_semaphore_file_and_unlink(INTERRUPT_SAMPLES_SEMAPHORE_FILE):
                 print("sample generation interrupted")
                 break
 
@@ -290,7 +295,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
 
             params_batches = chunk_list(params, scaled_batch_size)
 
-            pipe.scheduler = create_scheduler(p0.sampler, scheduler_config=pipe.scheduler.config)
+            pipe.scheduler = create_scheduler(p0.sampler, scheduler_config=pipe.scheduler.config, flow_match_shift=flow_match_shift, flow_match_shift_dynamic=flow_match_shift_dynamic)
             for batch in params_batches:
                 prompts = [p.prompt for p in batch]
                 negative_prompts = [p.negative_prompt for p in batch]
@@ -312,16 +317,15 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                 for cfg in cfgs:
                     generator = [torch.Generator(device=generator_device).manual_seed(p.seed) for p in batch]
 
-                    resolution_dynamic_shift = True
-                    if resolution_dynamic_shift and isinstance(pipe.scheduler,
-                                                               SDPipelineInferenceFlowMatchEulerDiscreteScheduler):
+                    if isinstance(pipe.scheduler,
+                                  SDPipelineInferenceFlowMatchEulerDiscreteScheduler) and pipe.scheduler.config.use_dynamic_shifting:
                         image_pixel_count = p0.width * p0.height
-                        # for exponential shift, we go from 0 to 3 over 1 megapixel
-                        shift = 3.0 * (image_pixel_count / 1024 ** 2)
+                        # for linear shift, we go from 1 to 3 over 1 megapixel
+                        assert pipe.scheduler.config.time_shift_type == 'linear'
+                        shift = 1.0 + 2.0 * (image_pixel_count / 1024**2)
                         pipe.scheduler.set_shift(shift)
                         # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
-                        print("updated scheduler with shift", shift, " -> timesteps",
-                              pipe.scheduler.timesteps_with_shift)
+                        print("updated scheduler with shift", shift)
 
                     images = pipe(prompt=prompt,
                                   prompt_embeds=embeds,

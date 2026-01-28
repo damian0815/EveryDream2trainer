@@ -76,8 +76,8 @@ from model.training_model import (
     TrainingModel,
     Conditioning,
 )
-from core.semaphore_files import check_semaphore_file_and_unlink, _WANT_SAMPLES_SEMAPHORE_FILE, \
-    _WANT_VALIDATION_SEMAPHORE_FILE
+from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, \
+    WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
 from optimizer.optimizers import EveryDreamOptimizer
@@ -903,7 +903,9 @@ def main(args):
 
             inference_pipe = sample_generator.create_inference_pipe(
                 model_being_trained=model,
-                diffusers_scheduler_config=model.noise_scheduler.config
+                diffusers_scheduler_config=model.noise_scheduler.config,
+                flow_match_shift=args.flow_match_shift,
+                flow_match_shift_dynamic=args.flow_match_shift_dynamic
             ).to(device)
             sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
@@ -929,6 +931,8 @@ def main(args):
                                           device=model.unet.device,
                                           timesteps_ranges=[(args.timestep_start, args.timestep_end)] * batch_size,
                                           )
+        if type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
+            timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
         model.load_vae_to_device(device)
         latents = get_latents(image, model, device=model.unet.device, args=args)
         if args.offload_vae:
@@ -1095,8 +1099,9 @@ def main(args):
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
                     if args.flow_match_shift_dynamic and type(model.noise_scheduler) == TrainFlowMatchEulerDiscreteScheduler:
-                        shift = 3.0 * (image_pixel_count / 1024**2)
-                        #print('at resolution', image_pixel_count ** 0.5, ', shift is ', shift)
+                        assert model.noise_scheduler.config.time_shift_type == 'linear'
+                        shift = 1.0 + 2.0 * (image_pixel_count / 1024**2)
+                        # print('at resolution', image_pixel_count ** 0.5, ', shift is ', shift)
                         model.set_noise_scheduler_shift(shift)
                         if teacher_model:
                             teacher_model.set_noise_scheduler_shift(shift)
@@ -1117,7 +1122,7 @@ def main(args):
 
                     ed_optimizer.step_schedulers(tv.global_step)
 
-                    if sample_generator.should_generate_samples(tv.global_step, local_step=step) or check_semaphore_file_and_unlink(_WANT_SAMPLES_SEMAPHORE_FILE):
+                    if sample_generator.should_generate_samples(tv.global_step, local_step=step) or check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE):
                         generate_samples(global_step=tv.global_step, batch=full_batch)
 
                     if args.ema_decay_rate != None:
@@ -1149,9 +1154,11 @@ def main(args):
 
                         torch.cuda.empty_cache()
 
+                    # -- validation
+
                     if validator and (
                             step in validation_steps
-                            or check_semaphore_file_and_unlink(_WANT_VALIDATION_SEMAPHORE_FILE)
+                            or check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE)
                     ):
                         validator.do_validation(model=model,
                                                 global_step=tv.global_step,
@@ -1159,11 +1166,21 @@ def main(args):
 
                     min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 
+                    # -- saving
+
                     needs_save = False
+                    needs_optimizer_save = args.save_optimizer
                     if args.ckpt_every_n_minutes is not None and (min_since_last_ckpt > args.ckpt_every_n_minutes):
                         last_epoch_saved_time = time.time()
                         logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {tv.global_step}")
                         needs_save = True
+
+                    if check_semaphore_file_and_unlink(SAVE_FULL_SEMAPHORE_FILE):
+                        needs_save = True
+                    if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
+                        needs_save = True
+                        needs_optimizer_save = True
+
                     def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
                         return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
                                 epoch < args.max_epochs and epoch >= start_epoch)
@@ -1173,15 +1190,21 @@ def main(args):
                         needs_save = True
                     if needs_save:
                         save_path = make_save_path(epoch, tv.global_step)
-                        save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
+                        save_model(save_path,
+                                   global_step=tv.global_step,
+                                   ed_state=make_current_ed_state(),
                                    save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
                                    save_full_precision=args.save_full_precision,
-                                   save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                                   save_optimizer_flag=needs_optimizer_save,
+                                   save_ckpt=not args.no_save_ckpt,
                                    plugin_runner=plugin_runner)
+
                     if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
                         logging.info(f" Saving lora")
                         save_path = make_save_path(epoch, tv.global_step)
                         save_model_lora(model=model, save_path=save_path)
+
+                    # -- step end
 
                     plugin_runner.run_on_step_end(epoch=epoch,
                                           global_step=tv.global_step,

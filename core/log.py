@@ -33,6 +33,7 @@ class LogData:
     images_per_sec_log_step = []
     timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
     cumulative_timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
+    #cumulative_timestep_shifted_coverage: Counter = dataclasses.field(default_factory=Counter)
 
     forward_size_coverage: Counter = dataclasses.field(default_factory=Counter)
 
@@ -156,9 +157,8 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
                 log_writer.add_scalar(f'timesteps/{tag_prefix} max', max(coverage_dict.keys()), global_step)
 
         log_timestep_histogram("log step", log_data.timestep_coverage, log_min_max=True)
-        for key, count in log_data.timestep_coverage.items():
-            log_data.cumulative_timestep_coverage[key] += count
-        log_timestep_histogram("cumulative", log_data.cumulative_timestep_coverage)
+        log_timestep_histogram("cumulative", log_data.cumulative_timestep_coverage, log_min_max=False)
+        #log_timestep_histogram("shifted-cumulative", log_data.cumulative_timestep_shifted_coverage, log_min_max=False)
 
         log_data.timestep_coverage.clear()
 

@@ -591,12 +591,16 @@ class EveryDreamOptimizer:
             ckpt_path, OPTIMIZER_UNET_STATE_FILENAME
         )
         scaler_state_path = os.path.join(ckpt_path, SCALER_STATE_FILENAME)
-        if os.path.exists(te_optimizer_state_path) and self.optimizer_te is not None:
+        if (
+            os.path.exists(te_optimizer_state_path)
+            and self.optimizer_te is not None
+        ):
             self._load_optimizer(
                 self.optimizer_te,
                 te_optimizer_state_path,
                 expected_type=self.te_config["optimizer"],
-            ) if self.optimizer_te is not None else None
+                log_label="text encoder optimizer state"
+            )
         if (
             os.path.exists(unet_optimizer_state_path)
             and self.optimizer_unet is not None
@@ -605,9 +609,15 @@ class EveryDreamOptimizer:
                 self.optimizer_unet,
                 unet_optimizer_state_path,
                 expected_type=self.base_config["optimizer"],
-            ) if self.optimizer_unet is not None else None
+                log_label="unet optimizer state"
+            )
         if os.path.exists(scaler_state_path) and self.scaler is not None:
-            self._load_optimizer(self.scaler, scaler_state_path, expected_type="scaler")
+            self._load_optimizer(
+                self.scaler,
+                scaler_state_path,
+                expected_type="scaler",
+                log_label="grad scaler state"
+            )
 
     def create_optimizers(
         self, args, text_encoder_params: dict[str, list], unet_params: dict[str, list]
@@ -820,7 +830,7 @@ class EveryDreamOptimizer:
 
     @staticmethod
     def _load_optimizer(
-        optimizer: torch.optim.Optimizer, path: str, expected_type: str = None
+        optimizer: torch.optim.Optimizer, path: str, expected_type: str = None, log_label="optimizer state"
     ):
         """
         Loads the optimizer state to an Optimizer object
@@ -838,7 +848,7 @@ class EveryDreamOptimizer:
                     return
                 state_dict = state_dict["state_dict"]
             optimizer.load_state_dict(state_dict)
-            logging.info(f" Loaded optimizer state from {path}")
+            logging.info(f" Loaded {log_label} from {path}")
         except Exception as e:
             logging.warning(
                 f"{Fore.LIGHTYELLOW_EX}**Failed to load optimizer state from {path}, optimizer state will not be loaded, \n * Exception: {e}{Style.RESET_ALL}"

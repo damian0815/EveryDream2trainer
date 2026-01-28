@@ -277,7 +277,7 @@ def compute_basic_loss(
         # SD3 loss weight
         if not isinstance(noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
             raise NotImplementedError("SD3 loss weighting only implemented for TrainFlowMatchEulerDiscreteScheduler")
-        sigmas = TrainFlowMatchEulerDiscreteScheduler.get_shifted_sigmas(timestep_indices=timesteps, timestep_values=noise_scheduler.timesteps)
+        sigmas = noise_scheduler.get_sigmas_for_timesteps(timesteps)
         if loss_type == "sd3-cosmap":
             weighting_scheme = "cosmap"
         elif loss_type == "sd3-sigma_sqrt":
@@ -438,11 +438,6 @@ def get_model_prediction_and_target(
     )
     target = _get_target(latents, noise, model.noise_scheduler, timesteps).to(dtype=model.unet.dtype)
 
-    #if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler):
-    #    unet_timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=model.noise_scheduler.timesteps)
-    #else:
-    #    unet_timesteps = timesteps
-
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
@@ -503,8 +498,7 @@ def _get_noisy_latents(
     if hasattr(noise_scheduler, "add_noise"):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
     elif isinstance(noise_scheduler, FlowMatchEulerDiscreteScheduler):
-        shifted_timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timestep_indices=timesteps, timestep_values=noise_scheduler.timesteps)
-        noisy_latents = noise_scheduler.scale_noise(latents, shifted_timesteps, noise)
+        noisy_latents = noise_scheduler.scale_noise(latents, timesteps, noise)
     else:
         raise RuntimeError("Noise scheduler has no method to add noise to latents (tried .add_noise() and .scale_noise())")
     if latents_perturbation > 0:

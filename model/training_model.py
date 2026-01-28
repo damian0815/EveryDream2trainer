@@ -35,7 +35,7 @@ from utils.huggingface_downloader import try_download_model_from_hf
 from utils.unet_utils import check_for_sd1_attn
 
 
-def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=None, rescale_betas_zero_snr=False, flow_match_shift=1):
+def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=None, rescale_betas_zero_snr=False, flow_match_shift=1, flow_match_shift_dynamic=False):
     if train_sampler.lower() == "pndm":
         logging.info(f" * Using PNDM noise scheduler for training: {train_sampler}")
         noise_scheduler = PNDMScheduler.from_config(scheduler.config,
@@ -48,7 +48,15 @@ def get_training_noise_scheduler(scheduler, train_sampler: str, trained_betas=No
                                                         rescale_betas_zero_snr=rescale_betas_zero_snr)
     elif train_sampler.lower() == "flow-matching":
         logging.info(f" * Using FlowMatching noise scheduler for training: {train_sampler}")
-        noise_scheduler = TrainFlowMatchEulerDiscreteScheduler()
+        noise_scheduler = TrainFlowMatchEulerDiscreteScheduler.from_config(scheduler.config,
+                                                                           use_dynamic_shifting=flow_match_shift_dynamic,
+                                                                           time_shift_type='linear',
+                                                                           shift=flow_match_shift)
+        noise_scheduler.config.prediction_type = 'flow_prediction'
+        assert noise_scheduler.config.prediction_type == 'flow_prediction', "FlowMatching scheduler prediction_type not set correctly"
+        assert noise_scheduler.config.use_dynamic_shifting == flow_match_shift_dynamic, "FlowMatching scheduler dynamic shifting not set correctly"
+        assert noise_scheduler.config.time_shift_type == 'linear'
+        assert noise_scheduler.shift == flow_match_shift
     else:
         logging.info(f" * Using default (DDPM) noise scheduler for training: {train_sampler}")
         noise_scheduler = DDPMScheduler.from_config(scheduler.config,
@@ -106,6 +114,7 @@ class TrainingVariables:
     accumulated_pathnames: list[str] = field(default_factory=list)
     accumulated_captions: list[str] = field(default_factory=list)
     accumulated_timesteps: list[int] = field(default_factory=list)
+    accumulated_timesteps_shifted: list[int] = field(default_factory=list)
     desired_effective_batch_size: int|None = None
     interleave_bs1_bsN: bool = False
     interleaved_bs1_count: int|None = None
@@ -667,11 +676,15 @@ def load_model(args) -> TrainingModel:
         noise_scheduler = get_training_noise_scheduler(temp_scheduler, args.train_sampler,
                                                        trained_betas=trained_betas,
                                                        rescale_betas_zero_snr=False,
-                                                       flow_match_shift=args.flow_match_shift
-                                                       # True
+                                                       flow_match_shift=args.flow_match_shift,
+                                                       flow_match_shift_dynamic=args.flow_match_shift_dynamic
                                                        )
     else:
-        noise_scheduler = get_training_noise_scheduler(scheduler, args.train_sampler, flow_match_shift=args.flow_match_shift)
+        noise_scheduler = get_training_noise_scheduler(scheduler,
+                                                       args.train_sampler,
+                                                       flow_match_shift=args.flow_match_shift,
+                                                       flow_match_shift_dynamic=args.flow_match_shift_dynamic
+                                                       )
 
     compel = None
     if args.use_compel:
