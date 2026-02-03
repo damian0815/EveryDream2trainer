@@ -77,7 +77,8 @@ from model.training_model import (
     Conditioning,
 )
 from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, \
-    WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE
+    WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE, \
+    SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
 from optimizer.optimizers import EveryDreamOptimizer
@@ -982,6 +983,8 @@ def main(args):
         tv.remaining_stratified_timesteps = None
         tv.shared_timestep = None
         step = 0
+        wants_stop = False
+        force_save_optimizer = False
 
         for epoch in range(args.max_epochs):
             write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
@@ -1028,9 +1031,7 @@ def main(args):
             for step, full_batch in enumerate(train_dataloader):
                 #logging.info("... fetched.")
 
-
                 try:
-
                     train_progress_01 = compute_train_process_01(epoch=epoch, step=step, steps_per_epoch=epoch_len,
                                                                  max_epochs=args.max_epochs, max_global_steps=args.max_steps)
 
@@ -1098,10 +1099,13 @@ def main(args):
                             everything_contrastive_learning_p = args.everything_contrastive_learning_p
                         full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
-                    if args.flow_match_shift_dynamic and type(model.noise_scheduler) == TrainFlowMatchEulerDiscreteScheduler:
+                    if args.flow_match_shift_dynamic and type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
+                        # gentle shift, randomly falling back to no shift
                         assert model.noise_scheduler.config.time_shift_type == 'linear'
-                        shift = 1.0 + 2.0 * (image_pixel_count / 1024**2)
-                        # print('at resolution', image_pixel_count ** 0.5, ', shift is ', shift)
+                        shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
+                        if random.random() < args.flow_match_shift_dropout_p:
+                            shift = 1.0
+                        print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
                         model.set_noise_scheduler_shift(shift)
                         if teacher_model:
                             teacher_model.set_noise_scheduler_shift(shift)
@@ -1180,6 +1184,9 @@ def main(args):
                     if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
                         needs_save = True
                         needs_optimizer_save = True
+                    if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
+                        wants_stop = True
+                        force_save_optimizer = True
 
                     def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
                         return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
@@ -1220,13 +1227,17 @@ def main(args):
                             and ed_optimizer.will_do_grad_accum_step(step, tv.global_step)
                             and epoch_len-step < args.grad_accum
                     ):
-                        print(f"only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
+                        logging.info(f"* only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
                         break
 
                     tv.global_step += 1
 
+                    if wants_stop:
+                        logging.info(f"* Stop requested, stopping")
+                        break
+
                     if args.max_steps is not None and tv.global_step >= args.max_steps:
-                        print(f"max_steps reached, stopping")
+                        logging.info(f"* max_steps reached, stopping")
                         break
 
                     # end of step
@@ -1276,6 +1287,9 @@ def main(args):
 
             gc.collect()
 
+            if wants_stop:
+                break
+
             if args.max_steps is not None and tv.global_step >= args.max_steps:
                 break
 
@@ -1292,13 +1306,19 @@ def main(args):
         if not args.lora:
             save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
                        save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
-                       save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt,
+                       save_optimizer_flag=args.save_optimizer or force_save_optimizer, save_ckpt=not args.no_save_ckpt,
                        plugin_runner=plugin_runner)
         if args.lora:
             save_model_lora(model=model, save_path=save_path)
 
+
         if not sample_generator.should_generate_samples(global_step=tv.global_step-1, local_step=step):
             print("generating final samples")
+            # free up memory we might need for samples
+            tv.clear_accumulated_loss()
+            torch.cuda.empty_cache()
+            gc.collect()
+            # get samples for random captions
             _, batch = next(enumerate(train_dataloader))
             generate_samples(global_step=tv.global_step, batch=batch)
 
@@ -1483,6 +1503,7 @@ if __name__ == "__main__":
                            help="noise sampler used for training, (default: ddpm)", choices=["ddpm", "pndm", "ddim", "flow-matching"])
     argparser.add_argument("--flow_match_shift", type=float, default=1.0, help="For flow-matching train sampler, the noise shift parameter (def: 1.0)")
     argparser.add_argument("--flow_match_shift_dynamic", action=argparse.BooleanOptionalAction, default=False, help="If passed, set flow-matching shift dynamically based on resolution (target shift=3 @ 1024x1024)")
+    argparser.add_argument("--flow_match_shift_dropout_p", type=float, default=0.3, help="Probability that a given batch will see unshifted timesteps when doing flow-matching shift")
 
     argparser.add_argument("--keep_tags", type=int, default=0, help="Number of tags to keep when shuffle, used to randomly select subset of tags when shuffling is enabled, def: 0 (shuffle all)")
     argparser.add_argument("--wandb", action="store_true", default=False, help="enable wandb logging instead of tensorboard, requires env var WANDB_API_KEY")
