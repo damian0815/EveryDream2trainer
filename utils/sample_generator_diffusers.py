@@ -322,7 +322,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                         image_pixel_count = p0.width * p0.height
                         # for linear shift, we go from 1 to 3 over 1 megapixel
                         assert pipe.scheduler.config.time_shift_type == 'linear'
-                        shift = 1.0 + 2.0 * (image_pixel_count / 1024**2)
+                        shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
                         pipe.scheduler.set_shift(shift)
                         # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                         print("updated scheduler with shift", shift)

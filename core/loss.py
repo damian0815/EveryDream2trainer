@@ -1,6 +1,7 @@
 import logging
 import math
 import random
+from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 
 import torch
@@ -357,6 +358,18 @@ def get_timestep_weight(
         return torch.tensor(1)
 
 
+def get_midblock_out_shape(latents_shape: torch.Size, model: TrainingModel) -> torch.Size:
+    return (latents_shape[0], model.unet.mid_block.out_channels, latents_shape[2]//8, latents_shape[3]//8)
+
+
+@dataclass
+class ModelPredictionAndTargetReturnType:
+    model_pred: torch.Tensor
+    target: torch.Tensor
+    noisy_latents: torch.Tensor
+    midblock_out: torch.Tensor|None = None
+    teacher_target: torch.Tensor|None = None
+
 
 def get_model_prediction_and_target(
     latents,
@@ -373,11 +386,13 @@ def get_model_prediction_and_target(
     log_writer=None,
     global_step: int = 0,
     mask=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    lcf_mask=None,
+) -> ModelPredictionAndTargetReturnType:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
     Returns model_pred, target, teacher_target (None if teacher_mask is None), noisy_latents
     """
+    midblock_out_shape = get_midblock_out_shape(latents.shape, model)
 
     if mask is not None:
         # create full tensors
@@ -393,9 +408,16 @@ def get_model_prediction_and_target(
         noisy_latents = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
+        midblock_out = None if lcf_mask is None else torch.zeros(midblock_out_shape, dtype=model.unet.dtype, device=model.unet.device)
         if mask.sum() == 0:
             # early out for empty mask
-            return model_pred, target, teacher_target, noisy_latents
+            return ModelPredictionAndTargetReturnType(
+                model_pred=model_pred,
+                target=target,
+                teacher_target=teacher_target,
+                noisy_latents=noisy_latents,
+                midblock_out=midblock_out,
+            )
 
         latents_masked = latents[mask]
         conditioning_masked = conditioning.get_masked(mask)
@@ -406,31 +428,39 @@ def get_model_prediction_and_target(
             if teacher_conditioning is not None
             else None
         )
+        lcf_mask_masked = lcf_mask[mask] if lcf_mask is not None else None
         timesteps_masked = timesteps[mask]
-        model_pred_masked, target_masked, teacher_target_masked, noisy_latents_masked = (
-            get_model_prediction_and_target(
-                latents=latents_masked,
-                conditioning=conditioning_masked,
-                noise=noise_masked,
-                timesteps=timesteps_masked,
-                model=model,
-                args=args,
-                skip_contrastive=skip_contrastive,
-                teacher_model=teacher_model,
-                teacher_mask=teacher_mask_masked,
-                teacher_conditioning=teacher_conditioning_masked,
-                debug_fake=debug_fake,
-                log_writer=log_writer,
-                global_step=global_step,
-                mask=None,
-            )
+        masked_result = get_model_prediction_and_target(
+            latents=latents_masked,
+            conditioning=conditioning_masked,
+            noise=noise_masked,
+            timesteps=timesteps_masked,
+            model=model,
+            args=args,
+            skip_contrastive=skip_contrastive,
+            teacher_model=teacher_model,
+            teacher_mask=teacher_mask_masked,
+            teacher_conditioning=teacher_conditioning_masked,
+            debug_fake=debug_fake,
+            log_writer=log_writer,
+            global_step=global_step,
+            mask=None,
+            lcf_mask=lcf_mask_masked
         )
-        model_pred[mask] += model_pred_masked
-        target[mask] += target_masked
+        model_pred[mask] += masked_result.model_pred
+        target[mask] += masked_result.target
         if teacher_mask is not None:
-            teacher_target[mask] += teacher_target_masked
-        noisy_latents[mask] += noisy_latents_masked
-        return model_pred, target, teacher_target, noisy_latents
+            teacher_target[mask] += masked_result.teacher_target
+        if lcf_mask is not None:
+            midblock_out[mask] += masked_result.midblock_out
+        noisy_latents[mask] += masked_result.noisy_latents
+        return ModelPredictionAndTargetReturnType(
+            model_pred=model_pred,
+            target=target,
+            noisy_latents=noisy_latents,
+            midblock_out=midblock_out,
+            teacher_target=teacher_target,
+        )
 
     # logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(
@@ -438,57 +468,72 @@ def get_model_prediction_and_target(
     )
     target = _get_target(latents, noise, model.noise_scheduler, timesteps).to(dtype=model.unet.dtype)
 
+    midblock_out = None
     if debug_fake:
         model_pred = torch.ones_like(target).to(model.device)
     else:
-        model_pred = model.unet(
-            noisy_latents.to(dtype=model.unet.dtype),
-            timesteps.to(model.unet.device, dtype=model.unet.dtype),
-            encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
-            added_cond_kwargs=(
-                conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
-                if model.is_sdxl
-                else None
-            ),
-        ).sample
+        lcf_storage = {'midblock_out': None}
+        handle = None
+        try:
+            # hook mid-block output for LCF
+            def hook_fn(module, input, output):
+                assert output.shape == midblock_out_shape, f"Expected midblock output shape {midblock_out_shape} but got {output.shape}"
+                lcf_storage['midblock_out'] = output
 
+            handle = model.unet.mid_block.register_forward_hook(hook_fn)
+            model_pred = model.unet(
+                noisy_latents.to(dtype=model.unet.dtype),
+                timesteps.to(model.unet.device, dtype=model.unet.dtype),
+                encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
+                added_cond_kwargs=(
+                    conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
+                    if model.is_sdxl
+                    else None
+                ),
+            ).sample
+            midblock_out = None if lcf_mask is None else lcf_storage['midblock_out']
+            del lcf_storage
+        finally:
+            handle.remove()
+
+    teacher_target = None
     if teacher_mask is None:
-        teacher_target = None
+        pass
+    elif teacher_mask.sum() == 0:
+        teacher_target = torch.zeros_like(
+            latents, dtype=model.unet.dtype, device=model.unet.device
+        )
     else:
-        if teacher_mask.sum() == 0:
-            teacher_target = torch.zeros_like(
-                latents, dtype=model.unet.dtype, device=model.unet.device
-            )
-        else:
-            with torch.no_grad():
-                if teacher_conditioning is None:
-                    teacher_conditioning = conditioning
+        with torch.no_grad():
+            if teacher_conditioning is None:
+                teacher_conditioning = conditioning
 
-                teacher_target = get_teacher_target(
-                    teacher_model=teacher_model,
-                    teacher_conditioning=teacher_conditioning,
-                    student_model=model,
-                    timesteps=timesteps,
-                    student_unet_timesteps=timesteps,
-                    clean_image_latents=latents,
-                    noise=noise,
+            teacher_target = get_teacher_target(
+                teacher_model=teacher_model,
+                teacher_conditioning=teacher_conditioning,
+                student_model=model,
+                timesteps=timesteps,
+                student_unet_timesteps=timesteps,
+                clean_image_latents=latents,
+                noise=noise,
+            )
+
+            if log_writer is not None:
+                loss_preview_image_rgb = torchvision.utils.make_grid(teacher_target)
+                log_writer.add_image(
+                    tag="loss/teacher target",
+                    img_tensor=loss_preview_image_rgb,
+                    global_step=global_step,
                 )
 
-                if log_writer is not None:
-                    loss_preview_image_rgb = torchvision.utils.make_grid(teacher_target)
-                    log_writer.add_image(
-                        tag="loss/teacher target",
-                        img_tensor=loss_preview_image_rgb,
-                        global_step=global_step,
-                    )
+            #target = teacher_target * teacher_mask.view(-1, 1, 1, 1).expand_as(
+            #    target
+            #).to(target.device) + target * ~teacher_mask.view(-1, 1, 1, 1).expand_as(
+            #    target
+            #).to(target.device)
 
-                #target = teacher_target * teacher_mask.view(-1, 1, 1, 1).expand_as(
-                #    target
-                #).to(target.device) + target * ~teacher_mask.view(-1, 1, 1, 1).expand_as(
-                #    target
-                #).to(target.device)
-
-    return model_pred, target, teacher_target, noisy_latents
+    return ModelPredictionAndTargetReturnType(
+        model_pred=model_pred, target=target, noisy_latents=noisy_latents, teacher_target=teacher_target, midblock_out=midblock_out)
 
 
 def _get_noisy_latents(
@@ -943,51 +988,81 @@ def _get_ddpm_timesteps_for_flowmatch_timesteps(
 
 
 def get_local_contrastive_flow_loss(
-    model_pred: torch.Tensor,
-    model_pred_anchor: torch.Tensor,
+    midblock_out: torch.Tensor,
+    midblock_clean_out: torch.Tensor,
     low_noise_timesteps_mask: torch.Tensor,
     unique_identifiers: list[str],
     temperature,
 ) -> torch.Tensor:
 
-    low_noise_timesteps_count = low_noise_timesteps_mask.sum().item()
     # remove duplicate uids from low_noise_timesteps_mask
     for i in torch.nonzero(low_noise_timesteps_mask):
         uid = unique_identifiers[i.item()]
         for j in range(i.item() + 1, len(unique_identifiers)):
             if unique_identifiers[j] == uid:
                 low_noise_timesteps_mask[j] = False
+    low_noise_timesteps_count = low_noise_timesteps_mask.sum().item()
     if low_noise_timesteps_count > low_noise_timesteps_mask.sum().item():
         logging.warning(
             f" * get_local_contrastive_flow_loss: removed {low_noise_timesteps_count - low_noise_timesteps_mask.sum().item()} duplicate unique_identifiers from low_noise_timesteps_mask - had {low_noise_timesteps_count} now {low_noise_timesteps_mask.sum().item()}"
         )
 
-    contrastive_losses_full = torch.zeros(model_pred.shape[0], device=model_pred.device, dtype=model_pred.dtype)
+    contrastive_losses_full = torch.zeros(midblock_out.shape[0], device=midblock_out.device, dtype=midblock_out.dtype)
 
     # can only do contrastive if >1 samples
     n_contrastive = low_noise_timesteps_mask.sum().item()
     if n_contrastive >= 2:
-        # 3. Flatten spatial dimensions, then normalize for cosine similarity
-        features_current = model_pred[low_noise_timesteps_mask].flatten(
-            1
-        )  # [n_contrastive, CHW]
-        features_anchor = model_pred_anchor[low_noise_timesteps_mask].flatten(
-            1
-        )  # [n_contrastive, CHW]
+        # --- 1. Feature Extraction ---
+        # features_anchor: [N_anchors, C]
+        # These are the noisy representations (z) requiring gradients
+        features_anchor = F.normalize(midblock_out[low_noise_timesteps_mask].mean(dim=(2, 3)), p=2, dim=1)
 
-        features_current = torch.nn.functional.normalize(features_current, dim=-1)
-        features_anchor = torch.nn.functional.normalize(features_anchor, dim=-1).to(
-            dtype=features_current.dtype
-        )
+        # features_clean: [N_anchors, C]
+        # These are the CLEAN representations (h_clean), detached
+        # NOTE: Ensure midblock_clean_out is aligned with midblock_out (same batch order)
+        features_clean = F.normalize(midblock_clean_out[low_noise_timesteps_mask].mean(dim=(2, 3)).detach(), p=2, dim=1)
 
-        # 4. Compute contrastive loss (InfoNCE-style)
-        # Similarity matrix: [n_contrastive, n_contrastive]
-        logits = torch.matmul(features_current, features_anchor.T) / temperature
+        # features_negatives: [B, C]
+        # The pool of negatives includes the whole batch (noisy), detached
+        features_negatives = F.normalize(midblock_out.mean(dim=(2, 3)).detach(), p=2, dim=1)
 
-        # Positives are on the diagonal (same image at different noise levels)
-        labels = torch.arange(n_contrastive, device=model_pred.device)
+        # --- 2. Distance Computation ---
 
-        contrastive_losses_masked = torch.nn.functional.cross_entropy(logits, labels, reduction='none')
+        # Positive distances: ||z(i) - h_clean(i)||^2
+        pos_dists = torch.sum((features_anchor - features_clean) ** 2, dim=1)  # [N_anchors]
+        # Negative distances: ||z(i) - h_noisy(j)||^2 for all j
+        full_dists = torch.cdist(features_anchor, features_negatives, p=2) ** 2  # [N_anchors, B]
+
+        # --- 3. Construct Logits ---
+
+        # We need to form a logit vector where the "correct" class is the Clean version,
+        # and the "incorrect" classes are the Noisy versions of other images.
+
+        # Get the original batch indices corresponding to the anchors
+        anchor_indices = torch.where(low_noise_timesteps_mask)[0].to(full_dists.device)  # [N_anchors]
+
+        # We start with the full distance matrix (Anchor vs All Noisy)
+        # Currently, full_dists[k, anchor_indices[k]] is distance(Anchor_i, Noisy_i) ≈ 0.
+        # We REPLACE this self-match with the distance(Anchor_i, Clean_i).
+
+        # Create a range for row indexing
+        row_indices = torch.arange(features_anchor.shape[0], device=full_dists.device)
+
+        # Inject the positive distances into the matrix at the correct indices
+        # We clone to avoid in-place modification errors if this tensor is used elsewhere
+        logits_dists = full_dists.clone()
+        logits_dists[row_indices, anchor_indices] = pos_dists
+
+        # Negate because CrossEntropy expects logits (higher is better), but we have distances (lower is better)
+        logits = -logits_dists / temperature
+
+        # --- 4. Loss Calculation ---
+
+        # The 'target' for each anchor row is its original index in the batch
+        # (because we placed the clean-distance at that specific index)
+        contrastive_losses_masked = torch.nn.functional.cross_entropy(logits, anchor_indices, reduction='none')
+
+        # Assign back to full batch loss tensor
         contrastive_losses_full[low_noise_timesteps_mask] = contrastive_losses_masked
     return contrastive_losses_full
 
@@ -1002,18 +1077,18 @@ def apply_negative_loss_hinge(loss: torch.Tensor, mask: torch.Tensor, margin):
     )
 
 
-def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_type, timesteps, noise_scheduler, mask, amount: float):
+def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_type, timesteps, noise_scheduler, mask, amount: float) -> tuple[torch.Tensor, int]:
     B = v_pred.shape[0]
 
     # For stronger contrastive signal, use K negatives per sample
-    K = min(mask.sum()-1, 1/amount)  # number of negatives - cap by lambda to avoid to much negative influence
+    K = min(mask.sum()-1, 1/amount)  # number of negatives - cap by lambda to avoid too much negative influence
 
     contrastive_losses = torch.zeros_like(v_pred)
     # pick K random reference indices
     references = torch.randperm(B).tolist()
     contrastive_losses_count = 0
     for ref_idx in references:
-        if mask[ref_idx].item():
+        if not mask[ref_idx].item():
             continue
         choices = [i for i in range(B)
                    if i != ref_idx and mask[i].item() and unique_identifiers[i] != unique_identifiers[ref_idx]]
@@ -1033,7 +1108,7 @@ def get_contrastive_flow_matching_loss(target, v_pred, unique_identifiers, loss_
         if contrastive_losses_count >= K:
             break
 
-    return -contrastive_losses * amount
+    return -contrastive_losses * amount, contrastive_losses_count
 
 def get_contrastive_class_loss(clean_latents, noise, model_pred, timesteps,
                                noise_scheduler, class_labels: list[dict[str, set[str]]],

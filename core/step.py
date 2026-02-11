@@ -4,8 +4,10 @@ import gc
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from collections import Counter
+from dataclasses import dataclass
 from typing import Callable
 
 import math
@@ -20,6 +22,25 @@ from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_
     get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
+
+# Global performance profiling storage
+# Structure: {<label>: [duration_per_image, duration_per_image, ...]}
+PERFORMANCE_PROFILE = {}
+
+
+ENABLE_PERFORMANCE_LOGGING = False
+def record_performance_timing(label: str, duration_seconds: float, num_images: int):
+
+    """Record performance timing for a phase, normalized per image."""
+    if not ENABLE_PERFORMANCE_LOGGING:
+        return
+
+    global PERFORMANCE_PROFILE
+    if label not in PERFORMANCE_PROFILE:
+        PERFORMANCE_PROFILE[label] = []
+    duration_per_image = duration_seconds / max(1, num_images)
+    PERFORMANCE_PROFILE[label].append(duration_per_image)
+    logging.info(f"[PERF] {label}: {duration_seconds:.4f}s total, {duration_per_image:.6f}s per image ({num_images} images)")
 
 
 def train_step(
@@ -41,10 +62,18 @@ def train_step(
         did_step_optimizer_cb = lambda: True
     remaining_batch = full_batch
 
+    t_step_start = time.perf_counter()
+
     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
+        t_nibble_start = time.perf_counter()
         batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size(training_variables=tv))
         assert batch["runt_size"] == 0
+        image_shape = batch["image"].shape
+        num_images = image_shape[0]
+        record_performance_timing("1_batch_nibbling", time.perf_counter() - t_nibble_start, num_images)
 
+        # Caption selection logic
+        t_caption_start = time.perf_counter()
         #if args.contrastive_learning_curriculum_alpha == 0:
         #    contrastive_loss_scale = args.contrastive_loss_scale
         #else:
@@ -56,7 +85,6 @@ def train_step(
 
         loss_scale = args.loss_scale * batch["loss_scale"]
         assert loss_scale.shape[0] == batch["image"].shape[0]
-        image_shape = batch["image"].shape
         # loss_scale = loss_scale.float() * (reference_image_size / image_size)
 
         assert type(batch["captions"]) is dict
@@ -107,8 +135,12 @@ def train_step(
             caption_variants = [random.choice(caption_candidates)]
             # print('picked caption variant: ', caption_variants)
 
+        record_performance_timing("2_caption_selection", time.perf_counter() - t_caption_start, num_images)
+
         batch_size = image_shape[0]
 
+        # Noise generation
+        t_noise_start = time.perf_counter()
         with torch.no_grad():
             noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
             noise = get_noise(noise_shape, device=model.device, dtype=model.dtype,
@@ -116,19 +148,30 @@ def train_step(
                               zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                               batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise)
                               )
+        record_performance_timing("3_noise_generation", time.perf_counter() - t_noise_start, batch_size)
+
+        # VAE encoding
+        t_vae_start = time.perf_counter()
         assert batch["runt_size"] == 0 # _encode_latents assumption
         model.vae.to(model.device)
         latents = _encode_latents(model=model, image=batch["image"], amp=args.amp, tv=tv)
         if args.offload_vae:
             model.load_vae_to_device('cpu')
+        record_performance_timing("4_vae_encoding", time.perf_counter() - t_vae_start, batch_size)
 
         for caption_variant in caption_variants:
+
+            t_variant_start = time.perf_counter()
 
             # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
             if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] >= tv.max_backward_slice_size:
                 with torch.cuda.amp.autocast(enabled=args.amp):
-                    optimizer_backward(ed_optimizer, tv, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
 
+                    optimizer_backward(ed_optimizer, tv, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
+                    record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
+
+            # Timesteps generation
+            t_timesteps_start = time.perf_counter()
             timesteps = _get_step_timesteps(
                 count=batch["image"].shape[0],
                 timesteps_range=batch["timesteps_range"],
@@ -141,16 +184,23 @@ def train_step(
             # apply shift
             if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
                 timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
+            record_performance_timing("5_timesteps_generation", time.perf_counter() - t_timesteps_start, num_images/len(caption_variants))
 
+            # Conditional dropout
+            t_cond_dropout_start = time.perf_counter()
             _apply_cond_dropout(batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
             teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=timesteps, teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
+            record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images/len(caption_variants))
 
+            # Text conditioning generation
+            t_conditioning_start = time.perf_counter()
             conditioning, teacher_conditioning, caption_str = _generate_conditioning(
                 batch, caption_variant=caption_variant,
                 model=model, teacher_model=teacher_model,
                 teacher_mask=teacher_mask,
                 args=args
             )
+            record_performance_timing("7_conditioning_generation", time.perf_counter() - t_conditioning_start, num_images/len(caption_variants))
 
             is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
                                             for s in caption_str[0:batch_size]], device=model.unet.device,
@@ -160,7 +210,9 @@ def train_step(
 
             model_forward_slice_size = tv.forward_slice_size
 
-            model_pred, model_pred_anchor, target, teacher_target = repeat_with_oom_handling(initial_slice_size=tv.forward_slice_size, callback=lambda slice_size: _do_model_forward(
+            # Model forward pass
+            t_forward_start = time.perf_counter()
+            model_forward_result = repeat_with_oom_handling(initial_slice_size=tv.forward_slice_size, callback=lambda slice_size: _do_model_forward(
                         model=model,
 
                         batch=batch,
@@ -180,11 +232,14 @@ def train_step(
                         args=args
                     ), oom_log_info=f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} for full batch size {batch_size}. "
                 f"loss images accumulated: {tv.accumulated_loss_images_count}")
+            record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images/len(caption_variants))
 
-            loss_scale = loss_scale[:model_pred.shape[0]]
+            loss_scale = loss_scale[:model_forward_result.model_pred.shape[0]]
 
+            # Loss computation
+            t_loss_start = time.perf_counter()
             loss_1d = _do_loss(
-                model_pred, target, teacher_target, model_pred_anchor,
+                model_forward_result,
                 model=model,
                 batch=batch,
                 is_cond_dropout=is_cond_dropout,
@@ -200,8 +255,12 @@ def train_step(
                 args=args,
                 verbose=(tv.global_step % 200 == 0)
             )
-            del target, model_pred, model_pred_anchor
+            record_performance_timing("9_loss_computation", time.perf_counter() - t_loss_start, num_images/len(caption_variants))
 
+            del model_forward_result
+
+            # Loss logging and accumulation
+            t_loss_accum_start = time.perf_counter()
             for i, used_timestep in enumerate(timesteps):
                 used_timestep_detached = int(used_timestep.detach().item())
                 current, count = log_data.loss_per_timestep[tv.batch_resolution].get(used_timestep_detached, (0, 0))
@@ -275,7 +334,9 @@ def train_step(
             del loss_1d, loss_mean
             log_data.loss_log_step.append(loss_step)
             log_data.loss_epoch.append(loss_step)
+            record_performance_timing("10_loss_accumulation", time.perf_counter() - t_loss_accum_start, num_images/len(caption_variants))
 
+            # Backward pass (if needed)
             should_step_optimizer = (
                                         (tv.backwarded_images_count + tv.accumulated_loss_images_count)
                                         >= tv.desired_effective_batch_size
@@ -283,8 +344,10 @@ def train_step(
             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
+                t_backward_start = time.perf_counter()
                 with torch.cuda.amp.autocast(enabled=args.amp):
                     optimizer_backward(ed_optimizer, tv, 'regular backward: ')
+                record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
             # if tv.global_step >= 653 and tv.global_step < 656:
             #    print("step:", tv.global_step, "caption:", caption_variant, " - batch:", [os.readlink(x) for x in batch["pathnames"]], batch["captions"][caption_variant], "; timestep slice:", consumed_timesteps)
@@ -297,7 +360,9 @@ def train_step(
                     #      f'{tv.backwarded_images_count}, '
                     #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
 
+                    t_optimizer_step_start = time.perf_counter()
                     ed_optimizer.step_optimizer(tv.global_step, tv)
+                    record_performance_timing("12_optimizer_step", time.perf_counter() - t_optimizer_step_start, num_images)
 
                     tv.last_effective_batch_size = tv.backwarded_images_count
                     tv.total_trained_samples_count += tv.backwarded_images_count
@@ -319,6 +384,9 @@ def train_step(
                                 tv.interleaved_bs1_count = None
 
                 did_step_optimizer_cb()
+
+    t_step_end = time.perf_counter()
+    record_performance_timing("0_total_step_time", t_step_end - t_step_start, full_batch['image'].shape[0])
 
 
 def _get_cond_dropout_mask(caption_str) -> torch.Tensor:
@@ -792,6 +860,15 @@ def _generate_conditioning(batch: dict, caption_variant: str, model: TrainingMod
     return conditioning, teacher_conditioning, caption_str
 
 
+@dataclass
+class ModelForwardReturnType:
+    model_pred: torch.Tensor
+    target: torch.Tensor
+    lcf_midblock_out: torch.Tensor | None
+    lcf_midblock_clean_out: torch.Tensor | None
+    teacher_target: torch.Tensor | None
+
+
 def _do_model_forward(
     model: TrainingModel,
     batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning,
@@ -799,12 +876,13 @@ def _do_model_forward(
     teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
     forward_slice_size: int,
     tv: TrainingVariables, args: Namespace
-):
+) -> ModelForwardReturnType:
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
 
     model_pred_all = []
-    model_pred_anchor_all = []
+    lcf_midblock_out_all = []
+    lcf_midblock_out_clean_all = []
     target_all = []
     teacher_target_all = []
 
@@ -826,7 +904,15 @@ def _do_model_forward(
             teacher_conditioning_slice = teacher_conditioning.slice(slice_start, slice_end)
 
         try:
-            model_pred, target, teacher_target, noisy_latents = get_model_prediction_and_target(
+            if do_local_contrastive_flow_loss:
+                if type(model.noise_scheduler) is not TrainFlowMatchEulerDiscreteScheduler:
+                    raise NotImplementedError("Local Contrastive Flow loss only works with flow matching scheduler")
+                lcf_timestep_threshold = model.noise_scheduler.get_best_timestep_for_sigma(0.2)
+                lcf_mask_slice = (timesteps_slice < lcf_timestep_threshold)
+            else:
+                lcf_mask_slice = None
+
+            model_pred_result = get_model_prediction_and_target(
                 latents=latents_slice,
                 conditioning=conditioning_slice,
                 noise=noise_slice,
@@ -836,38 +922,40 @@ def _do_model_forward(
                 teacher_model=teacher_model,
                 teacher_mask=teacher_mask_slice,
                 teacher_conditioning=teacher_conditioning_slice,
+                lcf_mask=lcf_mask_slice
             )
 
-            model_pred_all.append(model_pred)
-            target_all.append(target)
-            teacher_target_all.append(teacher_target)
-            del target, teacher_target
+            model_pred_all.append(model_pred_result.model_pred)
+            target_all.append(model_pred_result.target)
+            teacher_target_all.append(model_pred_result.teacher_target)
+            lcf_midblock_out_all.append(model_pred_result.midblock_out)
+
+            # del
+            model_pred_result.target = None
+            model_pred_result.teacher_target = None
+            model_pred_result.midblock_out = None
 
             if do_local_contrastive_flow_loss:
-                if type(model.noise_scheduler) is not TrainFlowMatchEulerDiscreteScheduler:
-                    raise NotImplementedError("Local Contrastive Flow loss only works with flow matching scheduler")
-                lcf_timestep_threshold = model.noise_scheduler.get_best_timestep_for_sigma(0.2)
-                mask = (timesteps_slice < lcf_timestep_threshold)
-                if torch.sum(mask) == 0:
-                    model_pred_anchor = torch.zeros_like(model_pred)
-                else:
-                    anchor_timestep = model.noise_scheduler.get_best_timestep_for_sigma(0.5)
-                    anchor_timesteps_slice = torch.full_like(timesteps_slice, anchor_timestep)
-                    model_pred_anchor, _, _, _ = get_model_prediction_and_target(
-                        latents=noisy_latents,
-                        conditioning=conditioning_slice,
-                        noise=noise_slice,
-                        timesteps=anchor_timesteps_slice,
-                        model=model,
-                        args=args,
-                        teacher_model=None,
-                        teacher_mask=None,
-                        teacher_conditioning=None,
-                    )
-                model_pred_anchor_all.append(model_pred_anchor)
-                del model_pred_anchor
+                anchor_timestep = model.noise_scheduler.get_best_timestep_for_sigma(0)
+                anchor_timesteps_slice = torch.full_like(timesteps_slice, anchor_timestep)
 
-            del model_pred, conditioning_slice
+                model_pred_result_clean = get_model_prediction_and_target(
+                    latents=latents_slice,
+                    conditioning=conditioning_slice,
+                    noise=noise_slice,
+                    timesteps=anchor_timesteps_slice,
+                    model=model,
+                    args=args,
+                    teacher_model=None,
+                    teacher_mask=None,
+                    teacher_conditioning=None,
+                    mask=lcf_mask_slice,
+                    lcf_mask=lcf_mask_slice,
+                )
+                lcf_midblock_out_clean_all.append(model_pred_result_clean.midblock_out)
+                del model_pred_result_clean
+
+            del model_pred_result, conditioning_slice
 
         except (
                 torch.cuda.OutOfMemoryError,
@@ -884,20 +972,26 @@ def _do_model_forward(
     assert model_pred.shape[0] == batch_size
     assert timesteps.shape[0] == model_pred.shape[0]
 
-    model_pred_anchor = torch.cat(model_pred_anchor_all) if len(model_pred_anchor_all) > 0 else None
     target = torch.cat(target_all)
     if teacher_mask is None:
         teacher_target = None
     else:
         teacher_target = torch.cat(teacher_target_all)
-    del model_pred_all, model_pred_anchor_all, target_all, teacher_target_all
+    lcf_midblock_out = torch.cat(lcf_midblock_out_all) if do_local_contrastive_flow_loss else None
+    lcf_midblock_out_clean = torch.cat(lcf_midblock_out_clean_all) if do_local_contrastive_flow_loss else None
 
-    return model_pred, model_pred_anchor, target, teacher_target
+    return ModelForwardReturnType(
+        model_pred=model_pred,
+        target=target,
+        lcf_midblock_out=lcf_midblock_out,
+        lcf_midblock_clean_out=lcf_midblock_out_clean,
+        teacher_target=teacher_target
+    )
 
 
 
 def _do_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, teacher_target: torch.Tensor|None, model_pred_anchor: torch.Tensor|None,
+    model_forward_result: ModelForwardReturnType,
     model: TrainingModel,
     batch: dict,
     is_cond_dropout: torch.Tensor,
@@ -914,13 +1008,13 @@ def _do_loss(
     """
     Returns 1D loss tensor of shape [B].
     """
-    mask_img = None if batch["mask"] is None else batch["mask"][:model_pred.shape[0]]
+    mask_img = None if batch["mask"] is None else batch["mask"][:model_forward_result.model_pred.shape[0]]
 
     contrastive_loss_scale = 0
 
     loss = get_loss(
-        model_pred,
-        target,
+        model_forward_result.model_pred,
+        model_forward_result.target,
         is_cond_dropout=is_cond_dropout,
         mask_img=mask_img,
         timesteps=timesteps,
@@ -934,8 +1028,8 @@ def _do_loss(
     ).to(dtype=model.dtype)
     if teacher_mask is not None:
         teacher_loss = get_loss(
-            model_pred,
-            teacher_target,
+            model_forward_result.model_pred,
+            model_forward_result.teacher_target,
             is_cond_dropout=is_cond_dropout,
             mask_img=mask_img,
             timesteps=timesteps,
@@ -952,7 +1046,7 @@ def _do_loss(
         loss += teacher_loss * args.teacher_lambda
         del teacher_loss
 
-    if model_pred_anchor is not None:
+    if model_forward_result.lcf_midblock_out is not None:
         # doing local contrastive flow loss
         lcf_timestep_threshold = model.noise_scheduler.get_best_timestep_for_sigma(0.2)
         mask = (~negative_loss_mask).to(timesteps.device) & (
@@ -963,8 +1057,8 @@ def _do_loss(
             os.path.realpath(p) for p in batch["pathnames"]
         ]
         loss_lcf = get_local_contrastive_flow_loss(
-            model_pred,
-            model_pred_anchor,
+            model_forward_result.lcf_midblock_out,
+            model_forward_result.lcf_midblock_clean_out,
             low_noise_timesteps_mask=mask,
             unique_identifiers=pathnames_resolved,
             temperature=args.local_contrastive_flow_temperature
@@ -976,19 +1070,21 @@ def _do_loss(
     if random.random() < args.contrastive_flow_matching_loss_p:
         pathnames_resolved = [os.path.realpath(p)
                               for p in batch['pathnames']]
-        loss_cfm = get_contrastive_flow_matching_loss(
-            target,
-            model_pred,
+        mask = ~negative_loss_mask.cpu() & ~is_cond_dropout.cpu()
+        loss_cfm, sample_count = get_contrastive_flow_matching_loss(
+            model_forward_result.target,
+            model_forward_result.model_pred,
             unique_identifiers=pathnames_resolved,
             loss_type=args.loss_type,
             timesteps=timesteps,
             noise_scheduler=model.noise_scheduler,
-            mask=~negative_loss_mask,
+            mask=mask,
             amount=args.contrastive_flow_matching_loss_lambda
         )
+        log_writer.add_scalar("loss/CF sample count", sample_count, global_step=tv.global_step)
         loss += loss_cfm.to(dtype=loss.dtype)
 
-    log_data.loss_preview_image = torch.cat([model_pred, target, loss], dim=-2).detach().clone().cpu()
+    log_data.loss_preview_image = torch.cat([model_forward_result.model_pred, model_forward_result.target, loss], dim=-2).detach().clone().cpu()
 
     # reduce from [B, C, H, W] to [B] with mean
     loss = loss.mean(dim=list(range(1, len(loss.shape))))

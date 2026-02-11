@@ -57,7 +57,7 @@ class EveryDreamBatch(Dataset):
                  rated_dataset_dropout_target=0.5,
                  name='train',
                  contrastive_loss_batch_ids=None,
-                 use_masks=False,
+                 mask_p=0,
                  invert_masks=False,
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0,
@@ -88,7 +88,7 @@ class EveryDreamBatch(Dataset):
         self.image_train_items = []
         self.__update_image_train_items(1.0)
         self.name = name
-        self.use_masks = use_masks
+        self.mask_p = mask_p
         self.invert_masks = invert_masks
         self.contrastive_learning_dropout_p = contrastive_learning_dropout_p
         self.cond_dropout_noise_p = cond_dropout_noise_p
@@ -230,7 +230,8 @@ class EveryDreamBatch(Dataset):
         crop_jitter = (0.0
                        if image_train_item.runt_size > 0 # and do_contrastive_learning
                        else self.crop_jitter)
-        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=self.use_masks, invert_mask=self.invert_masks, return_crop_info=True)
+        load_mask = (random.random() < self.mask_p)
+        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=load_mask, invert_mask=self.invert_masks, return_crop_info=True)
         example["image"] = None if image_train_tmp.image is None else image_train_tmp.image.copy() # hack for now to avoid memory leak
         example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy() # hack for now to avoid memory leak
         image_train_tmp.image = None # hack for now to avoid memory leak

@@ -63,7 +63,8 @@ from core.loss import (
     get_latents
 )
 from core.step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
-    get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward
+    get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward, \
+    record_performance_timing
 from optimizer.attention_activation_control import ActivationLogger
 from model.training_model import (
     EveryDreamTrainingState,
@@ -744,6 +745,7 @@ def main(args):
         keep_same_sample_at_different_resolutions_together=args.keep_same_sample_at_different_resolutions_together
     )
 
+    mask_p = 0 if args.mask_p is None else args.mask_p
     train_batch = EveryDreamBatch(
         data_loader=data_loader,
         debug_level=1,
@@ -760,7 +762,7 @@ def main(args):
         contrastive_loss_batch_ids=args.contrastive_loss_batch_ids,
         contrastive_learning_dropout_p=args.contrastive_learning_dropout_p,
         cond_dropout_noise_p=args.cond_dropout_noise_p,
-        use_masks=args.use_masks,
+        mask_p=mask_p,
         invert_masks=args.invert_masks,
     )
 
@@ -943,7 +945,7 @@ def main(args):
                           zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
                           batch_share_noise=False)
 
-        model_pred, target, _, _ = get_model_prediction_and_target(
+        model_pred_result = get_model_prediction_and_target(
             latents,
             conditioning,
             noise,
@@ -953,7 +955,7 @@ def main(args):
             skip_contrastive=True
         )
 
-        return model_pred, target
+        return model_pred_result.model_pred, model_pred_result.target
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
@@ -1028,8 +1030,15 @@ def main(args):
 
             timesteps = None
             #logging.info("fetching batch...")
+
+            _dataloader_pre_time = time.perf_counter()
+
             for step, full_batch in enumerate(train_dataloader):
                 #logging.info("... fetched.")
+
+                _dataloader_post_time = time.perf_counter()
+                record_performance_timing('_dataloader_fetch', _dataloader_post_time - _dataloader_pre_time, full_batch['image'].shape[0])
+
 
                 try:
                     train_progress_01 = compute_train_process_01(epoch=epoch, step=step, steps_per_epoch=epoch_len,
@@ -1258,6 +1267,8 @@ def main(args):
                     raise
 
                 #logging.info("fetching...")
+
+                _dataloader_pre_time = time.perf_counter()
 
             steps_pbar.close()
 
@@ -1562,7 +1573,7 @@ if __name__ == "__main__":
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
 
     argparser.add_argument("--jacobian_descent", action='store_true', help="Do Jacobian Descent (see torchjd). Uses more VRAM.")
-    argparser.add_argument("--use_masks", action='store_true', help="If passed, look for files called eg image_name.jpg.mask.png in the data folder and use as mask for the loss")
+    argparser.add_argument("--mask_p", type=float, default=None, help="If passed, look for files called eg image_name.jpg.mask.png in the data folder and use as mask for the loss with given probability (0..1)")
     argparser.add_argument("--invert_masks", action=argparse.BooleanOptionalAction, help="If passed, invert the masks (white<->black)")
     argparser.add_argument("--use_both_mask_sides_contrastive", action='store_true', help="If passed, when using masks, do contrastive learning between mask and inverted mask with negative loss (use --negative_loss_margin to control clamping)")
 

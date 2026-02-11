@@ -72,7 +72,7 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def get_best_timestep_for_sigma(self, sigma: float):
         delta = (self.sigmas - sigma).abs()
         index = torch.argmin(delta).item()
-        return self.timesteps[index]
+        return self.timesteps[min(index, self.timesteps.shape[0]-1)]
 
 
     @property
