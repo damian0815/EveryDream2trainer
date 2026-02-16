@@ -1080,12 +1080,13 @@ def main(args):
                             gc.collect()
                             max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
                             if max_safe_forward_size == 0:
-                                # emergency backward
-                                with torch.cuda.amp.autocast(enabled=args.amp):
-                                    optimizer_backward(ed_optimizer, tv, 'emergency backward: ')
-                                torch.cuda.empty_cache()
-                                gc.collect()
-                                max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
+                                # maybe not enough memory. if we can, do an emergency backward pass if we have any loss pending
+                                if tv.accumulated_loss_images_count > 0:
+                                    with torch.cuda.amp.autocast(enabled=args.amp):
+                                        optimizer_backward(ed_optimizer, tv, 'emergency backward: ')
+                                    torch.cuda.empty_cache()
+                                    gc.collect()
+                                    max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
                                 if max_safe_forward_size == 0:
                                     logging.warning(" * Unable to free enough ram with emergency backward - possible OOM follows")
                                     max_safe_forward_size = 1
@@ -1556,6 +1557,7 @@ if __name__ == "__main__":
     argparser.add_argument("--contrastive_flow_matching_loss_p", type=float, default=0, help="Probability that a given batch will have Contrastive Flow Matching loss (Stoica et al., June 2025) applied")
     argparser.add_argument("--contrastive_flow_matching_loss_lambda", type=float, default=0.05, help="Lambda scaling factor for Contrastive Flow Matching loss. Ensure that K * lambda < 1")
 
+    argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="Probability to drop (non-LCF/non-CFM) contrastive learning")
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")
     argparser.add_argument("--contrastive_loss_scale", type=float, default=1, help="Scaling factor for contrastive loss")
     argparser.add_argument("--contrastive_loss_type", type=str, choices=['infonce', 'delta', 'infonce_with_text_similarity', 'infonce_softrepa'], help="Type of contrastive loss")

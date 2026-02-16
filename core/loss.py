@@ -1012,26 +1012,28 @@ def get_local_contrastive_flow_loss(
     # can only do contrastive if >1 samples
     n_contrastive = low_noise_timesteps_mask.sum().item()
     if n_contrastive >= 2:
-        # --- 1. Feature Extraction ---
-        # features_anchor: [N_anchors, C]
-        # These are the noisy representations (z) requiring gradients
-        features_anchor = F.normalize(midblock_out[low_noise_timesteps_mask].mean(dim=(2, 3)), p=2, dim=1)
+        # 1. Extract features
 
-        # features_clean: [N_anchors, C]
-        # These are the CLEAN representations (h_clean), detached
-        # NOTE: Ensure midblock_clean_out is aligned with midblock_out (same batch order)
-        features_clean = F.normalize(midblock_clean_out[low_noise_timesteps_mask].mean(dim=(2, 3)).detach(), p=2, dim=1)
+        # Noisy representations (z) requiring gradients
+        features_anchor = F.normalize(midblock_out[low_noise_timesteps_mask].mean(dim=(2, 3)), p=2, dim=1) # [N_anchors, C]
+        # Clean representations (h_clean) - correct labels (positive samples)
+        features_clean = F.normalize(midblock_clean_out[low_noise_timesteps_mask].mean(dim=(2, 3)), p=2, dim=1) # [N_anchors, C]
+        # Noisy representations from other samples  targets, detached, from all samples (including anchors themselves, but we will ignore self-matches later)
+        features_negatives = F.normalize(midblock_out.mean(dim=(2, 3)).detach(), p=2, dim=1) # [B, C]
 
-        # features_negatives: [B, C]
-        # The pool of negatives includes the whole batch (noisy), detached
-        features_negatives = F.normalize(midblock_out.mean(dim=(2, 3)).detach(), p=2, dim=1)
+        # Noisy representations (z) requiring gradients
+        #features_anchor = midblock_out[low_noise_timesteps_mask].mean(dim=(2, 3)) # [N_anchors, C]
+        # Clean representations (h_clean) - correct labels (positive samples)
+        #features_clean = midblock_clean_out[low_noise_timesteps_mask].mean(dim=(2, 3)) # [N_anchors, C]
+        # Noisy representations from other samples  targets, detached, from all samples (including anchors themselves, but we will ignore self-matches later)
+        #features_negatives = midblock_out.mean(dim=(2, 3)).detach() # [B, C]
 
         # --- 2. Distance Computation ---
 
         # Positive distances: ||z(i) - h_clean(i)||^2
-        pos_dists = torch.sum((features_anchor - features_clean) ** 2, dim=1)  # [N_anchors]
+        pos_dists_sq = torch.sum((features_anchor - features_clean) ** 2, dim=1)  # [N_anchors]
         # Negative distances: ||z(i) - h_noisy(j)||^2 for all j
-        full_dists = torch.cdist(features_anchor, features_negatives, p=2) ** 2  # [N_anchors, B]
+        full_dists_sq = torch.cdist(features_anchor, features_negatives, p=2) ** 2  # [N_anchors, B]
 
         # --- 3. Construct Logits ---
 
@@ -1039,19 +1041,19 @@ def get_local_contrastive_flow_loss(
         # and the "incorrect" classes are the Noisy versions of other images.
 
         # Get the original batch indices corresponding to the anchors
-        anchor_indices = torch.where(low_noise_timesteps_mask)[0].to(full_dists.device)  # [N_anchors]
+        anchor_indices = torch.where(low_noise_timesteps_mask)[0].to(full_dists_sq.device)  # [N_anchors]
 
         # We start with the full distance matrix (Anchor vs All Noisy)
-        # Currently, full_dists[k, anchor_indices[k]] is distance(Anchor_i, Noisy_i) ≈ 0.
+        # Currently, full_dists_sq[k, anchor_indices[k]] is distance(Anchor_i, Noisy_i) ≈ 0.
         # We REPLACE this self-match with the distance(Anchor_i, Clean_i).
 
         # Create a range for row indexing
-        row_indices = torch.arange(features_anchor.shape[0], device=full_dists.device)
+        row_indices = torch.arange(features_anchor.shape[0], device=full_dists_sq.device)
 
         # Inject the positive distances into the matrix at the correct indices
         # We clone to avoid in-place modification errors if this tensor is used elsewhere
-        logits_dists = full_dists.clone()
-        logits_dists[row_indices, anchor_indices] = pos_dists
+        logits_dists = full_dists_sq.clone()
+        logits_dists[row_indices, anchor_indices] = pos_dists_sq
 
         # Negate because CrossEntropy expects logits (higher is better), but we have distances (lower is better)
         logits = -logits_dists / temperature

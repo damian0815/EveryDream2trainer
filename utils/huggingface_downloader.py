@@ -32,12 +32,11 @@ def try_download_model_from_hf(repo_id: str, variant: str|None=None) -> Tuple[St
         return pipe, None, False, None
 
     # load it to download it
-    #pipe, cache_folder = StableDiffusionPipeline.from_pretrained(repo_id, return_cached_folder=True)
-    cache_folder = AutoModel.download(repo_id)
-    pipe = AutoModel.from_pretrained(repo_id)
+    #cache_folder = huggingface_hub.snapshot_download(repo_id)
+    pipe = StableDiffusionPipeline.from_pretrained(repo_id)
 
-    is_sd1_attn, yaml_path = get_attn_yaml(cache_folder)
-    print(f"* HuggingFace Downloaded model from {repo_id} to {cache_folder}.")
-    print(f"** Using attention yaml file: {yaml_path}, is_sd1_attn: {is_sd1_attn}.")
+    #is_sd1_attn, yaml_path = get_attn_yaml(cache_folder)
+    #print(f"* HuggingFace Downloaded model from {repo_id} to {cache_folder}.")
+    #print(f"** Using attention yaml file: {yaml_path}, is_sd1_attn: {is_sd1_attn}.")
 
-    return pipe, cache_folder, is_sd1_attn, yaml_path
+    return pipe, None, None, None

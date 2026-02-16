@@ -40,10 +40,14 @@ class ImageGenerationParams:
 
     @classmethod
     def from_invokeai_metadata(cls, m, original_index=None, cfg_rescale_override=None, karras_override=False,
-                               resolution_override=None, edit_prompt_fn=None):
-        scheduler = 'euler_a' if m['scheduler'] == 'k_euler_a' else m['scheduler']
-        if karras_override and scheduler.endswith("_k"):
-            scheduler = scheduler[:-2]
+                               resolution_override=None, scheduler_override=None, edit_prompt_fn=None):
+
+        if scheduler_override is not None:
+            scheduler = scheduler_override
+        else:
+            scheduler = 'euler_a' if m['scheduler'] == 'k_euler_a' else m['scheduler']
+            if karras_override and scheduler.endswith("_k"):
+                scheduler = scheduler[:-2]
 
         width = int(m['width'])
         height = int(m['height'])
@@ -55,7 +59,9 @@ class ImageGenerationParams:
                 else:
                     height += 8
 
-        prompt = m['positive_prompt'].strip()
+        prompt = m.get('positive_prompt', m.get('prompt')).strip()
+        if prompt is None:
+            raise ValueError("no prompt found in metadata: ", m)
         if edit_prompt_fn is not None:
             prompt = edit_prompt_fn(prompt)
 
@@ -254,6 +260,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                               index_offset=0,
                               flow_match_shift=1,
                               flow_match_shift_dynamic=False,
+                              start_offset=0,
                               ):
     extra_cfgs = extra_cfgs or []
     all_params = sorted(all_params, key=lambda x: get_critical_params(x))
@@ -284,6 +291,14 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                 break
 
             params = list(params)
+            while start_offset > 0 and len(params) > 0:
+                start_offset -= 1
+                base_sample_index += 1
+                pbar_update(1, skipped=True)
+                params.pop(0)
+            if len(params) == 0:
+                continue
+
             p0: ImageGenerationParams = params[0]
 
             pbar.set_postfix_str(f"{k}: {len(params)} images")
