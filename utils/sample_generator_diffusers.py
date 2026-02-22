@@ -312,92 +312,96 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
 
             pipe.scheduler = create_scheduler(p0.sampler, scheduler_config=pipe.scheduler.config, flow_match_shift=flow_match_shift, flow_match_shift_dynamic=flow_match_shift_dynamic)
             for batch in params_batches:
-                prompts = [p.prompt for p in batch]
-                negative_prompts = [p.negative_prompt for p in batch]
-                pipe.set_progress_bar_config(leave=False, desc=f"{len(prompts)} gens")
+                try:
+                    prompts = [p.prompt for p in batch]
+                    negative_prompts = [p.negative_prompt for p in batch]
+                    pipe.set_progress_bar_config(leave=False, desc=f"{len(prompts)} gens")
 
-                conditioning = compel(prompts, negative_prompt=negative_prompts) if compel is not None else None
-                
-                embeds, pooled_embeds, negative_embeds, negative_pooled_embeds = (
-                    (None, None, None, None) if conditioning is None else (conditioning.embeds, conditioning.pooled_embeds, conditioning.negative_embeds, conditioning.negative_pooled_embeds)
-                )
-                
-                prompt, negative_prompt = (
-                    (prompts, negative_prompts) if compel is None else (None, None)
-                )
+                    conditioning = compel(prompts, negative_prompt=negative_prompts) if compel is not None else None
 
-                batch_images = []
+                    embeds, pooled_embeds, negative_embeds, negative_pooled_embeds = (
+                        (None, None, None, None) if conditioning is None else (conditioning.embeds, conditioning.pooled_embeds, conditioning.negative_embeds, conditioning.negative_pooled_embeds)
+                    )
 
-                cfgs = [p0.cfg] + extra_cfgs
-                for cfg in cfgs:
-                    generator = [torch.Generator(device=generator_device).manual_seed(p.seed) for p in batch]
+                    prompt, negative_prompt = (
+                        (prompts, negative_prompts) if compel is None else (None, None)
+                    )
 
-                    if isinstance(pipe.scheduler,
-                                  SDPipelineInferenceFlowMatchEulerDiscreteScheduler) and pipe.scheduler.config.use_dynamic_shifting:
-                        image_pixel_count = p0.width * p0.height
-                        # for linear shift, we go from 1 to 3 over 1 megapixel
-                        assert pipe.scheduler.config.time_shift_type == 'linear'
-                        shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
-                        pipe.scheduler.set_shift(shift)
-                        # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
-                        print("updated scheduler with shift", shift)
+                    batch_images = []
 
-                    images = pipe(prompt=prompt,
-                                  prompt_embeds=embeds,
-                                  pooled_prompt_embeds=pooled_embeds,
-                                  negative_prompt=negative_prompt,
-                                  negative_prompt_embeds=negative_embeds,
-                                  negative_pooled_prompt_embeds=negative_pooled_embeds,
-                                  generator=generator,
-                                  width=p0.width,
-                                  height=p0.height,
-                                  guidance_scale=cfg,
-                                  guidance_rescale=p0.cfg_rescale_multiplier,
-                                  num_inference_steps=p0.steps
-                                  ).images
+                    cfgs = [p0.cfg] + extra_cfgs
+                    for cfg in cfgs:
+                        generator = [torch.Generator(device=generator_device).manual_seed(p.seed) for p in batch]
 
-                    for image in images:
-                        draw = ImageDraw.Draw(image)
-                        print_msg = f"cfg:{cfg:.1f}"
+                        if isinstance(pipe.scheduler,
+                                      SDPipelineInferenceFlowMatchEulerDiscreteScheduler) and pipe.scheduler.config.use_dynamic_shifting:
+                            image_pixel_count = p0.width * p0.height
+                            # for linear shift, we go from 1 to 3 over 1 megapixel
+                            assert pipe.scheduler.config.time_shift_type == 'linear'
+                            shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
+                            pipe.scheduler.set_shift(shift)
+                            # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
+                            print("updated scheduler with shift", shift)
 
-                        l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
-                        text_width = r - l
-                        text_height = b - t
+                        images = pipe(prompt=prompt,
+                                      prompt_embeds=embeds,
+                                      pooled_prompt_embeds=pooled_embeds,
+                                      negative_prompt=negative_prompt,
+                                      negative_prompt_embeds=negative_embeds,
+                                      negative_pooled_prompt_embeds=negative_pooled_embeds,
+                                      generator=generator,
+                                      width=p0.width,
+                                      height=p0.height,
+                                      guidance_scale=cfg,
+                                      guidance_rescale=p0.cfg_rescale_multiplier,
+                                      num_inference_steps=p0.steps
+                                      ).images
 
-                        x = float(image.width - text_width - 10)
-                        y = float(image.height - text_height - 10)
+                        for image in images:
+                            draw = ImageDraw.Draw(image)
+                            print_msg = f"cfg:{cfg:.1f}"
 
-                        draw.rectangle((x, y, image.width, image.height), fill="white")
-                        draw.text((x, y), print_msg, fill="black", font=font)
+                            l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
+                            text_width = r - l
+                            text_height = b - t
 
-                    batch_images.append(images)
-                    del images
+                            x = float(image.width - text_width - 10)
+                            y = float(image.height - text_height - 10)
 
-                for prompt_idx in range(len(batch)):
-                    #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
-                    result = Image.new('RGB', (p0.width * len(cfgs), p0.height))
-                    x_offset = 0
+                            draw.rectangle((x, y, image.width, image.height), fill="white")
+                            draw.text((x, y), print_msg, fill="black", font=font)
 
-                    for cfg_idx in range(len(cfgs)):
-                        image = batch_images[cfg_idx][prompt_idx]
-                        result.paste(image, (x_offset, 0))
-                        x_offset += image.width
+                        batch_images.append(images)
+                        del images
 
-                    metadata = PngInfo()
-                    invokeai_metadata = update_metadata(METADATA_TEMPLATE,
-                                                        model_node_data,
-                                                        batch[prompt_idx])
-                    auto1111_metadata = get_auto1111_md_for_invoke_md(invokeai_metadata)
-                    metadata.add_text("invokeai_metadata", json.dumps(invokeai_metadata))
-                    metadata.add_text("parameters", auto1111_metadata)
+                    for prompt_idx in range(len(batch)):
+                        #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
+                        result = Image.new('RGB', (p0.width * len(cfgs), p0.height))
+                        x_offset = 0
 
-                    image_save_cb(result,
-                                  sample_index=base_sample_index+prompt_idx,
-                                  prompt=batch[prompt_idx].prompt,
-                                  pngmetadata=metadata)
+                        for cfg_idx in range(len(cfgs)):
+                            image = batch_images[cfg_idx][prompt_idx]
+                            result.paste(image, (x_offset, 0))
+                            x_offset += image.width
 
-                    del result
-                del batch_images
+                        metadata = PngInfo()
+                        invokeai_metadata = update_metadata(METADATA_TEMPLATE,
+                                                            model_node_data,
+                                                            batch[prompt_idx])
+                        auto1111_metadata = get_auto1111_md_for_invoke_md(invokeai_metadata)
+                        metadata.add_text("invokeai_metadata", json.dumps(invokeai_metadata))
+                        metadata.add_text("parameters", auto1111_metadata)
+
+                        image_save_cb(result,
+                                      sample_index=base_sample_index+prompt_idx,
+                                      prompt=batch[prompt_idx].prompt,
+                                      pngmetadata=metadata)
+
+                        del result
+                    del batch_images
+                except Exception as e:
+                    print("Error generating batch, skipping. Error:", repr(e))
+                    continue
 
                 pbar_update(len(batch))
                 base_sample_index += len(batch)

@@ -12,9 +12,10 @@ def same_barename(lhs, rhs):
     return barename(lhs) == barename(rhs)
     
 def is_image(file):
+    extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif'}
     return (
-        ext(file) in {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif'}
-        and not file.endswith(".mask.png")
+        ext(file) in extensions
+        and not any(file.endswith(f".mask{extension}") for extension in extensions)
     )
 
 def read_text(file):

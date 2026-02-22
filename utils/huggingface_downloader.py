@@ -3,7 +3,7 @@ import os
 from typing import Optional, Tuple
 
 import huggingface_hub
-from diffusers import StableDiffusionPipeline, AutoModel, StableDiffusionXLPipeline
+from diffusers import StableDiffusionPipeline, AutoModel, StableDiffusionXLPipeline, DiffusionPipeline
 
 from utils.unet_utils import get_attn_yaml
 
@@ -33,7 +33,7 @@ def try_download_model_from_hf(repo_id: str, variant: str|None=None) -> Tuple[St
 
     # load it to download it
     #cache_folder = huggingface_hub.snapshot_download(repo_id)
-    pipe = StableDiffusionPipeline.from_pretrained(repo_id)
+    pipe = DiffusionPipeline.from_pretrained(repo_id)
 
     #is_sd1_attn, yaml_path = get_attn_yaml(cache_folder)
     #print(f"* HuggingFace Downloaded model from {repo_id} to {cache_folder}.")

@@ -424,8 +424,9 @@ def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, 
             return encoder_hidden_states
 
     # https://arxiv.org/pdf/2405.20494
-    perturbation_deviation = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
-    perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation)
+    perturbation_deviation_max = embedding_perturbation / math.sqrt(encoder_hidden_states.shape[2])
+    perturbation_deviation = torch.randn(encoder_hidden_states.shape[0]) * perturbation_deviation_max
+    perturbation_delta = torch.randn_like(encoder_hidden_states) * (perturbation_deviation.unsqueeze(-1).unsqueeze(-1))
     encoder_hidden_states = encoder_hidden_states + perturbation_delta
     del cuda_caption
     return encoder_hidden_states
