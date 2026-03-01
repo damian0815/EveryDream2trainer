@@ -179,12 +179,14 @@ class EveryDreamOptimizer:
             logging.warning(
                 "* Ignoring use_grad_scaler entry in optimizer config, will be set automatically"
             )
-        if model.unet.dtype == torch.bfloat16:
+        is_training_unet = not args.disable_unet_training
+        is_training_te = not args.disable_textenc_training
+        if (is_training_unet and model.unet.dtype == torch.bfloat16) or (is_training_te and model.text_encoder.dtype == torch.bfloat16):
             self.use_grad_scaler = False
-            logging.info("* bfloat16 unet: no grad scaler")
-        elif model.unet.dtype == torch.float16:
+            logging.info("* bfloat16 unet/te: no grad scaler")
+        elif (is_training_unet and model.unet.dtype == torch.float16) or (is_training_te and model.text_encoder.dtype == torch.float16):
             self.use_grad_scaler = True
-            logging.info("* float16 unet: using grad scaler")
+            logging.info("* float16 unet/te: using grad scaler")
         elif args.amp:
             self.use_grad_scaler = True
             logging.info(f"* AMP in use: using grad scaler")
@@ -200,15 +202,10 @@ class EveryDreamOptimizer:
             )
         else:
             self.text_encoder_params = {
-                "default": list(
-                    itertools.chain(
-                        [
-                            self._apply_text_encoder_freeze(model.text_encoder),
-                            self._apply_text_encoder_freeze(model.text_encoder_2)
-                            if model.text_encoder_2 is not None
-                            else [],
-                        ]
-                    )
+                "default": list(self._apply_text_encoder_freeze(model.text_encoder)) + (
+                    list(self._apply_text_encoder_freeze(model.text_encoder_2))
+                    if model.text_encoder_2 is not None
+                    else []
                 )
             }
             self.unet_params = self._apply_unet_freeze(
@@ -236,7 +233,6 @@ class EveryDreamOptimizer:
         self.text_encoder_params, _ = plugin_runner.run_add_parameters(
             self.text_encoder_params, []
         )
-        self.text_encoder_params = list(self.text_encoder_params)
 
         # with torch.no_grad():
         #    log_action = lambda n, label: logging.info(f"{Fore.LIGHTBLUE_EX} {label} weight normal: {n:.1f}{Style.RESET_ALL}")
@@ -473,7 +469,10 @@ class EveryDreamOptimizer:
                             )
 
         if self.log_grad_norm:
-            _log_grad_norms(self.optimizer_unet, self.log_writer, optimizer_name='unet', global_step=global_step)
+            if self.optimizer_unet is not None:
+                _log_grad_norms(self.optimizer_unet, self.log_writer, optimizer_name='unet', global_step=global_step)
+            if self.optimizer_te is not None:
+                _log_grad_norms(self.optimizer_te, self.log_writer, optimizer_name='te', global_step=global_step)
 
         if self.scaler is None:
             for optimizer in self.optimizers:
@@ -667,9 +666,13 @@ class EveryDreamOptimizer:
         if args.lr_advance_steps is None:
             args.lr_advance_steps = 0
 
+        te_config["lr"] = te_config.get("lr", None) or base_config["lr"]
         if args.lr is not None:
             # override for legacy support reasons
+            # preserve TE ratio
+            te_lr_ratio = te_config["lr"] / base_config["lr"]
             base_config["lr"] = args.lr
+            te_config["lr"] = args.lr * te_lr_ratio
 
         base_config["lr_end"] = (
             base_config.get("lr_end", args.lr_end) or base_config["lr"] / 100.0
@@ -699,7 +702,6 @@ class EveryDreamOptimizer:
             base_config.get("lr_num_restarts", None) or args.lr_num_restarts
         )
 
-        te_config["lr"] = te_config.get("lr", None) or base_config["lr"]
         te_config["optimizer"] = (
             te_config.get("optimizer", None) or base_config["optimizer"]
         )
@@ -898,11 +900,6 @@ class EveryDreamOptimizer:
             safeguard_warmup = local_optimizer_config.get(
                 "safeguard_warmup", safeguard_warmup
             )
-            if args.lr is not None:
-                curr_lr = args.lr
-                logging.info(
-                    f"Overriding LR from optimizer config with main config/cli LR setting: {curr_lr}"
-                )
 
         if optimizer_name is None or optimizer_name == "adamw8bit":
             if not self.use_grad_scaler and self.unet.dtype != torch.bfloat16:
@@ -921,6 +918,8 @@ class EveryDreamOptimizer:
 
         param_groups = []
 
+        # urgh. i let Claude write this without checking the output 🙈
+        # todo: refactor so it doesn't suck (specifically: this is super stupid complicated)
         if is_component_lr:
             # Component-specific LR mode for UNet
             logging.info(
@@ -981,8 +980,13 @@ class EveryDreamOptimizer:
         else:
             # Standard mode: single group (dict with one key, usually "default")
             # Get the single group's parameters
-            group_name = list(parameters.keys())[0]
-            param_list = parameters[group_name]
+            if type(parameters) is dict:
+                assert len(parameters) == 1
+                group_name = list(parameters.keys())[0]
+                param_list = parameters[group_name]
+            else:
+                group_name = "default"
+                param_list = parameters
 
             attention_weight_decay = local_optimizer_config.get(
                 "weight_decay_attn_qk", None

@@ -183,12 +183,13 @@ class EveryDreamValidator:
 
     def do_validation(self, model: TrainingModel, global_step: int,
                       get_model_prediction_and_target_callable: Callable[
-                                         [torch.Tensor, Conditioning], tuple[torch.Tensor, torch.Tensor]]):
+                                         [torch.Tensor, Conditioning], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         mean_loss_accumulator = 0
         for i, dataset in enumerate(self.validation_datasets):
             mean_loss = self._calculate_validation_loss(model, logging_tag=dataset.name,
                                                         dataloader=dataset.dataloader,
-                                                        get_model_prediction_and_target=get_model_prediction_and_target_callable)
+                                                        get_model_prediction_and_target=get_model_prediction_and_target_callable,
+                                                        global_step=global_step)
             mean_loss_accumulator += mean_loss
             self.log_writer.add_scalar(tag=f"loss/{dataset.name}",
                                        scalar_value=mean_loss,
@@ -202,13 +203,18 @@ class EveryDreamValidator:
                                        global_step=global_step)
 
     def _calculate_validation_loss(self, model, logging_tag, dataloader, get_model_prediction_and_target: Callable[
-        [torch.Tensor, Conditioning], tuple[torch.Tensor, torch.Tensor]]) -> float:
+        [torch.Tensor, Conditioning], tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                                   global_step: int = 0) -> float:
         with torch.no_grad(), isolate_rng():
             # ok to override seed here because we are in a `with isolate_rng():` block
             random.seed(self.seed)
             torch.manual_seed(self.seed)
 
             loss_validation_epoch = []
+            # accumulators for bias/variance and per-timestep histograms
+            all_residuals = []       # list of float: mean signed residual per sample
+            all_timesteps = []       # list of float: timestep per sample (normalised to [0,1])
+
             steps_pbar = tqdm(range(len(dataloader)), position=1, leave=False)
             steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Validate ({logging_tag}){Style.RESET_ALL}")
 
@@ -223,22 +229,35 @@ class EveryDreamValidator:
                     else:
                         tokens_2 = None
 
-                    encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                    encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
                         tokens, tokens_2, caption_str, model, args=None
                     )
                     if model.is_sdxl:
                         add_time_ids = batch["add_time_ids"].to(encoder_hidden_states.device)
-                        conditioning = Conditioning.sdxl_conditioning(text_encoder_hidden_states=encoder_hidden_states,
-                                                                      text_encoder_2_hidden_states=encoder_2_hidden_states,
-                                                                      text_encoder_2_pooled_embeds=encoder_2_pooled_embeds,
-                                                                      add_time_ids=add_time_ids
-                                                                      )
+                        conditioning = Conditioning.sdxl_conditioning(
+                            text_encoder_hidden_states=encoder_hidden_states,
+                            text_encoder_pooled_embeds=encoder_pooled_embeds,
+                            text_encoder_2_hidden_states=encoder_2_hidden_states,
+                            text_encoder_2_pooled_embeds=encoder_2_pooled_embeds,
+                            add_time_ids=add_time_ids
+                        )
                     else:
-                        conditioning = Conditioning.sd12_conditioning(text_encoder_hidden_states=encoder_hidden_states)
+                        conditioning = Conditioning.sd12_conditioning(
+                            text_encoder_hidden_states=encoder_hidden_states,
+                            text_encoder_pooled_embeds=encoder_pooled_embeds
+                        )
 
-                    model_pred, target = get_model_prediction_and_target(batch["image"], conditioning)
+                    model_pred, target, timesteps = get_model_prediction_and_target(batch["image"], conditioning)
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                    # per-sample signed residuals (mean over C,H,W) → shape [B]
+                    residuals = (model_pred.float() - target.float()).mean(dim=(1, 2, 3))
+                    all_residuals.extend(residuals.detach().clone().cpu().tolist())
+
+                    # normalise timesteps to [0,1]; they may be raw scheduler integers (0–1000) or floats
+                    t_norm = timesteps.float().cpu() / model.noise_scheduler.config.num_train_timesteps
+                    all_timesteps.extend(t_norm.detach().clone().cpu().tolist())
 
                     del target, model_pred, conditioning
                     loss_step = loss.detach().item()
@@ -249,6 +268,29 @@ class EveryDreamValidator:
             steps_pbar.close()
 
         loss_validation_local = sum(loss_validation_epoch) / len(loss_validation_epoch)
+
+        # --- scalar bias & variance ---
+        residuals_tensor = torch.tensor(all_residuals, dtype=torch.float32)
+        bias = residuals_tensor.mean().item()
+        variance = residuals_tensor.var().item()
+        self.log_writer.add_scalar(tag=f"loss/val_{logging_tag}_bias", scalar_value=bias, global_step=global_step)
+        self.log_writer.add_scalar(tag=f"loss/val_{logging_tag}_variance", scalar_value=variance, global_step=global_step)
+        logging.info(f"Validation ({logging_tag}) bias={bias:.4f}  variance={variance:.4f}")
+
+        # --- mean residual by timestep bucket ---
+        # Produces a 1D tensor [n_buckets] of mean residuals, x=bucket index ~ timestep, y=mean residual
+        n_buckets = 20
+        timesteps_tensor = torch.tensor(all_timesteps, dtype=torch.float32)
+        bucket_ids = (timesteps_tensor * n_buckets).long().clamp(0, n_buckets - 1)
+        mean_residual_by_t = torch.zeros(n_buckets, dtype=torch.float32)
+        for b in range(n_buckets):
+            mask = bucket_ids == b
+            if mask.sum() > 0:
+                mean_residual_by_t[b] = residuals_tensor[mask].mean()
+        self.log_writer.add_histogram(tag=f"loss/val_{logging_tag}_residuals_by_t",
+                                      values=mean_residual_by_t,
+                                      global_step=global_step)
+
         return loss_validation_local
 
     def _build_automatic_validation_dataset_if_required(self, image_train_items: list[ImageTrainItem], model: TrainingModel) \

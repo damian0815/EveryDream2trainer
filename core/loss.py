@@ -2,7 +2,7 @@ import logging
 import math
 import random
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
+from typing import Optional, Literal
 
 import torch
 import torchvision
@@ -569,7 +569,7 @@ def _get_target(latents, noise, noise_scheduler, timesteps):
 def _get_noisy_latents_and_target(
     latents,
     noise,
-    noise_scheduler: (SchedulerMixin, ConfigMixin),
+    noise_scheduler: SchedulerMixin|ConfigMixin,
     timesteps,
     latents_perturbation,
 ):
@@ -1208,3 +1208,37 @@ def _compute_contrast_scores(class_labels: list[dict[str, set[str]]]) -> torch.T
             contrast_scores[i, j] = score
     return contrast_scores
 
+
+# CLIP cross-entropy (InfoNCE) loss
+def get_clip_loss(
+    image_embeds: torch.Tensor,
+    text_embeds: torch.Tensor,
+    model: TrainingModel,
+    mask: torch.Tensor
+) -> torch.Tensor:
+    #with torch.no_grad():
+    #    pixels = model.clip_processor(images=images, return_tensors="pt").pixel_values.to(model.device)  # [B, 3, H, W]
+    #    image_embeds = model.clip_model.get_image_features(pixels)  # [B, 1024]
+
+    #text_embeds = model.clip_model.text_projection(text_encoder_pooler_output.to(dtype=model.clip_model.text_projection.weight.dtype))  # [B, 1024]
+
+    # normalize features
+    image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
+    # cosine similarity as logits
+    logits_per_text = torch.matmul(text_embeds, image_embeds.t().to(text_embeds.device))
+    logits_per_text = logits_per_text * model.clip_model.logit_scale.exp().to(text_embeds.device)
+    logits_per_image = logits_per_text.t()
+
+    # labels are indices of the correct match
+    batch_size = text_embeds.shape[0]
+    labels = torch.arange(batch_size, device=text_embeds.device).long()
+    labels[~mask] = -1  # set ignored samples to -1
+    clip_loss_1d = (
+        F.cross_entropy(logits_per_image, labels, reduction="none", ignore_index=-1) +
+        F.cross_entropy(logits_per_text, labels, reduction="none", ignore_index=-1)
+    ) / 2
+    clip_loss_1d[~mask] = 0
+
+    return clip_loss_1d

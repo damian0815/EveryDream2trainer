@@ -40,8 +40,10 @@ from tqdm.auto import tqdm
 
 from diffusers import (
     StableDiffusionPipeline,
-    FlowMatchEulerDiscreteScheduler,
+    FlowMatchEulerDiscreteScheduler, AutoModel,
 )
+from transformers import CLIPModel, CLIPProcessor, AutoProcessor
+
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 # from diffusers.models import AttentionBlock
 # from accelerate import Accelerator
@@ -75,7 +77,7 @@ from model.training_model import (
     get_use_ema_decay_training,
     TrainingVariables,
     TrainingModel,
-    Conditioning,
+    Conditioning, load_clip_model,
 )
 from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, \
     WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE, \
@@ -472,6 +474,9 @@ def main(args):
     print(f" Args:")
     pprint.pprint(vars(args))
 
+    if args.debug_log_on_nan:
+        torch.autograd.set_detect_anomaly(True)
+
     if args.seed == -1:
         args.seed = random.randint(0, 2**30)
     seed = args.seed
@@ -514,11 +519,23 @@ def main(args):
         teacher_model = None
     else:
         try:
-            model = load_model(args)
+            model: TrainingModel = load_model(args)
         except Exception as e:
             traceback.print_exc()
             logging.error(f" * Failed to load checkpoint: {repr(e)} * ")
             raise
+
+        if args.clip_vision_model_source is not None:
+            if args.disable_textenc_training:
+                logging.error(f" * Ignoring --clip_vision_model_source because --disable_textenc_training was passed")
+            else:
+                logging.info(f" * Loading CLIP vision model from {args.clip_vision_model_source}")
+                clip_model, clip_processor = load_clip_model(args.clip_vision_model_source, args.clip_vision_model_processor_source)
+                clip_model.requires_grad_(False)
+                clip_model.to(device, dtype=torch.float16)
+                del clip_model.text_model
+                model.clip_model = clip_model
+                model.clip_processor = clip_processor
 
         if args.teacher is not None and args.teacher_p > 0:
             logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
@@ -918,16 +935,18 @@ def main(args):
             gc.collect()
             torch.cuda.empty_cache()
 
-    def make_save_path(epoch, global_step, prepend=""):
+    def make_save_path(epoch, global_step, num_trained_samples, prepend=""):
         basename = f"{prepend}{args.project_name}"
         if epoch is not None:
             basename += f"-ep{epoch:02}"
         if global_step is not None:
             basename += f"-gs{global_step:05}"
+        if num_trained_samples is not None:
+            basename += f"-n{num_trained_samples:06}"
         return os.path.join(log_folder, "ckpts", basename)
 
     def get_model_prediction_and_target_validation_wrapper(image: torch.Tensor, conditioning: Conditioning
-                                                ) -> Tuple[torch.Tensor, torch.Tensor]:
+                                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = image.shape[0]
         timesteps = get_uniform_timesteps(batch_size=batch_size,
                                           batch_share_timesteps=False,
@@ -955,7 +974,7 @@ def main(args):
             skip_contrastive=True
         )
 
-        return model_pred_result.model_pred, model_pred_result.target
+        return model_pred_result.model_pred, model_pred_result.target, timesteps
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
@@ -1206,7 +1225,7 @@ def main(args):
                         logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
                         needs_save = True
                     if needs_save:
-                        save_path = make_save_path(epoch, tv.global_step)
+                        save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
                         save_model(save_path,
                                    global_step=tv.global_step,
                                    ed_state=make_current_ed_state(),
@@ -1218,7 +1237,7 @@ def main(args):
 
                     if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
                         logging.info(f" Saving lora")
-                        save_path = make_save_path(epoch, tv.global_step)
+                        save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
                         save_model_lora(model=model, save_path=save_path)
 
                     # -- step end
@@ -1226,6 +1245,7 @@ def main(args):
                     plugin_runner.run_on_step_end(epoch=epoch,
                                           global_step=tv.global_step,
                                           local_step=step,
+                                          num_samples=tv.total_trained_samples_count,
                                           project_name=args.project_name,
                                           log_writer=log_writer,
                                           log_folder=log_folder,
@@ -1313,7 +1333,7 @@ def main(args):
         plugin_runner.run_on_training_end(ed_state=make_current_ed_state(), log_folder=log_folder, project_name=args.project_name, global_step=tv.global_step)
 
         save_path = make_save_path(
-            epoch, tv.global_step, prepend=("" if args.no_prepend_last else "last-")
+            epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count, prepend=("" if args.no_prepend_last else "last-")
         )
         if not args.lora:
             save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
@@ -1443,9 +1463,9 @@ if __name__ == "__main__":
     argparser.add_argument("--data_multiplier_per_path", type=str, nargs="+", default=[], help="optional json file(s) mapping real image paths (symlinks resolved) to an additional multiplier factor. You may pass multiple files.")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
-    argparser.add_argument("--disable_amp", action="store_true", default=False, help="disables automatic mixed precision (def: False)")
-    argparser.add_argument("--disable_textenc_training", action="store_true", default=False, help="disables training of text encoder (def: False)")
-    argparser.add_argument("--disable_unet_training", action="store_true", default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
+    argparser.add_argument("--disable_amp", action=argparse.BooleanOptionalAction, default=False, help="disables automatic mixed precision (def: False)")
+    argparser.add_argument("--disable_textenc_training", action=argparse.BooleanOptionalAction, default=False, help="disables training of text encoder (def: False)")
+    argparser.add_argument("--disable_unet_training", action=argparse.BooleanOptionalAction, default=False, help="disables training of unet (def: False) NOT RECOMMENDED")
     argparser.add_argument("--freeze_unet_balanced", action="store_true", default=False, help="If passed, apply a 'balanced' unet freeze strategy: Train time_embedding.*, *.attentions.* (all parameters within attention blocks), conv_norm_out.*, and conv_out.*. Freeze the rest (conv_in.*, *.resnets.*, *samplers.*)." )
     argparser.add_argument("--embedding_perturbation", type=float, default=0.0, help="random perturbation of text embeddings (def: 0.0)")
     argparser.add_argument("--latents_perturbation", type=float, default=0.0, help="random perturbation of latents (def: 0.0)")
@@ -1591,11 +1611,15 @@ if __name__ == "__main__":
     argparser.add_argument("--offload_text_encoder", action="store_true", help="If passed, offload text encoder(s) to CPU when not in use, saves VRAM but is slower")
     argparser.add_argument("--no_save_on_error", action="store_true", help="If passed, do not save model on error/ctrl-c")
 
+    argparser.add_argument("--clip_vision_model_source", default=None, help="If specified, the vision model to use for text encoder contrastive training, eg 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K'.")
+    argparser.add_argument("--clip_vision_model_processor_source", default=None, help="If specified, the preprocessor to use for text encoder contrastive training, eg 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K'. If not specified, will use the same source as --clip_vision_model_source")
+    argparser.add_argument("--clip_vision_contrastive_loss_lambda", type=float, default=0.1, help="Lambda scaling factor for contrastive loss between text encoder and CLIP vision model features")
+
     argparser.add_argument("--debug_no_load_model", action="store_true", help="If passed, do not load model weights (for testing purposes only)")
+
+    argparser.add_argument("--debug_log_on_nan", action=argparse.BooleanOptionalAction, help="If specified, use set_detect_anomaly to find NaNs in autograd. Slow.")
 
     # load CLI args to overwrite existing config args
     args = argparser.parse_args(args=argv, namespace=args)
-
-    #torch.autograd.set_detect_anomaly(True)
 
     main(args)

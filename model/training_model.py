@@ -24,7 +24,7 @@ from diffusers import (
     StableDiffusionXLPipeline,
 )
 from diffusers.utils import convert_state_dict_to_diffusers
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPProcessor, CLIPModel
 from peft.utils import get_peft_model_state_dict
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
@@ -233,6 +233,9 @@ class TrainingModel:
     cond_dropout_tokens: torch.Tensor|None = None
     cond_dropout_tokens_2: torch.Tensor|None = None
 
+    clip_model = None  # 'CLIP'|None = None
+    clip_processor = None  # 'Compose'|None = None
+
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
         return TrainingModel(
@@ -291,6 +294,8 @@ class TrainingModel:
 @dataclass
 class Conditioning:
     _text_encoder_hidden_states: torch.Tensor
+    _text_encoder_pooled_embeds: torch.Tensor|None
+
     _text_encoder_2_hidden_states: torch.Tensor|None
 
     _text_encoder_2_pooled_embeds: torch.Tensor|None
@@ -304,6 +309,10 @@ class Conditioning:
         else:
             return self._text_encoder_hidden_states
 
+    @property
+    def pooled_embeds(self) -> torch.Tensor:
+        return self._text_encoder_pooled_embeds
+
     def get_added_cond_kwargs(self, dtype) -> dict:
         return {
             "text_embeds": self._text_encoder_2_pooled_embeds.to(dtype=dtype),
@@ -311,64 +320,75 @@ class Conditioning:
         }
 
     @staticmethod
-    def sd12_conditioning(text_encoder_hidden_states: torch.Tensor):
+    def sd12_conditioning(text_encoder_hidden_states: torch.Tensor, text_encoder_pooled_embeds: torch.Tensor):
         return Conditioning(_text_encoder_hidden_states=text_encoder_hidden_states,
+                            _text_encoder_pooled_embeds=text_encoder_pooled_embeds,
                             _text_encoder_2_hidden_states=None,
                             _text_encoder_2_pooled_embeds=None,
                             _add_time_ids=None)
 
     @staticmethod
     def sdxl_conditioning(text_encoder_hidden_states: torch.Tensor,
+                          text_encoder_pooled_embeds: torch.Tensor,
                           text_encoder_2_hidden_states: torch.Tensor,
                           text_encoder_2_pooled_embeds: torch.Tensor,
                           add_time_ids: torch.Tensor):
 
         return Conditioning(_text_encoder_hidden_states=text_encoder_hidden_states,
+                            _text_encoder_pooled_embeds=text_encoder_pooled_embeds,
                             _text_encoder_2_hidden_states=text_encoder_2_hidden_states,
                             _text_encoder_2_pooled_embeds=text_encoder_2_pooled_embeds,
                             _add_time_ids=add_time_ids)
 
     def get_masked(self, mask: torch.Tensor) -> 'Conditioning':
         return Conditioning(_text_encoder_hidden_states=self._text_encoder_hidden_states[mask],
+                            _text_encoder_pooled_embeds=self._text_encoder_pooled_embeds[mask],
                             _text_encoder_2_hidden_states=self._text_encoder_2_hidden_states[mask] if self._text_encoder_2_hidden_states is not None else None,
                             _text_encoder_2_pooled_embeds=self._text_encoder_2_pooled_embeds[mask] if self._text_encoder_2_pooled_embeds is not None else None,
                             _add_time_ids=self._add_time_ids[mask] if self._add_time_ids is not None else None)
 
     def slice(self, slice_start: int, slice_end: int) -> 'Conditioning':
-        return _make_conditioning_slice(self._text_encoder_hidden_states, self._text_encoder_2_hidden_states,
-                                                     self._text_encoder_2_pooled_embeds, add_time_ids=self._add_time_ids,
-                                                     slice_start=slice_start, slice_end=slice_end)
+        return _make_conditioning_slice(self._text_encoder_hidden_states,
+                                        self._text_encoder_pooled_embeds,
+                                        self._text_encoder_2_hidden_states,
+                                        self._text_encoder_2_pooled_embeds,
+                                        add_time_ids=self._add_time_ids,
+                                        slice_start=slice_start,
+                                        slice_end=slice_end)
 
 def _make_conditioning_slice(
     encoder_hidden_states: torch.Tensor,
+    encoder_pooled_embeds: torch.Tensor,
     encoder_2_hidden_states: torch.Tensor|None,
     encoder_2_pooled_embeds: torch.Tensor|None,
     add_time_ids: torch.Tensor|None,
     slice_start, slice_end
 ) -> Conditioning:
     encoder_hidden_states_slice = encoder_hidden_states[slice_start:slice_end]
+    encoder_pooled_embeds_slice = encoder_pooled_embeds[slice_start:slice_end]
     if encoder_2_hidden_states is not None:
         encoder_2_hidden_states_slice = encoder_2_hidden_states[slice_start:slice_end]
         encoder_2_pooled_embeds_slice = encoder_2_pooled_embeds[slice_start:slice_end]
         add_time_ids_slice = add_time_ids[slice_start:slice_end]
         return Conditioning.sdxl_conditioning(
             text_encoder_hidden_states=encoder_hidden_states_slice,
+            text_encoder_pooled_embeds=encoder_pooled_embeds_slice,
             text_encoder_2_hidden_states=encoder_2_hidden_states_slice,
             text_encoder_2_pooled_embeds=encoder_2_pooled_embeds_slice,
             add_time_ids=add_time_ids_slice,
         )
     else:
         return Conditioning.sd12_conditioning(
-            text_encoder_hidden_states=encoder_hidden_states_slice
+            text_encoder_hidden_states=encoder_hidden_states_slice,
+            text_encoder_pooled_embeds=encoder_pooled_embeds_slice,
         )
 
 
-def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
+def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
     # todo: move to Conditioning
-    # todo: -----
     if model.compel:
         print("Compel is setup but not being used (not implemented)")
-    encoder_hidden_states = _encode_caption_tokens(
+    encoder_hidden_states, encoder_pooled_embeds = _encode_caption_tokens(
         tokens,
         model.text_encoder,
         clip_skip=args.clip_skip if args else 0,
@@ -376,6 +396,7 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
         compel=model.compel,
         is_sdxl=model.is_sdxl,
         caption_strings=caption_str,
+        return_pooled=True
     )
     if model.is_sdxl:
         # note: to support a "style" prompt we'd need to collect/encode a "tokens_3" (style prompt tokens)
@@ -388,14 +409,14 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
             compel=model.compel,
             caption_strings=caption_str,
             is_sdxl=model.is_sdxl,
-            return_pooled = True
+            return_pooled=True
         )
     else:
         encoder_2_hidden_states = None
         encoder_2_pooled_embeds = None
     # todo: -----
     # todo: move to conditioning (end)
-    return encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds
+    return encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds
 
 
 def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, embedding_perturbation: bool,
@@ -417,8 +438,12 @@ def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, 
             # for SD1 and SD2 we need to normalize the hidden states
             encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states)
 
-        if return_pooled:
+        if is_sdxl:
             pooler_output = encoder_output[0]
+        else:
+            pooler_output = encoder_output.pooler_output
+
+        if return_pooled:
             return encoder_hidden_states, pooler_output
         else:
             return encoder_hidden_states
@@ -713,6 +738,11 @@ def load_model(args) -> TrainingModel:
     )
     model_being_trained.set_noise_scheduler_shift(args.flow_match_shift)
     return model_being_trained
+
+def load_clip_model(model_id: str, processor_model_id: str=None) -> tuple[CLIPModel, CLIPProcessor]:
+    model = CLIPModel.from_pretrained('apple/DFN5B-CLIP-ViT-H-14')
+    processor = CLIPProcessor.from_pretrained(processor_model_id or model_id, use_fast=True)
+    return model, processor
 
 
 def get_use_ema_decay_training(args):

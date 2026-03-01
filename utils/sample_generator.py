@@ -295,7 +295,7 @@ class SampleGenerator:
                                 shift = 1.0 + 0.5 * (image_pixel_count / 1024 ** 2)
                                 pipe.scheduler.set_shift(shift)
                                 #pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
-                                print("updated scheduler with shift", shift)
+                                #print("updated scheduler with shift", shift)
 
                             images = pipe(
                                 prompt=prompt,

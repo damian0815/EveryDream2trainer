@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import LogData
 from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
-    get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss
+    get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 
@@ -244,7 +244,7 @@ def train_step(
                 batch=batch,
                 is_cond_dropout=is_cond_dropout,
                 timesteps=timesteps,
-                prompt_embeds=conditioning.prompt_embeds,
+                conditioning=conditioning,
                 teacher_mask=teacher_mask,
 
                 tv=tv,
@@ -257,7 +257,17 @@ def train_step(
             )
             record_performance_timing("9_loss_computation", time.perf_counter() - t_loss_start, num_images/len(caption_variants))
 
+            if model.clip_model is not None:
+                clip_loss_1d = get_clip_loss(
+                    image_embeds=model_forward_result.clip_image_features,
+                    text_embeds=model_forward_result.clip_pooled_text_features,
+                    model=model,
+                    mask=~is_cond_dropout,
+                )
+                loss_1d += clip_loss_1d * args.clip_vision_contrastive_loss_lambda
+
             del model_forward_result
+
 
             # Loss logging and accumulation
             t_loss_accum_start = time.perf_counter()
@@ -837,20 +847,23 @@ def _generate_conditioning(batch: dict, caption_variant: str, model: TrainingMod
             add_time_ids = None
 
         model.load_textenc_to_device(model.device)
-        encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+        encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
             tokens, tokens_2, caption_str, model, args
         )
-        conditioning = Conditioning(encoder_hidden_states, encoder_2_hidden_states, encoder_2_pooled_embeds,
+        conditioning = Conditioning(encoder_hidden_states, encoder_pooled_embeds,
+                                    encoder_2_hidden_states, encoder_2_pooled_embeds,
                                     add_time_ids)
 
         if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
             teacher_conditioning = None
         else:
             with torch.no_grad():
-                teacher_encoder_hidden_states, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
+                teacher_encoder_hidden_states, teacher_encoder_pooled_embeds, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
                     tokens, tokens_2, caption_str, teacher_model, args
                 )
-            teacher_conditioning = Conditioning(teacher_encoder_hidden_states, teacher_encoder_2_hidden_states,
+            teacher_conditioning = Conditioning(teacher_encoder_hidden_states,
+                                                teacher_encoder_pooled_embeds,
+                                                teacher_encoder_2_hidden_states,
                                                 teacher_encoder_2_pooled_embeds,
                                                 add_time_ids if teacher_model.is_sdxl else None)
 
@@ -867,6 +880,8 @@ class ModelForwardReturnType:
     lcf_midblock_out: torch.Tensor | None
     lcf_midblock_clean_out: torch.Tensor | None
     teacher_target: torch.Tensor | None
+    clip_image_features: torch.Tensor | None
+    clip_pooled_text_features: torch.Tensor | None
 
 
 def _do_model_forward(
@@ -885,6 +900,8 @@ def _do_model_forward(
     lcf_midblock_out_clean_all = []
     target_all = []
     teacher_target_all = []
+    clip_image_features_all = []
+    clip_pooled_text_features_all = []
 
     slices = list(get_slices(batch_size, forward_slice_size))
     for slice_index, (slice_start, slice_end) in enumerate(slices):
@@ -935,6 +952,18 @@ def _do_model_forward(
             model_pred_result.teacher_target = None
             model_pred_result.midblock_out = None
 
+            if model.clip_model:
+                with torch.no_grad():
+                    images_slice = batch["image"][slice_start:slice_end]
+                    pixels = model.clip_processor(images=images_slice, return_tensors="pt").pixel_values.to(
+                        model.device)  # [B, 3, H, W]
+                    image_embeds = model.clip_model.get_image_features(pixels)  # [B, 1024]
+                text_embeds = model.clip_model.text_projection(
+                    conditioning_slice.pooled_embeds.to(dtype=model.clip_model.text_projection.weight.dtype))  # [B, 1024]
+                clip_image_features_all.append(image_embeds)
+                clip_pooled_text_features_all.append(text_embeds)
+                del image_embeds, text_embeds
+
             if do_local_contrastive_flow_loss:
                 anchor_timestep = model.noise_scheduler.get_best_timestep_for_sigma(0)
                 anchor_timesteps_slice = torch.full_like(timesteps_slice, anchor_timestep)
@@ -980,15 +1009,18 @@ def _do_model_forward(
     lcf_midblock_out = torch.cat(lcf_midblock_out_all) if do_local_contrastive_flow_loss else None
     lcf_midblock_out_clean = torch.cat(lcf_midblock_out_clean_all) if do_local_contrastive_flow_loss else None
 
+    clip_image_features = torch.cat(clip_image_features_all) if model.clip_model else None
+    clip_pooled_text_features = torch.cat(clip_pooled_text_features_all) if model.clip_model else None
+
     return ModelForwardReturnType(
         model_pred=model_pred,
         target=target,
         lcf_midblock_out=lcf_midblock_out,
         lcf_midblock_clean_out=lcf_midblock_out_clean,
-        teacher_target=teacher_target
+        teacher_target=teacher_target,
+        clip_image_features=clip_image_features,
+        clip_pooled_text_features=clip_pooled_text_features
     )
-
-
 
 def _do_loss(
     model_forward_result: ModelForwardReturnType,
@@ -998,7 +1030,7 @@ def _do_loss(
     teacher_mask: torch.Tensor,
     timesteps: torch.Tensor,
     negative_loss_mask: torch.Tensor,
-    prompt_embeds: torch.Tensor,
+    conditioning: Conditioning,
     args: Namespace,
     tv: TrainingVariables,
     log_data: LogData,
@@ -1020,7 +1052,7 @@ def _do_loss(
         timesteps=timesteps,
         negative_loss_mask=negative_loss_mask,
         noise_scheduler=model.noise_scheduler,
-        prompt_embeds=prompt_embeds,
+        prompt_embeds=conditioning.prompt_embeds,
         do_contrastive_learning=batch["do_contrastive_learning"],
         contrastive_loss_scale=contrastive_loss_scale,
         verbose=verbose,
@@ -1035,7 +1067,7 @@ def _do_loss(
             timesteps=timesteps,
             negative_loss_mask=negative_loss_mask,
             noise_scheduler=model.noise_scheduler,
-            prompt_embeds=prompt_embeds,
+            prompt_embeds=conditioning.prompt_embeds,
             do_contrastive_learning=False,
             contrastive_loss_scale=0,
             verbose=verbose,

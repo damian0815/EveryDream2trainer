@@ -21,10 +21,10 @@ class InterruptiblePlugin(BasePlugin):
     def on_epoch_start(self, **kwargs):
         print(f"InterruptiblePlugin: {int((self.last_save_time + self.save_interval) - time.time()) // 60} minutes remaining until next save")
 
-    def on_step_end(self, local_step, global_step, epoch, project_name, log_folder, **kwargs):
+    def on_step_end(self, local_step, global_step, epoch, project_name, log_folder, num_samples, **kwargs):
         if self.last_save_time + self.save_interval < time.time():
             self.last_save_time = time.time()
-            ckpt_name = f"rolling-{project_name}-ep{epoch:02}-gs{global_step:05}"
+            ckpt_name = f"rolling-{project_name}-ep{epoch:02}-gs{global_step:05}-n{num_samples:06}"
             save_path = os.path.join(log_folder, "ckpts", ckpt_name)
             print(f"InterruptiblePlugin: saving model to {save_path}")
             try:

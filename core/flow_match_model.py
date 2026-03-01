@@ -104,4 +104,4 @@ class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteS
         if self.config.use_dynamic_shifting and 'mu' not in kwargs:
             kwargs['mu'] = self.shift
         super().set_timesteps(num_inference_steps=num_inference_steps, device=device, **kwargs)
-        print(f'timesteps ({num_inference_steps}):', self.timesteps)
+        #print(f'timesteps ({num_inference_steps}):', self.timesteps)
