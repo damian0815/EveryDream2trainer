@@ -56,7 +56,7 @@ from data.data_loader import DataLoaderMultiAspect
 from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
-from data.every_dream_validation import EveryDreamValidator
+from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, ImageCaption, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
 from core.loss import (
@@ -392,6 +392,7 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, glo
         )
 
     print (f" * Found {len(resolved_items)} items in '{args.data_root}'")
+    gc.collect()
 
     return resolved_items
 
@@ -427,7 +428,7 @@ def update_ema(model, ema_model, decay, default_device, ema_device: str):
 def _get_default_forward_slice_size(args, batch_resolution):
     if args.forward_slice_size:
         resolution_index = args.resolution.index(batch_resolution)
-        return args.forward_slice_size[resolution_index]
+        return min(args.batch_size, args.forward_slice_size[resolution_index])
     else:
         return args.batch_size
 
@@ -468,6 +469,9 @@ def main(args):
     if os.name == 'nt':
         print(" * Windows detected, disabling Triton")
         os.environ['XFORMERS_FORCE_DISABLE_TRITON'] = "1"
+
+    import faulthandler
+    faulthandler.enable()  # by default will dump on sys.stderr, but can also print to a regular file
 
     log_time, log_folder = setup_local_logger(args)
     args = setup_args(args)
@@ -946,7 +950,7 @@ def main(args):
         return os.path.join(log_folder, "ckpts", basename)
 
     def get_model_prediction_and_target_validation_wrapper(image: torch.Tensor, conditioning: Conditioning
-                                                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                                                ) -> ValidationStepResult:
         batch_size = image.shape[0]
         timesteps = get_uniform_timesteps(batch_size=batch_size,
                                           batch_share_timesteps=False,
@@ -974,15 +978,34 @@ def main(args):
             skip_contrastive=True
         )
 
-        return model_pred_result.model_pred, model_pred_result.target, timesteps
+        return ValidationStepResult(
+            model_pred=model_pred_result.model_pred,
+            target=model_pred_result.target,
+            timesteps=timesteps,
+            noisy_latents=model_pred_result.noisy_latents,
+        )
+
+    def make_inference_pipe():
+        """Factory that builds a fresh inference pipeline for anomaly validation."""
+        return sample_generator.create_inference_pipe(
+            model_being_trained=model,
+            diffusers_scheduler_config=model.noise_scheduler.config,
+            flow_match_shift=args.flow_match_shift,
+            flow_match_shift_dynamic=args.flow_match_shift_dynamic,
+        ).to(device)
 
     # Pre-train validation to establish a starting point on the loss graph
     if validator and not args.no_initial_validation:
-        validator.do_validation(
-            model=model,
-            global_step=0,
-            get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper
-        )
+        try:
+            validator.do_validation(
+                model=model,
+                global_step=0,
+                get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
+                pipe_factory=make_inference_pipe,
+            )
+        except Exception as ex:
+            traceback.print_exc()
+            logging.warning(f"Validation failed during initial validation step, continuing anyway. Exception: {ex}")
 
     # the sample generator might be configured to generate samples before step 0
     if sample_generator.generate_pretrain_samples:
@@ -1188,14 +1211,16 @@ def main(args):
                         torch.cuda.empty_cache()
 
                     # -- validation
-
                     if validator and (
                             step in validation_steps
                             or check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE)
                     ):
-                        validator.do_validation(model=model,
-                                                global_step=tv.global_step,
-                                                get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper)
+                        validator.do_validation(
+                            model=model,
+                            global_step=tv.global_step,
+                            get_model_prediction_and_target_callable =get_model_prediction_and_target_validation_wrapper,
+                            pipe_factory=make_inference_pipe
+                        )
 
                     min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 
@@ -1343,6 +1368,14 @@ def main(args):
         if args.lora:
             save_model_lora(model=model, save_path=save_path)
 
+        if validator:
+            print("doing final validation pass")
+            validator.do_validation(
+                model=model,
+                global_step=tv.global_step,
+                get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
+                pipe_factory=make_inference_pipe
+            )
 
         if not sample_generator.should_generate_samples(global_step=tv.global_step-1, local_step=step):
             print("generating final samples")

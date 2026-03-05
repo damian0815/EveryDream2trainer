@@ -16,6 +16,8 @@ limitations under the License.
 import bisect
 import json
 import logging
+import uuid
+
 import math
 import os
 import random
@@ -172,6 +174,7 @@ class ImageTrainItem:
         self.timesteps_range = timesteps_range
         self.target_wh = None
         self.is_runt = False
+        self.uid = uuid.uuid4().hex
 
         self.image_size = None
         if image is None or len(image) == 0:
@@ -226,28 +229,6 @@ class ImageTrainItem:
             logging.warning(F"Error rotating image: {e} on {self.pathname}, image will be loaded as is, EXIF may be corrupt") if print_error else None
             pass
         return image
-    
-    def _needs_transpose(self, image, print_error=False):
-        try:
-            exif = image.getexif()
-            orientation = exif.get(0x0112)
-            """
-                https://pillow.readthedocs.io/en/stable/_modules/PIL/ImageOps.html#exif_transpose
-                method = {
-                    2: Image.Transpose.FLIP_LEFT_RIGHT,
-                    3: Image.Transpose.ROTATE_180,
-                    4: Image.Transpose.FLIP_TOP_BOTTOM,
-                    5: Image.Transpose.TRANSPOSE,
-                    6: Image.Transpose.ROTATE_270,
-                    7: Image.Transpose.TRANSVERSE,
-                    8: Image.Transpose.ROTATE_90,
-                }.get(orientation)
-            """
-            return orientation in [5, 6, 7, 8]
-        except Exception as e:
-            logging.warning(F"Error rotating image: {e} on {self.pathname}, image will be loaded as is, EXIF may be corrupt") if print_error else None
-            pass
-        return False
 
     def _get_random_jitter_amounts(self, image, crop_jitter=0.02):
         """
@@ -410,7 +391,7 @@ class ImageTrainItem:
         try:
             # check if image can be opened
             with PIL.Image.open(self.pathname) as image:
-                if self._needs_transpose(image):
+                if _needs_transpose(image):
                     height, width = image.size
                 else:
                     width, height = image.size
@@ -456,5 +437,26 @@ class ImageTrainItem:
 
         return image
 
+def _needs_transpose(image, print_error=False):
+    try:
+        exif = image.getexif()
+        orientation = exif.get(0x0112)
+        """
+            https://pillow.readthedocs.io/en/stable/_modules/PIL/ImageOps.html#exif_transpose
+            method = {
+                2: Image.Transpose.FLIP_LEFT_RIGHT,
+                3: Image.Transpose.ROTATE_180,
+                4: Image.Transpose.FLIP_TOP_BOTTOM,
+                5: Image.Transpose.TRANSPOSE,
+                6: Image.Transpose.ROTATE_270,
+                7: Image.Transpose.TRANSVERSE,
+                8: Image.Transpose.ROTATE_90,
+            }.get(orientation)
+        """
+        return orientation in [5, 6, 7, 8]
+    except Exception as e:
+        logging.warning(F"Error rotating image: {e} on {self.pathname}, image will be loaded as is, EXIF may be corrupt") if print_error else None
+        pass
+    return False
 
 DEFAULT_BATCH_ID = "default_batch"

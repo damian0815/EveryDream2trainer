@@ -85,7 +85,7 @@ class EveryDreamBatch(Dataset):
         self.rated_dataset = rated_dataset
         self.rated_dataset_dropout_target = rated_dataset_dropout_target
         # First epoch always trains on all images
-        self.image_train_items = []
+        self.image_train_items: list[ImageTrainItem] = []
         self.__update_image_train_items(1.0)
         self.name = name
         self.mask_p = mask_p
@@ -322,92 +322,6 @@ def build_torch_dataloader(dataset, batch_size, num_workers=None) -> torch.utils
     return dataloader
 
 
-def collapse_captions(batch):
-
-    #runt_size = batch[0]["runt_size"]
-    #runt_offset = len(batch) - runt_size
-    #print("runt size:", runt_size, "runt offset:", runt_offset)
-
-    caption_counts = Counter([k for b in batch
-                              for k, v in b["caption"].items()])
-    assert len(caption_counts) > 0
-
-    # map from caption variant to source caption per example
-    caption_source_map: dict[str, dict[int, str]] = defaultdict(dict)
-    available_captions = {
-        k: [i for i, example in enumerate(batch)
-            if k in example["caption"]
-            #and i < runt_offset
-            ]
-        for k in caption_counts.keys()
-    }
-    keys_in_count_order = list([k for k, _ in caption_counts.most_common()])
-    keys_in_reverse_count_order = list(reversed(keys_in_count_order))
-    for k in keys_in_count_order:
-        #print('processing caption key:', k)
-        for i, example in enumerate(batch):
-            #if i >= runt_offset:
-            #    continue
-            #el
-            if k in example["caption"]:
-                if i in available_captions[k]:
-                    #print("  using caption", k, "for example", i)
-                    caption_source_map[k][i] = k
-                    available_captions[k].remove(i)
-                #else:
-                #    print('  wanted to use caption', k, 'for example', i, 'but it is already taken')
-            else:
-                # find a substitute caption
-                #print(f'  not in {example["caption"].keys()} -> looking for substitute for example', i)
-                for sub_k in keys_in_reverse_count_order:
-                    #print('    checking substitute caption key:', sub_k)
-                    if i in available_captions[sub_k]:
-                        #print("    found substitute caption:", sub_k)
-                        caption_source_map[k][i] = sub_k
-                        available_captions[sub_k].remove(i)
-                        break
-
-    #print(caption_source_map.keys())
-    for i in range(len(batch)):
-        populated_caption_keys = []
-        for k in caption_source_map.keys():
-            if i not in caption_source_map[k]:
-                if not populated_caption_keys:
-                    populated_caption_keys = [k for k in batch[i]["caption"].keys()]
-                caption_source_map[k][i] = populated_caption_keys.pop()
-
-    #for i in range(runt_offset, len(batch)):
-    #    # copy caption info from its source
-    #    runt_source_index = next((j for j in range(runt_offset) if batch[j]["pathname"] == batch[i]["pathname"]), None)
-    #    assert runt_source_index is not None, f"couldn't find source for runt example {i} with pathname {batch[i]["pathname"]} (available: {[batch[j]["pathname"] for j in range(runt_offset)]}, runts: ), runt size {runt_size}, batch len {len(batch)}"
-    #    #print("runt source index for example", i, "is", runt_source_index, "-> copying")
-    #    for k in caption_source_map.keys():
-    #        #print("  copying caption for key", k, "=", caption_source_map[k][runt_source_index])
-    #        caption_source_map[k][i] = caption_source_map[k][runt_source_index]
-
-    #print("final caption source map:", caption_source_map)
-
-    captions = {}
-    tokens = {}
-    tokens_2 = {} if "tokens_2" in batch[0] else None
-    # map from caption variant to source caption per example
-    for k, source_map in caption_source_map.items():
-        #print("k:", k, "source_map:", source_map)
-        sourced_captions = [example["caption"].get(source_map.get(i, None), None)
-                       for i, example in enumerate(batch)]
-        #print(sourced_captions)
-        if all(c is None for c in sourced_captions):
-            continue
-        captions[k] = sourced_captions
-        tokens[k] = [example["tokens"].get(source_map.get(i, None), None)
-                     for i, example in enumerate(batch)]
-        if tokens_2 is not None:
-            tokens_2[k] = [example["tokens_2"].get(source_map.get(i, None), None)
-                            for i, example in enumerate(batch)]
-
-    return captions, tokens, tokens_2
-
-
 def _build_caption_counts_per_category(batch) -> Counter:
     return Counter([k
                     for b in batch
@@ -428,7 +342,7 @@ def _replace_default_with_most_common(batch):
                     b["tokens_2"][replacement] = b["tokens_2"]["default"]
                     del b["tokens_2"]["default"]
 
-def collapse_captions_v2(batch):
+def collapse_captions(batch):
     _replace_default_with_most_common(batch)
     caption_counts_per_category = _build_caption_counts_per_category(batch)
     assert len(caption_counts_per_category) > 0
@@ -536,7 +450,7 @@ def collate_fn(batch):
 
     # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     # replace all 'default' with the most common
-    captions, tokens, tokens_2 = collapse_captions_v2(batch)
+    captions, tokens, tokens_2 = collapse_captions(batch)
 
     add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
 

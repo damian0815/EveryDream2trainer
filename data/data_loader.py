@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import bisect
-import json
 import logging
 from collections import defaultdict
 
@@ -33,6 +32,8 @@ import PIL.Image
 from utils.first_fit_decreasing import first_fit_decreasing
 
 PIL.Image.MAX_IMAGE_PIXELS = 715827880*4 # increase decompression bomb error limit to 4x default
+
+
 
 class DataLoaderMultiAspect():
     """
@@ -65,34 +66,35 @@ class DataLoaderMultiAspect():
         self.ratings_summed: list[float] = []
         self.__update_rating_sums()
 
-
-    def __pick_multiplied_set(self, randomizer: random.Random):
-        """
-        Deals with multiply.txt whole and fractional numbers
-        """
+    @staticmethod
+    def __pick_multiplied_set_helper(items: list[ImageTrainItem], multipliers: dict[str, float], required_count: int, randomizer: random.Random):
         picked_images = []
-        data_copy = copy.deepcopy(self.prepared_train_data) # deep copy to avoid modifying original multiplier property
-        randomizer.shuffle(data_copy)
 
         # first, collect all images + duplicates for multiplier >= 1
-        for iti in data_copy:
-            while iti.multiplier >= 1:
+        for iti in items:
+            while multipliers[iti.uid] >= 1:
                 picked_images.append(iti)
-                iti.multiplier -= 1
+                multipliers[iti.uid] -= 1
+                if len(picked_images) >= required_count:
+                    break
 
-        remaining = self.expected_epoch_size - len(picked_images)
-        assert remaining >= 0, "Something went wrong with the multiplier calculation"
+        remaining = required_count - len(picked_images)
 
-        randomizer.shuffle(data_copy)
+        randomizer.shuffle(items)
         # resolve fractional parts, ensure each is only added max once
         while remaining > 0:
-            for iti in data_copy:
-                if randomizer.random() < iti.multiplier:
+            picked = 0
+            for iti in items:
+                if randomizer.random() < multipliers[iti.uid]:
                     picked_images.append(iti)
-                    iti.multiplier = 0
+                    multipliers[iti.uid] = 0
                     remaining -= 1
+                    picked += 1
                     if remaining <= 0:
                         break
+            if picked == 0:
+                print(f'ran out of items - {remaining} more needed but no more items to pick from')
+                break
         
         return picked_images
 
@@ -112,11 +114,16 @@ class DataLoaderMultiAspect():
         self.seed += 1
         randomizer = random.Random(self.seed)
 
-        self.prepared_train_data.sort(key=lambda img: img.pathname)
+        multipliers = {i.uid: i.multiplier for i in self.prepared_train_data}
+        #data_copy = copy.deepcopy(self.prepared_train_data)
+        randomizer.shuffle(self.prepared_train_data)
+
         if dropout_fraction < 1.0:
             picked_images = self.__pick_random_subset(dropout_fraction, randomizer)
         else:
-            picked_images = self.__pick_multiplied_set(randomizer)
+            picked_images = self.__pick_multiplied_set_helper(self.prepared_train_data, multipliers, required_count=self.expected_epoch_size, randomizer=randomizer)
+            for i in picked_images:
+                assert multipliers[i.uid] < i.multiplier
 
         randomizer.shuffle(picked_images)
 
@@ -151,26 +158,28 @@ class DataLoaderMultiAspect():
             if len(bucket_contents) == 0:
                 del buckets[key]
 
+        for key, bucket_contents in buckets.items():
+            print(" - bucket ", key, " has ", len(bucket_contents), " items")
+
         # handle remaining runts by taking from unpicked items, and/or randomly duplicating picked items
         for key, bucket_contents in buckets.items():
             if len(bucket_contents) % batch_size != 0:
                 assert key[0] == DEFAULT_BATCH_ID, "there should be no more runts in named batches"
 
-                picked_images_paths = {i.pathname for i in bucket_contents}
+                required_count = batch_size - len(bucket_contents) % batch_size
                 unpicked_images_preshuffled = [
                     i
                     for i in self.prepared_train_data
-                    if _make_bucket_key(i) == key and i.pathname not in picked_images_paths
+                    if _make_bucket_key(i) == key and multipliers[i.uid] > 0
                 ]
-
-                # fill what we can from unpicked images first
-                while unpicked_images_preshuffled and len(bucket_contents) % batch_size != 0:
-                    bucket_contents.append(unpicked_images_preshuffled.pop())
+                topup = self.__pick_multiplied_set_helper(unpicked_images_preshuffled, multipliers, required_count=required_count, randomizer=randomizer)
+                bucket_contents.extend(topup)
 
                 # still runts?
                 final_truncate_count = len(bucket_contents) % batch_size
                 if final_truncate_count > 0:
                     # we weren't able to fill all runts from unpicked images, so duplicate existing items
+                    logging.warning(f"After top-up from unpicked images, bucket {key} with {len(bucket_contents)} still has {final_truncate_count} runts. These will be filled by duplicating existing items in the bucket, which may cause some overfitting. To avoid this, consider adding more items at aspect ratio {key} or reduce your batch count.")
                     runt_bucket_start_offset = len(bucket_contents) - final_truncate_count
                     non_runts = bucket_contents.copy()
                     for _ in range(batch_size - final_truncate_count):
@@ -207,6 +216,11 @@ class DataLoaderMultiAspect():
 
         if self.keep_same_sample_at_different_resolutions_together:
             items = reorder_same_sample_different_resolution_adjacency(items, chunk_size=self.chunk_shuffle_batch_size, randomizer=randomizer)
+
+        wh_counts = Counter([tuple(i.target_wh) for i in items])
+        print("Final aspect ratio distribution:")
+        for wh, count in wh_counts.items():
+            print(f" - {wh}: {count} images, {(count/len(items))*100:.2f}% of total")
 
         return items
 
@@ -419,6 +433,7 @@ def _print_path_match_sequences(chunks):
         else:
             current_value_count += 1
     print("sequence of ", current_value_count, "x", current_value)
+
 
 
 
