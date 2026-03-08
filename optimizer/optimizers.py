@@ -188,8 +188,12 @@ class EveryDreamOptimizer:
             self.use_grad_scaler = True
             logging.info("* float16 unet/te: using grad scaler")
         elif args.amp:
-            self.use_grad_scaler = True
-            logging.info(f"* AMP in use: using grad scaler")
+            if args.amp_without_grad_scaler:
+                self.use_grad_scaler = False
+                logging.info("* AMP in use but --amp_without_grad_scaler was passed -> no grad scaler")
+            else:
+                self.use_grad_scaler = True
+                logging.info(f"* AMP in use: using grad scaler")
         else:
             self.use_grad_scaler = False
             logging.info("* no grad scaler")
@@ -201,22 +205,28 @@ class EveryDreamOptimizer:
                 args, model
             )
         else:
-            self.text_encoder_params = {
-                "default": list(self._apply_text_encoder_freeze(model.text_encoder)) + (
-                    list(self._apply_text_encoder_freeze(model.text_encoder_2))
-                    if model.text_encoder_2 is not None
-                    else []
+            if is_training_te:
+                self.text_encoder_params = {
+                    "default": list(self._apply_text_encoder_freeze(model.text_encoder)) + (
+                        list(self._apply_text_encoder_freeze(model.text_encoder_2))
+                        if model.text_encoder_2 is not None
+                        else []
+                    )
+                }
+            else:
+                self.text_encoder_params = {"default": []}
+            if is_training_unet:
+                self.unet_params = self._apply_unet_freeze(
+                    model.unet,
+                    unet_freeze_config=optimizer_config.get("unet_freezing", {}),
+                    unet_component_lr_config=self.unet_component_lr_config,
+                    cross_attention_dim_to_find=2048
+                    if model.is_sdxl
+                    else model.text_encoder.config.hidden_size,
+                    unet_freeze_regex=args.unet_freeze_regex,
                 )
-            }
-            self.unet_params = self._apply_unet_freeze(
-                model.unet,
-                unet_freeze_config=optimizer_config.get("unet_freezing", {}),
-                unet_component_lr_config=self.unet_component_lr_config,
-                cross_attention_dim_to_find=2048
-                if model.is_sdxl
-                else model.text_encoder.config.hidden_size,
-                unet_freeze_regex=args.unet_freeze_regex,
-            )
+            else:
+                self.unet_params = {"default": []}
         if args.debug_unet_freeze_regex:
             logging.info("--debug_unet_freeze_regex passed - bailing out")
             exit(0)

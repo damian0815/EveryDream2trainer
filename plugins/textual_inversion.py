@@ -1,9 +1,7 @@
-import itertools
 import json
 import logging
 import os.path
 import random
-from typing import Optional, cast
 
 import torch
 from colorama import Fore
@@ -39,7 +37,7 @@ In addition, you'll need a very high LR on the TE - maybe even as high as 1e-3. 
 class TextualInversionPlugin(BasePlugin):
 
     def __init__(self):
-        path = os.path.join(os.path.dirname(__file__), "textual_inversion.json")
+        path = "./textual_inversion.json"
         logging.info(f" * Textual Inversion plugin instantiated, loading config from {path}")
         with open(path, 'rt') as f:
             self.config = json.load(f)
@@ -52,6 +50,7 @@ class TextualInversionPlugin(BasePlugin):
         self.text_encoder: CLIPTextModel = None
         self.tokenizer: CLIPTokenizer = None
         self.log_folder: str = None
+        self.caption_grammar: CaptionGrammar = None
 
     @property
     def fallback_word(self):
@@ -59,6 +58,9 @@ class TextualInversionPlugin(BasePlugin):
         tokens = self.training_words_to_tokens[fallback_word]
         return self.tokenizer.decode(tokens)
 
+    @property
+    def always_use_caption_grammar(self) -> bool:
+        return self.config.get('always_use_caption_grammar', True)
 
 
     def on_model_load(self, **kwargs):
@@ -101,7 +103,7 @@ class TextualInversionPlugin(BasePlugin):
             #text_model: CLIPTextModel = self.text_encoder.text_model
             self.training_words = []
             for token_config in self.config['tokens']:
-                # {"token": "*", "initializer": "corpse, abstract, group", "vector_length": 8}
+                # eg: {"token": "*", "initializer": "corpse, abstract, group", "vector_length": 8, "overwrite_existing": false, "initialize_random": false}
                 training_word = token_config['token']
 
                 self.training_words.append(training_word)
@@ -160,6 +162,19 @@ class TextualInversionPlugin(BasePlugin):
             embeddings.embedding_offsets_individual = self.embedding_offsets_individual
             embeddings.register_forward_hook(_embedding_forward_individual_hook)
 
+            logging.info(" * Textual Inversion plugin: training the following words: " + ", ".join(self.training_words))
+
+            self.caption_grammar = CaptionGrammar(
+                token=self._get_token_sequence(0),
+                class_name=self.config.get('caption_grammar_class_name', None)
+            )
+            if len(self.training_words) > 0 and self.always_use_caption_grammar:
+                logging.warning(f" * Textual Inversion plugin: always_use_caption_grammar is enabled but you have multiple training words. This will cause ALL your captions to be overwritten with captions built using {self.caption_grammar.token} and occasionally class {self.caption_grammar.class_name}.")
+
+    def _get_token_sequence(self, training_word_index: int) -> str:
+        tokens = self.training_words_to_tokens[self.training_words[training_word_index]]
+        return self.tokenizer.decode(tokens)
+
     def on_model_save(self, **kwargs):
         # ed_state = kwargs['ed_state']
         save_path = kwargs['save_path']
@@ -189,10 +204,11 @@ class TextualInversionPlugin(BasePlugin):
     def expand_tokens(self, base_token_text, vector_length) -> list[str]:
         return [f'{base_token_text}.{i}' for i in range(vector_length)]
 
-    def add_parameters(self, text_encoder_parameters, unet_parameters):
+    def add_parameters(self, text_encoder_parameters: dict, unet_parameters):
         if self.lerp_target_weights is None:
-            text_encoder_parameters = itertools.chain(text_encoder_parameters,
-                    [('te_offset', self.embedding_offsets_individual)])
+            for p in text_encoder_parameters.values():
+                p: list
+                p.extend([('te_offset', self.embedding_offsets_individual)])
         return text_encoder_parameters, unet_parameters
 
     def on_step_end(self, **kwargs):
@@ -235,10 +251,10 @@ class TextualInversionPlugin(BasePlugin):
             self.embedding_offsets_individual.data = torch.zeros_like(self.embedding_offsets_individual.data)
 
     def transform_caption(self, caption:str, pathname: str):
-        if len(caption.strip()) == 0:
-            imagenet_caption = self.make_imagenet_caption()
-            #print('made caption:', imagenet_caption)
-            return imagenet_caption
+        if len(caption.strip()) == 0 or self.always_use_caption_grammar:
+            caption = self.caption_grammar.sample()
+            print('made caption:', caption)
+            return caption
 
         if (self.fallback_word is not None
                 and all(re.search('(^|[\W])'+word+'([\W]|$)', caption) is None
@@ -302,3 +318,118 @@ def _apply_weight_offsets(
         0, index, embedding_offsets_individual
     )
     return offset_weight
+
+
+
+class CaptionGrammar:
+    def __init__(self, token: str, class_name: str | None = None):
+        """
+        token: textual inversion token, e.g. "<sks>"
+        class_name: optional grounding class, e.g. "dog", "chair"
+        """
+        self.token = token
+        self.class_name = class_name
+
+        # ---- anchor prompts (very important) ----
+        self.anchor = [
+            "{token}",
+            "a photo of {token}",
+            "a picture of {token}",
+            "a close-up photo of {token}",
+        ]
+
+        if class_name:
+            self.anchor += [
+                "a photo of a {token} {class_name}",
+                "a picture of a {token} {class_name}",
+            ]
+
+        # ---- prefixes ----
+        self.prefix = [
+            "a photo of",
+            "a picture of",
+            "a cropped photo of",
+            "a close-up photo of",
+            "a blurry photo of",
+            "a low resolution photo of",
+            "a detailed photo of",
+            "a bright photo of",
+            "a dark photo of",
+        ]
+
+        # ---- descriptors (weak semantics) ----
+        self.descriptor = [
+            "small",
+            "large",
+            "clean",
+            "dirty",
+            "bright",
+            "dark",
+            "simple",
+            "detailed",
+            "shiny",
+            "old",
+            "new",
+        ]
+
+        # ---- environments ----
+        self.context = [
+            "on a table",
+            "on the ground",
+            "in a room",
+            "in a studio",
+            "outdoors",
+            "indoors",
+            "in natural light",
+            "in soft lighting",
+            "with a blurred background",
+        ]
+
+        # ---- photographic modifiers ----
+        self.camera = [
+            "macro",
+            "close-up",
+            "wide angle",
+        ]
+
+        # ---- rare noise prompts ----
+        self.noise = [
+            "a strange {token}",
+            "a weird photo of {token}",
+            "a bad photo of {token}",
+        ]
+
+    def _format(self, s: str):
+        return s.format(token=self.token, class_name=self.class_name or "")
+
+    def sample(self) -> str:
+        r = random.random()
+
+        # ---- 35% anchor prompts ----
+        if r < 0.35:
+            return self._format(random.choice(self.anchor))
+
+        # ---- 35% prefix + descriptor + token ----
+        if r < 0.70:
+            prefix = random.choice(self.prefix)
+            desc = random.choice(self.descriptor)
+
+            if self.class_name and random.random() < 0.4:
+                return f"{prefix} a {desc} {self.token} {self.class_name}"
+
+            return f"{prefix} a {desc} {self.token}"
+
+        # ---- 20% prefix + descriptor + token + context ----
+        if r < 0.90:
+            prefix = random.choice(self.prefix)
+            desc = random.choice(self.descriptor)
+            ctx = random.choice(self.context)
+
+            if self.class_name and random.random() < 0.4:
+                return f"{prefix} a {desc} {self.token} {self.class_name} {ctx}"
+
+            return f"{prefix} a {desc} {self.token} {ctx}"
+
+        # ---- 10% noise prompts ----
+        return self._format(random.choice(self.noise))
+

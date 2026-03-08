@@ -879,9 +879,16 @@ def main(args):
     train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size, num_workers=args.num_dataloader_workers)
 
     model.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model.unet.eval()
+    if args.disable_unet_training:
+        model.unet.requires_grad_(False)
+
     model.text_encoder.train() if not args.disable_textenc_training else model.text_encoder.eval()
+    if args.disable_textenc_training:
+        model.text_encoder.requires_grad_(False)
     if model.is_sdxl:
         model.text_encoder_2.train() if not args.disable_textenc_training else model.text_encoder_2.eval()
+        if args.disable_textenc_training:
+            model.text_encoder_2.requires_grad_(False)
 
     logging.info(f" unet device: {model.unet.device}, precision: {model.unet.dtype}, training: {model.unet.training}")
     logging.info(f" text_encoder device: {model.text_encoder.device}, precision: {model.text_encoder.dtype}, training: {model.text_encoder.training}")
@@ -1113,7 +1120,7 @@ def main(args):
                         torch.cuda.empty_cache()
 
                     safe_backward_size = _get_safe_backward_size(gpu, model.device, image_pixel_count // 64)
-                    if safe_backward_size > tv.max_backward_slice_size and safe_backward_size:
+                    if safe_backward_size > tv.max_backward_slice_size:
                         logging.info(f"at resolution {tv.batch_resolution} you could probably do backward={safe_backward_size} (you requested max {tv.max_backward_slice_size})")
 
                     if not args.disable_backward_memsafe and tv.batch_resolution not in args.disable_backward_memsafe_resolutions:
@@ -1471,7 +1478,8 @@ if __name__ == "__main__":
     load_train_json_from_file(args, report_load=True)
 
     argparser = argparse.ArgumentParser(description="EveryDream2 Training options")
-    argparser.add_argument("--amp", action="store_true",  default=True, help="deprecated, use --disable_amp if you wish to disable AMP")
+    argparser.add_argument("--amp", action=argparse.BooleanOptionalAction,  default=True, help="deprecated, use --disable_amp if you wish to disable AMP")
+    argparser.add_argument("--amp_without_grad_scaler", action=argparse.BooleanOptionalAction, default=False, help="If passed, use AMP but without a grad scaler (default: False, meaning use grad scaler when AMP is enabled)")
     argparser.add_argument("--force_bfloat16", action=argparse.BooleanOptionalAction, default=False, help="If passed, use bfloat16 for training")
     argparser.add_argument("--init_grad_scale", type=int, default=None, help="initial value for GradScaler (default=2^17.5)")
     argparser.add_argument("--attn_type", type=str, default="sdp", help="Attention mechanismto use", choices=["xformers", "sdp", "slice"])

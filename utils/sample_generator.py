@@ -494,7 +494,7 @@ class SampleGenerator:
             offset = self.epoch_start_global_step % every_n_steps
             self.steps_to_generate_this_epoch = list(range(offset, self.epoch_length, every_n_steps))
         else:
-            self.steps_to_generate_this_epoch = get_generate_step_indices(0, self.epoch_length, every_n_epochs=self.sample_epochs)
+            self.steps_to_generate_this_epoch = get_generate_step_indices(self.epoch, self.epoch_length, every_n_epochs=self.sample_epochs)
         # skip step 0
         if self.epoch_start_global_step == 0 and 0 in self.steps_to_generate_this_epoch:
             self.steps_to_generate_this_epoch.remove(0)

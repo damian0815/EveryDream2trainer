@@ -1,0 +1,7 @@
+{
+  "tokens": [
+    { "token": "*", "initializer":  "ugly, deformed, distorted", "vector_length": 8, "overwrite_existing": false, "initialize_random": false }
+  ],
+  "always_use_caption_grammar": true,
+  "caption_grammar_class_name": "car"
+}
