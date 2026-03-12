@@ -645,7 +645,7 @@ def load_model(args) -> TrainingModel:
         tokenizer = pipe.tokenizer
         unet = pipe.unet
 
-        qk_norm = unet.config.get('qk_norm', None)
+        qk_norm = unet.config.get('qk_norm', "none")
         if qk_norm is not None:
             logging.info(f" * unet has qk_norm={qk_norm}")
         else:

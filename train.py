@@ -1115,7 +1115,7 @@ def main(args):
                     tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
                         # do backward now
-                        optimizer_backward(ed_optimizer, tv, 'truncated backward: ')
+                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ')
                         gc.collect()
                         torch.cuda.empty_cache()
 
@@ -1132,7 +1132,7 @@ def main(args):
                                 # maybe not enough memory. if we can, do an emergency backward pass if we have any loss pending
                                 if tv.accumulated_loss_images_count > 0:
                                     with torch.cuda.amp.autocast(enabled=args.amp):
-                                        optimizer_backward(ed_optimizer, tv, 'emergency backward: ')
+                                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ')
                                     torch.cuda.empty_cache()
                                     gc.collect()
                                     max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
@@ -1179,6 +1179,7 @@ def main(args):
                         log_writer=log_writer,
                         log_data=log_data,
                         steps_pbar=steps_pbar,
+                        plugin_runner=plugin_runner,
                         did_step_optimizer_cb=None,
                         args=args,
                     )

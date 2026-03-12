@@ -50,7 +50,8 @@ class TextualInversionPlugin(BasePlugin):
         self.text_encoder: CLIPTextModel = None
         self.tokenizer: CLIPTokenizer = None
         self.log_folder: str = None
-        self.caption_grammar: CaptionGrammar = None
+        self.caption_grammar: dict[str, CaptionGrammar] = {}
+        self.push_embeddings_apart: bool = False
 
     @property
     def fallback_word(self):
@@ -61,7 +62,6 @@ class TextualInversionPlugin(BasePlugin):
     @property
     def always_use_caption_grammar(self) -> bool:
         return self.config.get('always_use_caption_grammar', True)
-
 
     def on_model_load(self, **kwargs):
         self.text_encoder = kwargs.get('text_encoder')
@@ -86,6 +86,9 @@ class TextualInversionPlugin(BasePlugin):
 
             raise RuntimeError("Misconfigured optimizer config")
 
+        self.push_embeddings_apart = self.config.get('push_embeddings_apart', False)
+
+        # TODO: remove lerp stuff
         if 'lerp' in self.config:
             lerp_target = self.config['lerp']['lerp_target']
             from safetensors.torch import load_file
@@ -164,12 +167,14 @@ class TextualInversionPlugin(BasePlugin):
 
             logging.info(" * Textual Inversion plugin: training the following words: " + ", ".join(self.training_words))
 
-            self.caption_grammar = CaptionGrammar(
-                token=self._get_token_sequence(0),
-                class_name=self.config.get('caption_grammar_class_name', None)
-            )
-            if len(self.training_words) > 0 and self.always_use_caption_grammar:
-                logging.warning(f" * Textual Inversion plugin: always_use_caption_grammar is enabled but you have multiple training words. This will cause ALL your captions to be overwritten with captions built using {self.caption_grammar.token} and occasionally class {self.caption_grammar.class_name}.")
+            caption_grammar_class_name = self.config.get('caption_grammar_class_name', None)
+            if len(self.training_words) > 0 and caption_grammar_class_name is not None:
+                logging.warning(f" * Textual Inversion plugin: CaptionGrammar always using class {caption_grammar_class_name} for all tokens (this might not be what you want).")
+            self.caption_grammar = {self.training_words[i]: CaptionGrammar(
+                token=self._get_token_sequence(i),
+                class_name=caption_grammar_class_name
+            ) for i in range(len(self.training_words))}
+
 
     def _get_token_sequence(self, training_word_index: int) -> str:
         tokens = self.training_words_to_tokens[self.training_words[training_word_index]]
@@ -181,10 +186,10 @@ class TextualInversionPlugin(BasePlugin):
         te_path = os.path.join(save_path, 'text_embeddings')
         self.save(te_path)
 
-    def save(self, save_path, suffix: str=''):
+    def save(self, folder, suffix: str=''):
         self.bounce_down_weights()
         with torch.no_grad():
-            os.makedirs(save_path, exist_ok=True)
+            os.makedirs(folder, exist_ok=True)
             embeddings: nn.Embedding = self.text_encoder.get_input_embeddings()
             offset_weights = _apply_weight_offsets(self.training_token_ids, embeddings, self.embedding_offsets_individual)
             for word, tokens in self.training_words_to_tokens.items():
@@ -197,7 +202,7 @@ class TextualInversionPlugin(BasePlugin):
                     'string_to_param': {'*': embeddings_stack.detach().clone().cpu()},
                     'name': word,
                 }
-                save_path = os.path.join(save_path, f'{word}{suffix}.pt')
+                save_path = os.path.join(folder, f'{word}{suffix}.pt')
                 torch.save(dict, save_path)
 
 
@@ -210,6 +215,41 @@ class TextualInversionPlugin(BasePlugin):
                 p: list
                 p.extend([('te_offset', self.embedding_offsets_individual)])
         return text_encoder_parameters, unet_parameters
+
+    def on_optimizer_backward(self, loss: torch.Tensor, **kwargs):
+        if self.push_embeddings_apart:
+            embeddings = self.text_encoder.get_input_embeddings()
+            offset_weights = _apply_weight_offsets(self.training_token_ids,
+                                                   original_embeddings=embeddings,
+                                                   embedding_offsets_individual=self.embedding_offsets_individual)
+
+            word_vecs = [offset_weights[tokens] for tokens in self.training_words_to_tokens.values()]
+            if len(word_vecs) < 2:
+                return
+
+            k_max = max(v.shape[0] for v in word_vecs)
+            padded = torch.stack([
+                F.pad(v, (0, 0, 0, k_max - v.shape[0]))
+                for v in word_vecs
+            ])  # [N, k_max, e]
+            flat = padded.view(len(word_vecs), -1)  # [N, k_max * e]
+
+            # all unique pairs
+            idx_a, idx_b = zip(*[
+                (i, j)
+                for i in range(len(word_vecs))
+                for j in range(i + 1, len(word_vecs))
+            ])
+            a = flat[list(idx_a)]  # [num_pairs, k_max*e]
+            b = flat[list(idx_b)]  # [num_pairs, k_max*e]
+
+            targets = torch.full((len(idx_a),), -1.0, device=a.device)
+            separation_loss = F.cosine_embedding_loss(a, b, targets, margin=0.)
+
+            scale = self.config.get('push_embeddings_apart_scale', 1.0)
+            loss += separation_loss * scale
+            logging.info(f" * TI separation loss: {separation_loss.item():.4f}")
+
 
     def on_step_end(self, **kwargs):
         if self.lerp_target_weights is not None:
@@ -252,7 +292,11 @@ class TextualInversionPlugin(BasePlugin):
 
     def transform_caption(self, caption:str, pathname: str):
         if len(caption.strip()) == 0 or self.always_use_caption_grammar:
-            caption = self.caption_grammar.sample()
+            training_word = next((w for w in self.training_words if w in caption), None)
+            if training_word is None:
+                logging.warning(f"Unable to find matching training word in caption. training words: {self.training_words}, caption: '{caption}'")
+                return caption
+            caption = self.caption_grammar[training_word].sample()
             print('made caption:', caption)
             return caption
 

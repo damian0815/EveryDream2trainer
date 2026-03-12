@@ -3,6 +3,8 @@ import importlib
 import logging
 import time
 import warnings
+
+import torch
 from PIL import Image
 
 class BasePlugin:
@@ -21,6 +23,8 @@ class BasePlugin:
     def on_step_start(self, **kwargs):
         pass
     def on_step_end(self, **kwargs):
+        pass
+    def on_optimizer_backward(self, loss: torch.Tensor, **kwargs):
         pass
     def transform_caption(self, caption:str, pathname: str):
         return caption
@@ -107,7 +111,12 @@ class PluginRunner:
         for plugin in self.plugins:
             with Timer(warn_seconds=self.step_warn_seconds, label=f'{plugin.__class__.__name__}'):
                 plugin.on_step_end(**kwargs)
-    
+
+    def run_on_optimizer_backward(self, loss: torch.Tensor, **kwargs):
+        for plugin in self.plugins:
+            with Timer(warn_seconds=self.step_warn_seconds, label=f'{plugin.__class__.__name__}'):
+                plugin.on_optimizer_backward(loss, **kwargs)
+
     def run_transform_caption(self, caption, pathname):
         with Timer(warn_seconds=self.step_warn_seconds, label="plugin.transform_caption"):
             for plugin in self.plugins:

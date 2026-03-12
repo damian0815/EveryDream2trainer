@@ -22,6 +22,7 @@ from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_
     get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
+from plugins.plugins import PluginRunner
 
 # Global performance profiling storage
 # Structure: {<label>: [duration_per_image, duration_per_image, ...]}
@@ -55,6 +56,7 @@ def train_step(
     log_data: LogData,
     steps_pbar,
 
+    plugin_runner: PluginRunner,
     did_step_optimizer_cb: Callable|None,
     args: argparse.Namespace,
 ):
@@ -167,7 +169,7 @@ def train_step(
             if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] >= tv.max_backward_slice_size:
                 with torch.cuda.amp.autocast(enabled=args.amp):
 
-                    optimizer_backward(ed_optimizer, tv, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
+                    optimizer_backward(ed_optimizer, tv, plugin_runner, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
                     record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
 
             # Timesteps generation
@@ -356,7 +358,7 @@ def train_step(
                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                 t_backward_start = time.perf_counter()
                 with torch.cuda.amp.autocast(enabled=args.amp):
-                    optimizer_backward(ed_optimizer, tv, 'regular backward: ')
+                    optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
                 record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
             # if tv.global_step >= 653 and tv.global_step < 656:
@@ -729,11 +731,12 @@ def _get_step_timesteps_internal(
 
 
 
-def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, log_hint=''):
+def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, plugin_runner: PluginRunner, log_hint=''):
     if tv.accumulated_loss_images_count == 0:
         logging.warning("no accumulated loss images, not doing backward")
     else:
         try:
+            plugin_runner.run_on_optimizer_backward(loss=tv.accumulated_loss)
             gc.collect()
             torch.cuda.empty_cache()
             optimizer.backward(tv.accumulated_loss)
