@@ -19,7 +19,8 @@ from torch.utils.tensorboard import SummaryWriter
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import LogData
 from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
-    get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss
+    get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss, \
+    compute_timestep_intervals
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 from plugins.plugins import PluginRunner
@@ -373,12 +374,13 @@ def train_step(
                     #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
 
                     t_optimizer_step_start = time.perf_counter()
-                    ed_optimizer.step_optimizer(tv.global_step, tv)
+                    ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
                     record_performance_timing("12_optimizer_step", time.perf_counter() - t_optimizer_step_start, num_images)
 
                     tv.last_effective_batch_size = tv.backwarded_images_count
                     tv.total_trained_samples_count += tv.backwarded_images_count
                     tv.optimizer_step += 1
+                    tv.current_timestep_interval = None   # draw a new SNR interval next step
                     tv.backwarded_images_count = 0
 
                     # if we are interleaving BS1, increment counter
@@ -682,6 +684,20 @@ def _get_step_timesteps_internal(
                 [tv.remaining_stratified_timesteps, next_timesteps])
         timesteps: torch.Tensor = tv.remaining_stratified_timesteps[:full_batch_size]
         tv.remaining_stratified_timesteps = tv.remaining_stratified_timesteps[full_batch_size:]
+        return timesteps
+    elif args.timestep_interval_sampling:
+        # --- SNR-interval timestep sampling ---
+        # All samples in a batch share the same SNR-homogeneous interval.
+        # Interval is chosen once per optimizer step and held until cleared after step_optimizer().
+        if tv.current_timestep_interval is None:
+            tv.current_timestep_interval = random.choice(tv.timestep_intervals)
+        t_lo, t_hi = tv.current_timestep_interval
+        timesteps = torch.randint(
+            low=t_lo,
+            high=max(t_lo + 1, t_hi + 1),   # randint high is exclusive
+            size=(full_batch_size,),
+            device=model.unet.device,
+        ).long()
         return timesteps
     else:
         if full_batch_timesteps_range is not None:

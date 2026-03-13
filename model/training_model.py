@@ -129,6 +129,9 @@ class TrainingVariables:
     shared_timestep: int|None = None
     shared_noise: torch.Tensor|None = None
 
+    current_timestep_interval: tuple[int, int] | None = None          # per-optimizer-step latch for interval sampling
+    timestep_intervals: list[tuple[int, int]] | None = None           # pre-computed SNR-based clusters
+
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
 
     prev_accumulated_pathnames: list[str] = field(default_factory=list)

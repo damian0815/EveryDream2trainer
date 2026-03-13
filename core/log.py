@@ -27,6 +27,8 @@ class LogData:
         default_factory=lambda: defaultdict(dict)) # batch_resolution -> timestep -> (loss sum, count)
     loss_per_image_and_timestep: dict[int, dict[str, list[tuple[float, float]]]] = dataclasses.field(
         default_factory=lambda: defaultdict(dict)) # batch_resolution -> image_path -> list of (timestep, loss)
+    grad_norms: dict[str, list[float]] = dataclasses.field(default_factory=lambda: defaultdict(list)) # param name -> list of grad norms
+    grad_weight_ratios: dict[str, list[float]] = dataclasses.field(default_factory=lambda: defaultdict(list)) # param name -> list of grad to weight ratios
 
     loss_epoch = []
     images_per_sec = []
@@ -101,6 +103,10 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         torch.save(loss_sums_and_counts, f)
     with open(os.path.join(log_folder, "loss_per_image_and_timestep.pt"), "wb") as f:
         torch.save(log_data.loss_per_image_and_timestep, f)
+    with open(os.path.join(log_folder, "grad_norms.pt"), "wb") as f:
+        torch.save(log_data.grad_norms, f)
+    with open(os.path.join(log_folder, "grad_weight_ratios.pt"), "wb") as f:
+        torch.save(log_data.grad_weight_ratios, f)
 
     # for batch_resolution in args.resolution:
     #    #image = _create_bar_chart_image(loss_per_timestep[batch_resolution])

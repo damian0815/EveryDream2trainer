@@ -174,6 +174,7 @@ class EveryDreamOptimizer:
             "apply_grad_scaler_step_tweaks", True
         )
 
+        self.transformer_lr_scale = optimizer_config.get("transformer_lr_scale", 10.0)
 
         if "use_grad_scaler" in optimizer_config:
             logging.warning(
@@ -206,27 +207,25 @@ class EveryDreamOptimizer:
             )
         else:
             if is_training_te:
-                self.text_encoder_params = {
-                    "default": list(self._apply_text_encoder_freeze(model.text_encoder)) + (
-                        list(self._apply_text_encoder_freeze(model.text_encoder_2))
-                        if model.text_encoder_2 is not None
-                        else []
-                    )
-                }
+                self.text_encoder_params = list(self._apply_text_encoder_freeze(model.text_encoder)) + (
+                    list(self._apply_text_encoder_freeze(model.text_encoder_2))
+                    if model.text_encoder_2 is not None
+                    else []
+                )
+
             else:
-                self.text_encoder_params = {"default": []}
+                self.text_encoder_params = []
             if is_training_unet:
                 self.unet_params = self._apply_unet_freeze(
                     model.unet,
                     unet_freeze_config=optimizer_config.get("unet_freezing", {}),
-                    unet_component_lr_config=self.unet_component_lr_config,
                     cross_attention_dim_to_find=2048
                     if model.is_sdxl
                     else model.text_encoder.config.hidden_size,
                     unet_freeze_regex=args.unet_freeze_regex,
                 )
             else:
-                self.unet_params = {"default": []}
+                self.unet_params = []
         if args.debug_unet_freeze_regex:
             logging.info("--debug_unet_freeze_regex passed - bailing out")
             exit(0)
@@ -419,7 +418,7 @@ class EveryDreamOptimizer:
             logging.error(f"Global step: {tv.global_step}")
             raise InfOrNanException("** inf or NaN detected in UNet gradients")
 
-    def step_optimizer(self, global_step, tv: "TrainingVariables", log_hint: str = ""):
+    def step_optimizer(self, global_step, tv: "TrainingVariables", log_data: 'LogData'):
         if self.scaler is not None:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
@@ -530,6 +529,18 @@ class EveryDreamOptimizer:
                         log_action,
                     )
 
+        # collect grad stats
+        for name, param in self.unet.named_parameters():
+            if param.grad is not None:
+                param_grad_norm = param.grad.norm().item()
+                param_weight_norm = param.data.norm().item()
+                log_data.grad_norms[name].append(
+                    param_grad_norm
+                )
+                log_data.grad_weight_ratios[name].append(
+                    param_grad_norm / (param_weight_norm + 1e-8)
+                )
+
         self._zero_grad(set_to_none=True)
 
     def step_schedulers(self, global_step):
@@ -629,7 +640,10 @@ class EveryDreamOptimizer:
             )
 
     def create_optimizers(
-        self, args, text_encoder_params: dict[str, list], unet_params: dict[str, list]
+        self,
+        args,
+        text_encoder_params: list[tuple[str, torch.nn.Parameter]], # named parameters
+        unet_params: list[tuple[str, torch.nn.Parameter]]  # named parameters
     ):
         """
         creates optimizers from config and args for unet and text encoder
@@ -868,7 +882,7 @@ class EveryDreamOptimizer:
             pass
 
     def _create_optimizer(
-        self, label, args, local_optimizer_config, parameters: dict[str, list]
+        self, label, args, local_optimizer_config, parameters: list[tuple[str, torch.nn.Parameter]]
     ):
         """
         parameters is always a dict:
@@ -921,119 +935,25 @@ class EveryDreamOptimizer:
             curr_lr = default_lr
             logging.warning(f"No LR setting found, defaulting to {default_lr}")
 
-        # Check if this is component-specific LR (multi-group) or standard (single group)
-        is_component_lr = (
-            label == "unet" and len(parameters) > 1 and "cross_attention" in parameters
-        )
-
-        param_groups = []
-
-        # urgh. i let Claude write this without checking the output 🙈
-        # todo: refactor so it doesn't suck (specifically: this is super stupid complicated)
-        if is_component_lr:
-            # Component-specific LR mode for UNet
-            logging.info(
-                f"{Fore.CYAN}=== Using Component-Specific Learning Rates for UNet ==={Style.RESET_ALL}"
-            )
-
-            component_configs = {
-                "cross_attention": {
-                    "lr_scale": self.unet_component_lr_config.get(
-                        "cross_attention_lr_scale", 1.0
-                    ),
-                    "weight_decay": self.unet_component_lr_config.get(
-                        "cross_attention_weight_decay", weight_decay
-                    ),
-                },
-                "self_attention": {
-                    "lr_scale": self.unet_component_lr_config.get(
-                        "self_attention_lr_scale", 1.0
-                    ),
-                    "weight_decay": self.unet_component_lr_config.get(
-                        "self_attention_weight_decay", weight_decay
-                    ),
-                },
-                "resnet": {
-                    "lr_scale": self.unet_component_lr_config.get(
-                        "resnet_lr_scale", 1.0
-                    ),
-                    "weight_decay": self.unet_component_lr_config.get(
-                        "resnet_weight_decay", weight_decay
-                    ),
-                },
-                "other": {
-                    "lr_scale": self.unet_component_lr_config.get(
-                        "other_lr_scale", 1.0
-                    ),
-                    "weight_decay": self.unet_component_lr_config.get(
-                        "other_weight_decay", weight_decay
-                    ),
-                },
-            }
-
-            for component_name, component_params in parameters.items():
-                if component_params:  # Only add non-empty groups
-                    config = component_configs[component_name]
-                    component_lr = curr_lr * config["lr_scale"]
-                    param_groups.append(
-                        {
-                            "params": [p for n, p in component_params],
-                            "betas": (betas[0], betas[1]),
-                            "weight_decay": config["weight_decay"],
-                            "lr": component_lr,
-                            "name": component_name,
-                        }
-                    )
-                    logging.info(
-                        f"{Fore.CYAN}  {component_name}: {len(component_params)} params, LR={component_lr:.2e}, WD={config['weight_decay']}{Style.RESET_ALL}"
-                    )
-        else:
-            # Standard mode: single group (dict with one key, usually "default")
-            # Get the single group's parameters
-            if type(parameters) is dict:
-                assert len(parameters) == 1
-                group_name = list(parameters.keys())[0]
-                param_list = parameters[group_name]
-            else:
-                group_name = "default"
-                param_list = parameters
-
-            attention_weight_decay = local_optimizer_config.get(
-                "weight_decay_attn_qk", None
-            )
-            if attention_weight_decay is None:
-                param_groups = [
-                    {
-                        "params": [p for n, p in param_list],
-                        "betas": (betas[0], betas[1]),
-                        "weight_decay": weight_decay,
-                        "lr": curr_lr,
-                        "name": group_name,
-                    }
-                ]
-            else:
-                regular_group, attention_group = _extract_attention_parameter_group(
-                    param_list
-                )
-                logging.info(
-                    f"Using split parameter groups: {len(regular_group)} regular parameters @ weight decay {weight_decay}  , {len(attention_group)} attention parameters @ weight decay {attention_weight_decay}"
-                )
-                param_groups = [
-                    {
-                        "params": [p for n, p in regular_group],
-                        "betas": (betas[0], betas[1]),
-                        "weight_decay": weight_decay,
-                        "lr": curr_lr,
-                        "name": "regular",
-                    },
-                    {
-                        "params": [p for n, p in attention_group],
-                        "betas": (betas[0], betas[1]),
-                        "weight_decay": attention_weight_decay,
-                        "lr": curr_lr,
-                        "name": "attention_high_decay",
-                    },
-                ]
+        def _is_transformer_module(name: str) -> bool:
+            return re.match(r".*transformer_blocks.*", name) is not None
+        logging.info(f"* Using transformer LR scale {self.transformer_lr_scale}")
+        param_groups = [
+            {
+                "params": [p for n, p in parameters if _is_transformer_module(n)],
+                "betas": (betas[0], betas[1]),
+                "weight_decay": weight_decay,
+                "lr": curr_lr * self.transformer_lr_scale,
+                "name": "transformer",
+            },
+            {
+                "params": [p for n, p in parameters if not _is_transformer_module(n)],
+                "betas": (betas[0], betas[1]),
+                "weight_decay": weight_decay,
+                "lr": curr_lr,
+                "name": "non-transformer",
+            },
+        ]
 
         if optimizer_name:
             optimizer_name = optimizer_name.lower()
@@ -1238,9 +1158,8 @@ class EveryDreamOptimizer:
         unet: UNet2DConditionModel,
         unet_freeze_config: dict[str, bool],
         unet_freeze_regex: str | None,
-        unet_component_lr_config: dict,
         cross_attention_dim_to_find: int,
-    ):
+    ) -> list[tuple[str, torch.nn.Parameter]]:
         """
         Returns either:
         - A simple chain of parameters (old behavior) if no component LR config
@@ -1493,17 +1412,6 @@ class EveryDreamOptimizer:
 
             should_freeze = lambda name: should_freeze_from_optimizer_json(name)
 
-        def get_component_type(n):
-            """Determine which component type a parameter belongs to"""
-            if any(n.startswith(prefix) for prefix in cross_attn_layer_names):
-                return "cross_attention"
-            elif any(n.startswith(prefix) for prefix in self_attn_layer_names):
-                return "self_attention"
-            elif "resnet" in n.lower() or "resnets" in n.lower():
-                return "resnet"
-            else:
-                return "other"
-
         for n, p in unet.named_parameters():
             p.requires_grad = not should_freeze(n)
 
@@ -1519,43 +1427,11 @@ class EveryDreamOptimizer:
                 "All UNet parameters are frozen, nothing to train! Double-check your unet freeze config."
             )
 
-        # Always return dict structure
-        if unet_component_lr_config and unet_component_lr_config.get("enabled", False):
-            # Component-specific LR mode: return 4 separate groups
-            component_groups = {
-                "cross_attention": [],
-                "self_attention": [],
-                "resnet": [],
-                "other": [],
-            }
-
-            for n, p in unet.named_parameters():
-                if p.requires_grad:
-                    component_type = get_component_type(n)
-                    component_groups[component_type].append((n, p))
-
-            # Log component counts
-            print("\n=== UNet Component-Specific LR Groups ===")
-            for component, params in component_groups.items():
-                if params:
-                    lr_scale = unet_component_lr_config.get(
-                        f"{component}_lr_scale", 1.0
-                    )
-                    param_count = sum(p.numel() for p in params)
-                    print(
-                        f"  {component}: {len(params)} parameters ({param_count} floats) (LR scale: {lr_scale}x)"
-                    )
-
-            return component_groups
-        else:
-            # Standard mode: return single group dict for consistency
-            return {
-                "default": list(
-                    itertools.chain(
-                        [np for np in unet.named_parameters() if np[1].requires_grad]
-                    )
-                )
-            }
+        return list(
+            itertools.chain(
+                [np for np in unet.named_parameters() if np[1].requires_grad]
+            )
+        )
 
     def _apply_text_encoder_freeze(self, text_encoder) -> chain[torch.nn.Parameter]:
         num_layers = len(text_encoder.text_model.encoder.layers)
@@ -1842,28 +1718,6 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
         return lr_lambda_cycleinternal(current_cycle_step)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
-def _extract_attention_parameter_group(
-    parameters: list[tuple[str, torch.nn.Parameter]],
-) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
-    """
-    Extracts the attention parameters from the given parameters list.
-    Returns a tuple of two lists: regular parameters and attention parameters.
-    """
-    regular_group = []
-    attention_group = []
-
-    for name, param in parameters:
-        name = name.lower()
-        if ("attn" in name or "attention" in name) and any(
-            qk in name for qk in ["to_q", "to_k", "query", "key"]
-        ):
-            attention_group.append((name, param))
-        else:
-            regular_group.append((name, param))
-
-    return regular_group, attention_group
 
 
 def _should_freeze_from_regexes(regexes: str, name: str) -> bool:

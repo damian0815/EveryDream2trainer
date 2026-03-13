@@ -661,6 +661,81 @@ def compute_snr(timesteps, noise_scheduler):
     return snr
 
 
+def snr_based_clustering(snr: "np.ndarray", k: int) -> list[tuple[int, int]]:
+    """
+    cf Hyojun Go et al [Neurips 2023] Addressing Negative Transfer in Diffusion Models
+    https://gohyojun15.github.io/ANT_diffusion/
+
+    Dynamic programming partition of [0, len(snr)-1] into k contiguous intervals
+    minimising within-interval SNR heterogeneity.
+
+    Cost of interval [left, right]: sum of |snr[t] - snr[center]| for t in [left, right].
+    Returns k (left, right) inclusive index pairs (relative to the input snr array).
+    """
+    import numpy as np
+    n = snr.shape[0]
+    D = np.full((n, k), np.inf)   # D[i,j] = min cost to cover [0..i] with j+1 clusters
+    S = np.zeros((n, k), dtype=int)
+
+    def interval_cost(left, right):
+        if left == right:
+            return 0.0
+        center = round((left + right + 1) / 2)
+        return float(np.abs(snr[left:right + 1] - snr[center]).sum())
+
+    for j in range(k):
+        for i in reversed(range(n)):
+            if j == 0:
+                D[i, j] = interval_cost(0, i)
+            elif i >= j:
+                costs = np.full(i, np.inf)
+                for L in range(j, i):
+                    costs[L] = D[L, j - 1] + interval_cost(L + 1, i)
+                D[i, j] = costs.min()
+                S[i, j] = int(costs.argmin())
+
+    # Backtrack to recover split boundaries
+    bounds = []
+    b = 0
+    for j in reversed(range(k)):
+        b = S[-1, k - 1] if j == k - 1 else S[int(b), j]
+        bounds.append(int(b))
+
+    # Build (left, right) inclusive index pairs
+    clusters = []
+    reversed_bounds = list(reversed(bounds))
+    for idx in range(k):
+        left  = reversed_bounds[idx]
+        right = reversed_bounds[idx + 1] - 1 if idx + 1 < k else n - 1
+        clusters.append((int(left), int(right)))
+    return clusters
+
+
+def compute_timestep_intervals(noise_scheduler, k: int,
+                               t_start: int, t_end: int) -> list[tuple[int, int]]:
+    """
+    Compute k SNR-homogeneous contiguous intervals over [t_start, t_end] using DP.
+    Works for both flow-matching and DDPM/v-pred schedulers.
+    Returns absolute timestep (left, right) inclusive pairs.
+    """
+    import numpy as np
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
+
+    all_t = torch.arange(t_start, t_end)
+    if isinstance(noise_scheduler, (TrainFlowMatchEulerDiscreteScheduler,
+                                    FlowMatchEulerDiscreteScheduler)):
+        # SNR(t) = t² / (1−t)²  for linear flow-matching schedule
+        t_norm = all_t.float() / noise_scheduler.config.num_train_timesteps
+        snr = (t_norm ** 2 / (1.0 - t_norm + 1e-8) ** 2).numpy()
+    else:
+        snr = compute_snr(all_t, noise_scheduler).numpy()
+
+    clusters = snr_based_clustering(snr, k)
+    # clusters are relative indices into all_t — shift to absolute timestep values
+    return [(t_start + l, t_start + r) for l, r in clusters]
+
+
 def vae_preview(latents: torch.Tensor) -> torch.Tensor:
     # adapted from https://github.com/invoke-ai/InvokeAI/blob/main/invokeai/app/util/step_callback.py
     SD1_5_LATENT_RGB_FACTORS = torch.tensor(

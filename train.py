@@ -62,7 +62,8 @@ from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_ar
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
-    get_latents
+    get_latents,
+    compute_timestep_intervals,
 )
 from core.step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
     get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward, \
@@ -1033,6 +1034,19 @@ def main(args):
         tv.desired_effective_batch_size = choose_effective_batch_size(args, 0)
         tv.remaining_stratified_timesteps = None
         tv.shared_timestep = None
+
+        if args.timestep_interval_sampling:
+            if args.timesteps_multirank_stratified:
+                raise ValueError("--timestep_interval_sampling and --timesteps_multirank_stratified are mutually exclusive")
+            if args.timestep_curriculum_alpha != 0:
+                logging.warning(" * --timestep_interval_sampling is not compatible with --timestep_curriculum_alpha; intervals are pre-computed from --timestep_start/--timestep_end and will not shift during training")
+            tv.timestep_intervals = compute_timestep_intervals(
+                model.noise_scheduler,
+                k=args.timestep_interval_n,
+                t_start=args.timestep_start,
+                t_end=args.timestep_end,
+            )
+            logging.info(f" * Timestep interval sampling: {len(tv.timestep_intervals)} SNR-based intervals: {tv.timestep_intervals}")
         step = 0
         wants_stop = False
         force_save_optimizer = False
@@ -1570,6 +1584,10 @@ if __name__ == "__main__":
     argparser.add_argument("--timesteps_multirank_stratified_alpha", type=float, default=1.5, help="multirank stratified timesteps PPF alpha")
     argparser.add_argument("--timesteps_multirank_stratified_beta", type=float, default=2, help="multirank stratified timesteps PPF beta")
     argparser.add_argument("--timesteps_multirank_stratified_mode_scale", type=float, default=0.5, help="multirank stratified timesteps mode scale")
+    argparser.add_argument("--timestep_interval_sampling", action=argparse.BooleanOptionalAction, default=False,
+                           help="Sample all images in an optimizer step from the same SNR-homogeneous timestep interval, rotating the interval each step. Mutually exclusive with --timesteps_multirank_stratified.")
+    argparser.add_argument("--timestep_interval_n", type=int, default=10,
+                           help="Number of SNR-homogeneous intervals for --timestep_interval_sampling (default: 10)")
     argparser.add_argument("--timestep_curriculum_alpha", type=float, default=0, help="if passed, shift timestep range toward fine details as training progresses")
     argparser.add_argument("--timestep_initial_start", type=int, default=800, help="If using timestep_curriculum_alpha, the initial start timestep (default 800); will transition to --timestep_start")
     argparser.add_argument("--timestep_initial_end", type=int, default=1000, help="If using timestep_curriculum_alpha, the initial end timestep (default 1000); will transition to --timestep_end")
