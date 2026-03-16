@@ -25,6 +25,24 @@ def get_lr_scale_for_zone(zone: str) -> float:
         'up_inner__qkv': 10.0,
         'up_mid__qkv': 6.0,
         'up_outer__qkv': 5.0,
+
+        # attn1 (self-attention) — depth-sensitive, anchored to down_outer
+        'down_outer__attn1_qkv': 4.0,
+        'down_mid__attn1_qkv': 8.0,
+        'down_inner__attn1_qkv': 15.0,
+        'mid__attn1_qkv': 20.0,
+        'up_inner__attn1_qkv': 10.0,
+        'up_mid__attn1_qkv': 6.0,
+        'up_outer__attn1_qkv': 5.0,
+
+        # attn2 (cross-attention) — depth-insensitive, uniformly starved
+        'down_outer__attn2_qkv': 20.0,
+        'down_mid__attn2_qkv': 20.0,
+        'down_inner__attn2_qkv': 20.0,
+        'mid__attn2_qkv': 20.0,
+        'up_inner__attn2_qkv': 20.0,
+        'up_mid__attn2_qkv': 20.0,
+        'up_outer__attn2_qkv': 20.0,
     }
     return LR_SCALES[zone]
 
@@ -62,14 +80,19 @@ def get_unet_module_zone(name: str) -> str:
     else:
         return 'other'  # fallback for anything unmatched
 
-    # --- type flag: qkv is a consistent outlier in every zone ---
-    is_qkv = bool(re.search(r'\.to_[qkv]\.weight$', name))
-
     # --- type flag ---
     is_qkv = bool(re.search(r'\.to_[qkv]\.weight$', name))
 
     if is_qkv:
-        return f'{zone}__qkv'
+        is_attn1 = bool(re.search(r'\.attn1\.to_[qkv]\.weight$', name))
+        is_attn2 = bool(re.search(r'\.attn2\.to_[qkv]\.weight$', name))
+
+        if is_attn1:
+            return f'{zone}__attn1_qkv'
+        elif is_attn2:
+            return f'{zone}__attn2_qkv'
+        else:
+            return f'{zone}__qkv'
     if zone == 'mid':
         is_ff = bool(re.search(r'\.ff\.', name))
         if is_ff:
