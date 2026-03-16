@@ -1,8 +1,8 @@
-
+import json
+import os
 import re
 
-def get_lr_scale(module_name: str) -> float:
-    zone = _categorise_v2(module_name)
+def get_lr_scale_for_zone(zone: str) -> float:
 
     LR_SCALES = {
         # zone            log_ratio_approx   → multiplier (exp(ref - val), ref=+1.7)
@@ -28,8 +28,14 @@ def get_lr_scale(module_name: str) -> float:
     }
     return LR_SCALES[zone]
 
+def get_raw_unet_module_lr_scales() -> dict[str, float]:
+    with open(os.path.join(os.path.dirname(__file__), 'grad_ratios.json'), 'r') as f:
+        d = json.load(f)
+        return {n: 1/r for n, r in d.items()}  # invert to get lr scale multipliers
+        #return {n: min(100, max(0.01, 1/r)) for n, r in d.items()}  # clamp to avoid extreme outliers
 
-def _categorise_v2(name: str) -> str:
+
+def get_unet_module_zone(name: str) -> str:
     """
     Returns a zone + optional type label for a parameter name.
     Zone captures UNet block position; type flags the qkv outlier.

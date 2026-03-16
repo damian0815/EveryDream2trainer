@@ -21,6 +21,7 @@ from core.log import LogData
 from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
     get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss, \
     compute_timestep_intervals
+from data.dataset import select_caption_variants
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 from plugins.plugins import PluginRunner
@@ -91,52 +92,15 @@ def train_step(
         # loss_scale = loss_scale.float() * (reference_image_size / image_size)
 
         assert type(batch["captions"]) is dict
-        available_non_default = [k for k in batch["captions"].keys() if k != "default"]
-        if args.caption_variants:
-            available_requested = list(set(available_non_default).intersection(set(args.caption_variants)))
-            # add wildcards for each missing - this takes care of '*' as variant too
-            missing = max(0, len(args.caption_variants) - len(available_requested))
-            for _ in range(missing):
-                remaining = list(set(available_non_default) - set(available_requested))
-                if not remaining:
-                    break
-                available_requested.append(random.choice(remaining))
-            caption_candidates = available_requested
-        else:
-            caption_candidates = available_non_default
 
-        if args.all_caption_variants:
-            caption_counter = Counter()
-            # add requested captions
-            for k in batch["captions"].keys():
-                if k in caption_candidates or (
-                    # only add 'default' if it's the only caption
-                    k == 'default'
-                    and len(batch["captions"].keys()) == 1
-                ):
-                    for image_index in range(len(batch["captions"][k])):
-                        if batch["captions"][k][image_index] is not None:
-                            caption_counter[k] += 1
-            #logging.info(
-            #    f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
-            caption_variants = list(caption_counter.keys())
-        else:
-            if caption_candidates:
-                requested_choice = random.choice(caption_candidates)
-                if requested_choice == '*':
-                    caption_candidates = available_non_default
-                else:
-                    caption_candidates = [requested_choice]
-
-            if len(caption_candidates) == 0:
-                caption_candidates.append("default")
-                if "default" not in batch["captions"]:
-                    logging.info(
-                        f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']}")
-                    batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
-                    batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
-            caption_variants = [random.choice(caption_candidates)]
-            # print('picked caption variant: ', caption_variants)
+        try:
+            caption_variants = select_caption_variants(batch["captions"], requested_caption_variants=args.caption_variants, all_caption_variants=args.all_caption_variants)
+        except RuntimeError as e:
+            logging.info(
+                f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']} - treating as cond dropout for this batch **")
+            batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
+            batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
+            caption_variants = ['default']
 
         record_performance_timing("2_caption_selection", time.perf_counter() - t_caption_start, num_images)
 

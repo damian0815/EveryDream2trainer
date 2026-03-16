@@ -1,3 +1,4 @@
+import random
 import traceback
 
 import yaml
@@ -6,7 +7,7 @@ import json
 from attrs import define, field
 from data.image_train_item import ImageCaption, ImageTrainItem, check_caption_json
 from utils.fs_helpers import *
-from typing import Iterable
+from typing import Iterable, Counter
 
 from tqdm import tqdm
 
@@ -304,3 +305,50 @@ class Dataset:
                 logging.error(f" *** Error preloading image or caption for: {image}, error: {e}")
                 raise e
         return items
+
+def select_caption_variants(captions_dict: dict[str, str], requested_caption_variants: list[str], all_caption_variants: bool):
+    available_non_default = [k for k in captions_dict if k != "default"]
+    if requested_caption_variants:
+        available_requested = list(set(available_non_default).intersection(set(requested_caption_variants)))
+        # add wildcards for each missing - this takes care of '*' as variant too
+        missing = max(0, len(requested_caption_variants) - len(available_requested))
+        for _ in range(missing):
+            remaining = list(set(available_non_default) - set(available_requested))
+            if not remaining:
+                break
+            available_requested.append(random.choice(remaining))
+        caption_candidates = available_requested
+    else:
+        caption_candidates = available_non_default
+
+    if all_caption_variants:
+        caption_counter = Counter()
+        # add requested captions
+        for k in captions_dict.keys():
+            if k in caption_candidates or (
+                # only add 'default' if it's the only caption
+                k == 'default'
+                and len(captions_dict.keys()) == 1
+            ):
+                for image_index in range(len(captions_dict[k])):
+                    if captions_dict[k][image_index] is not None:
+                        caption_counter[k] += 1
+        # logging.info(
+        #    f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
+        return list(caption_counter.keys())
+    else:
+        if caption_candidates:
+            requested_choice = random.choice(caption_candidates)
+            if requested_choice == '*':
+                caption_candidates = available_non_default
+            else:
+                caption_candidates = [requested_choice]
+
+        if len(caption_candidates) == 0:
+            caption_candidates.append("default")
+            if "default" not in captions_dict:
+                raise RuntimeError("No captions found for batch, even default. This should not happen. Check your dataset and caption files.")
+                #batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
+                #batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
+        return [random.choice(caption_candidates)]
+

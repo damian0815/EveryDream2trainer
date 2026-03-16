@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 import itertools
 import os
+from collections import defaultdict
 from functools import partial
 from itertools import chain
 from typing import Generator
@@ -38,6 +39,7 @@ import pprint
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
+from optimizer.per_unet_layer_scales import get_lr_scale_for_zone, get_unet_module_zone, get_raw_unet_module_lr_scales
 from plugins.plugins import PluginRunner
 import re
 
@@ -574,7 +576,7 @@ class EveryDreamOptimizer:
             # Multiple param groups - include group name in key
             return {
                 f"lr unet {pg.get('name', f'group_{idx}')}": pg["lr"]
-                for idx, pg in enumerate(param_groups)
+                for idx, pg in enumerate(param_groups[:10]) # limit to 10 groups to avoid excessive logging
             }
 
     def get_textenc_lr(self):
@@ -935,25 +937,56 @@ class EveryDreamOptimizer:
             curr_lr = default_lr
             logging.warning(f"No LR setting found, defaulting to {default_lr}")
 
-        def _is_transformer_module(name: str) -> bool:
-            return re.match(r".*transformer_blocks.*", name) is not None
-        logging.info(f"* Using transformer LR scale {self.transformer_lr_scale}")
-        param_groups = [
-            {
-                "params": [p for n, p in parameters if _is_transformer_module(n)],
-                "betas": (betas[0], betas[1]),
-                "weight_decay": weight_decay,
-                "lr": curr_lr * self.transformer_lr_scale,
-                "name": "transformer",
-            },
-            {
-                "params": [p for n, p in parameters if not _is_transformer_module(n)],
-                "betas": (betas[0], betas[1]),
-                "weight_decay": weight_decay,
-                "lr": curr_lr,
-                "name": "non-transformer",
-            },
-        ]
+        param_grouping = args.optimizer_param_grouping
+        if param_grouping == 'zones':
+            zone_members = defaultdict(list)
+            for name, p in parameters:
+                zone = get_unet_module_zone(name)
+                zone_members[zone].append(p)
+            param_groups = [{
+                'name': z,
+                'params': zone_members[z],
+                'betas': (betas[0], betas[1]),
+                'weight_decay': weight_decay,
+                'lr': curr_lr * get_lr_scale_for_zone(z)
+            } for z in zone_members.keys()]
+        elif param_grouping == 'per-module':
+            scales = get_raw_unet_module_lr_scales()
+            param_groups = [{
+                'name': n,
+                'params': [p],
+                'betas': (betas[0], betas[1]),
+                'weight_decay': weight_decay,
+                'lr': curr_lr * scales[n]
+            } for n, p in parameters]
+        elif param_grouping == 'transformer10x':
+            param_groups = [{
+                'name': 'transformer_blocks',
+                'params': [p for n, p in parameters if 'transformer_blocks' in n],
+                'betas': (betas[0], betas[1]),
+                'weight_decay': weight_decay,
+                'lr': curr_lr * 10
+            }, {
+                'name': 'non-transformer_blocks',
+                'params': [p for n, p in parameters if 'transformer_blocks' not in n],
+                'betas': (betas[0], betas[1]),
+                'weight_decay': weight_decay,
+                'lr': curr_lr
+            }]
+        elif param_grouping == 'single':
+            param_groups = [{
+                'params': [p for n, p in parameters],
+                'betas': (betas[0], betas[1]),
+                'weight_decay': weight_decay,
+                'lr': curr_lr
+            }]
+        else:
+            raise ValueError(f"Unknown param grouping {param_grouping}")
+
+        logging.info("* Optimizer param groups:")
+        for pg in param_groups:
+            print(f"   - {pg['name']}: {len(pg['params'])} params, lr: {pg['lr']}, betas: {pg['betas']}, weight_decay: {pg['weight_decay']}")
+
 
         if optimizer_name:
             optimizer_name = optimizer_name.lower()
