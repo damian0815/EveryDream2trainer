@@ -52,7 +52,7 @@ from accelerate.utils import set_seed
 import wandb
 import webbrowser
 from torch.utils.tensorboard import SummaryWriter
-from data.data_loader import DataLoaderMultiAspect
+from data.data_loader import DataLoaderMultiAspect, expand_caption_dict
 from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
@@ -82,7 +82,7 @@ from model.training_model import (
 )
 from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, \
     WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE, \
-    SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE
+    SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE, SAVE_FULL_AND_STOP_SEMAPHORE_FILE
 from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
 from optimizer.optimizers import EveryDreamOptimizer
@@ -329,25 +329,6 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, glo
     logging.info(" Preloading images...")
 
     resolved_items = resolver.resolve(args.data_root, args, resolution, aspects)
-    """if args.explode_caption_dicts:
-        exploded_items = []
-        for item in resolved_items:
-            if not item.caption.startswith('<<json>>'):
-                exploded_items.append(item)
-            else:
-                dict = json.loads(item.caption.replace('<<json>>', ''))
-                for value in dict.values():
-                    new_item = deepcopy(item)
-                    new_item.caption = ImageCaption(
-                        main_prompt=value,
-                        rating=1.0,
-                        tags=[],
-                        tag_weights=[],
-                        max_target_length=DEFAULT_MAX_CAPTION_LENGTH,
-                        use_weights=False)
-                    exploded_items.append(new_item)
-        resolved_items = exploded_items
-    """
 
     # Remove erroneous items
     for item in resolved_items:
@@ -546,9 +527,15 @@ def main(args):
             logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
             teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
             if isinstance(teacher_pipeline.scheduler, FlowMatchEulerDiscreteScheduler):
-                teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler()
-            if teacher_pipeline.scheduler.config.prediction_type != model.noise_scheduler.config.prediction_type:
-                logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.prediction_type}, training model {model.noise_scheduler.config.prediction_type} - support is experimental")
+                teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler.from_config(teacher_pipeline.scheduler.config,
+                                                                                   use_dynamic_shifting=args.flow_match_shift_dynamic,
+                                                                                   time_shift_type='linear',
+                                                                                   shift=args.flow_match_shift)
+
+            if type(teacher_pipeline.scheduler) != type(model.noise_scheduler):
+                logging.warning(f" * Teacher and training model schedulers are different classes - support may be experimental. Teacher type {type(teacher_pipeline.scheduler)}, training model {type(model.noise_scheduler)}")
+            if teacher_pipeline.scheduler.config.get('prediction_type', None) != model.noise_scheduler.config.get('prediction_type', None):
+                logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.get('prediction_type')}, training model {model.noise_scheduler.config.get('prediction_type')} - support is experimental")
 
             teacher_unet = teacher_pipeline.unet
             teacher_unet.eval()
@@ -560,8 +547,14 @@ def main(args):
             epsilon = 1e-2
             with torch.no_grad():
                 for k in teacher_te_sd.keys():
-                    # may have different token counts
-                    if k not in base_te_sd or base_te_sd[k].shape != teacher_te_sd[k].shape:
+                    if k == 'text_model.embeddings.token_embedding.weight':
+                        # may have different token counts
+                        if base_te_sd[k].shape != teacher_te_sd[k].shape:
+                            # different token counts -> use the shorter
+                            min_len = min(base_te_sd[k].shape[0], teacher_te_sd[k].shape[0])
+                            teacher_te_sd[k] = teacher_te_sd[k][:min_len]
+                            base_te_sd[k] = base_te_sd[k][:min_len]
+                    if k not in base_te_sd.keys():
                         # different!
                         delta = 1+epsilon
                         break
@@ -722,7 +715,7 @@ def main(args):
     else:
         logging.info(f"* Using caption variants: {args.caption_variants}")
 
-    image_train_items = []
+    image_train_items: list[ImageTrainItem] = []
 
     for resolution_index, batch_resolution in enumerate(args.resolution):
         this_aspects = aspects.get_aspect_buckets(batch_resolution,
@@ -732,6 +725,12 @@ def main(args):
         if resolution_multiplier != 1.0:
             print(f"Using global multiplier {resolution_multiplier} for resolution {batch_resolution}")
         image_train_items.extend(resolve_image_train_items(args, batch_resolution, this_aspects, global_multiplier=resolution_multiplier))
+    for i in image_train_items:
+        if i.cond_dropout is None:
+            i.cond_dropout = args.cond_dropout
+    if args.cond_dropout_global is not None:
+        for i in image_train_items:
+            i.cond_dropout *= args.cond_dropout_global
 
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
@@ -756,6 +755,15 @@ def main(args):
 
     plugin_runner = PluginRunner(plugins=plugins)
     plugin_runner.run_on_model_load(unet=model.unet, text_encoder=model.text_encoder, tokenizer=model.tokenizer, optimizer_config=optimizer_config)
+
+    if args.expand_caption_variants:
+        unexpanded_count = len(image_train_items)
+        image_train_items = [
+            expanded_i
+            for unexpanded_i in image_train_items
+            for expanded_i in expand_caption_dict(unexpanded_i, args.caption_variants)
+        ]
+        logging.info(f" * Caption variants expanded - had {unexpanded_count} items, now {len(image_train_items)} items")
 
     data_loader = DataLoaderMultiAspect(
         image_train_items=image_train_items,
@@ -933,16 +941,30 @@ def main(args):
             extra_info: str = ""
             torch.cuda.empty_cache()
 
-            inference_pipe = sample_generator.create_inference_pipe(
-                model_being_trained=model,
-                diffusers_scheduler_config=model.noise_scheduler.config,
-                flow_match_shift=args.flow_match_shift,
-                flow_match_shift_dynamic=args.flow_match_shift_dynamic
-            ).to(device)
-            sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
+            unet_was_training = model.unet.training
+            text_encoder_was_training = model.text_encoder.training
+            try:
+                model.unet.eval()
+                model.text_encoder.eval()
+                if model.text_encoder_2:
+                    model.text_encoder_2.eval()
+                inference_pipe = sample_generator.create_inference_pipe(
+                    model_being_trained=model,
+                    diffusers_scheduler_config=model.noise_scheduler.config,
+                    flow_match_shift=args.flow_match_shift,
+                    flow_match_shift_dynamic=args.flow_match_shift_dynamic
+                ).to(device)
+                sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
-            # Cleanup
-            del inference_pipe
+                # Cleanup
+                del inference_pipe
+            finally:
+                if unet_was_training:
+                    model.unet.train()
+                if text_encoder_was_training:
+                    model.text_encoder.train()
+                    if model.text_encoder_2:
+                        model.text_encoder_2.train()
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -1178,7 +1200,7 @@ def main(args):
                         shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
                         if random.random() < args.flow_match_shift_dropout_p:
                             shift = 1.0
-                        print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
+                        #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
                         model.set_noise_scheduler_shift(shift)
                         if teacher_model:
                             teacher_model.set_noise_scheduler_shift(shift)
@@ -1260,6 +1282,8 @@ def main(args):
                     if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
                         needs_save = True
                         needs_optimizer_save = True
+                    if check_semaphore_file_and_unlink(SAVE_FULL_AND_STOP_SEMAPHORE_FILE):
+                        wants_stop = True
                     if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
                         wants_stop = True
                         force_save_optimizer = True
@@ -1514,9 +1538,9 @@ if __name__ == "__main__":
                            help="source for cond dropout curriculum - timestep (high timestep (high noise)...low timestep), batch size (initial_batch_size...final_batch_size), or global_step")
     argparser.add_argument("--final_cond_dropout", type=float, default=None, help="if doing cond dropout curriculum, the final cond dropout (timestep=0)")
     argparser.add_argument("--loss_scale", type=float, default=1, help="additional loss scaling")
-    argparser.add_argument("--dropout", type=float, default=0, help="Dropout rate (def: 0.0)")
+    argparser.add_argument("--cond_dropout_global", type=float, default=None, help="Global conditioning dropout probability multiplier - if passed, all cond_dropout probabilities are multiplied by this")
     argparser.add_argument("--data_root", type=str, default="input", help="folder where your training images are")
-    argparser.add_argument("--data_multiplier_per_path", type=str, nargs="+", default=[], help="optional json file(s) mapping real image paths (symlinks resolved) to an additional multiplier factor. You may pass multiple files.")
+    argparser.add_argument("--data_multiplier_per_path", type=str, nargs="*", default=[], help="optional json file(s) mapping real image paths (symlinks resolved) to an additional multiplier factor. You may pass multiple files.")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None, help="number of worker threads for dataloaders (affects performance). if not specified, default is based on CPU count and batch size.")
     argparser.add_argument("--skip_undersized_images", action='store_true', help="If passed, ignore images that are considered undersized for the training resolution")
     argparser.add_argument("--disable_amp", action=argparse.BooleanOptionalAction, default=False, help="disables automatic mixed precision (def: False)")
@@ -1559,6 +1583,8 @@ if __name__ == "__main__":
     argparser.add_argument("--unet_freeze_regex", default=None, help='Unet freeze regex(es). Specify multiply matches by separating with `;`. Matches are applied in order. `freeze` or `unfreeze` specifies what the match does. Last match wins. eg: --unet_freeze_regex "freeze .*; unfreeze down_blocks\\.0\\..*attentions.*; freeze .*\\.norm1" -> freeze all, then unfreeze attention modules in down_block 0 except norm1 layers. Use --debug_unet_freeze_regex to apply rules and dump result to console without actually training.')
     argparser.add_argument("--debug_unet_freeze_regex", action="store_true", help="If passed, apply unet freeze regex and dump results to console without training")
     argparser.add_argument("--optimizer_param_grouping", type=str, default="single", help="Parameter grouping strategy for optimizer, (def: single)", choices=["single", "transformer10x", "zones", "per-module"])
+    argparser.add_argument("--optimizer_progressive_unlock", action=argparse.BooleanOptionalAction, default=False, help="If passed, progressively unlock parameters")
+    argparser.add_argument("--optimizer_progressive_unlock_by_qk_proximity", action=argparse.BooleanOptionalAction, default=False, help="If passed, progressively unlock parameters by proximity to qk attention parameters")
 
     argparser.add_argument('--plugins', nargs='+', help='Names of plugins to use')
     argparser.add_argument("--project_name", type=str, default="myproj", help="Project name for logs and checkpoints, ex. 'tedbennett', 'superduperV1'")
@@ -1626,7 +1652,7 @@ if __name__ == "__main__":
     argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
-    argparser.add_argument("--teacher_p", type=float, default=0.5, help="Probability of teacher model being used as target")
+    argparser.add_argument("--teacher_p", type=float, default=1.0, help="Probability of teacher model being used as target")
     argparser.add_argument("--teacher_lambda", type=float, default=1.0, help="When teacher is used, the scale factor for teacher loss when added to regular loss")
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
 
@@ -1638,6 +1664,9 @@ if __name__ == "__main__":
 
     argparser.add_argument("--contrastive_flow_matching_loss_p", type=float, default=0, help="Probability that a given batch will have Contrastive Flow Matching loss (Stoica et al., June 2025) applied")
     argparser.add_argument("--contrastive_flow_matching_loss_lambda", type=float, default=0.05, help="Lambda scaling factor for Contrastive Flow Matching loss. Ensure that K * lambda < 1")
+
+    argparser.add_argument("--saturation_penalty_scale", type=float, default=0.0, help="Scale for the saturation penalty loss that discourages all-black or all-white/washed-out outputs. Suggested starting value: 0.02. Set to 0 to disable.")
+    argparser.add_argument("--saturation_penalty_t_max", type=float, default=200.0, help="Only apply saturation penalty for timesteps < t_max (low-noise regime). Default 200 out of 1000.")
 
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="Probability to drop (non-LCF/non-CFM) contrastive learning")
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")
@@ -1651,12 +1680,14 @@ if __name__ == "__main__":
     argparser.add_argument("--everything_contrastive_learning_curriculum_alpha", type=float, default=0, help="if >0, attenuate everything_contrastive_learning_p to 0 using this alpha as timestep approaches 0")
     argparser.add_argument("--caption_variants", type=str, nargs="*", default=[], help="If passed, use only these caption variants from json captions")
     argparser.add_argument("--all_caption_variants", action=argparse.BooleanOptionalAction, help='if passed, use ALL caption variants every step')
+    argparser.add_argument("--expand_caption_variants", action=argparse.BooleanOptionalAction, help='if passed, expand caption variant dicts into individual items, one for each entry in caption_variants')
+    argparser.add_argument("--caption_cross_concatenation_p", type=float, default=0, help="Probability of doing caption cross concatenation. When active, two caption variants are encoded separately and concatenated (cf long prompts at inference).")
+    argparser.add_argument("--caption_cross_concatenation_empty_half_p", type=float, default=0.2, help="When doing caption cross concatenation, probability of one variant being an empty prompt (default 0.2)")
     argparser.add_argument("--use_compel", action='store_true', help='if passed, use Compel to process prompts with long-prompt support')
 
     argparser.add_argument("--batch_id_dropout_p", type=float, default=0, help="dropout probability for batch ids, 0..1")
     argparser.add_argument("--cond_dropout_noise_p", type=float, default=0, help="how often to use noise (torch.randn) for the image with conditional dropout - helps prevent overfitting of unconditioned prompt")
 
-    argparser.add_argument("--jacobian_descent", action='store_true', help="Do Jacobian Descent (see torchjd). Uses more VRAM.")
     argparser.add_argument("--mask_p", type=float, default=None, help="If passed, look for files called eg image_name.jpg.mask.png in the data folder and use as mask for the loss with given probability (0..1)")
     argparser.add_argument("--invert_masks", action=argparse.BooleanOptionalAction, help="If passed, invert the masks (white<->black)")
     argparser.add_argument("--use_both_mask_sides_contrastive", action='store_true', help="If passed, when using masks, do contrastive learning between mask and inverted mask with negative loss (use --negative_loss_margin to control clamping)")

@@ -2,7 +2,7 @@ import os
 import yaml
 import argparse
 
-def count_multiplied_set_helper(root_dir, log_depth):
+def count_multiplied_set_helper(root_dir, log_depth, indent=""):
     if not os.path.isdir(root_dir):
         return 0
     count = 0
@@ -16,20 +16,20 @@ def count_multiplied_set_helper(root_dir, log_depth):
                 multiply = config.get('multiply', multiply)
                 #print(f"Found multiply in {filename}: {multiply}")
         elif os.path.isdir(full_path):
-            count += count_multiplied_set_helper(full_path, log_depth-1)
+            count += count_multiplied_set_helper(full_path, log_depth-1, indent=indent+"  ")
         elif filename.endswith(".txt"):
             count += 1
 
     if log_depth >= 0:
-        print(count*multiply, multiply, root_dir)
+        print(f'{indent}{int(count*multiply)} (x{multiply})  {root_dir}')
     return count * multiply
 
 
 
 if __name__ == '__main__':
     arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument("root_dir")
-    arg_parser.add_argument("--max_log_depth", type=int, default=0, help="Max depth to log counts for")
+    arg_parser.add_argument("root_dir", default='.', nargs='?')
+    arg_parser.add_argument("--max_log_depth", type=int, default=1, help="Max depth to log counts for")
 
     args = arg_parser.parse_args()
 

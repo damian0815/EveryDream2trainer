@@ -1,6 +1,66 @@
 import json
 import os
 import re
+from collections import defaultdict
+from typing import Literal
+
+import torch
+
+
+class ParamGroupBuilder:
+    def __init__(self, optimizer_param_grouping: Literal['zones', 'per-module', 'transformer10x', 'single'], betas, weight_decay, base_lr):
+        self.param_grouping = optimizer_param_grouping
+        self.betas = betas
+        self.weight_decay = weight_decay
+        self.base_lr = base_lr
+
+    def build_param_groups(self, parameters: tuple[str, torch.nn.Parameter]) -> list[dict]:
+        if self.param_grouping == 'zones':
+            zone_members = defaultdict(list)
+            for name, p in parameters:
+                zone = get_unet_module_zone(name)
+                zone_members[zone].append(p)
+            return [{
+                'name': z,
+                'params': zone_members[z],
+                'betas': self.betas,
+                'weight_decay': self.weight_decay,
+                'lr': self.base_lr * get_lr_scale_for_zone(z)
+            } for z in zone_members.keys()]
+        elif self.param_grouping == 'per-module':
+            scales = get_raw_unet_module_lr_scales()
+            return [{
+                'name': n,
+                'params': [p],
+                'betas': self.betas,
+                'weight_decay': self.weight_decay,
+                'lr': self.base_lr * scales[n]
+            } for n, p in parameters]
+        elif  self.param_grouping == 'transformer10x':
+            return [{
+                'name': 'transformer_blocks',
+                'params': [p for n, p in parameters if 'transformer_blocks' in n],
+                'betas': self.betas,
+                'weight_decay': self.weight_decay,
+                'lr': self.base_lr * 10
+            }, {
+                'name': 'non-transformer_blocks',
+                'params': [p for n, p in parameters if 'transformer_blocks' not in n],
+                'betas': self.betas,
+                'weight_decay': self.weight_decay,
+                'lr': self.base_lr
+            }]
+        elif  self.param_grouping == 'single':
+            return [{
+                'params': [p for n, p in parameters],
+                'betas': self.betas,
+                'weight_decay': self.weight_decay,
+                'lr': self.base_lr
+            }]
+        else:
+            raise ValueError(f"Unknown param grouping {self.param_grouping}")
+
+
 
 def get_lr_scale_for_zone(zone: str) -> float:
 

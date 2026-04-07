@@ -1,6 +1,8 @@
 import logging
 import os
 from typing import Callable, Optional, Union, Dict, Any, Tuple
+
+import line_profiler
 from typing_extensions import Self
 
 import torch
@@ -54,8 +56,9 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     @staticmethod
     def get_shifted_timesteps(timestep_indices, timestep_values):
         """ For incoming timestep indices (from 0 to num_train_timesteps-1), get the exact timesteps incorporating any shift """
-        assert timestep_indices.min() >= 0 and timestep_indices.max() < len(timestep_values), \
-            f"Timestep indices should be >=0, <{len(timestep_values)} but got min {timestep_indices.min()} max {timestep_indices.max()}"
+        # this assertion is slow
+        #assert timestep_indices.min() >= 0 and timestep_indices.max() < len(timestep_values), \
+        #    f"Timestep indices should be >=0, <{len(timestep_values)} but got min {timestep_indices.min()} max {timestep_indices.max()}"
 
         # timestep indices goes from 0 to 999 but self.timesteps goes from 1000 to 1
         # so we need to reverse the indices

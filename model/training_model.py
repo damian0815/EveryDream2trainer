@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import safetensors.torch
 import torch
 from colorama import Fore, Style
-from compel import Compel, ReturnedEmbeddingsType, SplitLongTextMode
+from compel import Compel, ReturnedEmbeddingsType, SplitLongTextMode, Conditioning
 from diffusers import (
     PNDMScheduler,
     DDIMScheduler,
@@ -358,6 +358,15 @@ class Conditioning:
                                         add_time_ids=self._add_time_ids,
                                         slice_start=slice_start,
                                         slice_end=slice_end)
+
+    @classmethod
+    def cat(cls, conditioning: list[Conditioning]) -> 'Conditioning':
+        return Conditioning(_text_encoder_hidden_states=torch.cat([c._text_encoder_hidden_states for c in conditioning], dim=1),
+                            _text_encoder_pooled_embeds=torch.cat([c._text_encoder_pooled_embeds for c in conditioning], dim=1) if conditioning[0]._text_encoder_pooled_embeds is not None else None,
+                            _text_encoder_2_hidden_states=torch.cat([c._text_encoder_2_hidden_states for c in conditioning], dim=1) if conditioning[0]._text_encoder_2_hidden_states is not None else None,
+                            _text_encoder_2_pooled_embeds=torch.cat([c._text_encoder_2_pooled_embeds for c in conditioning], dim=1) if conditioning[0]._text_encoder_2_pooled_embeds is not None else None,
+                            _add_time_ids=torch.cat([c._add_time_ids for c in conditioning], dim=1) if conditioning[0]._add_time_ids is not None else None)
+
 
 def _make_conditioning_slice(
     encoder_hidden_states: torch.Tensor,
@@ -739,7 +748,8 @@ def load_model(args) -> TrainingModel:
         yaml=yaml,
         compel=compel
     )
-    model_being_trained.set_noise_scheduler_shift(args.flow_match_shift)
+    if isinstance(noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+        model_being_trained.set_noise_scheduler_shift(args.flow_match_shift)
     return model_being_trained
 
 def load_clip_model(model_id: str, processor_model_id: str=None) -> tuple[CLIPModel, CLIPProcessor]:

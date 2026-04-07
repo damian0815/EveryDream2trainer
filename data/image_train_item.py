@@ -17,6 +17,7 @@ import bisect
 import json
 import logging
 import uuid
+from copy import deepcopy
 
 import math
 import os
@@ -436,6 +437,12 @@ class ImageTrainItem:
             image = image.crop((x_crop, y_crop, x_crop + min_xy, y_crop + min_xy))
 
         return image
+
+    def copy_with_new_uid(self):
+        copy = deepcopy(self)
+        copy.uid = uuid.uuid4().hex
+        return copy
+
 
 def _needs_transpose(image, print_error=False):
     try:

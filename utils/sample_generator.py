@@ -246,7 +246,8 @@ class SampleGenerator:
         sample_index = 0
         with autocast():
             try:
-                if self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts:
+                do_regular_samples = self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts
+                if do_regular_samples:
                     batch: list[SampleRequest]
                     def sample_compatibility_test(a: SampleRequest, b: SampleRequest) -> bool:
                         return a.size == b.size
@@ -402,6 +403,9 @@ class SampleGenerator:
         """
         creates a pipeline for SD inference
         """
+        if model_being_trained.is_flow_matching and self.scheduler != 'flow-matching':
+            print(f"Warning: model is flow-matching but scheduler is '{self.scheduler}'. Overriding.")
+            self.scheduler = 'flow-matching'
         scheduler = self._create_scheduler(diffusers_scheduler_config, flow_match_shift, flow_match_shift_dynamic)
         pipe = model_being_trained.build_inference_pipeline(scheduler=scheduler)
         if self.use_xformers:

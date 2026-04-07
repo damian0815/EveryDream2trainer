@@ -6,7 +6,6 @@ import os
 import random
 import time
 from argparse import Namespace
-from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
 
@@ -15,12 +14,13 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
+import line_profiler
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import LogData
 from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
     get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss, \
-    compute_timestep_intervals
+    compute_saturation_penalty_loss
 from data.dataset import select_caption_variants
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
@@ -46,6 +46,7 @@ def record_performance_timing(label: str, duration_seconds: float, num_images: i
     logging.info(f"[PERF] {label}: {duration_seconds:.4f}s total, {duration_per_image:.6f}s per image ({num_images} images)")
 
 
+@line_profiler.profile
 def train_step(
     full_batch: dict,
     model: TrainingModel,
@@ -94,8 +95,9 @@ def train_step(
         assert type(batch["captions"]) is dict
 
         try:
-            caption_variants = select_caption_variants(batch["captions"], requested_caption_variants=args.caption_variants, all_caption_variants=args.all_caption_variants)
+            caption_variants = select_caption_variants(batch["captions"], requested_variants=args.caption_variants, all_caption_variants=args.all_caption_variants, caption_cross_concatenation_p=args.caption_cross_concatenation_p, caption_cross_concatenation_empty_half_p=args.caption_cross_concatenation_empty_half_p)
         except RuntimeError as e:
+            logging.error(f"Caught error {repr(e)} while calling select_caption_variants -> surprise cond dropout")
             logging.info(
                 f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']} - treating as cond dropout for this batch **")
             batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
@@ -131,7 +133,7 @@ def train_step(
             t_variant_start = time.perf_counter()
 
             # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
-            if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] >= tv.max_backward_slice_size:
+            if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] > tv.max_backward_slice_size:
                 with torch.cuda.amp.autocast(enabled=args.amp):
 
                     optimizer_backward(ed_optimizer, tv, plugin_runner, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
@@ -155,25 +157,25 @@ def train_step(
 
             # Conditional dropout
             t_cond_dropout_start = time.perf_counter()
-            _apply_cond_dropout(batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
+            cond_dropout_mask = build_cond_dropout_mask(batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
             teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=timesteps, teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
             record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images/len(caption_variants))
 
             # Text conditioning generation
             t_conditioning_start = time.perf_counter()
             conditioning, teacher_conditioning, caption_str = _generate_conditioning(
-                batch, caption_variant=caption_variant,
-                model=model, teacher_model=teacher_model,
+                batch,
+                caption_variant=caption_variant,
+                cond_dropout_mask=cond_dropout_mask,
+                model=model,
+                teacher_model=teacher_model,
                 teacher_mask=teacher_mask,
                 args=args
             )
             record_performance_timing("7_conditioning_generation", time.perf_counter() - t_conditioning_start, num_images/len(caption_variants))
 
-            is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
-                                            for s in caption_str[0:batch_size]], device=model.unet.device,
-                                           dtype=torch.bool)
-            tv.cond_dropout_count += torch.sum(is_cond_dropout)
-            tv.non_cond_dropout_count += torch.sum(~is_cond_dropout)
+            tv.cond_dropout_count += torch.sum(cond_dropout_mask)
+            tv.non_cond_dropout_count += torch.sum(~cond_dropout_mask)
 
             model_forward_slice_size = tv.forward_slice_size
 
@@ -209,7 +211,7 @@ def train_step(
                 model_forward_result,
                 model=model,
                 batch=batch,
-                is_cond_dropout=is_cond_dropout,
+                is_cond_dropout=cond_dropout_mask,
                 timesteps=timesteps,
                 conditioning=conditioning,
                 teacher_mask=teacher_mask,
@@ -229,7 +231,7 @@ def train_step(
                     image_embeds=model_forward_result.clip_image_features,
                     text_embeds=model_forward_result.clip_pooled_text_features,
                     model=model,
-                    mask=~is_cond_dropout,
+                    mask=~cond_dropout_mask,
                 )
                 loss_1d += clip_loss_1d * args.clip_vision_contrastive_loss_lambda
 
@@ -272,8 +274,8 @@ def train_step(
             #    f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
             # )
 
-            log_data.loss_log_step_cd.append(loss_1d[is_cond_dropout].mean().detach().item())
-            log_data.loss_log_step_non_cd.append(loss_1d[~is_cond_dropout].mean().detach().item())
+            log_data.loss_log_step_cd.append(loss_1d[cond_dropout_mask].mean().detach().item())
+            log_data.loss_log_step_non_cd.append(loss_1d[~cond_dropout_mask].mean().detach().item())
 
             log_data.forward_size_coverage[loss_1d.shape[0]] += 1
 
@@ -367,15 +369,7 @@ def train_step(
     record_performance_timing("0_total_step_time", t_step_end - t_step_start, full_batch['image'].shape[0])
 
 
-def _get_cond_dropout_mask(caption_str) -> torch.Tensor:
-    is_cond_dropout = torch.tensor([(s is None or len(s.strip()) == 0)
-                                    for s in caption_str], device='cpu',
-                                   dtype=torch.bool)
-    return is_cond_dropout
-
-
-def _apply_cond_dropout(batch: dict, timesteps: torch.Tensor, model: TrainingModel, tv: TrainingVariables, train_progress_01: float,
-                        args: Namespace):
+def build_cond_dropout_mask(batch: dict, timesteps: torch.Tensor, model: TrainingModel, tv: TrainingVariables, train_progress_01: float, args: Namespace):
     # apply cond dropout
     initial_batch_size = args.batch_size if args.initial_batch_size is None else args.initial_batch_size
     final_batch_size = args.batch_size if args.final_batch_size is None else args.final_batch_size
@@ -384,6 +378,7 @@ def _apply_cond_dropout(batch: dict, timesteps: torch.Tensor, model: TrainingMod
     else:
         cdp_01_bs = min(1, max(0, (tv.desired_effective_batch_size - initial_batch_size)
                                / (final_batch_size - initial_batch_size)))
+    mask_contents = []
     for sample_index in range(timesteps.shape[0]):
         cdp_01_ts = 1 - (timesteps[
                              sample_index].cpu().item() / model.noise_scheduler.config.num_train_timesteps)
@@ -400,26 +395,36 @@ def _apply_cond_dropout(batch: dict, timesteps: torch.Tensor, model: TrainingMod
         else:
             raise ValueError("Unrecognized value for --cond_dropout_curriculum_source")
         final_cond_dropout = args.cond_dropout if args.final_cond_dropout is None else args.final_cond_dropout
+
+        sample_cond_dropout = batch["cond_dropout"][sample_index]
+        if sample_cond_dropout is None:
+            sample_cond_dropout = args.cond_dropout
+
         if args.cond_dropout_curriculum_alpha:
-            this_cond_dropout_p = get_exponential_scaled_value(cdp_01,
-                                                               initial_value=args.cond_dropout,
-                                                               final_value=final_cond_dropout,
+            initial_factor = 1.0
+            final_factor = final_cond_dropout / args.cond_dropout
+            sample_cond_dropout *= get_exponential_scaled_value(cdp_01,
+                                                               initial_value=initial_factor,
+                                                               final_value=final_factor,
                                                                alpha=args.cond_dropout_curriculum_alpha)
-        else:
-            this_cond_dropout_p = args.cond_dropout
-        tv.cond_dropouts.append(this_cond_dropout_p)
-        if random.random() <= this_cond_dropout_p:
-            # drop all captions for this sample
-            for k in batch["captions"].keys():
-                if batch["captions"][k][sample_index] is None:
-                    continue
-                batch["tokens"][k][sample_index] = model.cond_dropout_tokens
-                if model.is_sdxl:
-                    batch["tokens_2"][k][sample_index] = model.cond_dropout_tokens_2
-                batch["captions"][k][sample_index] = model.cond_dropout_caption
-            if random.random() <= args.cond_dropout_noise_p:
-                batch["image"][sample_index] = torch.randn_like(
-                    batch["image"][sample_index])
+        tv.cond_dropouts.append(sample_cond_dropout)
+        mask_contents.append(random.random() <= sample_cond_dropout)
+
+    return torch.tensor(mask_contents, device=model.unet.device, dtype=torch.bool)
+
+def apply_cond_dropout_to_batch(batch, caption_variant, model: TrainingModel, cond_dropout_mask: torch.Tensor, args: Namespace):
+    for sample_index in range(batch["image"].shape[0]):
+        if not cond_dropout_mask[sample_index]:
+            continue
+        if batch["captions"][caption_variant][sample_index] is None:
+            continue
+        batch["tokens"][caption_variant][sample_index] = model.cond_dropout_tokens
+        if model.is_sdxl:
+            batch["tokens_2"][caption_variant][sample_index] = model.cond_dropout_tokens_2
+        batch["captions"][caption_variant][sample_index] = model.cond_dropout_caption
+        if random.random() <= args.cond_dropout_noise_p:
+            batch["image"][sample_index] = torch.randn_like(
+                batch["image"][sample_index])
 
 
 def get_nibble_size(training_variables: TrainingVariables) -> int:
@@ -729,11 +734,11 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
             #      f"backward accumulated {tv.backwarded_images_count}")
             tv.clear_accumulated_loss()
-        except InfOrNanException as e:
+        except InfOrNanException:
             logging.error(
                 "* Caught Inf or NaN during backward pass, clearing accumulated loss and resetting optimizer"
             )
-            optimizer._zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             tv.backwarded_images_count = 0
         except torch.OutOfMemoryError:
             logging.error(f"OOM step {tv.global_step} during optimizer.backward of {tv.accumulated_loss_images_count} accumulated loss images @resolution {tv.batch_resolution}")
@@ -810,7 +815,18 @@ def _generate_teacher_mask_or_none(teacher_model: TrainingModel|None, timesteps:
     batch_size = timesteps.shape[0]
     return (torch.rand(batch_size) < teacher_p).to(teacher_model.unet.device)
 
-def _generate_conditioning(batch: dict, caption_variant: str, model: TrainingModel, teacher_model: TrainingModel, teacher_mask, args) -> tuple[Conditioning, Conditioning|None, list[str]]:
+def _generate_conditioning(
+    batch: dict,
+    caption_variant: str|tuple[str, str],
+    cond_dropout_mask: torch.Tensor,
+    model: TrainingModel,
+    teacher_model: TrainingModel,
+    teacher_mask,
+args) -> tuple[Conditioning, Conditioning|None, list[str]]:
+
+    if type(caption_variant) is str:
+        caption_variant = (caption_variant, )
+
     with (
         torch.no_grad()
         if args.disable_textenc_training
@@ -819,36 +835,75 @@ def _generate_conditioning(batch: dict, caption_variant: str, model: TrainingMod
         # todo move this logic to the dataloader
         batch_size = batch["image"].shape[0]
 
-        caption_str = [batch["captions"][caption_variant][i] for i in range(batch_size)]
-        assert all(c is not None for c in caption_str)
-        tokens = torch.stack([batch["tokens"][caption_variant][i] for i in range(batch_size)])
-        if model.is_sdxl:
-            tokens_2 = torch.stack([batch["tokens_2"][caption_variant][i] for i in range(batch_size)])
-            add_time_ids = batch["add_time_ids"].to(model.unet.device)
-        else:
-            tokens_2 = None
-            add_time_ids = None
-
         model.load_textenc_to_device(model.device)
-        encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
-            tokens, tokens_2, caption_str, model, args
-        )
-        conditioning = Conditioning(encoder_hidden_states, encoder_pooled_embeds,
-                                    encoder_2_hidden_states, encoder_2_pooled_embeds,
-                                    add_time_ids)
 
-        if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
-            teacher_conditioning = None
-        else:
-            with torch.no_grad():
-                teacher_encoder_hidden_states, teacher_encoder_pooled_embeds, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
-                    tokens, tokens_2, caption_str, teacher_model, args
-                )
-            teacher_conditioning = Conditioning(teacher_encoder_hidden_states,
+        caption_str = []
+        tokens = []
+        tokens_2 = []
+        add_time_ids = []
+
+        for key in caption_variant:
+            this_tokens_2 = None
+            this_add_time_ids = None
+            if key is None:
+                # empty variant half
+                this_caption_str = [model.cond_dropout_caption] * batch_size
+                this_tokens = model.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
+                if model.is_sdxl:
+                    this_tokens_2 = model.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
+            else:
+                this_caption_str = [batch["captions"][key][i] for i in range(batch_size)]
+                assert all(c is not None for c in caption_str)
+                this_tokens = torch.stack([batch["tokens"][key][i] for i in range(batch_size)])
+                if model.is_sdxl:
+                    this_tokens_2 = torch.stack([batch["tokens_2"][key][i] for i in range(batch_size)])
+
+            if model.is_sdxl:
+                this_add_time_ids = batch["add_time_ids"].to(model.unet.device)
+
+            for i in range(cond_dropout_mask.shape[0]):
+                if cond_dropout_mask[i]:
+                    this_caption_str[i] = model.cond_dropout_caption
+                    this_tokens[i] = model.cond_dropout_tokens
+                    if model.is_sdxl:
+                        this_tokens_2[i] = model.cond_dropout_tokens_2
+
+            caption_str.append(this_caption_str)
+            tokens.append(this_tokens)
+            tokens_2.append(this_tokens_2)
+            add_time_ids.append(this_add_time_ids)
+
+        conditioning_list = []
+        teacher_conditioning_list = []
+
+        for i, key in enumerate(caption_variant):
+            encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
+                tokens[i], tokens_2[i], caption_str[i], model, args
+            )
+            conditioning_list.append(Conditioning(encoder_hidden_states, encoder_pooled_embeds,
+                                        encoder_2_hidden_states, encoder_2_pooled_embeds,
+                                        add_time_ids[i]))
+
+            if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
+                pass
+            else:
+                with torch.no_grad():
+                    teacher_encoder_hidden_states, teacher_encoder_pooled_embeds, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
+                        tokens[i], tokens_2[i], caption_str[i], teacher_model, args
+                    )
+
+                    teacher_conditioning_list.append(Conditioning(teacher_encoder_hidden_states,
                                                 teacher_encoder_pooled_embeds,
                                                 teacher_encoder_2_hidden_states,
                                                 teacher_encoder_2_pooled_embeds,
-                                                add_time_ids if teacher_model.is_sdxl else None)
+                                                add_time_ids[i] if teacher_model.is_sdxl else None))
+
+        # concatenate
+        conditioning = Conditioning.cat(conditioning_list)
+        if teacher_conditioning_list:
+            teacher_conditioning = Conditioning.cat(teacher_conditioning_list)
+        else:
+            teacher_conditioning = None
 
         if args.offload_text_encoder:
             model.load_textenc_to_device('cpu')
@@ -860,17 +915,17 @@ def _generate_conditioning(batch: dict, caption_variant: str, model: TrainingMod
 class ModelForwardReturnType:
     model_pred: torch.Tensor
     target: torch.Tensor
+    noisy_latents: torch.Tensor
     lcf_midblock_out: torch.Tensor | None
     lcf_midblock_clean_out: torch.Tensor | None
     teacher_target: torch.Tensor | None
     clip_image_features: torch.Tensor | None
     clip_pooled_text_features: torch.Tensor | None
 
-
 def _do_model_forward(
     model: TrainingModel,
     batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning,
-    timesteps: torch.Tensor, caption_variant: str,
+    timesteps: torch.Tensor, caption_variant: str|tuple[str, str],
     teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
     forward_slice_size: int,
     tv: TrainingVariables, args: Namespace
@@ -882,6 +937,7 @@ def _do_model_forward(
     lcf_midblock_out_all = []
     lcf_midblock_out_clean_all = []
     target_all = []
+    noisy_latents_all = []
     teacher_target_all = []
     clip_image_features_all = []
     clip_pooled_text_features_all = []
@@ -927,11 +983,13 @@ def _do_model_forward(
 
             model_pred_all.append(model_pred_result.model_pred)
             target_all.append(model_pred_result.target)
+            noisy_latents_all.append(model_pred_result.noisy_latents)
             teacher_target_all.append(model_pred_result.teacher_target)
             lcf_midblock_out_all.append(model_pred_result.midblock_out)
 
             # del
             model_pred_result.target = None
+            model_pred_result.noisy_latents = None
             model_pred_result.teacher_target = None
             model_pred_result.midblock_out = None
 
@@ -973,10 +1031,14 @@ def _do_model_forward(
                 torch.cuda.OutOfMemoryError,
                 torch.OutOfMemoryError,
         ):
+            if type(caption_variant) is tuple:
+                caption_variant_actual = caption_variant[1] if caption_variant[0] is None else caption_variant[0]
+            else:
+                caption_variant_actual = caption_variant
             logging.error(
                 f"OOM step {tv.global_step} in unet forward @resolution {tv.batch_resolution} slice size {tv.forward_slice_size}, from latents " 
                 f"of shape {latents_slice.shape} (samples {slice_start} to {slice_end} of {batch_size}). "
-                f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.path.realpath(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant]}, timesteps: {timesteps_slice.detach().cpu().tolist()}"
+                f"loss images accumulated: {tv.accumulated_loss_images_count}, caption: f{caption_variant} - batch: {[os.path.realpath(x) for x in batch['pathnames']]}, {batch['captions'][caption_variant_actual]}, timesteps: {timesteps_slice.detach().cpu().tolist()}"
             )
             raise
 
@@ -985,6 +1047,7 @@ def _do_model_forward(
     assert timesteps.shape[0] == model_pred.shape[0]
 
     target = torch.cat(target_all)
+    noisy_latents = torch.cat(noisy_latents_all)
     if teacher_mask is None:
         teacher_target = None
     else:
@@ -998,6 +1061,7 @@ def _do_model_forward(
     return ModelForwardReturnType(
         model_pred=model_pred,
         target=target,
+        noisy_latents=noisy_latents,
         lcf_midblock_out=lcf_midblock_out,
         lcf_midblock_clean_out=lcf_midblock_out_clean,
         teacher_target=teacher_target,
@@ -1103,6 +1167,17 @@ def _do_loss(
 
     # reduce from [B, C, H, W] to [B] with mean
     loss = loss.mean(dim=list(range(1, len(loss.shape))))
+
+    if args.saturation_penalty_scale > 0:
+        saturation_penalty = compute_saturation_penalty_loss(
+            model_pred=model_forward_result.model_pred,
+            noisy_latents=model_forward_result.noisy_latents,
+            timesteps=timesteps,
+            noise_scheduler=model.noise_scheduler,
+            t_max=args.saturation_penalty_t_max,
+        ).to(dtype=loss.dtype)
+        log_writer.add_scalar("loss/saturation_penalty", saturation_penalty.mean().item(), global_step=tv.global_step)
+        loss += saturation_penalty * args.saturation_penalty_scale
 
     return loss
 

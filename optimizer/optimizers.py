@@ -17,7 +17,6 @@ limitations under the License.
 import logging
 import itertools
 import os
-from collections import defaultdict
 from functools import partial
 from itertools import chain
 from typing import Generator
@@ -39,7 +38,8 @@ import pprint
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
-from optimizer.per_unet_layer_scales import get_lr_scale_for_zone, get_unet_module_zone, get_raw_unet_module_lr_scales
+from optimizer.block_order_unet import ProgressiveUnlock
+from optimizer.per_unet_layer_scales import ParamGroupBuilder
 from plugins.plugins import PluginRunner
 import re
 
@@ -119,6 +119,7 @@ class LRSteering:
         """Set the base LR for a scheduler."""
         for param_group in scheduler.optimizer.param_groups:
             param_group["lr"] = lr
+
 
 
 class EveryDreamOptimizer:
@@ -232,15 +233,6 @@ class EveryDreamOptimizer:
             logging.info("--debug_unet_freeze_regex passed - bailing out")
             exit(0)
 
-        if args.jacobian_descent:
-            from torchjd.aggregation import UPGrad
-            import torchjd
-
-            self.jacobian_aggregator = UPGrad()
-            self.jacobian_backward = torchjd.backward
-        else:
-            self.jacobian_aggregator = None
-
         self.text_encoder_params, _ = plugin_runner.run_add_parameters(
             self.text_encoder_params, []
         )
@@ -249,6 +241,10 @@ class EveryDreamOptimizer:
         #    log_action = lambda n, label: logging.info(f"{Fore.LIGHTBLUE_EX} {label} weight normal: {n:.1f}{Style.RESET_ALL}")
         #    self._log_weight_normal(text_encoder.text_model.encoder.layers.parameters(), "text encoder", log_action)
         #    self._log_weight_normal(unet.parameters(), "unet", log_action)
+
+        self.param_group_builder = ParamGroupBuilder(args.optimizer_param_grouping, betas=self.base_config["betas"], weight_decay=self.base_config["weight_decay"], base_lr=self.base_config["lr"])
+        if not args.disable_textenc_training:
+            raise NotImplementedError("Text encoder training is currently not available - need to add TE LR support to ParamGroupBuilder logic")
 
         self.optimizers = []
         self.optimizer_te_2 = None  # todo: support 2nd text encoder optimizer
@@ -280,6 +276,18 @@ class EveryDreamOptimizer:
             self.scaler = None
 
         self.load(args.resume_ckpt)
+        if args.optimizer_progressive_unlock:
+            self.progressive_unlock = ProgressiveUnlock(
+                optimizer=self.optimizer_unet,
+                model=self.unet,
+                total_steps=(epoch_len * self.max_epochs) / 0.95,
+                param_group_builder=self.param_group_builder,
+                order_by_distance_to_qk=args.optimizer_progressive_unlock_by_qk_proximity,
+                initial_step_offset=self.base_config['lr_advance_steps']
+            )
+            self.progressive_unlock.step(0)
+        else:
+            self.progressive_unlock = None
 
         logging.info(
             f" Grad scaler enabled: {self.scaler is not None and self.scaler.is_enabled()} (amp mode)"
@@ -322,15 +330,7 @@ class EveryDreamOptimizer:
         loss_scaled_if_necessary = (
             loss if self.scaler is None else self.scaler.scale(loss)
         )
-        if self.jacobian_aggregator is not None:
-            self.jacobian_backward(
-                tensors=loss_scaled_if_necessary,
-                inputs=itertools.chain(self.text_encoder_params, self.unet_params),
-                A=self.jacobian_aggregator,
-                parallel_chunk_size=None,
-            )
-        else:
-            loss_scaled_if_necessary.backward()
+        loss_scaled_if_necessary.backward()
 
     def register_unet_nan_hooks_full(self):
         def detailed_nan_hook(module, grad_input, grad_output, name: str = "unknown"):
@@ -543,14 +543,17 @@ class EveryDreamOptimizer:
                     param_grad_norm / (param_weight_norm + 1e-8)
                 )
 
-        self._zero_grad(set_to_none=True)
+        if self.progressive_unlock:
+            self.progressive_unlock.step(global_step)
+
+        self.zero_grad(set_to_none=True)
 
     def step_schedulers(self, global_step):
         self.lr_steering.apply_steering_if_necessary(self.lr_schedulers)
         for scheduler in self.lr_schedulers:
             scheduler.step()
 
-    def _zero_grad(self, set_to_none=False):
+    def zero_grad(self, set_to_none=False):
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
 
@@ -937,56 +940,16 @@ class EveryDreamOptimizer:
             curr_lr = default_lr
             logging.warning(f"No LR setting found, defaulting to {default_lr}")
 
-        param_grouping = args.optimizer_param_grouping
-        if param_grouping == 'zones':
-            zone_members = defaultdict(list)
-            for name, p in parameters:
-                zone = get_unet_module_zone(name)
-                zone_members[zone].append(p)
-            param_groups = [{
-                'name': z,
-                'params': zone_members[z],
-                'betas': (betas[0], betas[1]),
-                'weight_decay': weight_decay,
-                'lr': curr_lr * get_lr_scale_for_zone(z)
-            } for z in zone_members.keys()]
-        elif param_grouping == 'per-module':
-            scales = get_raw_unet_module_lr_scales()
-            param_groups = [{
-                'name': n,
-                'params': [p],
-                'betas': (betas[0], betas[1]),
-                'weight_decay': weight_decay,
-                'lr': curr_lr * scales[n]
-            } for n, p in parameters]
-        elif param_grouping == 'transformer10x':
-            param_groups = [{
-                'name': 'transformer_blocks',
-                'params': [p for n, p in parameters if 'transformer_blocks' in n],
-                'betas': (betas[0], betas[1]),
-                'weight_decay': weight_decay,
-                'lr': curr_lr * 10
-            }, {
-                'name': 'non-transformer_blocks',
-                'params': [p for n, p in parameters if 'transformer_blocks' not in n],
-                'betas': (betas[0], betas[1]),
-                'weight_decay': weight_decay,
-                'lr': curr_lr
-            }]
-        elif param_grouping == 'single':
-            param_groups = [{
-                'params': [p for n, p in parameters],
-                'betas': (betas[0], betas[1]),
-                'weight_decay': weight_decay,
-                'lr': curr_lr
-            }]
+        if args.optimizer_progressive_unlock:
+            param_groups = []
+            logging.info("* Progressive unlock is enabled, no param groups")
         else:
-            raise ValueError(f"Unknown param grouping {param_grouping}")
+            param_groups = self.param_group_builder.build_param_groups(parameters=parameters)
+            logging.info("* Optimizer param groups:")
+            for pg in param_groups:
+                print(f"   - {pg.get('name', '<none>')}: {len(pg['params'])} params, lr: {pg['lr']}, betas: {pg['betas']}, weight_decay: {pg['weight_decay']}")
 
-        logging.info("* Optimizer param groups:")
-        for pg in param_groups:
-            print(f"   - {pg['name']}: {len(pg['params'])} params, lr: {pg['lr']}, betas: {pg['betas']}, weight_decay: {pg['weight_decay']}")
-
+        param_groups.insert(0, {"name": "dummy", "params": [], "lr": curr_lr, "betas": betas, "weight_decay": weight_decay})
 
         if optimizer_name:
             optimizer_name = optimizer_name.lower()

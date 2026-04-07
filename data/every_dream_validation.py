@@ -266,31 +266,47 @@ class EveryDreamValidator:
                       get_model_prediction_and_target_callable: Callable[
                                          [torch.Tensor, Conditioning], ValidationStepResult],
                       pipe_factory: Optional[Callable[[], any]] = None):
-        mean_loss_accumulator = 0
-        for i, dataset in enumerate(self.validation_datasets):
-            mean_loss = self._calculate_validation_loss(model, logging_tag=dataset.name,
-                                                        dataloader=dataset.dataloader,
-                                                        get_model_prediction_and_target=get_model_prediction_and_target_callable,
-                                                        global_step=global_step)
-            mean_loss_accumulator += mean_loss
-            self.log_writer.add_scalar(tag=f"val/{dataset.name}",
-                                       scalar_value=mean_loss,
-                                       global_step=global_step)
-            dataset.track_loss_trend(mean_loss)
 
-            if self.anomaly_checkpoint is not None and pipe_factory is not None:
-                self._calculate_anomaly_metrics(model=model,
-                                                logging_tag=dataset.name,
-                                                dataloader=dataset.dataloader,
-                                                pipe_factory=pipe_factory,
-                                                global_step=global_step)
+        unet_was_training = model.unet.training
+        text_encoder_was_training = model.text_encoder.training
+        try:
+            model.unet.eval()
+            model.text_encoder.eval()
+            if model.is_sdxl:
+                model.text_encoder_2.eval()
 
-        # log combine loss to val/_all_val_combined
-        if len(self.validation_datasets) > 1:
-            total_mean_loss = mean_loss_accumulator / len(self.validation_datasets)
-            self.log_writer.add_scalar(tag=f"val/_all_val_combined",
-                                       scalar_value=total_mean_loss,
-                                       global_step=global_step)
+            mean_loss_accumulator = 0
+            for i, dataset in enumerate(self.validation_datasets):
+                mean_loss = self._calculate_validation_loss(model, logging_tag=dataset.name,
+                                                            dataloader=dataset.dataloader,
+                                                            get_model_prediction_and_target=get_model_prediction_and_target_callable,
+                                                            global_step=global_step)
+                mean_loss_accumulator += mean_loss
+                self.log_writer.add_scalar(tag=f"val/{dataset.name}",
+                                           scalar_value=mean_loss,
+                                           global_step=global_step)
+                dataset.track_loss_trend(mean_loss)
+
+                if self.anomaly_checkpoint is not None and pipe_factory is not None:
+                    self._calculate_anomaly_metrics(model=model,
+                                                    logging_tag=dataset.name,
+                                                    dataloader=dataset.dataloader,
+                                                    pipe_factory=pipe_factory,
+                                                    global_step=global_step)
+
+            # log combine loss to val/_all_val_combined
+            if len(self.validation_datasets) > 1:
+                total_mean_loss = mean_loss_accumulator / len(self.validation_datasets)
+                self.log_writer.add_scalar(tag=f"val/_all_val_combined",
+                                           scalar_value=total_mean_loss,
+                                           global_step=global_step)
+        finally:
+            if unet_was_training:
+                model.unet.train()
+            if text_encoder_was_training:
+                model.text_encoder.train()
+                if model.is_sdxl:
+                    model.text_encoder_2.train()
 
     def _calculate_validation_loss(self, model, logging_tag, dataloader, get_model_prediction_and_target: Callable[
         [torch.Tensor, Conditioning], ValidationStepResult],

@@ -166,6 +166,7 @@ class EveryDreamBatch(Dataset):
         else:
             example["mask"] = None
         example["untransformed_caption"] = example["caption"]
+        example["cond_dropout"] = train_item["cond_dropout"]
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"], pathname=example["pathname"])
         if type(example["caption"]) is dict:
             caption_dict = example["caption"]
@@ -237,8 +238,7 @@ class EveryDreamBatch(Dataset):
         image_train_tmp.image = None # hack for now to avoid memory leak
         image_train_tmp.mask = None # hack for now to avoid memory leak
         example["caption"] = image_train_tmp.caption
-        if image_train_tmp.cond_dropout is not None:
-            example["cond_dropout"] = image_train_tmp.cond_dropout
+        example["cond_dropout"] = image_train_tmp.cond_dropout
         example["runt_size"] = image_train_tmp.runt_size
         example["shuffle_tags"] = image_train_tmp.shuffle_tags
         example["loss_scale"] = image_train_tmp.loss_scale
@@ -475,6 +475,8 @@ def collate_fn(batch):
     if all(tsr is None for tsr in timesteps_range):
         timesteps_range = None
 
+    cond_dropout = [example.get("cond_dropout") for example in batch]
+
     ret = {
         "tokens": tokens,
         "image": images,
@@ -485,7 +487,9 @@ def collate_fn(batch):
         "do_contrastive_learning": do_contrastive_learning,
         "timesteps_range": timesteps_range,
         "pathnames": pathnames,
+        "cond_dropout": cond_dropout
     }
+
     if tokens_2:
         ret["tokens_2"] = tokens_2
         ret["add_time_ids"] = add_time_ids

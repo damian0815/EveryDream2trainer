@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import bisect
+import json
 import logging
 from collections import defaultdict
 
@@ -26,7 +27,8 @@ from collections import Counter
 
 from tqdm.auto import tqdm
 
-from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
+from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
+from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID, ImageCaption
 import PIL.Image
 
 from utils.first_fit_decreasing import first_fit_decreasing
@@ -435,5 +437,45 @@ def _print_path_match_sequences(chunks):
     print("sequence of ", current_value_count, "x", current_value)
 
 
+def expand_caption_dict(item: ImageTrainItem, caption_variants: list[str]) -> list[ImageTrainItem]:
+    if not caption_variants:
+        return [item]
+    if not item.caption.get_caption().startswith('<<json>>'):
+        return [item]
+
+    caption_data = json.loads(item.caption.get_caption().replace('<<json>>', ''))
+    all_keys = list(caption_data.keys())
+    number_of_items = len(caption_variants)
+    base_keys = list(set(caption_data.keys()).intersection(set(caption_variants)))
+    others = list(set(caption_data.keys()).difference(set(caption_variants)))
+    if len(base_keys) < number_of_items:
+        base_keys.extend(random.sample(others, k=min(len(others), number_of_items-len(base_keys))))
+
+    expanded_items = []
+    random.shuffle(base_keys)
+    number_of_captions_per_dict = math.ceil(len(all_keys) / len(base_keys))
+    available_keys = list(set(all_keys).difference(set(base_keys)))
+    while available_keys and base_keys:
+        new_item = item.copy_with_new_uid()
+
+        base_key = base_keys.pop()
+        if len(base_keys) > 0:
+            other_keys = random.sample(available_keys, k=number_of_captions_per_dict-1)
+        else:
+            other_keys = list(available_keys)
+        for k in other_keys:
+            available_keys.remove(k)
+        this_keys = [base_key] + other_keys
+
+        caption = "<<json>>" + json.dumps({k: caption_data[k] for k in this_keys})
+        new_item.caption = ImageCaption(
+            main_prompt=caption,
+            rating=1.0,
+            tags=[],
+            tag_weights=[],
+            max_target_length=DEFAULT_MAX_CAPTION_LENGTH,
+            use_weights=False)
+        expanded_items.append(new_item)
+    return expanded_items
 
 

@@ -1,4 +1,6 @@
 import logging
+
+import line_profiler
 import math
 import random
 from dataclasses import dataclass
@@ -317,6 +319,90 @@ def compute_basic_loss(
         return loss_mse
 
 
+def compute_saturation_penalty_loss(
+    model_pred: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    timesteps: torch.Tensor,
+    noise_scheduler,
+    t_max: float = 200.0,
+    mean_penalty_scale: float = 1.0,
+    var_penalty_scale: float = 0.0,
+    var_threshold: float = 0.1,
+) -> torch.Tensor:
+    """
+    Penalises all-black or all-white/washed-out predictions in flow matching.
+
+    The model predicts velocity v ≈ noise - x₀.  For flow matching the noisy
+    latent is  z_t = (1-t̄)*x₀ + t̄*noise  where t̄ = t / T ∈ [0,1].
+    Inverting gives the denoised estimate:
+        x̂₀ = (z_t - t̄ · v) / (1 - t̄)   [denominator clamped ≥ 1e-3]
+
+    Empirically (VAE latent space):
+      - All-black images produce large positive spatial means in some channels
+        (e.g. +4.8, +3.0).
+      - All-white images produce even larger spatial means (+11.3, +7.3).
+      - Natural images produce near-zero means on average across the dataset.
+    So penalising (spatial_mean)² reliably fires on both collapse modes and
+    is essentially free on well-distributed natural image batches.
+
+    The variance-collapse term is *disabled by default* (var_penalty_scale=0):
+    empirical tests show that black images can have *high* latent variance in
+    some channels (e.g. channel 2 variance ~12 for black vs ~9 for random),
+    making it an unreliable signal. Enable it only if you observe true
+    low-variance collapse in your latent space.
+
+    Both terms are only active for t < t_max (low-noise regime) where x̂₀ is
+    a reliable estimate of the clean image.
+
+    Args:
+        model_pred:         [B, C, H, W] velocity prediction (grad flows through)
+        noisy_latents:      [B, C, H, W] z_t  (detached, no grad required)
+        timesteps:          [B] integer timesteps in [0, num_train_timesteps]
+        noise_scheduler:    scheduler with .config.num_train_timesteps
+        t_max:              only apply to timesteps < t_max  (default 200 / 1000)
+        mean_penalty_scale: weight for the (spatial_mean)² term  (default 1.0)
+        var_penalty_scale:  weight for the variance-collapse hinge (default 0.0)
+        var_threshold:      variance below which the hinge fires   (default 0.1)
+
+    Returns:
+        per_sample_loss: [B] — zeros for samples with timestep ≥ t_max
+    """
+
+    if type(noise_scheduler) is not TrainFlowMatchEulerDiscreteScheduler:
+        raise ValueError("Saturation penalty loss only implemented for Flow Matching")
+
+    B = model_pred.shape[0]
+    device = model_pred.device
+    T = noise_scheduler.config.num_train_timesteps
+
+    # Normalised time t̄ ∈ [0, 1]: 0 = clean, 1 = pure noise
+    t_bar = (timesteps.float() / T).view(B, 1, 1, 1).to(device)          # [B,1,1,1]
+
+    with torch.no_grad():
+        noisy_latents_f = noisy_latents.float().to(device)
+
+    # Reconstruct x̂₀ = (z_t - t̄ · v) / (1 - t̄)
+    denom = (1.0 - t_bar).clamp(min=1e-3)
+    x0_hat = (noisy_latents_f - t_bar * model_pred.float()) / denom      # [B, C, H, W]
+
+    # Spatial mean per sample per channel — large magnitude = degenerate output
+    spatial_mean = x0_hat.mean(dim=(2, 3))                                # [B, C]
+    mean_penalty = (spatial_mean ** 2).mean(dim=1)                        # [B]
+
+    penalty = mean_penalty_scale * mean_penalty
+
+    if var_penalty_scale > 0:
+        spatial_var = x0_hat.var(dim=(2, 3), unbiased=False)              # [B, C]
+        var_penalty = F.relu(var_threshold - spatial_var).mean(dim=1)     # [B]
+        penalty = penalty + var_penalty_scale * var_penalty
+
+    # Zero out samples in the high-noise regime
+    active_mask = (timesteps.float() < t_max).to(device)                  # [B]
+    penalty = penalty * active_mask
+
+    return penalty
+
+
 def get_timestep_weight(
     timesteps: torch.Tensor, loss_shape, min_snr_gamma, loss_mode_scale, noise_scheduler
 ) -> torch.Tensor:
@@ -371,6 +457,7 @@ class ModelPredictionAndTargetReturnType:
     teacher_target: torch.Tensor|None = None
 
 
+@line_profiler.profile
 def get_model_prediction_and_target(
     latents,
     conditioning: Conditioning,
@@ -874,8 +961,8 @@ def get_teacher_target(
     clean_image_latents: torch.Tensor,
     noise: torch.Tensor,
 ):
-    teacher_prediction_type = teacher_model.noise_scheduler.config.prediction_type
-    student_prediction_type = student_model.noise_scheduler.config.prediction_type
+    teacher_prediction_type = 'flow_prediction' if type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler else teacher_model.noise_scheduler.config.get('prediction_type', '<unknown teacher prediction type>')
+    student_prediction_type = 'flow_prediction' if type(student_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler else student_model.noise_scheduler.config.get('prediction_type', '<unknown student prediction type>')
     if (
         teacher_prediction_type in ["v_prediction", "v-prediction"]
         and student_prediction_type == "flow_prediction"

@@ -461,6 +461,25 @@ def merge_add_diff(a, b, c, alpha, unet_only=False):
     del pipe
     return merged
 
+def do_multi_merge_direct_unet_only(models, model_weights):
+    unet_accumulator_sd = None
+    weights_normalized = [w/sum(model_weights) for w in model_weights]
+    for i, p in enumerate(models):
+        unet = UNet2DConditionModel.from_pretrained(p, subfolder="unet")
+        if unet_accumulator_sd is None:
+            unet_accumulator_sd = unet.state_dict()
+        else:
+            unet_sd = unet.state_dict()
+            for key in unet_sd.keys():
+                if key not in unet_accumulator_sd:
+                    print(f"skipping {key} since it is not present in all models")
+                    unet_accumulator_sd.pop(key)
+                    continue
+                unet_accumulator_sd[key] += unet_sd[key] * weights_normalized[i]
+            del unet_sd
+        del unet
+
+
 
 def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, block_weights=None,
                    num_intermediates=1,
@@ -468,6 +487,9 @@ def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, b
                    unet_only=False):
     if not model_weights:
         model_weights = [1]*len(models)
+
+    if False and per_module_alphas is None and block_weights is None and unet_only:
+        return do_multi_merge_direct_unet_only(models, model_weights, algorithm)
 
     if num_intermediates > 1:
         chunk_size = math.ceil(len(models)/num_intermediates)

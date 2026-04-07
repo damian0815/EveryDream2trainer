@@ -306,20 +306,27 @@ class Dataset:
                 raise e
         return items
 
-def select_caption_variants(captions_dict: dict[str, str], requested_caption_variants: list[str], all_caption_variants: bool):
-    available_non_default = [k for k in captions_dict if k != "default"]
-    if requested_caption_variants:
-        available_requested = list(set(available_non_default).intersection(set(requested_caption_variants)))
+
+def select_caption_variants(
+    captions_dict: dict[str, list[str]],
+    requested_variants: list[str],
+    all_caption_variants: bool,
+    caption_cross_concatenation_p: float,
+    caption_cross_concatenation_empty_half_p: float
+) -> list[str|tuple[str, str]]:
+    available_non_default_variants = set(k for k in captions_dict if k != "default")
+    if requested_variants:
+        available_requested = available_non_default_variants.intersection(set(requested_variants))
         # add wildcards for each missing - this takes care of '*' as variant too
-        missing = max(0, len(requested_caption_variants) - len(available_requested))
+        missing = max(0, len(requested_variants) - len(available_requested))
         for _ in range(missing):
-            remaining = list(set(available_non_default) - set(available_requested))
+            remaining = available_non_default_variants - available_requested
             if not remaining:
                 break
-            available_requested.append(random.choice(remaining))
-        caption_candidates = available_requested
+            available_requested.add(random.choice(list(remaining)))
+        caption_candidates = list(available_requested)
     else:
-        caption_candidates = available_non_default
+        caption_candidates = list(available_non_default_variants)
 
     if all_caption_variants:
         caption_counter = Counter()
@@ -335,20 +342,112 @@ def select_caption_variants(captions_dict: dict[str, str], requested_caption_var
                         caption_counter[k] += 1
         # logging.info(
         #    f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
-        return list(caption_counter.keys())
+        selected_primary_variants = list(caption_counter.keys())
     else:
-        if caption_candidates:
-            requested_choice = random.choice(caption_candidates)
-            if requested_choice == '*':
-                caption_candidates = available_non_default
-            else:
-                caption_candidates = [requested_choice]
-
         if len(caption_candidates) == 0:
             caption_candidates.append("default")
             if "default" not in captions_dict:
                 raise RuntimeError("No captions found for batch, even default. This should not happen. Check your dataset and caption files.")
                 #batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
                 #batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
-        return [random.choice(caption_candidates)]
+        selected_primary_variants = [random.choice(caption_candidates)]
+
+    remaining_unused = set(available_non_default_variants) - set(selected_primary_variants) - set(requested_variants)
+
+    final_variants = []
+    for i, left in enumerate(selected_primary_variants):
+        others = set(c for c in available_non_default_variants if c != left)
+        if random.random() > caption_cross_concatenation_p or len(others) == 0:
+            final_variants.append(left)
+            continue
+
+        # repopulate remaining unused if empty, but exclude selected primary variants and requested variants
+        right_candidates = others.intersection(remaining_unused)
+        if not right_candidates:
+            remaining_unused = set(available_non_default_variants) - set(selected_primary_variants)
+            if not remaining_unused:
+                remaining_unused = set(available_non_default_variants)
+        if not right_candidates:
+            # ran out of candidates to concatenate with, just use the left variant
+            final_variants.append(left)
+            continue
+
+        right = random.choice(list(right_candidates))
+        remaining_unused.remove(right)
+
+        # perhaps swap
+        if random.random() < 0.5:
+            left, right = right, left
+        concat_pair = [left, right]
+        # perhaps replace one with empty
+        if random.random() < caption_cross_concatenation_empty_half_p:
+            concat_pair[random.randint(0, 1)] = None
+
+        final_variants.append(tuple(concat_pair))
+
+    return final_variants
+
+
+
+def select_caption_variants_new(
+    captions_dict: dict[str, str],
+    requested_variants: list[str],
+    all_caption_variants: bool,
+    caption_cross_concatenation_p: float,
+    caption_cross_concatenation_empty_half_p: float
+) -> list[str|tuple[str, str]]:
+    available_non_default_variants = set(k for k in captions_dict if k != "default")
+    if requested_variants:
+        available_requested = available_non_default_variants.intersection(set(requested_variants))
+        # add wildcards for each missing - this takes care of '*' as variant too
+        missing = max(0, len(requested_variants) - len(available_requested))
+        for _ in range(missing):
+            remaining = available_non_default_variants - available_requested
+            if not remaining:
+                break
+            available_requested.add(random.choice(list(remaining)))
+        caption_candidates = list(available_requested)
+    else:
+        caption_candidates = list(available_non_default_variants)
+
+    batch_size = len(next(iter(captions_dict.values())))
+    selected_primary_variants = []
+    for i in range(batch_size):
+        selected_primary_variants.append(random.choice(caption_candidates))
+
+    remaining_unused = set(available_non_default_variants) - set(selected_primary_variants) - set(requested_variants)
+
+    variants = []
+    for i in range(batch_size):
+        left = selected_primary_variants[i]
+        others = set(c for c in available_non_default_variants if c != left)
+        if random.random() > caption_cross_concatenation_p or len(others) == 0:
+            variants.append(left)
+            continue
+
+        # repopulate remaining unused if empty, but exclude selected primary variants and requested variants
+        right_candidates = others.intersection(remaining_unused)
+        if not right_candidates:
+            remaining_unused = set(available_non_default_variants) - set(selected_primary_variants)
+            if not remaining_unused:
+                remaining_unused = set(available_non_default_variants)
+        if not right_candidates:
+            # ran out of candidates to concatenate with, just use the left variant
+            variants.append(left)
+            continue
+
+        right = random.choice(list(right_candidates))
+        remaining_unused.remove(right)
+
+        # perhaps swap
+        if random.random() < 0.5:
+            left, right = right, left
+        concat_pair = [left, right]
+        # perhaps replace one with empty
+        if random.random() < caption_cross_concatenation_empty_half_p:
+            concat_pair[random.randint(0, 1)] = None
+
+        variants.append(tuple(concat_pair))
+
+    return variants
 
