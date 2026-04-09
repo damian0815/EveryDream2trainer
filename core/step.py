@@ -158,10 +158,12 @@ def train_step(
             # Conditional dropout
             t_cond_dropout_start = time.perf_counter()
             cond_dropout_mask = build_cond_dropout_mask(batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
-            teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=timesteps, teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
+            is_cond_dropout_noise = cond_dropout_mask & (torch.rand(batch_size, device=model.unet.device) < args.cond_dropout_noise_p) # replace latents with noise where True
+
             record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images/len(caption_variants))
 
             # Text conditioning generation
+            teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=timesteps, teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
             t_conditioning_start = time.perf_counter()
             conditioning, teacher_conditioning, caption_str = _generate_conditioning(
                 batch,
@@ -188,6 +190,7 @@ def train_step(
                         latents=latents,
                         noise=noise,
                         conditioning=conditioning,
+                        is_cond_dropout_noise=is_cond_dropout_noise,
 
                         timesteps=timesteps,
                         caption_variant=caption_variant,
@@ -411,20 +414,6 @@ def build_cond_dropout_mask(batch: dict, timesteps: torch.Tensor, model: Trainin
         mask_contents.append(random.random() <= sample_cond_dropout)
 
     return torch.tensor(mask_contents, device=model.unet.device, dtype=torch.bool)
-
-def apply_cond_dropout_to_batch(batch, caption_variant, model: TrainingModel, cond_dropout_mask: torch.Tensor, args: Namespace):
-    for sample_index in range(batch["image"].shape[0]):
-        if not cond_dropout_mask[sample_index]:
-            continue
-        if batch["captions"][caption_variant][sample_index] is None:
-            continue
-        batch["tokens"][caption_variant][sample_index] = model.cond_dropout_tokens
-        if model.is_sdxl:
-            batch["tokens_2"][caption_variant][sample_index] = model.cond_dropout_tokens_2
-        batch["captions"][caption_variant][sample_index] = model.cond_dropout_caption
-        if random.random() <= args.cond_dropout_noise_p:
-            batch["image"][sample_index] = torch.randn_like(
-                batch["image"][sample_index])
 
 
 def get_nibble_size(training_variables: TrainingVariables) -> int:
@@ -924,7 +913,7 @@ class ModelForwardReturnType:
 
 def _do_model_forward(
     model: TrainingModel,
-    batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning,
+    batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning, is_cond_dropout_noise: torch.Tensor,
     timesteps: torch.Tensor, caption_variant: str|tuple[str, str],
     teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
     forward_slice_size: int,
@@ -948,6 +937,7 @@ def _do_model_forward(
         latents_slice = latents[slice_start:slice_end]
         noise_slice = noise[slice_start:slice_end]
         timesteps_slice = timesteps[slice_start:slice_end]
+        is_cond_dropout_noise_slice = is_cond_dropout_noise[slice_start:slice_end]
         if teacher_mask is None:
             teacher_mask_slice = None
         else:
@@ -973,6 +963,7 @@ def _do_model_forward(
                 conditioning=conditioning_slice,
                 noise=noise_slice,
                 timesteps=timesteps_slice,
+                is_cond_dropout_noise=is_cond_dropout_noise_slice,
                 model=model,
                 args=args,
                 teacher_model=teacher_model,
@@ -1014,6 +1005,7 @@ def _do_model_forward(
                     conditioning=conditioning_slice,
                     noise=noise_slice,
                     timesteps=anchor_timesteps_slice,
+                    is_cond_dropout_noise=is_cond_dropout_noise_slice,
                     model=model,
                     args=args,
                     teacher_model=None,

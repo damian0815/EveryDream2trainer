@@ -356,10 +356,16 @@ class ImageTrainItem:
             if mask is not None:
                 mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh)
             crop_topleft = (crop_topleft[0] + trim_crop_offset[0], crop_topleft[1] + trim_crop_offset[1])
+            cropped_width = image.size[0]
 
+            # resize
             image = image.resize(self.target_wh)
             if mask:
                 mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
+            # apply scale factor to crop_topleft to put it in the resized image space
+            resized_cropped_width = image.size[0]
+            image_scale_factor = resized_cropped_width / cropped_width
+            crop_topleft = (crop_topleft[0] * image_scale_factor, crop_topleft[1] * image_scale_factor)
 
             if random.random() < self.flip.p:
                 image = TF.hflip(image)

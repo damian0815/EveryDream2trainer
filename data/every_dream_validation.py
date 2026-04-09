@@ -1,5 +1,7 @@
 import json
 import logging
+import traceback
+
 import math
 import random
 from dataclasses import dataclass, field
@@ -451,7 +453,12 @@ class EveryDreamValidator:
           val/{logging_tag}_anomaly_pct_mean  — mean anomaly pixel % across images
           val/{logging_tag}_anomaly_pct        — histogram of per-image anomaly %
         """
-        from data.anomaly_detector import segment_image as anomaly_segment_image
+        try:
+            from data.anomaly_detector import segment_image as anomaly_segment_image
+        except ImportError:
+            traceback.print_exc()
+            logging.error("Anomaly checkpoint provided but failed to import anomaly detector.  Check your config and environment.")
+            return
 
         anomaly_model = self._get_anomaly_model(model.unet.device)
         anomaly_model.to(model.unet.device)

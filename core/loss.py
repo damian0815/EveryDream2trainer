@@ -465,6 +465,7 @@ def get_model_prediction_and_target(
     timesteps: torch.Tensor,
     model: TrainingModel,
     args=None,
+    is_cond_dropout_noise: torch.Tensor = None,
     skip_contrastive: bool = False,
     teacher_model: TrainingModel | None = None,
     teacher_mask: torch.Tensor | None = None,
@@ -549,6 +550,12 @@ def get_model_prediction_and_target(
             teacher_target=teacher_target,
         )
 
+    if is_cond_dropout_noise is not None:
+        # apply cond dropout noise probability: for samples where conditioning is dropped, replace latents with pure noise with some probability
+        for sample_index in range(latents.shape[0]):
+            if is_cond_dropout_noise[sample_index]:
+                latents[sample_index] = torch.randn_like(latents[sample_index])
+
     # logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(
         latents, noise, model.noise_scheduler, timesteps, args.latents_perturbation
@@ -563,11 +570,14 @@ def get_model_prediction_and_target(
         handle = None
         try:
             # hook mid-block output for LCF
-            def hook_fn(module, input, output):
-                assert output.shape == midblock_out_shape, f"Expected midblock output shape {midblock_out_shape} but got {output.shape}"
-                lcf_storage['midblock_out'] = output
+            if lcf_mask is None:
+                handle = None
+            else:
+                def hook_fn(module, input, output):
+                    assert output.shape == midblock_out_shape, f"Expected midblock output shape {midblock_out_shape} but got {output.shape}"
+                    lcf_storage['midblock_out'] = output
+                handle = model.unet.mid_block.register_forward_hook(hook_fn)
 
-            handle = model.unet.mid_block.register_forward_hook(hook_fn)
             model_pred = model.unet(
                 noisy_latents.to(dtype=model.unet.dtype),
                 timesteps.to(model.unet.device, dtype=model.unet.dtype),
@@ -581,7 +591,8 @@ def get_model_prediction_and_target(
             midblock_out = None if lcf_mask is None else lcf_storage['midblock_out']
             del lcf_storage
         finally:
-            handle.remove()
+            if handle is not None:
+                handle.remove()
 
     teacher_target = None
     if teacher_mask is None:

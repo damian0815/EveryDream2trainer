@@ -173,18 +173,6 @@ class EveryDreamBatch(Dataset):
         else:
             caption_dict = {"default": example["caption"]}
 
-        # for k in caption_dict.keys():
-        #    if self.randomizer.random() <= (train_item.get("cond_dropout", self.conditional_dropout)):
-        #        caption_dict[k] = " "
-
-        #if self.random_instance.random() <= self.cond_dropout_noise_p:
-        #    # example["image"] = torch.randn_like(example["image"])
-        #    perlin_shape = example["image"].shape[1:]
-        #    perlin3 = torch.stack([rand_perlin_2d_octaves(perlin_shape, (1, 1), 7)
-        #                           for _ in range(3)]
-        #                          ).to(example["image"].device, dtype=example["image"].dtype)
-        #    example["image"] = transforms.Normalize(mean=0.5, std=0.5)(perlin3)
-
         try:
             caption_keys = list(caption_dict.keys())
             example["caption"] = {k: caption_dict.get(k, None) or caption_dict[self.random_instance.choice(caption_keys)]
@@ -248,8 +236,8 @@ class EveryDreamBatch(Dataset):
         example["pathname"] = image_train_tmp.pathname
 
         example["add_time_ids"] = _get_add_time_ids(
-            original_size = (uncropped_h, uncropped_w),
-            target_size = (image_train_item.target_wh[1], image_train_item.target_wh[0]),
+            original_size_hw = (uncropped_h, uncropped_w),
+            target_size_hw = (image_train_item.target_wh[1], image_train_item.target_wh[0]),
             crops_coords_top_left = (crop_tl_y, crop_tl_x),
             dtype=torch.float32
         )
@@ -500,9 +488,16 @@ def collate_fn(batch):
 
 # from SDXLPipeline
 def _get_add_time_ids(
-        original_size, crops_coords_top_left, target_size, dtype
+        original_size_hw, crops_coords_top_left, target_size_hw, dtype
     ):
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        """
+        original_size_hw: (h, w) of the original image before resizing or cropping
+        crops_coords_top_left: (y, x) of the top left corner of the crop in the original image coordinates (0, 0 if no cropping)
+        target_size_hw: (h, w) of the final image fed to the model after cropping and resizing
+
+        eg:
+        """
+        add_time_ids = list(original_size_hw + crops_coords_top_left + target_size_hw)
 
         passed_add_embed_dim = (
             256 #unet.config.addition_time_embed_dim

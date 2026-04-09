@@ -52,7 +52,7 @@ from accelerate.utils import set_seed
 import wandb
 import webbrowser
 from torch.utils.tensorboard import SummaryWriter
-from data.data_loader import DataLoaderMultiAspect, expand_caption_dict
+from data.data_loader import DataLoaderMultiAspect
 from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader
@@ -756,15 +756,6 @@ def main(args):
     plugin_runner = PluginRunner(plugins=plugins)
     plugin_runner.run_on_model_load(unet=model.unet, text_encoder=model.text_encoder, tokenizer=model.tokenizer, optimizer_config=optimizer_config)
 
-    if args.expand_caption_variants:
-        unexpanded_count = len(image_train_items)
-        image_train_items = [
-            expanded_i
-            for unexpanded_i in image_train_items
-            for expanded_i in expand_caption_dict(unexpanded_i, args.caption_variants)
-        ]
-        logging.info(f" * Caption variants expanded - had {unexpanded_count} items, now {len(image_train_items)} items")
-
     data_loader = DataLoaderMultiAspect(
         image_train_items=image_train_items,
         seed=seed,
@@ -772,7 +763,9 @@ def main(args):
         grad_accum=args.grad_accum,
         chunk_shuffle_batch_size=args.batch_size,
         batch_id_dropout_p=args.batch_id_dropout_p,
-        keep_same_sample_at_different_resolutions_together=args.keep_same_sample_at_different_resolutions_together
+        keep_same_sample_at_different_resolutions_together=args.keep_same_sample_at_different_resolutions_together,
+        caption_variants=args.caption_variants,
+        expand_caption_variants=args.expand_caption_variants
     )
 
     mask_p = 0 if args.mask_p is None else args.mask_p
@@ -1166,6 +1159,7 @@ def main(args):
                             max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
                             if max_safe_forward_size == 0:
                                 # maybe not enough memory. if we can, do an emergency backward pass if we have any loss pending
+                                accumulated_loss_images_count_before_emergency_backward = tv.accumulated_loss_images_count
                                 if tv.accumulated_loss_images_count > 0:
                                     with torch.cuda.amp.autocast(enabled=args.amp):
                                         optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ')
@@ -1173,7 +1167,7 @@ def main(args):
                                     gc.collect()
                                     max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
                                 if max_safe_forward_size == 0:
-                                    logging.warning(" * Unable to free enough ram with emergency backward - possible OOM follows")
+                                    logging.warning(f" * Unable to free enough ram even after emergency backward of {accumulated_loss_images_count_before_emergency_backward} samples worth of accumulated loss @res {tv.batch_resolution} - possible OOM follows")
                                     max_safe_forward_size = 1
                             #if max_safe_forward_size < _get_default_forward_slice_size(args, tv.batch_resolution):
                             #    logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")

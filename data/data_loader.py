@@ -48,12 +48,17 @@ class DataLoaderMultiAspect():
     def __init__(self, image_train_items: list[ImageTrainItem], seed=555,
                  batch_size=1, grad_accum=1,
                  chunk_shuffle_batch_size=None, batch_id_dropout_p=0,
-                 keep_same_sample_at_different_resolutions_together=False):
+                 keep_same_sample_at_different_resolutions_together=False,
+                 caption_variants: list[str]=None,
+                 expand_caption_variants: bool=False
+                 ):
         self.seed = seed
         self.batch_size = batch_size
         self.grad_accum = grad_accum
         self.chunk_shuffle_batch_size = chunk_shuffle_batch_size or batch_size
         self.prepared_train_data = image_train_items
+        self.caption_variants = caption_variants
+        self.expand_caption_variants = expand_caption_variants
         random.Random(self.seed).shuffle(self.prepared_train_data)
         self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
         self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
@@ -148,6 +153,19 @@ class DataLoaderMultiAspect():
             batch_id_override = DEFAULT_BATCH_ID if randomizer.random() <= self.batch_id_dropout_p else None
             _add_image_to_appropriate_bucket(image_caption_pair, batch_id_override=batch_id_override)
 
+        # expand caption dicts
+        pre_expanded_counts = {k: len(v) for k,v in buckets.items()}
+        if self.expand_caption_variants:
+            print(" * DataLoaderMultiAspect expanding caption dicts into multiple items with different subsets of captions, based on caption_variants: ", self.caption_variants)
+            for key, bucket_contents in list(buckets.items()):
+                pre_expanded_counts[key] = len(bucket_contents)
+                expanded_bucket_contents = []
+                for item in bucket_contents:
+                    expanded_items = expand_caption_dict(item, caption_variants=self.caption_variants)
+                    expanded_bucket_contents.extend(expanded_items)
+                buckets[key] = expanded_bucket_contents
+                #print(f" - expanded bucket {key} from {len(bucket_contents)} to {len(expanded_bucket_contents)} items")
+
         # handled named batch runts by demoting them to the DEFAULT_BATCH_ID
         for key, bucket_contents in [(k, b) for k, b in buckets.items() if k[0] != DEFAULT_BATCH_ID]:
             runt_count = len(bucket_contents) % batch_size
@@ -161,7 +179,11 @@ class DataLoaderMultiAspect():
                 del buckets[key]
 
         for key, bucket_contents in buckets.items():
-            print(" - bucket ", key, " has ", len(bucket_contents), " items")
+            expanded_details = "" if len(bucket_contents)==pre_expanded_counts[key] else "" f" (expanded from {pre_expanded_counts[key]} items)"
+            print(" - bucket ", key, " has ", len(bucket_contents), " items" + expanded_details)
+
+        for key in buckets.keys():
+            random.shuffle(buckets[key])
 
         # handle remaining runts by taking from unpicked items, and/or randomly duplicating picked items
         for key, bucket_contents in buckets.items():
@@ -191,14 +213,14 @@ class DataLoaderMultiAspect():
                         item.runt_size = final_truncate_count
                         bucket_contents[runt_bucket_start_offset + i] = item
             assert len(bucket_contents) % batch_size == 0
-            assert [i.target_wh == bucket_contents[0].target_wh for i in bucket_contents], "mixed aspect ratios in a bucket - this shouldn't happen"
+            assert all(i.target_wh == bucket_contents[0].target_wh for i in bucket_contents), "mixed aspect ratios in a bucket - this shouldn't happen"
 
         items_by_batch_id = collapse_buckets_by_batch_id(buckets)
         # at this point items have a partially deterministic order
         # (in particular: rarer aspect ratios are more likely to cluster at the end due to stochastic sampling)
         # so we shuffle them to mitigate this, using chunked_shuffle to keep batches with the same aspect ratio together
         items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size*grad_accum, randomizer=randomizer)
-                             for k,v in items_by_batch_id.items()} 
+                             for k,v in items_by_batch_id.items()}
         if not items_by_batch_id:
             raise RuntimeError("No images available after applying dropout and multipliers. Check your dataset and multiplier settings.")
         # paranoia: verify that this hasn't fucked up the aspect ratio batching
@@ -280,7 +302,7 @@ def chunk_list(l: List, chunk_size) -> List:
 def unchunk_list(chunked_list: List):
     return [i for c in chunked_list for i in c]
 
-def collapse_buckets_by_batch_id(buckets: Dict) -> Dict:
+def collapse_buckets_by_batch_id(buckets: dict[tuple, list[ImageTrainItem]]) -> dict[str, list[ImageTrainItem]]:
     batch_ids = [k[0] for k in buckets.keys()]
     items_by_batch_id = {}
     for batch_id in batch_ids:
@@ -455,12 +477,12 @@ def expand_caption_dict(item: ImageTrainItem, caption_variants: list[str]) -> li
     random.shuffle(base_keys)
     number_of_captions_per_dict = math.ceil(len(all_keys) / len(base_keys))
     available_keys = list(set(all_keys).difference(set(base_keys)))
-    while available_keys and base_keys:
+    for base_key in base_keys:
         new_item = item.copy_with_new_uid()
 
         base_key = base_keys.pop()
         if len(base_keys) > 0:
-            other_keys = random.sample(available_keys, k=number_of_captions_per_dict-1)
+            other_keys = random.sample(available_keys, k=min(len(available_keys), number_of_captions_per_dict-1))
         else:
             other_keys = list(available_keys)
         for k in other_keys:

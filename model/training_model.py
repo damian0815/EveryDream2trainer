@@ -362,10 +362,10 @@ class Conditioning:
     @classmethod
     def cat(cls, conditioning: list[Conditioning]) -> 'Conditioning':
         return Conditioning(_text_encoder_hidden_states=torch.cat([c._text_encoder_hidden_states for c in conditioning], dim=1),
-                            _text_encoder_pooled_embeds=torch.cat([c._text_encoder_pooled_embeds for c in conditioning], dim=1) if conditioning[0]._text_encoder_pooled_embeds is not None else None,
                             _text_encoder_2_hidden_states=torch.cat([c._text_encoder_2_hidden_states for c in conditioning], dim=1) if conditioning[0]._text_encoder_2_hidden_states is not None else None,
-                            _text_encoder_2_pooled_embeds=torch.cat([c._text_encoder_2_pooled_embeds for c in conditioning], dim=1) if conditioning[0]._text_encoder_2_pooled_embeds is not None else None,
-                            _add_time_ids=torch.cat([c._add_time_ids for c in conditioning], dim=1) if conditioning[0]._add_time_ids is not None else None)
+                            _text_encoder_pooled_embeds=conditioning[0]._text_encoder_pooled_embeds if conditioning[0]._text_encoder_pooled_embeds is not None else None,
+                            _text_encoder_2_pooled_embeds=conditioning[0]._text_encoder_2_pooled_embeds if conditioning[0]._text_encoder_2_pooled_embeds is not None else None,
+                            _add_time_ids=conditioning[0]._add_time_ids if conditioning[0]._add_time_ids is not None else None)
 
 
 def _make_conditioning_slice(
