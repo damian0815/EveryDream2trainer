@@ -342,6 +342,7 @@ class ImageTrainItem:
             img_jitter = min(img_jitter, crop_jitter)
             img_jitter = max(img_jitter, 0.0)
             
+            uncropped_width, uncropped_height = image.size
             if img_jitter > 0.0:
                 jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
                 image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
@@ -351,7 +352,6 @@ class ImageTrainItem:
                 jitter_amounts = (0, 0, 0, 0)
             crop_topleft = (jitter_amounts[0], jitter_amounts[2])
 
-            uncropped_width, uncropped_height = image.size
             image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh)
             if mask is not None:
                 mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh)
@@ -362,10 +362,15 @@ class ImageTrainItem:
             image = image.resize(self.target_wh)
             if mask:
                 mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
-            # apply scale factor to crop_topleft to put it in the resized image space
+
+            # sdxl: add_time_embeds crop tracking
             resized_cropped_width = image.size[0]
             image_scale_factor = resized_cropped_width / cropped_width
+            # apply scale factor to crop_topleft to put it in the resized image space
             crop_topleft = (crop_topleft[0] * image_scale_factor, crop_topleft[1] * image_scale_factor)
+            # if original image is larger than resize, discard the original size and just use the resized size
+            if max(math.log(image.size[1] / uncropped_height), math.log(image.size[0] / uncropped_width)) < -0.1:
+                uncropped_width, uncropped_height = uncropped_width * image_scale_factor, uncropped_height * image_scale_factor
 
             if random.random() < self.flip.p:
                 image = TF.hflip(image)
