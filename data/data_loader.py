@@ -16,6 +16,7 @@ limitations under the License.
 import bisect
 import json
 import logging
+import re
 from collections import defaultdict
 
 import math
@@ -459,6 +460,23 @@ def _print_path_match_sequences(chunks):
     print("sequence of ", current_value_count, "x", current_value)
 
 
+def _find_actual_variant_keys(caption_keys: list[str], patterns: list[str]) -> list[str]:
+    regexes = { pattern: re.compile(r'^'+pattern+r'$', re.IGNORECASE) for pattern in patterns }
+    def _matches_variant(key: str, pattern: str) -> bool:
+        return regexes[pattern].match(key) is not None
+    variant_buckets = {pattern: set(k for k in caption_keys if _matches_variant(k, pattern))
+                       for pattern in patterns}
+
+    # take all the keys with exactly one match
+    matching_keys = set(next(iter(keys)) for pattern, keys in variant_buckets.items() if len(keys)==1)
+    for pattern, keys in variant_buckets.items():
+        remaining_keys = keys.difference(matching_keys)
+        if remaining_keys:
+            matching_keys.add(random.choice(list(remaining_keys)))
+
+    return list(matching_keys)
+
+
 def expand_caption_dict(item: ImageTrainItem, caption_variants: list[str]) -> list[ImageTrainItem]:
     if not caption_variants:
         return [item]
@@ -467,11 +485,10 @@ def expand_caption_dict(item: ImageTrainItem, caption_variants: list[str]) -> li
 
     caption_data = json.loads(item.caption.get_caption().replace('<<json>>', ''))
     all_keys = list(caption_data.keys())
-    number_of_items = len(caption_variants)
-    base_keys = list(set(caption_data.keys()).intersection(set(caption_variants)))
-    others = list(set(caption_data.keys()).difference(set(caption_variants)))
-    if len(base_keys) < number_of_items:
-        base_keys.extend(random.sample(others, k=min(len(others), number_of_items-len(base_keys))))
+    base_keys = _find_actual_variant_keys(all_keys, patterns=caption_variants)
+    others = list(set(caption_data.keys()).difference(set(base_keys)))
+    if len(base_keys) == 0:
+        base_keys.extend(random.sample(others, k=min(len(others), len(caption_variants))))
 
     expanded_items = []
     random.shuffle(base_keys)
@@ -480,7 +497,6 @@ def expand_caption_dict(item: ImageTrainItem, caption_variants: list[str]) -> li
     for base_key in base_keys:
         new_item = item.copy_with_new_uid()
 
-        base_key = base_keys.pop()
         if len(base_keys) > 0:
             other_keys = random.sample(available_keys, k=min(len(available_keys), number_of_captions_per_dict-1))
         else:
