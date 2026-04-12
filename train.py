@@ -1576,7 +1576,7 @@ if __name__ == "__main__":
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
     argparser.add_argument("--unet_freeze_regex", default=None, help='Unet freeze regex(es). Specify multiply matches by separating with `;`. Matches are applied in order. `freeze` or `unfreeze` specifies what the match does. Last match wins. eg: --unet_freeze_regex "freeze .*; unfreeze down_blocks\\.0\\..*attentions.*; freeze .*\\.norm1" -> freeze all, then unfreeze attention modules in down_block 0 except norm1 layers. Use --debug_unet_freeze_regex to apply rules and dump result to console without actually training.')
     argparser.add_argument("--debug_unet_freeze_regex", action="store_true", help="If passed, apply unet freeze regex and dump results to console without training")
-    argparser.add_argument("--optimizer_param_grouping", type=str, default="single", help="Parameter grouping strategy for optimizer, (def: single)", choices=["single", "transformer10x", "zones", "per-module"])
+    argparser.add_argument("--optimizer_param_grouping", type=str, nargs="+", default="single", help="Parameter grouping strategy for optimizer. one of 'single', 'transformer10x', 'zones', 'per-module <json_path>'. Default: 'single'")
     argparser.add_argument("--optimizer_progressive_unlock", action=argparse.BooleanOptionalAction, default=False, help="If passed, progressively unlock parameters")
     argparser.add_argument("--optimizer_progressive_unlock_by_qk_proximity", action=argparse.BooleanOptionalAction, default=False, help="If passed, progressively unlock parameters by proximity to qk attention parameters")
 
@@ -1627,7 +1627,7 @@ if __name__ == "__main__":
     argparser.add_argument("--rated_dataset", action="store_true", default=False, help="enable rated image set training, to less often train on lower rated images through the epochs")
     argparser.add_argument("--rated_dataset_target_dropout_percent", type=int, default=50, help="how many images (in percent) should be included in the last epoch (Default 50)")
     argparser.add_argument("--zero_frequency_noise_ratio", type=float, default=0.02, help="adds zero frequency noise, for improving contrast (def: 0.0) use 0.0 to 0.15")
-    argparser.add_argument("--enable_zero_terminal_snr", action="store_true", default=None, help="Use zero terminal SNR noising beta schedule")
+    argparser.add_argument("--enable_zero_terminal_snr", action=argparse.BooleanOptionalAction, default=None, help="Use zero terminal SNR noising beta schedule")
     argparser.add_argument("--mix_zero_terminal_snr", action="store_true", default=None, help="Mix zero termianl SNR with regular training")
     argparser.add_argument("--match_zero_terminal_snr", action="store_true", default=None, help="use zero terminal SNR target as regular noise scheduler input")
     argparser.add_argument("--load_settings_every_epoch", action="store_true", default=None, help="Enable reloading of 'train.json' at start of every epoch.")

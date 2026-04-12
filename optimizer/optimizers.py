@@ -949,7 +949,7 @@ class EveryDreamOptimizer:
             for pg in param_groups:
                 print(f"   - {pg.get('name', '<none>')}: {len(pg['params'])} params, lr: {pg['lr']}, betas: {pg['betas']}, weight_decay: {pg['weight_decay']}")
 
-        param_groups.insert(0, {"name": "dummy", "params": [], "lr": curr_lr, "betas": betas, "weight_decay": weight_decay})
+        param_groups.insert(0, {"name": "_base_lr", "params": [], "lr": curr_lr, "betas": betas, "weight_decay": weight_decay})
 
         if optimizer_name:
             optimizer_name = optimizer_name.lower()

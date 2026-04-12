@@ -264,6 +264,7 @@ class EveryDreamValidator:
             validate_every_n_steps = epoch_length_steps / num_divisions
             return [math.ceil((i+1)*validate_every_n_steps) - 1 for i in range(num_divisions)]
 
+    @torch.no_grad()
     def do_validation(self, model: TrainingModel, global_step: int,
                       get_model_prediction_and_target_callable: Callable[
                                          [torch.Tensor, Conditioning], ValidationStepResult],
@@ -535,7 +536,7 @@ class EveryDreamValidator:
         self.log_writer.add_scalar(tag=f"val/{logging_tag}_anomaly_pct_mean",
                                    scalar_value=mean_pct, global_step=global_step)
         self.log_writer.add_histogram(tag=f"val/{logging_tag}_anomaly_pct",
-                                      values=pcts_tensor, global_step=global_step)
+                                      values=pcts_tensor.detach().clone(), global_step=global_step)
         logging.info(f"Anomaly validation ({logging_tag}) mean_anomaly_pct={mean_pct:.4f}  n={len(anomaly_pcts)}")
 
     def _build_automatic_validation_dataset_if_required(self, image_train_items: list[ImageTrainItem], model: TrainingModel) \
