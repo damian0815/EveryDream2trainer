@@ -723,6 +723,7 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
             #      f"backward accumulated {tv.backwarded_images_count}")
             tv.clear_accumulated_loss()
+            tv.register_backward_oom_or_not(oomed=False)
         except InfOrNanException:
             logging.error(
                 "* Caught Inf or NaN during backward pass, clearing accumulated loss and resetting optimizer"
@@ -732,6 +733,7 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
         except torch.OutOfMemoryError:
             logging.error(f"OOM step {tv.global_step} during optimizer.backward of {tv.accumulated_loss_images_count} accumulated loss images @resolution {tv.batch_resolution}")
             logging.error(f" -> dropping this batch of {tv.accumulated_loss_images_count} accumulated loss images")
+            tv.register_backward_oom_or_not(oomed=True)
 
         tv.clear_accumulated_loss()
 

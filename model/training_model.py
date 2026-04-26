@@ -1,5 +1,7 @@
+import argparse
 import copy
 import logging
+from collections import defaultdict
 
 import diffusers
 import math
@@ -103,8 +105,14 @@ class TrainingVariables:
     global_step: int = None
     batch_resolution: int = None
 
+
     max_backward_slice_size: int = None
+    default_max_backward_slice_size: dict[int, int] = field(default_factory=dict)
+    backward_oom_history: dict[int, list[bool]] = field(default_factory=lambda: defaultdict(list))
+
     forward_slice_size: int = None
+    default_forward_slice_size: dict[int, int] = field(default_factory=dict)
+    forward_oom_history: dict[int, list[bool]] = field(default_factory=lambda: defaultdict(list))
 
     last_effective_batch_size: int = 0
     effective_backward_size: int = 0
@@ -137,6 +145,19 @@ class TrainingVariables:
     prev_accumulated_pathnames: list[str] = field(default_factory=list)
     prev_accumulated_captions: list[str] = field(default_factory=list)
     prev_accumulated_timesteps: list[int] = field(default_factory=list)
+
+
+    def setup_default_slice_sizes(self, args: argparse.Namespace):
+        for index, resolution in enumerate(args.resolution):
+            if args.max_backward_slice_size:
+                self.default_max_backward_slice_size[resolution] = args.max_backward_slice_size[index]
+            else:
+                self.default_max_backward_slice_size[resolution] = args.batch_size
+            if args.forward_slice_size:
+                self.default_forward_slice_size[resolution] = min(args.batch_size, args.forward_slice_size[index])
+            else:
+                self.default_forward_slice_size[resolution] = args.batch_size
+
 
     def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
 
@@ -191,6 +212,35 @@ class TrainingVariables:
         filtered = copy.copy(self)
         filtered.cond_dropouts = []
         return filtered
+
+    def register_backward_oom_or_not(self, oomed: bool):
+        backward_oom_history_size = 10
+        self._register_oom_or_not(oomed, self.backward_oom_history, max_history_size=backward_oom_history_size)
+        batch_resolution = self.batch_resolution
+        oom_pct = sum(self.backward_oom_history[batch_resolution]) / len(self.backward_oom_history[batch_resolution])
+        if oom_pct > 0.333:
+            logging.warning(
+                f"Backward OOM'd for resolution {batch_resolution} in {oom_pct * 100}% of the last {backward_oom_history_size} batches")
+            current_backward_size = self.default_max_backward_slice_size[batch_resolution]
+            new_backward_size = current_backward_size - 1
+            if new_backward_size > 0:
+                logging.warning(f" -> dropping max backward size for {batch_resolution} to {new_backward_size}")
+                self.default_max_backward_slice_size[batch_resolution] = new_backward_size
+            else:
+                logging.error(f" !! max backward size for {batch_resolution} is already 1, cannot drop any further")
+
+    def register_forward_oom_or_not(self, oomed: bool):
+        forward_oom_history_size = 20
+        self._register_oom_or_not(oomed, self.forward_oom_history, max_history_size=forward_oom_history_size)
+        batch_resolution = self.batch_resolution
+        oom_pct = sum(self.forward_oom_history[batch_resolution]) / len(self.forward_oom_history[batch_resolution])
+
+
+    def _register_oom_or_not(self, oomed, oom_history, max_history_size):
+        batch_resolution = self.batch_resolution
+        oom_history[batch_resolution].append(oomed)
+        if len(oom_history[batch_resolution]) > max_history_size:
+            oom_history[batch_resolution].pop(0)
 
 
 @dataclass

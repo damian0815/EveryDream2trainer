@@ -407,20 +407,11 @@ def update_ema(model, ema_model, decay, default_device, ema_device: str):
         if need_to_delete_original:
             del(original_model_on_proper_device)
 
-def _get_default_forward_slice_size(args, batch_resolution):
-    if args.forward_slice_size:
-        resolution_index = args.resolution.index(batch_resolution)
-        return min(args.batch_size, args.forward_slice_size[resolution_index])
-    else:
-        return args.batch_size
+def _get_default_forward_slice_size(tv: TrainingVariables):
+    return tv.default_forward_slice_size[tv.batch_resolution]
 
-def _choose_backward_slice_size(args, tv: TrainingVariables):
-    if args.max_backward_slice_size:
-        resolution_index = args.resolution.index(tv.batch_resolution)
-        backward_slice_size = args.max_backward_slice_size[resolution_index]
-    else:
-        backward_slice_size = args.batch_size
-
+def _choose_backward_slice_size(tv: TrainingVariables):
+    backward_slice_size = tv.default_max_backward_slice_size[tv.batch_resolution]
     return max(
         1,
         min(
@@ -909,6 +900,7 @@ def main(args):
     epoch_times = []
 
     tv = TrainingVariables()
+    tv.setup_default_slice_sizes(args)
     tv.global_step = 0
     training_start_time = time.time()
     last_epoch_saved_time = training_start_time
@@ -1141,7 +1133,7 @@ def main(args):
                         args.resolution, image_pixel_count=image_pixel_count
                     )
                     tv.forward_slice_size = _get_default_forward_slice_size(args, tv.batch_resolution)
-                    tv.max_backward_slice_size = _choose_backward_slice_size(args, tv)
+                    tv.max_backward_slice_size = _choose_backward_slice_size(tv)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
                         # do backward now
                         optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ')
