@@ -26,7 +26,7 @@ import gc
 import random
 import traceback
 
-from typing import Tuple
+from typing import Tuple, Optional
 
 from colorama import Fore, Style
 import numpy as np
@@ -55,7 +55,8 @@ from torch.utils.tensorboard import SummaryWriter
 from data.data_loader import DataLoaderMultiAspect
 from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
 
-from data.every_dream import EveryDreamBatch, build_torch_dataloader
+from data.every_dream import EveryDreamBatch, build_torch_dataloader, collate_fn as ed_collate_fn
+from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeBScheduler
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, ImageCaption, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
@@ -98,6 +99,71 @@ from plugins.plugins import PluginRunner
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
+
+
+def _epoch_step_source(
+    train_dataloader,
+    train_batch: "EveryDreamBatch",
+    difficulty_estimator: Optional["DifficultyEstimator"],
+    epoch_len: int,
+    batch_size: int,
+    seed: int,
+):
+    """
+    Yields (step, full_batch) for one training epoch.
+
+    * If no DifficultyEstimator or a TypeA scheduler is active: just enumerates
+      the pre-built train_dataloader unchanged.
+
+    * If a TypeB (spaced-repetition) scheduler is active: rebuilds the item list
+      every slab_size batches by calling build_next_slab(), then wraps the
+      updated EveryDreamBatch in a fresh single-threaded DataLoader for that slab.
+      num_workers=0 is intentional – there is no point spinning worker processes
+      up/down at every slab boundary.
+    """
+    type_b: Optional["TypeBScheduler"] = None
+    if difficulty_estimator is not None and isinstance(difficulty_estimator.scheduler, TypeBScheduler):
+        type_b = difficulty_estimator.scheduler
+
+    if type_b is None:
+        yield from enumerate(train_dataloader)
+        return
+
+    slab_size = type_b.slab_size
+    n_slots = slab_size * batch_size
+    rng = random.Random(seed)
+    step = 0
+    all_items = train_batch.data_loader.prepared_train_data
+
+    while step < epoch_len:
+        slab_items = type_b.build_next_slab(
+            items=all_items,
+            scores=difficulty_estimator.scores,
+            obs_counts=difficulty_estimator.obs_counts,
+            min_obs_count=difficulty_estimator.min_obs_count,
+            n_slots=n_slots,
+            rng=rng,
+        )
+        # Override image_train_items for this slab (EveryDreamBatch.__len__ and
+        # __getitem__ both key off self.image_train_items, so this is sufficient).
+        train_batch.image_train_items = slab_items
+        slab_dl = torch.utils.data.DataLoader(
+            train_batch,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=ed_collate_fn,
+            pin_memory=False,
+        )
+        slab_step = 0
+        for full_batch in slab_dl:
+            if step >= epoch_len:
+                break
+            yield step, full_batch
+            step += 1
+            slab_step += 1
+            if slab_step >= slab_size:
+                break
 
 def setup_local_logger(args):
     """
@@ -375,6 +441,11 @@ def resolve_image_train_items(args: argparse.Namespace, resolution, aspects, glo
 
     print (f" * Found {len(resolved_items)} items in '{args.data_root}'")
     gc.collect()
+
+    # Stamp base_multiplier now that all user-configured multiplier changes are done.
+    # DifficultyEstimator schedulers scale relative to this value, not the mutated one.
+    for item in resolved_items:
+        item.base_multiplier = item.multiplier
 
     return resolved_items
 
@@ -784,7 +855,71 @@ def main(args):
 
     epoch_len = math.ceil(len(train_batch) / args.batch_size)
 
-    if get_use_ema_decay_training(args):
+    # -- DifficultyEstimator construction --------------------------------------
+    difficulty_estimator: Optional[DifficultyEstimator] = None
+    if getattr(args, "difficulty_estimator", None):
+        _de_db_path = args.difficulty_estimator
+
+        # Auto-infer model type if not specified
+        _de_model_type = getattr(args, "difficulty_estimator_model_type", None)
+        if not _de_model_type:
+            if getattr(args, "train_sampler", None) == "flow-matching":
+                _de_model_type = "flowmatching-sd2"
+            else:
+                logging.warning(
+                    "DifficultyEstimator: --difficulty_estimator_model_type not set "
+                    "and could not be auto-inferred from --train_sampler. "
+                    "Loss normalisation will be skipped; scores will not update."
+                )
+                _de_model_type = "unknown"
+
+        _de_scheduler_type = getattr(args, "difficulty_estimator_scheduler", "type_a")
+        _de_min_mult = getattr(args, "difficulty_estimator_min_multiplier", 0.5)
+        _de_max_mult = getattr(args, "difficulty_estimator_max_multiplier", 2.0)
+        _de_expand = getattr(args, "difficulty_estimator_expand_factor", 1.0)
+        _de_alpha = getattr(args, "difficulty_estimator_ema_alpha", 0.1)
+        _de_min_obs = getattr(args, "difficulty_estimator_min_observation_count", 10)
+
+        if _de_scheduler_type == "type_b":
+            _de_slab_size = getattr(args, "difficulty_estimator_slab_size", None) or 20
+            _de_base_interval = getattr(args, "difficulty_estimator_base_interval", None)
+            if _de_base_interval is None:
+                _de_base_interval = math.ceil(
+                    len(train_batch.data_loader.prepared_train_data) /
+                    (_de_slab_size * args.batch_size)
+                )
+                logging.info(
+                    "DifficultyEstimator (TypeB): auto-computed base_interval=%d "
+                    "(dataset_size=%d, slab_size=%d, batch_size=%d)",
+                    _de_base_interval,
+                    len(train_batch.data_loader.prepared_train_data),
+                    _de_slab_size,
+                    args.batch_size,
+                )
+            scheduler = TypeBScheduler(
+                base_interval=_de_base_interval,
+                slab_size=_de_slab_size,
+                expand_factor=_de_expand,
+            )
+        else:
+            scheduler = TypeAScheduler(
+                min_multiplier=_de_min_mult,
+                max_multiplier=_de_max_mult,
+                expand_factor=_de_expand,
+            )
+
+        difficulty_estimator = DifficultyEstimator.load(
+            path=_de_db_path,
+            model_type_identifier=_de_model_type,
+            scheduler=scheduler,
+            min_obs_count=_de_min_obs,
+            ema_alpha=_de_alpha,
+        )
+        logging.info(
+            "DifficultyEstimator ready: scheduler=%s, model_type=%s, db=%s",
+            _de_scheduler_type, _de_model_type, _de_db_path,
+        )
+    # --------------------------------------------------------------------------
         args.ema_update_interval = args.ema_update_interval * args.grad_accum
         if args.ema_strength_target != None:
             total_number_of_steps: float = epoch_len * args.max_epochs
@@ -1368,7 +1503,16 @@ def main(args):
 
             epoch_pbar.update(1)
             if epoch < args.max_epochs - 1:
-                train_batch.shuffle(epoch_n=epoch, max_epochs = args.max_epochs)
+                # -- DifficultyEstimator epoch-end update --------------------
+                if difficulty_estimator is not None:
+                    difficulty_estimator.ingest_epoch_losses(log_data)
+                    difficulty_estimator.update_item_schedule(
+                        train_batch.data_loader.prepared_train_data
+                    )
+                    train_batch.data_loader.recompute_expected_epoch_size()
+                    difficulty_estimator.save(args.difficulty_estimator)
+                # ------------------------------------------------------------
+                train_batch.shuffle(epoch_n=epoch, max_epochs=args.max_epochs)
 
             if len(log_data.loss_epoch) > 0:
                 loss_epoch = sum(log_data.loss_epoch) / len(log_data.loss_epoch)

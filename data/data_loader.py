@@ -106,6 +106,10 @@ class DataLoaderMultiAspect():
         
         return picked_images
 
+    def recompute_expected_epoch_size(self) -> None:
+        """Recompute expected_epoch_size after item multipliers have been mutated."""
+        self.expected_epoch_size = math.floor(sum(i.multiplier for i in self.prepared_train_data))
+
     def get_shuffled_image_buckets(self, dropout_fraction: float = 1.0) -> list[ImageTrainItem]:
         """
         Returns the current list of `ImageTrainItem` in randomized order,

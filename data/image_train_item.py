@@ -168,6 +168,7 @@ class ImageTrainItem:
         self.cropped_img = None
         self.runt_size = 0
         self.multiplier = multiplier
+        self.base_multiplier = multiplier  # preserved so difficulty schedulers can scale relative to user intent
         self.cond_dropout = cond_dropout
         self.shuffle_tags = shuffle_tags
         self.batch_id = batch_id or DEFAULT_BATCH_ID
