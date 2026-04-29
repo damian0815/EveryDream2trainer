@@ -289,6 +289,10 @@ class TrainingModel:
     clip_model = None  # 'CLIP'|None = None
     clip_processor = None  # 'Compose'|None = None
 
+    # Self-Flow representation learning (set after construction in train.py)
+    self_flow_teacher_unet = None   # UNet2DConditionModel|None – frozen EMA copy
+    self_flow_proj_head = None      # SelfFlowProjectionHead|None – trainable 1×1 conv
+
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
         return TrainingModel(

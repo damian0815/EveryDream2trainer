@@ -162,12 +162,14 @@ class DataLoaderMultiAspect():
         pre_expanded_counts = {k: len(v) for k,v in buckets.items()}
         if self.expand_caption_variants:
             print(" * DataLoaderMultiAspect expanding caption dicts into multiple items with different subsets of captions, based on caption_variants: ", self.caption_variants)
+            pbar = tqdm(desc="expanding caption dicts", total=sum(len(v) for v in buckets.values()))
             for key, bucket_contents in list(buckets.items()):
                 pre_expanded_counts[key] = len(bucket_contents)
                 expanded_bucket_contents = []
                 for item in bucket_contents:
                     expanded_items = expand_caption_dict(item, caption_variants=self.caption_variants)
                     expanded_bucket_contents.extend(expanded_items)
+                    pbar.update()
                 buckets[key] = expanded_bucket_contents
                 #print(f" - expanded bucket {key} from {len(bucket_contents)} to {len(expanded_bucket_contents)} items")
 

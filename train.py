@@ -26,7 +26,7 @@ import gc
 import random
 import traceback
 
-from typing import Tuple, Optional
+from typing import Optional
 
 from colorama import Fore, Style
 import numpy as np
@@ -40,25 +40,21 @@ from tqdm.auto import tqdm
 
 from diffusers import (
     StableDiffusionPipeline,
-    FlowMatchEulerDiscreteScheduler, AutoModel,
+    FlowMatchEulerDiscreteScheduler,
 )
-from transformers import CLIPModel, CLIPProcessor, AutoProcessor
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
-# from diffusers.models import AttentionBlock
-# from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 import wandb
 import webbrowser
 from torch.utils.tensorboard import SummaryWriter
 from data.data_loader import DataLoaderMultiAspect
-from data.dataset import DEFAULT_MAX_CAPTION_LENGTH
 
 from data.every_dream import EveryDreamBatch, build_torch_dataloader, collate_fn as ed_collate_fn
 from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeBScheduler
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
-from data.image_train_item import ImageTrainItem, ImageCaption, DEFAULT_BATCH_ID
+from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
 from core.loss import (
     get_noise,
@@ -66,6 +62,7 @@ from core.loss import (
     get_latents,
     compute_timestep_intervals,
 )
+from core.self_flow import SelfFlowProjectionHead
 from core.step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
     get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward, \
     record_performance_timing
@@ -730,6 +727,28 @@ def main(args):
         model.unet_ema = unet_ema
         model.text_encoder_ema = text_encoder_ema
 
+        # Self-Flow EMA teacher setup (separate from the saves/sampling EMA copy)
+        if args.self_flow_p > 0.0:
+            if model.self_flow_teacher_unet is None:
+                logging.info(
+                    f"Self-Flow enabled (p={args.self_flow_p}), creating frozen EMA teacher UNet "
+                    f"(decay={args.self_flow_ema_decay})."
+                )
+                with torch.no_grad():
+                    sf_teacher = deepcopy(model.unet).to(device, dtype=model.unet.dtype)
+                sf_teacher.requires_grad_(False)
+                model.self_flow_teacher_unet = sf_teacher
+
+            if model.self_flow_proj_head is None:
+                boc = model.unet.config.block_out_channels  # e.g. [320, 640, 1280, 1280]
+                model.self_flow_proj_head = SelfFlowProjectionHead(
+                    in_channels=boc[1],
+                    out_channels=boc[-1],
+                ).to(device)
+                logging.info(
+                    f"  SelfFlowProjectionHead: {boc[1]} -> {boc[-1]} channels (fp32)"
+                )
+
         try:
             # currently broken on most systems?
             # unet = torch.compile(unet, mode="max-autotune")
@@ -939,6 +958,17 @@ def main(args):
                                        log_writer)
     #ed_optimizer.register_unet_nan_hooks_simple()
     #ed_optimizer.register_unet_nan_hooks_full()
+
+    # Attach projection head parameters to the unet optimizer so they get trained
+    if model.self_flow_proj_head is not None and ed_optimizer.optimizer_unet is not None:
+        proj_lr = ed_optimizer.base_config.get("lr", 1e-4)
+        ed_optimizer.optimizer_unet.add_param_group({
+            "params": list(model.self_flow_proj_head.parameters()),
+            "lr": proj_lr,
+        })
+        logging.info(
+            f"Self-Flow: added SelfFlowProjectionHead parameters to unet optimizer (lr={proj_lr})."
+        )
 
     log_args(log_writer, args, optimizer_config, log_folder, log_time)
 
@@ -1267,7 +1297,7 @@ def main(args):
                     tv.batch_resolution = get_best_match_resolution(
                         args.resolution, image_pixel_count=image_pixel_count
                     )
-                    tv.forward_slice_size = _get_default_forward_slice_size(args, tv.batch_resolution)
+                    tv.forward_slice_size = _get_default_forward_slice_size(tv)
                     tv.max_backward_slice_size = _choose_backward_slice_size(tv)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
                         # do backward now
@@ -1296,9 +1326,9 @@ def main(args):
                                 if max_safe_forward_size == 0:
                                     logging.warning(f" * Unable to free enough ram even after emergency backward of {accumulated_loss_images_count_before_emergency_backward} samples worth of accumulated loss @res {tv.batch_resolution} - possible OOM follows")
                                     max_safe_forward_size = 1
-                            #if max_safe_forward_size < _get_default_forward_slice_size(args, tv.batch_resolution):
+                            #if max_safe_forward_size < _get_default_forward_slice_size(tv):
                             #    logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
-                            tv.forward_slice_size = min([_get_default_forward_slice_size(args, tv.batch_resolution), max_safe_forward_size])
+                            tv.forward_slice_size = min([_get_default_forward_slice_size(tv), max_safe_forward_size])
                         else:
                             gpu_used_mem, gpu_total_mem = 0, 0
 
@@ -1359,6 +1389,18 @@ def main(args):
                             # debug_end_time = time.time() # Measure time
                             # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
                             # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
+
+                    # Self-Flow EMA teacher update (independent interval from main EMA)
+                    if model.self_flow_teacher_unet is not None:
+                        sf_interval = getattr(args, 'self_flow_ema_update_interval', 1)
+                        if ((tv.global_step + 1) % sf_interval) == 0:
+                            update_ema(
+                                model.unet,
+                                model.self_flow_teacher_unet,
+                                args.self_flow_ema_decay,
+                                default_device=device,
+                                ema_device=device,
+                            )
 
 
                     steps_pbar.update(1)
@@ -1807,6 +1849,18 @@ if __name__ == "__main__":
 
     argparser.add_argument("--saturation_penalty_scale", type=float, default=0.0, help="Scale for the saturation penalty loss that discourages all-black or all-white/washed-out outputs. Suggested starting value: 0.02. Set to 0 to disable.")
     argparser.add_argument("--saturation_penalty_t_max", type=float, default=200.0, help="Only apply saturation penalty for timesteps < t_max (low-noise regime). Default 200 out of 1000.")
+
+    argparser.add_argument("--self_flow_p", type=float, default=0.0,
+        help="Self-Flow: probability per step that the self-distillation representation loss is applied (0=disabled). "
+             "Adds ~2 extra UNet forward passes when active. Suggested starting value: 0.5.")
+    argparser.add_argument("--self_flow_gamma", type=float, default=0.8,
+        help="Self-Flow: weighting factor γ for the representation loss (Total = L_gen + γ·L_rep). Default: 0.8.")
+    argparser.add_argument("--self_flow_mask_ratio", type=float, default=0.25,
+        help="Self-Flow: fraction of spatial latent tokens that use the secondary noise level s (default: 0.25).")
+    argparser.add_argument("--self_flow_ema_decay", type=float, default=0.9999,
+        help="Self-Flow: EMA decay rate for the teacher UNet (default: 0.9999 as per the paper).")
+    argparser.add_argument("--self_flow_ema_update_interval", type=int, default=1,
+        help="Self-Flow: update the teacher EMA every N optimizer steps (default: 1).")
 
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="Probability to drop (non-LCF/non-CFM) contrastive learning")
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")

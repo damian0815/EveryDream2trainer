@@ -448,6 +448,42 @@ def get_midblock_out_shape(latents_shape: torch.Size, model: TrainingModel) -> t
     return (latents_shape[0], model.unet.mid_block.out_channels, latents_shape[2]//8, latents_shape[3]//8)
 
 
+def get_self_flow_shapes(latents_shape: torch.Size, model: TrainingModel):
+    """Return (student_shape, teacher_shape) for self-flow feature tensors.
+    Student: down_blocks[1] output -> (B, block_out_channels[1],  H/4, W/4)
+    Teacher: up_blocks[0]  output -> (B, block_out_channels[-1], H/4, W/4)
+    """
+    B = latents_shape[0]
+    H4, W4 = latents_shape[2] // 4, latents_shape[3] // 4
+    student_ch = model.unet.config.block_out_channels[1]
+    teacher_ch = model.unet.config.block_out_channels[-1]
+    return (B, student_ch, H4, W4), (B, teacher_ch, H4, W4)
+
+
+def build_self_flow_latents(
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+    noise_scheduler,
+    t: torch.Tensor,
+    s: torch.Tensor,
+    mask_ratio: float,
+):
+    """Build heterogeneously noised student latents and uniformly cleaner teacher latents.
+    Student  x_τ    : mask_ratio of spatial locations use noise level s, rest use t.
+    Teacher  x_{τ_min}: uniformly noised at τ_min = min(t, s) per sample.
+    Returns (x_tau, x_tau_min, tau_min_timesteps).
+    """
+    B, C, H, W = latents.shape
+    device = latents.device
+    x_t = _get_noisy_latents(latents, noise, noise_scheduler, t, latents_perturbation=0)
+    x_s = _get_noisy_latents(latents, noise, noise_scheduler, s, latents_perturbation=0)
+    M = (torch.rand(B, 1, H, W, device=device) < mask_ratio).float()
+    x_tau = (1.0 - M) * x_t + M * x_s
+    tau_min = torch.minimum(t, s)
+    x_tau_min = _get_noisy_latents(latents, noise, noise_scheduler, tau_min, latents_perturbation=0)
+    return x_tau, x_tau_min, tau_min
+
+
 @dataclass
 class ModelPredictionAndTargetReturnType:
     model_pred: torch.Tensor
@@ -455,6 +491,8 @@ class ModelPredictionAndTargetReturnType:
     noisy_latents: torch.Tensor
     midblock_out: torch.Tensor|None = None
     teacher_target: torch.Tensor|None = None
+    self_flow_student_features: torch.Tensor|None = None  # [B, Cs, H/4, W/4]
+    self_flow_teacher_features: torch.Tensor|None = None  # [B, Ct, H/4, W/4]
 
 
 @line_profiler.profile
@@ -475,6 +513,7 @@ def get_model_prediction_and_target(
     global_step: int = 0,
     mask=None,
     lcf_mask=None,
+    self_flow_s_timesteps: torch.Tensor | None = None,
 ) -> ModelPredictionAndTargetReturnType:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
@@ -497,6 +536,18 @@ def get_model_prediction_and_target(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         midblock_out = None if lcf_mask is None else torch.zeros(midblock_out_shape, dtype=model.unet.dtype, device=model.unet.device)
+
+        # self-flow feature placeholders
+        do_self_flow = (self_flow_s_timesteps is not None
+                  and model.self_flow_teacher_unet is not None)
+        if do_self_flow:
+            sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model)
+            self_flow_student_features = torch.zeros(sf_student_shape, dtype=model.unet.dtype, device=model.unet.device)
+            self_flow_teacher_features = torch.zeros(sf_teacher_shape, dtype=model.unet.dtype, device=model.unet.device)
+        else:
+            self_flow_student_features = None
+            self_flow_teacher_features = None
+
         if mask.sum() == 0:
             # early out for empty mask
             return ModelPredictionAndTargetReturnType(
@@ -505,6 +556,8 @@ def get_model_prediction_and_target(
                 teacher_target=teacher_target,
                 noisy_latents=noisy_latents,
                 midblock_out=midblock_out,
+                self_flow_student_features=self_flow_student_features,
+                self_flow_teacher_features=self_flow_teacher_features,
             )
 
         latents_masked = latents[mask]
@@ -518,6 +571,7 @@ def get_model_prediction_and_target(
         )
         lcf_mask_masked = lcf_mask[mask] if lcf_mask is not None else None
         timesteps_masked = timesteps[mask]
+        self_flow_s_timesteps_masked = self_flow_s_timesteps[mask] if self_flow_s_timesteps is not None else None
         masked_result = get_model_prediction_and_target(
             latents=latents_masked,
             conditioning=conditioning_masked,
@@ -533,7 +587,8 @@ def get_model_prediction_and_target(
             log_writer=log_writer,
             global_step=global_step,
             mask=None,
-            lcf_mask=lcf_mask_masked
+            lcf_mask=lcf_mask_masked,
+            self_flow_s_timesteps=self_flow_s_timesteps_masked,
         )
         model_pred[mask] += masked_result.model_pred
         target[mask] += masked_result.target
@@ -541,6 +596,9 @@ def get_model_prediction_and_target(
             teacher_target[mask] += masked_result.teacher_target
         if lcf_mask is not None:
             midblock_out[mask] += masked_result.midblock_out
+        if do_self_flow and masked_result.self_flow_student_features is not None:
+            self_flow_student_features[mask] += masked_result.self_flow_student_features
+            self_flow_teacher_features[mask] += masked_result.self_flow_teacher_features
         noisy_latents[mask] += masked_result.noisy_latents
         return ModelPredictionAndTargetReturnType(
             model_pred=model_pred,
@@ -548,6 +606,8 @@ def get_model_prediction_and_target(
             noisy_latents=noisy_latents,
             midblock_out=midblock_out,
             teacher_target=teacher_target,
+            self_flow_student_features=self_flow_student_features,
+            self_flow_teacher_features=self_flow_teacher_features,
         )
 
     if is_cond_dropout_noise is not None:
@@ -624,14 +684,75 @@ def get_model_prediction_and_target(
                     global_step=global_step,
                 )
 
-            #target = teacher_target * teacher_mask.view(-1, 1, 1, 1).expand_as(
-            #    target
-            #).to(target.device) + target * ~teacher_mask.view(-1, 1, 1, 1).expand_as(
-            #    target
-            #).to(target.device)
+
+    # ---- Self-Flow representation learning ----
+    self_flow_student_features = None
+    self_flow_teacher_features = None
+    sf_teacher_unet = model.self_flow_teacher_unet
+    if self_flow_s_timesteps is not None and sf_teacher_unet is not None:
+        sf_mask_ratio = args.self_flow_mask_ratio
+
+        # Build heterogeneously noised latents for student and teacher
+        x_tau, x_tau_min, tau_min_ts = build_self_flow_latents(
+            latents=latents,
+            noise=noise,
+            noise_scheduler=model.noise_scheduler,
+            t=timesteps,
+            s=self_flow_s_timesteps,
+            mask_ratio=sf_mask_ratio,
+        )
+
+        # --- Student forward: x_τ input, scalar timestep t, capture down_blocks[1] ---
+        sf_student_storage = {}
+
+        def _sf_student_hook(module, inp, output):
+            out = output[0] if isinstance(output, tuple) else output
+            sf_student_storage['h'] = out
+
+        sf_student_handle = model.unet.down_blocks[1].register_forward_hook(_sf_student_hook)
+        try:
+            model.unet(
+                x_tau.to(dtype=model.unet.dtype),
+                timesteps.to(model.unet.device, dtype=model.unet.dtype),  # use original t
+                encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
+                added_cond_kwargs=(
+                    conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
+                    if model.is_sdxl else None
+                ),
+            )
+        finally:
+            sf_student_handle.remove()
+        self_flow_student_features = sf_student_storage.get('h')
+
+        # --- Teacher forward: x_{τ_min} input, scalar τ_min, capture up_blocks[0] ---
+        sf_teacher_storage = {}
+
+        def _sf_teacher_hook(module, inp, output):
+            out = output[0] if isinstance(output, tuple) else output
+            sf_teacher_storage['h'] = out
+
+        sf_teacher_handle = sf_teacher_unet.up_blocks[0].register_forward_hook(_sf_teacher_hook)
+        try:
+            with torch.no_grad():
+                sf_teacher_unet(
+                    x_tau_min.to(dtype=sf_teacher_unet.dtype),
+                    tau_min_ts.to(sf_teacher_unet.device, dtype=sf_teacher_unet.dtype),
+                    encoder_hidden_states=conditioning.prompt_embeds.to(dtype=sf_teacher_unet.dtype),
+                    added_cond_kwargs=(
+                        conditioning.get_added_cond_kwargs(dtype=sf_teacher_unet.dtype)
+                        if model.is_sdxl else None
+                    ),
+                )
+        finally:
+            sf_teacher_handle.remove()
+        self_flow_teacher_features = sf_teacher_storage.get('h')
 
     return ModelPredictionAndTargetReturnType(
-        model_pred=model_pred, target=target, noisy_latents=noisy_latents, teacher_target=teacher_target, midblock_out=midblock_out)
+        model_pred=model_pred, target=target, noisy_latents=noisy_latents,
+        teacher_target=teacher_target, midblock_out=midblock_out,
+        self_flow_student_features=self_flow_student_features,
+        self_flow_teacher_features=self_flow_teacher_features,
+    )
 
 
 def _get_noisy_latents(
@@ -816,7 +937,6 @@ def compute_timestep_intervals(noise_scheduler, k: int,
     Works for both flow-matching and DDPM/v-pred schedulers.
     Returns absolute timestep (left, right) inclusive pairs.
     """
-    import numpy as np
     from diffusers import FlowMatchEulerDiscreteScheduler
     from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 

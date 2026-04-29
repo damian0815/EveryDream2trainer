@@ -21,6 +21,7 @@ from core.log import LogData
 from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_model_prediction_and_target, get_loss, \
     get_local_contrastive_flow_loss, apply_negative_loss_hinge, get_contrastive_flow_matching_loss, get_clip_loss, \
     compute_saturation_penalty_loss
+from core.self_flow import compute_self_flow_loss
 from data.dataset import select_caption_variants
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
@@ -912,6 +913,8 @@ class ModelForwardReturnType:
     teacher_target: torch.Tensor | None
     clip_image_features: torch.Tensor | None
     clip_pooled_text_features: torch.Tensor | None
+    self_flow_student_features: torch.Tensor | None
+    self_flow_teacher_features: torch.Tensor | None
 
 def _do_model_forward(
     model: TrainingModel,
@@ -923,6 +926,10 @@ def _do_model_forward(
 ) -> ModelForwardReturnType:
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
+    do_self_flow = (
+        model.self_flow_teacher_unet is not None
+        and random.random() < args.self_flow_p
+    )
 
     model_pred_all = []
     lcf_midblock_out_all = []
@@ -932,6 +939,8 @@ def _do_model_forward(
     teacher_target_all = []
     clip_image_features_all = []
     clip_pooled_text_features_all = []
+    self_flow_student_features_all = []
+    self_flow_teacher_features_all = []
 
     slices = list(get_slices(batch_size, forward_slice_size))
     for slice_index, (slice_start, slice_end) in enumerate(slices):
@@ -960,6 +969,18 @@ def _do_model_forward(
             else:
                 lcf_mask_slice = None
 
+            # Sample a second set of timesteps s for Self-Flow representation learning
+            if do_self_flow:
+                n_ts = model.noise_scheduler.config.num_train_timesteps
+                self_flow_s_timesteps_slice = torch.randint(
+                    0, n_ts, (slice_end - slice_start,), device=timesteps_slice.device
+                )
+                # shift
+                if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+                    self_flow_s_timesteps_slice = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(self_flow_s_timesteps_slice, model.noise_scheduler.timesteps)
+            else:
+                self_flow_s_timesteps_slice = None
+
             model_pred_result = get_model_prediction_and_target(
                 latents=latents_slice,
                 conditioning=conditioning_slice,
@@ -971,7 +992,8 @@ def _do_model_forward(
                 teacher_model=teacher_model,
                 teacher_mask=teacher_mask_slice,
                 teacher_conditioning=teacher_conditioning_slice,
-                lcf_mask=lcf_mask_slice
+                lcf_mask=lcf_mask_slice,
+                self_flow_s_timesteps=self_flow_s_timesteps_slice,
             )
 
             model_pred_all.append(model_pred_result.model_pred)
@@ -979,12 +1001,16 @@ def _do_model_forward(
             noisy_latents_all.append(model_pred_result.noisy_latents)
             teacher_target_all.append(model_pred_result.teacher_target)
             lcf_midblock_out_all.append(model_pred_result.midblock_out)
+            self_flow_student_features_all.append(model_pred_result.self_flow_student_features)
+            self_flow_teacher_features_all.append(model_pred_result.self_flow_teacher_features)
 
             # del
             model_pred_result.target = None
             model_pred_result.noisy_latents = None
             model_pred_result.teacher_target = None
             model_pred_result.midblock_out = None
+            model_pred_result.self_flow_student_features = None
+            model_pred_result.self_flow_teacher_features = None
 
             if model.clip_model:
                 with torch.no_grad():
@@ -1052,6 +1078,13 @@ def _do_model_forward(
     clip_image_features = torch.cat(clip_image_features_all) if model.clip_model else None
     clip_pooled_text_features = torch.cat(clip_pooled_text_features_all) if model.clip_model else None
 
+    if do_self_flow and any(f is not None for f in self_flow_student_features_all):
+        self_flow_student_features = torch.cat([f for f in self_flow_student_features_all if f is not None])
+        self_flow_teacher_features = torch.cat([f for f in self_flow_teacher_features_all if f is not None])
+    else:
+        self_flow_student_features = None
+        self_flow_teacher_features = None
+
     return ModelForwardReturnType(
         model_pred=model_pred,
         target=target,
@@ -1060,7 +1093,9 @@ def _do_model_forward(
         lcf_midblock_clean_out=lcf_midblock_out_clean,
         teacher_target=teacher_target,
         clip_image_features=clip_image_features,
-        clip_pooled_text_features=clip_pooled_text_features
+        clip_pooled_text_features=clip_pooled_text_features,
+        self_flow_student_features=self_flow_student_features,
+        self_flow_teacher_features=self_flow_teacher_features,
     )
 
 def _do_loss(
@@ -1172,6 +1207,19 @@ def _do_loss(
         ).to(dtype=loss.dtype)
         log_writer.add_scalar("loss/saturation_penalty", saturation_penalty.mean().item(), global_step=tv.global_step)
         loss += saturation_penalty * args.saturation_penalty_scale
+
+    # Self-Flow representation loss
+    if (model_forward_result.self_flow_student_features is not None
+            and model_forward_result.self_flow_teacher_features is not None
+            and getattr(model, 'self_flow_proj_head', None) is not None):
+        l_rep = compute_self_flow_loss(
+            student_features=model_forward_result.self_flow_student_features,
+            teacher_features=model_forward_result.self_flow_teacher_features,
+            proj_head=model.self_flow_proj_head,
+        )
+        gamma = args.self_flow_gamma
+        log_writer.add_scalar("loss/self_flow_rep", l_rep.item(), global_step=tv.global_step)
+        loss = loss + gamma * l_rep
 
     return loss
 
