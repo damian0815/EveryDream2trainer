@@ -24,3 +24,4 @@ torchsde
 peft==0.17.0
 lpips
 opencv-python
+scipy

@@ -9,7 +9,12 @@
         "stabilize_split_proportion": "For stabilize_training_loss, the proportion of the train dataset to overlap for stabilizing the train loss graph. Typical values are 0.15-0.2 (15-20% of the total dataset). Higher is more accurate but slower.",
         "every_n_epochs": "How often to run validation (1=every epoch, 2=every second epoch; 0.5=twice per epoch, 0.33=three times per epoch, etc.).",
         "seed": "The seed to use when running validation and stabilization passes.",
-        "use_relative_loss": "logs val/loss as negative relative to first pre-train val/loss value"
+        "use_relative_loss": "logs val/loss as negative relative to first pre-train val/loss value",
+        "clip_score_enabled": "If true, compute CLIP score (cosine similarity between one-step x̂₀ image reconstruction and the caption) during the normal validation pass. No image generation is required. Logged as val/{dataset}_clip_score. Higher is better; ~0.25-0.35 is typical for well-aligned image-text pairs.",
+        "clip_score_model": "HuggingFace model ID for the CLIP model used for scoring. Default 'openai/clip-vit-base-patch32'. Cached after first download.",
+        "fdd_enabled": "If true, compute Fréchet DINOv2 Distance (FDD) between fully-generated images and real validation images. Requires running full denoising inference (like anomaly eval). Logged as val/{dataset}_fdd. Lower is better; requires scipy.",
+        "fdd_n_images": "Number of images to generate and compare for FDD. Higher gives a more stable estimate but takes longer. Default 256. Meaningful minimum is ~64; stable above ~128.",
+        "fdd_model": "HuggingFace model ID for the DINOv2 feature extractor used in FDD. Default 'facebook/dinov2-small' (~22M params, fast). Can also use 'facebook/dinov2-base' or 'facebook/dinov2-large' for richer features."
     },
     "validate_training": true,
     "val_split_mode": "automatic",
@@ -20,5 +25,10 @@
     "stabilize_split_proportion": 0.15,
     "every_n_epochs": 1,
     "seed": 555,
-    "use_relative_loss": false
+    "use_relative_loss": false,
+    "clip_score_enabled": false,
+    "clip_score_model": "openai/clip-vit-base-patch32",
+    "fdd_enabled": false,
+    "fdd_n_images": 256,
+    "fdd_model": "facebook/dinov2-small"
 }

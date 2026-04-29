@@ -911,7 +911,7 @@ def get_multirank_stratified_random_timesteps(
             u = (indices + u) / batch_size
         sigmas = u
     elif distribution == "lognormal":
-        std = 1
+        std = alpha
         mean = 0
         u = torch.randn(batch_size) * std + mean
         sigmas = torch.sigmoid(u)

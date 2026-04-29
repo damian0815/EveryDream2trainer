@@ -1380,12 +1380,18 @@ def main(args):
                             step in validation_steps
                             or check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE)
                     ):
-                        validator.do_validation(
-                            model=model,
-                            global_step=tv.global_step,
-                            get_model_prediction_and_target_callable =get_model_prediction_and_target_validation_wrapper,
-                            pipe_factory=make_inference_pipe
-                        )
+                        try:
+                            validator.do_validation(
+                                model=model,
+                                global_step=tv.global_step,
+                                get_model_prediction_and_target_callable =get_model_prediction_and_target_validation_wrapper,
+                                pipe_factory=make_inference_pipe
+                            )
+                        except Exception as e:
+                            logging.error("Validation raised an exception: " + str(e))
+                            traceback.print_exc()
+                            # continue training even if validation fails
+
 
                     min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
 
@@ -1546,12 +1552,16 @@ def main(args):
 
         if validator:
             print("doing final validation pass")
-            validator.do_validation(
-                model=model,
-                global_step=tv.global_step,
-                get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
-                pipe_factory=make_inference_pipe
-            )
+            try:
+                validator.do_validation(
+                    model=model,
+                    global_step=tv.global_step,
+                    get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
+                    pipe_factory=make_inference_pipe
+                )
+            except Exception as e:
+                logging.error("Validation threw an exception: " + str(e))
+                traceback.print_exc()
 
         if not sample_generator.should_generate_samples(global_step=tv.global_step-1, local_step=step):
             print("generating final samples")
