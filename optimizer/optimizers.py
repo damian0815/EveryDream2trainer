@@ -251,12 +251,23 @@ class EveryDreamOptimizer:
         self.optimizer_te, self.optimizer_unet = self.create_optimizers(
             args, self.text_encoder_params, self.unet_params
         )
-        self.optimizers.append(
-            self.optimizer_te
-        ) if self.optimizer_te is not None else None
-        self.optimizers.append(
-            self.optimizer_unet
-        ) if self.optimizer_unet is not None else None
+        # Attach projection head parameters to the unet optimizer so they get trained
+        if model.self_flow_proj_head is not None and self.optimizer_unet is not None:
+            proj_lr = self.base_config.get("lr", 1e-4)
+            self.optimizer_unet.add_param_group({
+                "params": list(model.self_flow_proj_head.parameters()),
+                "lr": proj_lr,
+            })
+            logging.info(
+                f"Self-Flow: added SelfFlowProjectionHead parameters to unet optimizer (lr={proj_lr})."
+            )
+
+        if self.optimizer_te is not None:
+            self.optimizers.append(self.optimizer_te)
+        if self.optimizer_te_2 is not None:
+            self.optimizers.append(self.optimizer_te_2)
+        if self.optimizer_unet is not None:
+            self.optimizers.append(self.optimizer_unet)
 
         self.lr_schedulers = []
         schedulers = self.create_lr_schedulers(args, optimizer_config)
@@ -860,6 +871,62 @@ class EveryDreamOptimizer:
                 os.unlink(path)
 
     @staticmethod
+    def _reconcile_optimizer_state_dict(state_dict: dict, optimizer: torch.optim.Optimizer) -> dict:
+        """
+        Reconcile a loaded optimizer state dict with the current optimizer's parameter groups.
+        If any saved parameter group has a different number of parameters than the corresponding
+        optimizer group, that group's optimizer state is discarded (reset to empty) so that
+        load_state_dict() does not raise a size-mismatch error.
+        """
+        opt_groups = optimizer.param_groups
+        saved_groups = state_dict.get("param_groups", [])
+
+        if len(opt_groups) != len(saved_groups):
+            raise ValueError(
+                f"loaded state dict has {len(saved_groups)} parameter groups "
+                f"but optimizer has {len(opt_groups)}"
+            )
+
+        mismatched = {
+            i for i, (og, sg) in enumerate(zip(opt_groups, saved_groups))
+            if len(og["params"]) != len(sg["params"])
+        }
+
+        if not mismatched:
+            return state_dict  # nothing to fix
+
+        logging.warning(
+            f"{Fore.LIGHTYELLOW_EX}Optimizer parameter group size mismatch in groups "
+            f"{sorted(mismatched)}; discarding their saved states and continuing.{Style.RESET_ALL}"
+        )
+
+        # Rebuild state and param_groups with contiguous sequential IDs.
+        # PyTorch state_dict param IDs are simply 0-based integers assigned across all groups
+        # in order.  We reassign them to keep things consistent after dropping/replacing groups.
+        old_state = state_dict["state"]
+        new_state = {}
+        new_groups = []
+        next_id = 0
+
+        for i, (opt_g, saved_g) in enumerate(zip(opt_groups, saved_groups)):
+            n = len(opt_g["params"])
+            new_ids = list(range(next_id, next_id + n))
+            next_id += n
+
+            new_group = {k: v for k, v in saved_g.items() if k != "params"}
+            new_group["params"] = new_ids
+            new_groups.append(new_group)
+
+            if i not in mismatched:
+                # Remap old param IDs -> new param IDs, carrying over saved state
+                for old_id, new_nid in zip(saved_g["params"], new_ids):
+                    if old_id in old_state:
+                        new_state[new_nid] = old_state[old_id]
+            # Mismatched groups get no state entries -> fresh optimizer state for those params
+
+        return {"state": new_state, "param_groups": new_groups}
+
+    @staticmethod
     def _load_optimizer(
         optimizer: torch.optim.Optimizer, path: str, expected_type: str = None, log_label="optimizer state"
     ):
@@ -878,6 +945,7 @@ class EveryDreamOptimizer:
                     )
                     return
                 state_dict = state_dict["state_dict"]
+            state_dict = EveryDreamOptimizer._reconcile_optimizer_state_dict(state_dict, optimizer)
             optimizer.load_state_dict(state_dict)
             logging.info(f" Loaded {log_label} from {path}")
         except Exception as e:

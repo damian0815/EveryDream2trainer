@@ -218,7 +218,7 @@ class TrainingVariables:
         self._register_oom_or_not(oomed, self.backward_oom_history, max_history_size=backward_oom_history_size)
         batch_resolution = self.batch_resolution
         oom_pct = sum(self.backward_oom_history[batch_resolution]) / len(self.backward_oom_history[batch_resolution])
-        if oom_pct > 0.333:
+        if oom_pct > 0.75:
             logging.warning(
                 f"Backward OOM'd for resolution {batch_resolution} in {oom_pct * 100}% of the last {backward_oom_history_size} batches")
             current_backward_size = self.default_max_backward_slice_size[batch_resolution]
@@ -234,6 +234,16 @@ class TrainingVariables:
         self._register_oom_or_not(oomed, self.forward_oom_history, max_history_size=forward_oom_history_size)
         batch_resolution = self.batch_resolution
         oom_pct = sum(self.forward_oom_history[batch_resolution]) / len(self.forward_oom_history[batch_resolution])
+        if oom_pct > 0.75:
+            logging.warning(
+                f"Forward OOM'd for resolution {batch_resolution} in {oom_pct * 100}% of the last {forward_oom_history_size} batches")
+            current_forward_size = self.default_forward_slice_size[batch_resolution]
+            new_forward_size = current_forward_size - 1
+            if new_forward_size > 0:
+                logging.warning(f" -> dropping max backward size for {batch_resolution} to {new_forward_size}")
+                self.default_forward_slice_size[batch_resolution] = math.floor(new_forward_size)
+            else:
+                logging.error(f" !! max backward size for {batch_resolution} is already 1, cannot drop any further")
 
 
     def _register_oom_or_not(self, oomed, oom_history, max_history_size):
@@ -630,6 +640,11 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if save_optimizer_flag:
         logging.info(f" Saving optimizer state to {save_path}")
         ed_state.optimizer.save(save_path)
+
+    if ed_state.model.self_flow_proj_head is not None:
+        proj_head_path = os.path.join(save_path, "self_flow_proj_head.pt")
+        logging.info(f" * Saving Self-Flow projection head to {proj_head_path}")
+        torch.save(ed_state.model.self_flow_proj_head.state_dict(), proj_head_path)
 
 
 @torch.no_grad()

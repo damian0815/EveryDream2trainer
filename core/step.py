@@ -1211,15 +1211,14 @@ def _do_loss(
     # Self-Flow representation loss
     if (model_forward_result.self_flow_student_features is not None
             and model_forward_result.self_flow_teacher_features is not None
-            and getattr(model, 'self_flow_proj_head', None) is not None):
+            and model.self_flow_proj_head is not None):
         l_rep = compute_self_flow_loss(
             student_features=model_forward_result.self_flow_student_features,
             teacher_features=model_forward_result.self_flow_teacher_features,
             proj_head=model.self_flow_proj_head,
         )
-        gamma = args.self_flow_gamma
         log_writer.add_scalar("loss/self_flow_rep", l_rep.item(), global_step=tv.global_step)
-        loss = loss + gamma * l_rep
+        loss = loss + args.self_flow_gamma * l_rep
 
     return loss
 
