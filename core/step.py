@@ -615,15 +615,6 @@ def _get_step_timesteps_internal(
 ) -> torch.Tensor:
 
     if args.timesteps_multirank_stratified:
-        global _has_checked_bad_distribution
-        if isinstance(model.noise_scheduler, FlowMatchEulerDiscreteScheduler) and not _has_checked_bad_distribution:
-            distribution = args.timesteps_multirank_stratified_distribution
-            alpha = args.timesteps_multirank_stratified_alpha
-            beta = args.timesteps_multirank_stratified_beta
-            if distribution != 'uniform' and not (distribution == 'beta' and alpha == 0 or beta == 0):
-                logging.warning(" * Using FlowMatchEulerDiscreteScheduler with --timesteps_multirank_stratified_distribution != 'uniform' is not recommended - use the --flow_match_shift to control the distribution (recommended == 3)")
-            _has_checked_bad_distribution = True
-
         # the point of multirank stratified is to spread timesteps evenly across the batch.
         # so we need to do a dance here to make sure that we're actually spreading across the
         # desired_effective_batch_size - which will be "nibbled" later in chunks

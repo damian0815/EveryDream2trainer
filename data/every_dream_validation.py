@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from PIL import Image
 import torchvision.transforms as T
 
+from core.semaphore_files import check_semaphore_file_and_unlink, INTERRUPT_VALIDATION_SEMAPHORE_FILE
 from data.every_dream import build_torch_dataloader, EveryDreamBatch
 from data.data_loader import DataLoaderMultiAspect
 from data import resolver
@@ -655,6 +656,7 @@ class EveryDreamValidator:
         _to_tensor = T.ToTensor()
         pipe = pipe_factory()
         pipe.to(device)
+        pipe.set_progress_bar_config(disable=True)
         images_done = 0
 
         try:
@@ -662,57 +664,64 @@ class EveryDreamValidator:
                 random.seed(self.seed)
                 torch.manual_seed(self.seed)
 
-                for batch in dataloader:
-                    if images_done >= n_images_needed:
-                        break
-
-                    keys = list(batch["captions"].keys())
-                    for key in keys:
+                with tqdm(total=n_images_needed) as pbar:
+                    for batch in dataloader:
                         if images_done >= n_images_needed:
                             break
 
-                        caption_list = batch["captions"][key]
-                        n_take = min(len(caption_list), n_images_needed - images_done)
-                        prompts = caption_list[:n_take]
+                        if check_semaphore_file_and_unlink(INTERRUPT_VALIDATION_SEMAPHORE_FILE):
+                            print("Validation interrupted")
+                            break
 
-                        # single generation call — shared by both metrics
-                        with torch.autocast(device_type='cuda'):
-                            pipe_output = pipe(
-                                prompt=prompts,
-                                num_inference_steps=20,
-                                guidance_scale=7.5,
-                                generator=torch.Generator(device='cpu').manual_seed(self.seed),
-                            )
-                        pil_images = pipe_output.images  # list[PIL.Image], len == n_take
 
-                        # --- anomaly: consume up to anomaly_max_images total ---
-                        if run_anomaly:
-                            anomaly_take = min(n_take, self.anomaly_max_images - len(anomaly_pcts))
-                            for pil_img in pil_images[:anomaly_take]:
-                                mask_np = anomaly_segment_image(
-                                    model=anomaly_model,
-                                    image_pil=pil_img.convert('RGB'),
-                                    resolution=self._anomaly_resolution,
-                                    device=device,
-                                    threshold=self.anomaly_threshold,
+                        keys = list(batch["captions"].keys())
+                        for key in keys:
+                            if images_done >= n_images_needed:
+                                break
+
+                            caption_list = batch["captions"][key]
+                            n_take = min(len(caption_list), n_images_needed - images_done)
+                            prompts = caption_list[:n_take]
+
+                            # single generation call — shared by both metrics
+                            with torch.autocast(device_type='cuda'):
+                                pipe_output = pipe(
+                                    prompt=prompts,
+                                    num_inference_steps=20,
+                                    guidance_scale=7.5,
+                                    generator=torch.Generator(device='cpu').manual_seed(self.seed),
                                 )
-                                pct = float(mask_np.sum() / 255) / (mask_np.shape[0] * mask_np.shape[1])
-                                anomaly_pcts.append(pct)
+                            pil_images = pipe_output.images  # list[PIL.Image], len == n_take
 
-                        # --- FDD: consume up to fdd_n_images total ---
-                        if run_fdd:
-                            fdd_done = sum(f.shape[0] for f in real_feats_list)
-                            fdd_take = min(n_take, self.fdd_n_images - fdd_done)
-                            if fdd_take > 0:
-                                real_pixels_01 = (batch["image"][:fdd_take].float() + 1.0) / 2.0
-                                real_feats_list.append(_dinov2_features(dinov2, real_pixels_01, device))
+                            # --- anomaly: consume up to anomaly_max_images total ---
+                            if run_anomaly:
+                                anomaly_take = min(n_take, self.anomaly_max_images - len(anomaly_pcts))
+                                for pil_img in pil_images[:anomaly_take]:
+                                    mask_np = anomaly_segment_image(
+                                        model=anomaly_model,
+                                        image_pil=pil_img.convert('RGB'),
+                                        resolution=self._anomaly_resolution,
+                                        device=device,
+                                        threshold=self.anomaly_threshold,
+                                    )
+                                    pct = float(mask_np.sum() / 255) / (mask_np.shape[0] * mask_np.shape[1])
+                                    anomaly_pcts.append(pct)
 
-                                gen_tensor = torch.stack(
-                                    [_to_tensor(img.convert('RGB')) for img in pil_images[:fdd_take]]
-                                )
-                                gen_feats_list.append(_dinov2_features(dinov2, gen_tensor, device))
+                            # --- FDD: consume up to fdd_n_images total ---
+                            if run_fdd:
+                                fdd_done = sum(f.shape[0] for f in real_feats_list)
+                                fdd_take = min(n_take, self.fdd_n_images - fdd_done)
+                                if fdd_take > 0:
+                                    real_pixels_01 = (batch["image"][:fdd_take].float() + 1.0) / 2.0
+                                    real_feats_list.append(_dinov2_features(dinov2, real_pixels_01, device))
 
-                        images_done += n_take
+                                    gen_tensor = torch.stack(
+                                        [_to_tensor(img.convert('RGB')) for img in pil_images[:fdd_take]]
+                                    )
+                                    gen_feats_list.append(_dinov2_features(dinov2, gen_tensor, device))
+
+                            images_done += n_take
+                            pbar.update(n_take)
 
         finally:
             del pipe

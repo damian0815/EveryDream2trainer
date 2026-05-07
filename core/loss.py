@@ -1108,7 +1108,7 @@ def get_teacher_target(
         teacher_prediction_type in ["v_prediction", "v-prediction"]
         and student_prediction_type == "flow_prediction"
     ):
-        raise NotImplementedError("SNR-based timestep remapping implementation not correct for new flowmap timestep scheduling.")
+        #raise NotImplementedError("SNR-based timestep remapping implementation not correct for new flowmap timestep scheduling.")
         #@todo use student_noisy_timesteps to compute teacher timesteps based on SNR matching
         teacher_unet_timesteps, teacher_noisy_latents = _remap_noise_v_pred_to_flow_matching(
             teacher_model, student_model, timesteps, clean_image_latents, noise
@@ -1152,8 +1152,6 @@ def get_teacher_target(
     if teacher_prediction_type == student_prediction_type:
         return teacher_model_output
 
-    if student_prediction_type == 'flow_prediction' or teacher_prediction_type == 'flow_prediction':
-        raise NotImplementedError("conversion to/from flow_prediction is untested due to unet_timesteps handling")
     return _convert_model_output(
         noise=noise,
         teacher_input=teacher_noisy_latents,
@@ -1161,7 +1159,7 @@ def get_teacher_target(
         teacher_scheduler=teacher_model.noise_scheduler,
         teacher_unet_timesteps=teacher_unet_timesteps,
         student_prediction_type=student_prediction_type,
-        student_unet_timesteps=student_unet_timesteps,
+        student_timesteps=student_unet_timesteps,
     )
 
 
@@ -1261,12 +1259,14 @@ def _get_ddpm_timesteps_for_flowmatch_timesteps(
         torch.int16,
         torch.long,
     ], "expecting floating point (shifted) timesteps for flowmatch"
-    flowmatch_timestep_indices = flowmatch_scheduler.get_timestep_indices(
-        flowmatch_timesteps
-    ).cpu()
-    t_flow = flowmatch_scheduler.sigmas[flowmatch_timestep_indices]
+    t_flow = flowmatch_scheduler.get_sigmas_for_timesteps(
+        flowmatch_timesteps.to(flowmatch_scheduler.timesteps.device)
+    )
 
-    snr_flow = t_flow**2 / (1 - t_flow) ** 2
+    # FM interpolant: z_s = (1-s)*x_0 + s*eps  → SNR_FM = (1-s)^2 / s^2
+    # DDPM interpolant: x_t = α_t*x_0 + σ_t*eps → SNR_DDPM = alpha_bar/(1-alpha_bar)
+    # Matching SNRs: alpha_bar = (1-s)^2 / (s^2 + (1-s)^2)
+    snr_flow = (1 - t_flow) ** 2 / (t_flow ** 2 + 1e-8)
 
     # Find DDPM timestep where SNR matches
     # SNR_ddpm = alpha_bar / (1 - alpha_bar)
@@ -1275,11 +1275,11 @@ def _get_ddpm_timesteps_for_flowmatch_timesteps(
 
     # Find the closest DDPM timestep
     # scheduler.alphas_cumprod contains alpha_bar values for each timestep
-    alphas_cumprod = ddpm_scheduler.alphas_cumprod.cpu()
+    alphas_cumprod = ddpm_scheduler.alphas_cumprod
 
     # Find timestep with closest alpha_bar
     ddpm_timesteps = torch.argmin(
-        torch.abs(alphas_cumprod - alpha_bar_target.unsqueeze(-1)), dim=-1
+        torch.abs(alphas_cumprod.cpu() - alpha_bar_target.unsqueeze(-1).cpu()), dim=-1
     )
     # print(f"Flow t={t_flow} -> DDPM timestep={ddpm_timesteps}")
 
@@ -1287,7 +1287,7 @@ def _get_ddpm_timesteps_for_flowmatch_timesteps(
     # print(f"DDPM alpha_bar at t={ddpm_timesteps}: {ddpm_scheduler.alphas_cumprod[ddpm_timestep]}")
     # print(f"DDPM sqrt(alpha_bar): {torch.sqrt(ddpm_scheduler.alphas_cumprod[ddpm_timestep])}")
 
-    return ddpm_timesteps
+    return ddpm_timesteps.to(flowmatch_timesteps.device)
 
 
 def get_local_contrastive_flow_loss(

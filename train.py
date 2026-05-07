@@ -1369,7 +1369,7 @@ def main(args):
                             shift = 1.0
                         #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
                         model.set_noise_scheduler_shift(shift)
-                        if teacher_model:
+                        if teacher_model and type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
                             teacher_model.set_noise_scheduler_shift(shift)
 
                     train_step(
@@ -1780,7 +1780,7 @@ if __name__ == "__main__":
     argparser.add_argument("--optimizer_config", default="optimizer.json", help="Path to a JSON configuration file for the optimizer.  Default is 'optimizer.json'")
     argparser.add_argument("--unet_freeze_regex", default=None, help='Unet freeze regex(es). Specify multiply matches by separating with `;`. Matches are applied in order. `freeze` or `unfreeze` specifies what the match does. Last match wins. eg: --unet_freeze_regex "freeze .*; unfreeze down_blocks\\.0\\..*attentions.*; freeze .*\\.norm1" -> freeze all, then unfreeze attention modules in down_block 0 except norm1 layers. Use --debug_unet_freeze_regex to apply rules and dump result to console without actually training.')
     argparser.add_argument("--debug_unet_freeze_regex", action="store_true", help="If passed, apply unet freeze regex and dump results to console without training")
-    argparser.add_argument("--optimizer_param_grouping", type=str, nargs="+", default="single", help="Parameter grouping strategy for optimizer. one of 'single', 'transformer10x', 'zones', 'per-module <json_path>'. Default: 'single'")
+    argparser.add_argument("--optimizer_param_grouping", type=str, nargs="+", default=["single"], help="Parameter grouping strategy for optimizer. one of 'single', 'transformer10x', 'zones', 'per-module <json_path>'. Default: 'single'")
     argparser.add_argument("--optimizer_progressive_unlock", action=argparse.BooleanOptionalAction, default=False, help="If passed, progressively unlock parameters")
     argparser.add_argument("--optimizer_progressive_unlock_by_qk_proximity", action=argparse.BooleanOptionalAction, default=False, help="If passed, progressively unlock parameters by proximity to qk attention parameters")
 
