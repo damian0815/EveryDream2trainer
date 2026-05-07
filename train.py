@@ -1322,8 +1322,9 @@ def main(args):
                         torch.cuda.empty_cache()
 
                     safe_backward_size = _get_safe_backward_size(gpu, model.device, image_pixel_count // 64)
-                    if safe_backward_size > tv.max_backward_slice_size:
+                    if safe_backward_size > tv.max_backward_slice_size and tv.batch_resolution not in tv._backward_size_hint_logged:
                         logging.info(f"at resolution {tv.batch_resolution} you could probably do backward={safe_backward_size} (you requested max {tv.max_backward_slice_size})")
+                        tv._backward_size_hint_logged.add(tv.batch_resolution)
 
                     if not args.disable_backward_memsafe and tv.batch_resolution not in args.disable_backward_memsafe_resolutions:
                         if gpu is not None:

@@ -140,6 +140,8 @@ class TrainingVariables:
     current_timestep_interval: tuple[int, int] | None = None          # per-optimizer-step latch for interval sampling
     timestep_intervals: list[tuple[int, int]] | None = None           # pre-computed SNR-based clusters
 
+    _backward_size_hint_logged: set = field(default_factory=set)      # resolutions for which the "could do backward=N" hint has already been printed
+
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
 
     prev_accumulated_pathnames: list[str] = field(default_factory=list)
