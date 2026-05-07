@@ -646,6 +646,12 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
         logging.info(f" * Saving Self-Flow projection head to {proj_head_path}")
         torch.save(ed_state.model.self_flow_proj_head.state_dict(), proj_head_path)
 
+    if ed_state.model.self_flow_teacher_unet is not None:
+        teacher_path = os.path.join(save_path, "self_flow_teacher_unet.safetensors")
+        logging.info(f" * Saving Self-Flow teacher UNet to {teacher_path}")
+        state_dict = {k: v.cpu().contiguous() for k, v in ed_state.model.self_flow_teacher_unet.state_dict().items()}
+        safetensors.torch.save_file(state_dict, teacher_path)
+
 
 @torch.no_grad()
 def save_model_lora(model: TrainingModel, save_path: str):

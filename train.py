@@ -62,7 +62,7 @@ from core.loss import (
     get_latents,
     compute_timestep_intervals,
 )
-from core.self_flow import SelfFlowProjectionHead, SelfFlowMLPProjectionHead, get_self_flow_channels, SELF_FLOW_MODES
+from core.self_flow import SelfFlowMLPProjectionHead, get_self_flow_channels, SELF_FLOW_MODES
 from core.step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
     get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward, \
     record_performance_timing
@@ -85,6 +85,7 @@ from utils.isolate_rng import isolate_rng
 from utils.check_git import check_git
 from optimizer.optimizers import EveryDreamOptimizer
 from copy import deepcopy
+import safetensors.torch
 
 if torch.cuda.is_available():
     from utils.gpu import GPU
@@ -738,20 +739,27 @@ def main(args):
                 sf_teacher.requires_grad_(False)
                 model.self_flow_teacher_unet = sf_teacher
 
+                # Attempt to resume teacher UNet from the checkpoint sidecar
+                sf_teacher_sidecar = os.path.join(args.resume_ckpt, "self_flow_teacher_unet.safetensors")
+                if os.path.exists(sf_teacher_sidecar):
+                    logging.info(f"  Loading Self-Flow teacher UNet from {sf_teacher_sidecar}")
+                    try:
+                        state_dict = safetensors.torch.load_file(sf_teacher_sidecar, device=str(device))
+                        model.self_flow_teacher_unet.load_state_dict(state_dict)
+                        logging.info("  Self-Flow teacher UNet loaded successfully.")
+                    except Exception as e:
+                        logging.error(f" * Failed to load Self-Flow teacher UNet from {sf_teacher_sidecar}: {e}. Using fresh deepcopy.")
+                else:
+                    logging.info(f"  No Self-Flow teacher UNet sidecar found at {sf_teacher_sidecar}, using current model snapshot as starting point.")
+
             if model.self_flow_proj_head is None:
                 boc = model.unet.config.block_out_channels  # e.g. [320, 640, 1280, 1280]
                 sf_mode = getattr(args, 'self_flow_mode', 'shallow')
                 in_ch, out_ch = get_self_flow_channels(sf_mode, boc)
-                if args.self_flow_use_mlp_projection:
-                    model.self_flow_proj_head = SelfFlowMLPProjectionHead(
-                        in_channels=in_ch,
-                        out_channels=out_ch,
-                    ).to(device)
-                else:
-                    model.self_flow_proj_head = SelfFlowProjectionHead(
-                        in_channels=in_ch,
-                        out_channels=out_ch,
-                    ).to(device)
+                model.self_flow_proj_head = SelfFlowMLPProjectionHead(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                ).to(device)
                 logging.info(
                     f"  Self-Flow mode={sf_mode!r}, {type(model.self_flow_proj_head).__name__}: {in_ch} -> {out_ch} channels (fp32)"
                 )
@@ -1869,7 +1877,6 @@ if __name__ == "__main__":
         help="Self-Flow: EMA decay rate for the teacher UNet (default: 0.9999 as per the paper).")
     argparser.add_argument("--self_flow_ema_update_interval", type=int, default=1,
         help="Self-Flow: update the teacher EMA every N optimizer steps (default: 1).")
-    argparser.add_argument("--self_flow_use_mlp_projection", action=argparse.BooleanOptionalAction, default=False, help="Self-Flow: use MLP projection head instead of just conv1x1")
     argparser.add_argument("--self_flow_mode", type=str, default='shallow', choices=SELF_FLOW_MODES,
         help="Self-Flow: extraction-point arrangement. "
              "'shallow' (default): student=down_blocks[1], teacher=up_blocks[0] (H/4). "

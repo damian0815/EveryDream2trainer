@@ -93,29 +93,7 @@ def get_self_flow_modules(student_unet, teacher_unet, mode: str):
 
 # ---------------------------------------------------------------------------
 
-class SelfFlowProjectionHead(nn.Module):
-    """
-    Lightweight 1×1 conv projecting student down_blocks[1] features to teacher
-    up_blocks[0] channel space.  No spatial interpolation needed because both
-    extraction points are at the same H/4 × W/4 resolution.
-
-    Default channels match SD 2.1 (block_out_channels = [320, 640, 1280, 1280]):
-      in_channels  = block_out_channels[1]  = 640
-      out_channels = block_out_channels[-1] = 1280
-    Pass the actual values from model.unet.config.block_out_channels if needed.
-    """
-    @property
-    def dtype(self):
-        return self.proj.weight.dtype
-
-    def __init__(self, in_channels: int = 640, out_channels: int = 1280):
-        super().__init__()
-        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
-
-class SelfFlowMLPProjectionHead_Old(nn.Module):
+class SelfFlowMLPProjectionHead(nn.Module):
     """
     MLP projecting student down_blocks[1] features to teacher
     up_blocks[0] channel space.  No spatial interpolation needed because both
@@ -149,40 +127,11 @@ class SelfFlowMLPProjectionHead_Old(nn.Module):
         return self.proj(x)
 
 
-class SelfFlowMLPProjectionHead(nn.Module):
-    """
-    Projects Student bottleneck features (e.g., mid_block, 8x8, 1280c)
-    to match Teacher decoder features (e.g., up_blocks.1, 16x16, 1280c).
-    """
-    @property
-    def dtype(self):
-        return self.proj[0].weight.dtype
-
-    def __init__(self, in_channels: int = 1280, hidden_channels: int = 1280, out_channels: int = 1280):
-        super().__init__()
-
-        # 2-layer 1x1 Conv (acts as a non-linear MLP over channels)
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=True),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, out_channels, kernel_size=1, bias=False)
-        )
-
-    def forward(self, x: torch.Tensor, target_spatial_shape: tuple) -> torch.Tensor:
-        # 1. Project channels and apply non-linearity
-        x = self.proj(x)
-
-        # 2. Upsample spatial dimensions to match the Teacher
-        # target_spatial_shape should be (16, 16) based on your nodes
-        x = F.interpolate(x, size=target_spatial_shape, mode='bilinear', align_corners=False)
-
-        return x
-
 
 def compute_self_flow_loss(
     student_features: torch.Tensor,
     teacher_features: torch.Tensor,
-    proj_head: SelfFlowProjectionHead|SelfFlowMLPProjectionHead,
+    proj_head: SelfFlowMLPProjectionHead,
 ) -> torch.Tensor:
     """
     Representation loss: negative mean cosine similarity between projected student
@@ -194,14 +143,9 @@ def compute_self_flow_loss(
     Returns a scalar tensor (the mean over all spatial tokens and batch entries).
     """
 
-    if type(proj_head) is SelfFlowProjectionHead or type(proj_head) is SelfFlowMLPProjectionHead_Old:
+    if type(proj_head) is SelfFlowMLPProjectionHead:
         # project student features to teacher channel space
         projected = proj_head(student_features.to(proj_head.dtype))  # [B, Ct, H, W]
-
-    elif type(proj_head) is SelfFlowMLPProjectionHead:
-        # Project student to match teacher
-        target_shape = teacher_features.shape[2:]  # gets (16, 16)
-        projected = proj_head(student_features, target_shape)
     else:
         raise NotImplementedError(f"Missing logic for proj head type {type(proj_head)}")
 
