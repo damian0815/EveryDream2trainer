@@ -21,6 +21,7 @@ from core.loss_softrepa import (
     text_weighted_infonce_loss,
     text_weighted_infonce_loss_with_softrepa,
 )
+from core.self_flow import get_self_flow_modules, get_self_flow_channels, get_self_flow_spatial_divisors
 from model.training_model import TrainingModel, Conditioning
 
 # from train import pyramid_noise_like, compute_snr
@@ -448,16 +449,20 @@ def get_midblock_out_shape(latents_shape: torch.Size, model: TrainingModel) -> t
     return (latents_shape[0], model.unet.mid_block.out_channels, latents_shape[2]//8, latents_shape[3]//8)
 
 
-def get_self_flow_shapes(latents_shape: torch.Size, model: TrainingModel):
+def get_self_flow_shapes(latents_shape: torch.Size, model: TrainingModel, mode: str = 'shallow'):
     """Return (student_shape, teacher_shape) for self-flow feature tensors.
-    Student: down_blocks[1] output -> (B, block_out_channels[1],  H/4, W/4)
-    Teacher: up_blocks[0]  output -> (B, block_out_channels[-1], H/4, W/4)
+
+    Shapes depend on the extraction-point mode:
+      'shallow' / 'deep' / 'semantic' → H/4 × W/4 spatial resolution
+      'detail'                         → H/2 × W/2 spatial resolution
     """
     B = latents_shape[0]
-    H4, W4 = latents_shape[2] // 4, latents_shape[3] // 4
-    student_ch = model.unet.config.block_out_channels[1]
-    teacher_ch = model.unet.config.block_out_channels[-1]
-    return (B, student_ch, H4, W4), (B, teacher_ch, H4, W4)
+    boc = model.unet.config.block_out_channels
+    student_ch, teacher_ch = get_self_flow_channels(mode, boc)
+    s_div, t_div = get_self_flow_spatial_divisors(mode)
+    Hs, Ws = latents_shape[2] // s_div, latents_shape[3] // s_div
+    Ht, Wt = latents_shape[2] // t_div, latents_shape[3] // t_div
+    return (B, student_ch, Hs, Ws), (B, teacher_ch, Ht, Wt)
 
 
 def build_self_flow_latents(
@@ -541,7 +546,8 @@ def get_model_prediction_and_target(
         do_self_flow = (self_flow_s_timesteps is not None
                   and model.self_flow_teacher_unet is not None)
         if do_self_flow:
-            sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model)
+            sf_mode = getattr(args, 'self_flow_mode', 'shallow')
+            sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model, sf_mode)
             self_flow_student_features = torch.zeros(sf_student_shape, dtype=model.unet.dtype, device=model.unet.device)
             self_flow_teacher_features = torch.zeros(sf_teacher_shape, dtype=model.unet.dtype, device=model.unet.device)
         else:
@@ -691,6 +697,7 @@ def get_model_prediction_and_target(
     sf_teacher_unet = model.self_flow_teacher_unet
     if self_flow_s_timesteps is not None and sf_teacher_unet is not None:
         sf_mask_ratio = args.self_flow_mask_ratio
+        sf_mode = getattr(args, 'self_flow_mode', 'shallow')
 
         # Build heterogeneously noised latents for student and teacher
         x_tau, x_tau_min, tau_min_ts = build_self_flow_latents(
@@ -702,14 +709,17 @@ def get_model_prediction_and_target(
             mask_ratio=sf_mask_ratio,
         )
 
-        # --- Student forward: x_τ input, scalar timestep t, capture down_blocks[1] ---
+        # Resolve the modules to hook for this mode
+        sf_student_module, sf_teacher_module = get_self_flow_modules(model.unet, sf_teacher_unet, sf_mode)
+
+        # --- Student forward: x_τ input, scalar timestep t, capture student module ---
         sf_student_storage = {}
 
         def _sf_student_hook(module, inp, output):
             out = output[0] if isinstance(output, tuple) else output
             sf_student_storage['h'] = out
 
-        sf_student_handle = model.unet.down_blocks[1].register_forward_hook(_sf_student_hook)
+        sf_student_handle = sf_student_module.register_forward_hook(_sf_student_hook)
         try:
             model.unet(
                 x_tau.to(dtype=model.unet.dtype),
@@ -724,14 +734,14 @@ def get_model_prediction_and_target(
             sf_student_handle.remove()
         self_flow_student_features = sf_student_storage.get('h')
 
-        # --- Teacher forward: x_{τ_min} input, scalar τ_min, capture up_blocks[0] ---
+        # --- Teacher forward: x_{τ_min} input, scalar τ_min, capture teacher module ---
         sf_teacher_storage = {}
 
         def _sf_teacher_hook(module, inp, output):
             out = output[0] if isinstance(output, tuple) else output
             sf_teacher_storage['h'] = out
 
-        sf_teacher_handle = sf_teacher_unet.up_blocks[0].register_forward_hook(_sf_teacher_hook)
+        sf_teacher_handle = sf_teacher_module.register_forward_hook(_sf_teacher_hook)
         try:
             with torch.no_grad():
                 sf_teacher_unet(

@@ -8,16 +8,90 @@ The student U-Net is forward-passed with heterogeneously noised latents and
 forced to predict semantically richer features of an EMA teacher U-Net that
 receives a uniformly cleaner version of the same latents.
 
-Extraction points for SD 2.1 (block_out_channels = [320, 640, 1280, 1280]):
-  Student: down_blocks[1] output   -> [B, 640,  H/4, W/4]   (~30% depth)
-  Teacher: up_blocks[0]  output   -> [B, 1280, H/4, W/4]   (~65% depth)
-Both have identical spatial resolution, so only a 1x1 channel projection is needed.
+Four extraction-point arrangements are supported (SD 2.1 example shapes, 512px input):
+
+  'shallow' (default):
+    Student: down_blocks[1]                -> (B, boc[1],  H/4, W/4)  e.g. [B, 640,  16, 16]
+    Teacher: up_blocks[0]                  -> (B, boc[-1], H/4, W/4)  e.g. [B, 1280, 16, 16]
+
+  'deep':
+    Student: down_blocks[2].attentions[-1] -> (B, boc[-1], H/4, W/4)  e.g. [B, 1280, 16, 16]  (pre-downsampler)
+    Teacher: up_blocks[1].attentions[-1]   -> (B, boc[-1], H/4, W/4)  e.g. [B, 1280, 16, 16]  (pre-upsampler)
+
+  'semantic':
+    Student: down_blocks[2].attentions[-1] -> (B, boc[-1], H/4, W/4)  e.g. [B, 1280, 16, 16]  (pre-downsampler)
+    Teacher: up_blocks[0]                  -> (B, boc[-1], H/4, W/4)  e.g. [B, 1280, 16, 16]  (post-upsampler)
+
+  'detail':
+    Student: down_blocks[1].attentions[-1] -> (B, boc[1],  H/2, W/2)  e.g. [B, 640,  32, 32]  (pre-downsampler)
+    Teacher: up_blocks[1]                  -> (B, boc[-1], H/2, W/2)  e.g. [B, 1280, 32, 32]  (post-upsampler)
+
+In all modes student and teacher share the same spatial resolution, so only a
+1×1 channel projection is needed (no spatial interpolation).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# ---------------------------------------------------------------------------
+# Mode registry
+# ---------------------------------------------------------------------------
+
+SELF_FLOW_MODES = ['shallow', 'deep', 'semantic', 'detail']
+
+
+def get_self_flow_channels(mode: str, boc: list) -> tuple[int, int]:
+    """Return (student_channels, teacher_channels) for the given mode.
+
+    boc = block_out_channels list from the UNet config, e.g. [320, 640, 1280, 1280].
+
+    Modes 'shallow' and 'detail' tap into boc[1] (e.g. 640) on the student side.
+    Modes 'deep' and 'semantic' tap into boc[-1] (e.g. 1280) on the student side.
+    The teacher always produces boc[-1] channels.
+    """
+    if mode in ('shallow', 'detail'):
+        return boc[1], boc[-1]
+    elif mode in ('deep', 'semantic'):
+        return boc[-1], boc[-1]
+    else:
+        raise ValueError(f"Unknown self_flow_mode: {mode!r}. Choose from: {SELF_FLOW_MODES}")
+
+
+def get_self_flow_spatial_divisors(mode: str) -> tuple[int, int]:
+    """Return (student_spatial_divisor, teacher_spatial_divisor) for the given mode.
+
+    The divisors apply to the latent H and W to give the feature-map resolution:
+      'shallow' / 'deep' / 'semantic' → both H/4 × W/4
+      'detail'                         → both H/2 × W/2
+    """
+    if mode in ('shallow', 'deep', 'semantic'):
+        return 4, 4
+    elif mode == 'detail':
+        return 2, 2
+    else:
+        raise ValueError(f"Unknown self_flow_mode: {mode!r}. Choose from: {SELF_FLOW_MODES}")
+
+
+def get_self_flow_modules(student_unet, teacher_unet, mode: str):
+    """Return (student_module, teacher_module) to register forward hooks on.
+
+    Hooks should capture `output[0]` when output is a tuple, else output directly.
+    """
+    if mode == 'shallow':
+        return student_unet.down_blocks[1], teacher_unet.up_blocks[0]
+    elif mode == 'deep':
+        return student_unet.down_blocks[2].attentions[-1], teacher_unet.up_blocks[1].attentions[-1]
+    elif mode == 'semantic':
+        return student_unet.down_blocks[2].attentions[-1], teacher_unet.up_blocks[0]
+    elif mode == 'detail':
+        return student_unet.down_blocks[1].attentions[-1], teacher_unet.up_blocks[1]
+    else:
+        raise ValueError(f"Unknown self_flow_mode: {mode!r}. Choose from: {SELF_FLOW_MODES}")
+
+
+# ---------------------------------------------------------------------------
 
 class SelfFlowProjectionHead(nn.Module):
     """

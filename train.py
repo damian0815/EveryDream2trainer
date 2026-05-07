@@ -62,7 +62,7 @@ from core.loss import (
     get_latents,
     compute_timestep_intervals,
 )
-from core.self_flow import SelfFlowProjectionHead, SelfFlowMLPProjectionHead
+from core.self_flow import SelfFlowProjectionHead, SelfFlowMLPProjectionHead, get_self_flow_channels, SELF_FLOW_MODES
 from core.step import nibble_batch, choose_effective_batch_size, compute_train_process_01, \
     get_exponential_scaled_value, get_best_match_resolution, train_step, get_uniform_timesteps, optimizer_backward, \
     record_performance_timing
@@ -740,18 +740,20 @@ def main(args):
 
             if model.self_flow_proj_head is None:
                 boc = model.unet.config.block_out_channels  # e.g. [320, 640, 1280, 1280]
+                sf_mode = getattr(args, 'self_flow_mode', 'shallow')
+                in_ch, out_ch = get_self_flow_channels(sf_mode, boc)
                 if args.self_flow_use_mlp_projection:
                     model.self_flow_proj_head = SelfFlowMLPProjectionHead(
-                        in_channels=boc[1],
-                        out_channels=boc[-1],
+                        in_channels=in_ch,
+                        out_channels=out_ch,
                     ).to(device)
                 else:
                     model.self_flow_proj_head = SelfFlowProjectionHead(
-                        in_channels=boc[1],
-                        out_channels=boc[-1],
+                        in_channels=in_ch,
+                        out_channels=out_ch,
                     ).to(device)
                 logging.info(
-                    f"  {type(model.self_flow_proj_head)}: {boc[1]} -> {boc[-1]} channels (fp32)"
+                    f"  Self-Flow mode={sf_mode!r}, {type(model.self_flow_proj_head).__name__}: {in_ch} -> {out_ch} channels (fp32)"
                 )
                 # Attempt to resume projection head from the checkpoint sidecar
                 sf_proj_sidecar = os.path.join(args.resume_ckpt, "self_flow_proj_head.pt")
@@ -1868,6 +1870,12 @@ if __name__ == "__main__":
     argparser.add_argument("--self_flow_ema_update_interval", type=int, default=1,
         help="Self-Flow: update the teacher EMA every N optimizer steps (default: 1).")
     argparser.add_argument("--self_flow_use_mlp_projection", action=argparse.BooleanOptionalAction, default=False, help="Self-Flow: use MLP projection head instead of just conv1x1")
+    argparser.add_argument("--self_flow_mode", type=str, default='shallow', choices=SELF_FLOW_MODES,
+        help="Self-Flow: extraction-point arrangement. "
+             "'shallow' (default): student=down_blocks[1], teacher=up_blocks[0] (H/4). "
+             "'deep': student=down_blocks[2].attentions[-1], teacher=up_blocks[1].attentions[-1] (H/4). "
+             "'semantic': student=down_blocks[2].attentions[-1], teacher=up_blocks[0] (H/4). "
+             "'detail': student=down_blocks[1].attentions[-1], teacher=up_blocks[1] (H/2).")
 
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0, help="Probability to drop (non-LCF/non-CFM) contrastive learning")
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[], help="Batch ids for which contrastive learning should be done (default=[]). Use `--contrastive_loss_batch_ids default_batch` to do contrastive learning on all batches if you have not specified batch ids.")

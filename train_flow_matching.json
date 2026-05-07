@@ -60,5 +60,6 @@
   "self_flow_gamma": 0.8,
   "self_flow_mask_ratio": 0.25,
   "self_flow_ema_decay": 0.9999,
-  "self_flow_ema_update_interval": 1
+  "self_flow_ema_update_interval": 1,
+  "self_flow_mode": "shallow"
 }
