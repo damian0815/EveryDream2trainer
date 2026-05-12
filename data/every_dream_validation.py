@@ -36,6 +36,52 @@ from colorama import Fore, Style
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
+def monge_inception_distance_torch(x: torch.Tensor, y: torch.Tensor,
+                                   rng_seed: int = 42,
+                                   n_projections: int = 1000) -> torch.Tensor:
+    """
+    Compute the MIND (Monge Inception Distance) metric via Sliced Wasserstein Distance.
+
+    Unlike FID, MIND does not fit high-dimensional Gaussians; instead it projects
+    features onto random 1-D directions, sorts the projections and computes the exact
+    1-D optimal-transport distance.  This makes it >100× faster and ~10× more
+    memory-efficient than FID while achieving stable results with as few as 1k–5k
+    samples (vs. ~50k for FID).
+
+    Reference: "MIND: Monge Inception Distance" (Google DeepMind, 2024).
+
+    Args:
+        x: Generated feature embeddings, shape (num_samples, dim).
+        y: Real / ground-truth feature embeddings, shape (num_samples, dim).
+        rng_seed: Seed for reproducible random projections.
+        n_projections: Number of random projection directions (100–1000 recommended).
+
+    Returns:
+        Scalar tensor containing the MIND score (lower is better).
+    """
+    min_samples = min(x.shape[0], y.shape[0])
+    x = x[:min_samples]
+    y = y[:min_samples]
+
+    num_samples, d = x.shape
+    ALPHA = 3 * d
+
+    generator = torch.Generator(device=x.device).manual_seed(rng_seed)
+    u_proj = torch.randn((n_projections, d), generator=generator,
+                         dtype=x.dtype, device=x.device)
+    u_proj /= torch.linalg.norm(u_proj, dim=-1, keepdim=True)
+
+    x_proj = u_proj @ x.T  # (n_projections, num_samples)
+    y_proj = u_proj @ y.T
+
+    dists = torch.mean(
+        (torch.topk(x_proj, num_samples, dim=-1).values
+         - torch.topk(y_proj, num_samples, dim=-1).values) ** 2,
+        dim=1,
+    )
+    return ALPHA * torch.mean(dists)
+
+
 def _frechet_distance(mu1: np.ndarray, sigma1: np.ndarray,
                       mu2: np.ndarray, sigma2: np.ndarray) -> float:
     """Compute Fréchet distance between two Gaussians (N(mu1,sigma1), N(mu2,sigma2))."""
@@ -50,6 +96,7 @@ def _frechet_distance(mu1: np.ndarray, sigma1: np.ndarray,
 def _dinov2_features(model, images_01: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
     Extract DINOv2 [CLS] features from a batch of [0,1] RGB images [B,3,H,W].
+    Uses manual normalisation matching DINOv2's training stats.
     Returns [B, D] float32 CPU tensor.
     """
     _dinov2_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
@@ -59,6 +106,30 @@ def _dinov2_features(model, images_01: torch.Tensor, device: torch.device) -> to
     with torch.no_grad():
         out = model(pixel_values=imgs)
     return out.last_hidden_state[:, 0].float().cpu()
+
+
+def _dinov3_features(model, processor, images_01: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """
+    Extract DINOv3 pooled features from a batch of [0,1] RGB images [B,3,H,W].
+    Uses AutoImageProcessor for preprocessing (normalization and resize are handled
+    internally by the processor, which differs from DINOv2's manual pipeline).
+    Returns [B, D] float32 CPU tensor via outputs.pooler_output.
+    """
+    to_pil = T.ToPILImage()
+    pil_images = [to_pil(img.cpu().clamp(0.0, 1.0)) for img in images_01]
+    inputs = processor(images=pil_images, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.pooler_output.float().cpu()
+
+
+def _dino_features(model, processor, images_01: torch.Tensor, device: torch.device,
+                   version: int = 2) -> torch.Tensor:
+    """Dispatch to the correct DINO feature extractor based on `version` (2 or 3)."""
+    if version == 3:
+        return _dinov3_features(model, processor, images_01, device)
+    return _dinov2_features(model, images_01, device)
 
 
 def _compute_clip_score_batch(pixel_pred: torch.Tensor,
@@ -177,6 +248,7 @@ class EveryDreamValidator:
         self._clip_model_cache = None
         self._clip_tokenizer_cache = None
         self._dinov2_model_cache = None
+        self._dino_processor_cache = None  # only used for DINOv3
 
         self.config = {
             'batch_size': default_batch_size,
@@ -203,10 +275,16 @@ class EveryDreamValidator:
             'clip_score_enabled': False,
             'clip_score_model': 'openai/clip-vit-base-patch32',
 
-            # FDD: Fréchet DINOv2 Distance between generated and real images (requires generation)
+            # FDD: Fréchet DINO Distance between generated and real images (requires generation)
             'fdd_enabled': False,
             'fdd_n_images': 256,
             'fdd_model': 'facebook/dinov2-small',
+            # Which DINO version to use for feature extraction: 2 (default) or 3.
+            # DINOv3 uses AutoImageProcessor + pooler_output rather than manual
+            # normalisation + last_hidden_state CLS token, so it is NOT a drop-in
+            # replacement; set fdd_model to a dinov3 checkpoint when using version 3.
+            # Example DINOv3 checkpoint: "facebook/dinov3-vits16-pretrain-lvd1689m"
+            'fdd_dino_version': 2,
 
             'extra_manual_datasets': {},
         }
@@ -297,6 +375,10 @@ class EveryDreamValidator:
     def fdd_model(self) -> str:
         return self.config.get('fdd_model', 'facebook/dinov2-small')
 
+    @property
+    def fdd_dino_version(self) -> int:
+        return int(self.config.get('fdd_dino_version', 2))
+
     # ------------------------------------------------------------------
     # Lazy model loaders
     # ------------------------------------------------------------------
@@ -332,16 +414,26 @@ class EveryDreamValidator:
         self._clip_model_cache = self._clip_model_cache.to(device)
         return self._clip_model_cache, self._clip_tokenizer_cache
 
-    def _get_dinov2_model(self, device: torch.device):
-        """Lazy-load DINOv2 model; returns model on `device`."""
+    def _get_dino_model(self, device: torch.device):
+        """
+        Lazy-load the configured DINO model (v2 or v3) and return ``(model, processor)``.
+
+        For DINOv2 the processor is ``None`` — preprocessing is done manually inside
+        ``_dinov2_features``.  For DINOv3 an ``AutoImageProcessor`` is returned and
+        used inside ``_dinov3_features``.
+        """
         if self._dinov2_model_cache is None:
-            from transformers import AutoModel
+            from transformers import AutoModel, AutoImageProcessor
             model_id = self.fdd_model
-            logging.info(f"Loading DINOv2 model '{model_id}' for FDD evaluation...")
+            version  = self.fdd_dino_version
+            logging.info(f"Loading DINOv{version} model '{model_id}' for FDD/MIND evaluation...")
             self._dinov2_model_cache = AutoModel.from_pretrained(model_id).eval()
-            logging.info("DINOv2 model loaded.")
+            if version == 3:
+                self._dino_processor_cache = AutoImageProcessor.from_pretrained(model_id)
+                logging.info("DINOv3 processor loaded.")
+            logging.info(f"DINOv{version} model loaded.")
         self._dinov2_model_cache = self._dinov2_model_cache.to(device)
-        return self._dinov2_model_cache
+        return self._dinov2_model_cache, self._dino_processor_cache
 
     # ------------------------------------------------------------------
 
@@ -635,8 +727,9 @@ class EveryDreamValidator:
                 logging.info("Anomaly model moved to device for validation pass.")
 
         dinov2 = None
+        dino_processor = None
         if run_fdd:
-            dinov2 = self._get_dinov2_model(device)
+            dinov2, dino_processor = self._get_dino_model(device)
 
         if not run_anomaly and not run_fdd:
             return
@@ -646,7 +739,8 @@ class EveryDreamValidator:
             self.fdd_n_images       if run_fdd     else 0,
         )
         logging.info(f"Generation-based metrics ({logging_tag}): generating up to {n_images_needed} images "
-                     f"(anomaly={'yes' if run_anomaly else 'no'}, fdd={'yes' if run_fdd else 'no'})...")
+                     f"(anomaly={'yes' if run_anomaly else 'no'}, "
+                     f"fdd+mind={'yes (DINOv' + str(self.fdd_dino_version) + ')' if run_fdd else 'no'})...")
 
         # accumulators
         anomaly_pcts: list[float] = []
@@ -713,12 +807,12 @@ class EveryDreamValidator:
                                 fdd_take = min(n_take, self.fdd_n_images - fdd_done)
                                 if fdd_take > 0:
                                     real_pixels_01 = (batch["image"][:fdd_take].float() + 1.0) / 2.0
-                                    real_feats_list.append(_dinov2_features(dinov2, real_pixels_01, device))
+                                    real_feats_list.append(_dino_features(dinov2, dino_processor, real_pixels_01, device, self.fdd_dino_version))
 
                                     gen_tensor = torch.stack(
                                         [_to_tensor(img.convert('RGB')) for img in pil_images[:fdd_take]]
                                     )
-                                    gen_feats_list.append(_dinov2_features(dinov2, gen_tensor, device))
+                                    gen_feats_list.append(_dino_features(dinov2, dino_processor, gen_tensor, device, self.fdd_dino_version))
 
                             images_done += n_take
                             pbar.update(n_take)
@@ -742,15 +836,35 @@ class EveryDreamValidator:
                                           values=pcts_tensor.detach().clone(), global_step=global_step)
             logging.info(f"Anomaly ({logging_tag}) mean_anomaly_pct={mean_pct:.4f}  n={len(anomaly_pcts)}")
 
-        # --- log FDD results ---
+        # --- log FDD + MIND results ---
         if run_fdd and real_feats_list and gen_feats_list:
-            real_feats = torch.cat(real_feats_list, dim=0).numpy().astype(np.float64)
-            gen_feats  = torch.cat(gen_feats_list,  dim=0).numpy().astype(np.float64)
+            real_feats_tensor = torch.cat(real_feats_list, dim=0)
+            gen_feats_tensor  = torch.cat(gen_feats_list,  dim=0)
+            n_real = real_feats_tensor.shape[0]
+            n_gen  = gen_feats_tensor.shape[0]
 
-            if real_feats.shape[0] < 2 or gen_feats.shape[0] < 2:
-                logging.warning(f"FDD ({logging_tag}): too few images "
-                                f"({real_feats.shape[0]} real, {gen_feats.shape[0]} generated) — need ≥2. Skipping.")
+            if n_real < 2 or n_gen < 2:
+                logging.warning(f"FDD/MIND ({logging_tag}): too few images "
+                                f"({n_real} real, {n_gen} generated) — need ≥2. Skipping.")
             else:
+                # --- MIND (Monge Inception Distance) ---
+                try:
+                    mind_score = monge_inception_distance_torch(
+                        x=gen_feats_tensor,
+                        y=real_feats_tensor,
+                        rng_seed=self.seed,
+                        n_projections=1000,
+                    )
+                    self.log_writer.add_scalar(tag=f"val/{logging_tag}_mind",
+                                               scalar_value=mind_score.item(), global_step=global_step)
+                    logging.info(f"MIND ({logging_tag}) mind={mind_score.item():.4f}  "
+                                 f"n_real={n_real}  n_gen={n_gen}")
+                except Exception as exc:
+                    logging.warning(f"MIND ({logging_tag}): computation failed: {exc}")
+
+                # --- FDD (Fréchet DINOv2 Distance) ---
+                real_feats = real_feats_tensor.numpy().astype(np.float64)
+                gen_feats  = gen_feats_tensor.numpy().astype(np.float64)
                 mu_real,  sigma_real  = real_feats.mean(axis=0), np.cov(real_feats,  rowvar=False)
                 mu_gen,   sigma_gen   = gen_feats.mean(axis=0),  np.cov(gen_feats,   rowvar=False)
                 try:
@@ -758,7 +872,7 @@ class EveryDreamValidator:
                     self.log_writer.add_scalar(tag=f"val/{logging_tag}_fdd",
                                                scalar_value=fdd, global_step=global_step)
                     logging.info(f"FDD ({logging_tag}) fdd={fdd:.4f}  "
-                                 f"n_real={real_feats.shape[0]}  n_gen={gen_feats.shape[0]}")
+                                 f"n_real={n_real}  n_gen={n_gen}")
                 except Exception as exc:
                     logging.warning(f"FDD ({logging_tag}): Fréchet distance computation failed: {exc}")
 
