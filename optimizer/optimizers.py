@@ -1769,9 +1769,10 @@ def _get_polynomial_decay_schedule_with_warmup_adj(
         else:
             lr_range = lr_init - lr_end
             decay_steps = num_training_steps_cycle - num_warmup_steps_cycle
-            pct_remaining = (
+            pct_remaining = min(1, max(
+                0,
                 1 - (current_cycle_step - num_warmup_steps_cycle) / decay_steps
-            )
+            ))
             decay = lr_range * pct_remaining**power + lr_end
             return decay / lr_init  # as LambdaLR multiplies by lr_init
 
