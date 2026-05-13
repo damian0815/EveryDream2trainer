@@ -55,6 +55,7 @@ def train_step(
     tv: TrainingVariables,
     train_progress_01: float,
     ed_optimizer: EveryDreamOptimizer,
+    vae_dtype: torch.dtype,
 
     log_writer: SummaryWriter,
     log_data: LogData,
@@ -63,6 +64,7 @@ def train_step(
     plugin_runner: PluginRunner,
     did_step_optimizer_cb: Callable|None,
     args: argparse.Namespace,
+    latent_bridge=None,
 ):
     if did_step_optimizer_cb is None:
         did_step_optimizer_cb = lambda: True
@@ -123,7 +125,7 @@ def train_step(
         # VAE encoding
         t_vae_start = time.perf_counter()
         assert batch["runt_size"] == 0 # _encode_latents assumption
-        model.vae.to(model.device)
+        model.vae.to(vae_dtype)
         latents = _encode_latents(model=model, image=batch["image"], amp=args.amp, tv=tv)
         if args.offload_vae:
             model.load_vae_to_device('cpu')
@@ -202,7 +204,8 @@ def train_step(
 
                         forward_slice_size=slice_size,
                         tv=tv,
-                        args=args
+                        args=args,
+                        latent_bridge=latent_bridge,
                     ), oom_log_info=f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} for full batch size {batch_size}. "
                 f"loss images accumulated: {tv.accumulated_loss_images_count}")
             record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images/len(caption_variants))
@@ -913,7 +916,8 @@ def _do_model_forward(
     timesteps: torch.Tensor, caption_variant: str|tuple[str, str],
     teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
     forward_slice_size: int,
-    tv: TrainingVariables, args: Namespace
+    tv: TrainingVariables, args: Namespace,
+    latent_bridge=None,
 ) -> ModelForwardReturnType:
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
@@ -985,6 +989,7 @@ def _do_model_forward(
                 teacher_conditioning=teacher_conditioning_slice,
                 lcf_mask=lcf_mask_slice,
                 self_flow_s_timesteps=self_flow_s_timesteps_slice,
+                latent_bridge=latent_bridge,
             )
 
             model_pred_all.append(model_pred_result.model_pred)
@@ -1059,7 +1064,7 @@ def _do_model_forward(
 
     target = torch.cat(target_all)
     noisy_latents = torch.cat(noisy_latents_all)
-    if teacher_mask is None:
+    if teacher_mask is None or all(t is None for t in teacher_target_all):
         teacher_target = None
     else:
         teacher_target = torch.cat(teacher_target_all)
@@ -1125,7 +1130,7 @@ def _do_loss(
         verbose=verbose,
         args=args,
     ).to(dtype=model.dtype)
-    if teacher_mask is not None:
+    if teacher_mask is not None and model_forward_result.teacher_target is not None:
         teacher_loss = get_loss(
             model_forward_result.model_pred,
             model_forward_result.teacher_target,

@@ -519,6 +519,7 @@ def get_model_prediction_and_target(
     mask=None,
     lcf_mask=None,
     self_flow_s_timesteps: torch.Tensor | None = None,
+    latent_bridge=None,
 ) -> ModelPredictionAndTargetReturnType:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
@@ -534,7 +535,9 @@ def get_model_prediction_and_target(
         target = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
-        teacher_target = None if teacher_mask is None else torch.zeros_like(
+        # When the latent bridge is active it replaces latents upstream, so no
+        # separate teacher_target tensor is needed.
+        teacher_target = None if (teacher_mask is None or latent_bridge is not None) else torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         noisy_latents = torch.zeros_like(
@@ -595,10 +598,11 @@ def get_model_prediction_and_target(
             mask=None,
             lcf_mask=lcf_mask_masked,
             self_flow_s_timesteps=self_flow_s_timesteps_masked,
+            latent_bridge=latent_bridge,
         )
         model_pred[mask] += masked_result.model_pred
         target[mask] += masked_result.target
-        if teacher_mask is not None:
+        if teacher_target is not None and masked_result.teacher_target is not None:
             teacher_target[mask] += masked_result.teacher_target
         if lcf_mask is not None:
             midblock_out[mask] += masked_result.midblock_out
@@ -621,6 +625,25 @@ def get_model_prediction_and_target(
         for sample_index in range(latents.shape[0]):
             if is_cond_dropout_noise[sample_index]:
                 latents[sample_index] = torch.randn_like(latents[sample_index])
+
+    # ── Latent bridge: replace teacher-masked latents with teacher-generated x0 ──
+    # When the bridge is active the teacher is used as a "clean-latent factory":
+    # run its FM ODE from noise → x0^teacher, convert to student space, and use
+    # the result as the clean latent for standard FM training.  No separate
+    # teacher_target is needed – the ordinary FM target (noise - x0_bridge) is
+    # already teacher-guided.
+    if latent_bridge is not None and teacher_mask is not None and teacher_mask.any():
+        if teacher_conditioning is None:
+            teacher_conditioning = conditioning
+        with torch.no_grad():
+            bridge_x0 = latent_bridge.generate_clean_latents_in_student_space(
+                latent_shape=latents[teacher_mask].shape,
+                teacher_model=teacher_model,
+                teacher_conditioning=teacher_conditioning.get_masked(teacher_mask),
+                num_steps=4,
+            )
+        latents = latents.clone()
+        latents[teacher_mask] = bridge_x0.to(device=latents.device, dtype=latents.dtype)
 
     # logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(
@@ -661,7 +684,11 @@ def get_model_prediction_and_target(
                 handle.remove()
 
     teacher_target = None
-    if teacher_mask is None:
+    if teacher_mask is None or latent_bridge is not None:
+        # No supplementary teacher_target needed:
+        # - teacher_mask is None → no teacher guidance this step
+        # - latent_bridge active → standard `target` already encodes the teacher's
+        #   clean-latent distribution (latents were replaced upstream)
         pass
     elif teacher_mask.sum() == 0:
         teacher_target = torch.zeros_like(
@@ -681,14 +708,6 @@ def get_model_prediction_and_target(
                 clean_image_latents=latents,
                 noise=noise,
             )
-
-            if log_writer is not None:
-                loss_preview_image_rgb = torchvision.utils.make_grid(teacher_target)
-                log_writer.add_image(
-                    tag="loss/teacher target",
-                    img_tensor=loss_preview_image_rgb,
-                    global_step=global_step,
-                )
 
 
     # ---- Self-Flow representation learning ----

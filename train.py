@@ -56,6 +56,7 @@ from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeB
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
+from core.latent_interposer import TeacherLatentBridge
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
@@ -548,6 +549,8 @@ def main(args):
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
 
+    latent_bridge = None
+
     if args.debug_no_load_model:
         logging.warning("--debug_no_load_model passed - not loading model!")
         model = TrainingModel(
@@ -646,6 +649,8 @@ def main(args):
         else:
             teacher_model = None
 
+        latent_bridge = TeacherLatentBridge.for_models(teacher_model, model)
+
         model.cond_dropout_tokens = torch.tensor(model.tokenizer(model.cond_dropout_caption,
                                                                truncation=True,
                                                                padding="max_length",
@@ -688,8 +693,9 @@ def main(args):
             logging.info("* Using SDP attention *")
 
         train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float32)
+        vae_dtype = torch.float16 if args.amp else train_dtype
 
-        model.vae = model.vae.to(device, dtype=torch.float16 if args.amp else train_dtype)
+        model.vae = model.vae.to(device, dtype=vae_dtype)
         model.unet = model.unet.to(device, dtype=train_dtype)
         if args.disable_textenc_training and args.amp:
             model.text_encoder = model.text_encoder.to(device, dtype=torch.float16)
@@ -1385,7 +1391,9 @@ def main(args):
                         steps_pbar=steps_pbar,
                         plugin_runner=plugin_runner,
                         did_step_optimizer_cb=None,
+                        vae_dtype=vae_dtype,
                         args=args,
+                        latent_bridge=latent_bridge,
                     )
 
                     ed_optimizer.step_schedulers(tv.global_step)
