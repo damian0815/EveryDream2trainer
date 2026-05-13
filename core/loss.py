@@ -1211,10 +1211,26 @@ def _teacher_target_via_interposer(
 
     Returns v_target_vS with same dtype as student_model.unet.
     """
+    # ---- Resolve per-space VAE scaling factors ----
+    # The interposer operates on RAW (unscaled) VAE latents.
+    # We unscale before converting and re-scale after, so that every tensor
+    # that touches a UNet or VAE is in the expected scaled representation.
+    def _vae_scale(model: TrainingModel) -> float:
+        vae = getattr(model, 'vae', None)
+        if vae is not None:
+            sf = getattr(vae.config, 'scaling_factor', None)
+            if sf is not None:
+                return float(sf)
+        return 0.13025 if getattr(model, 'is_sdxl', False) else 0.18215
+
+    src_scale = _vae_scale(student_model)
+    dst_scale = _vae_scale(teacher_model)
+
     # ---- 1. Convert clean student latents → teacher VAE space ----
+    # Unscale first (interposer expects raw latents), then re-scale with dst_scale.
     x_1_vT = latent_interposer.convert(
-        clean_image_latents.float(), src=src_space, dst=dst_space
-    )  # shape [B, 4, H, W], restored to original device
+        (clean_image_latents / src_scale).float(), src=src_space, dst=dst_space
+    ) * dst_scale  # shape [B, 4, H, W], now scaled in teacher VAE space
 
     # ---- 2. Get σ for the current timestep batch ----
     # Both schedulers share the same shift config, so student's lookup is fine.
@@ -1251,9 +1267,11 @@ def _teacher_target_via_interposer(
     x_1_hat_vT = x_t_vT - sigma_b * v_hat_vT
 
     # ---- 7. Map predicted clean endpoint back to student VAE space ----
+    # Unscale from teacher space, convert, then re-scale to student space.
     x_1_hat_vS = latent_interposer.convert(
-        x_1_hat_vT.to(clean_image_latents.dtype), src=dst_space, dst=src_space
-    ).to(student_noise.device).float()
+        (x_1_hat_vT / dst_scale).to(clean_image_latents.dtype), src=dst_space, dst=src_space
+    ) * src_scale
+    x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
 
     # ---- 8. Build student-space distillation velocity target ----
     # Code convention: target = x_0_vS − x_1_hat_vS  (noise − clean)

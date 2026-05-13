@@ -60,132 +60,26 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from core.latent_interposer import LatentInterposer, LatentSpaceType
+from model.training_model import TrainingModel
 
 
 # ---------------------------------------------------------------------------
-# Model-loading helpers
+# Model loading
 # ---------------------------------------------------------------------------
 
-def _vae_subdir(model_path: str) -> str:
-    """Return the path to use for AutoencoderKL, handling both full pipelines and bare VAEs."""
-    candidate = os.path.join(model_path, "vae")
-    return candidate if os.path.isdir(candidate) else model_path
+def load_model(path: str, device: str, dtype: torch.dtype) -> TrainingModel:
+    """Load any SD-family model as a TrainingModel via AutoPipelineForText2Image."""
+    from diffusers import AutoPipelineForText2Image
+    print(f"  Loading pipeline from: {path}")
+    pipe = AutoPipelineForText2Image.from_pretrained(path, torch_dtype=dtype).to(device)
+    model = TrainingModel.from_pipeline(pipe)
+    del pipe
+    return model
 
 
-def load_vae(model_path: str, device: str, dtype: torch.dtype):
-    from diffusers import AutoencoderKL
-    path = _vae_subdir(model_path)
-    print(f"  Loading VAE from: {path}")
-    vae = AutoencoderKL.from_pretrained(path, torch_dtype=dtype)
-    vae.eval().to(device)
-    return vae
-
-
-def load_unet(model_path: str, device: str, dtype: torch.dtype):
-    from diffusers import UNet2DConditionModel
-    candidate = os.path.join(model_path, "unet")
-    path = candidate if os.path.isdir(candidate) else model_path
-    print(f"  Loading UNet from: {path}")
-    unet = UNet2DConditionModel.from_pretrained(path, torch_dtype=dtype)
-    unet.eval().to(device)
-    return unet
-
-
-def load_text_encoder_sd2(model_path: str, device: str, dtype: torch.dtype):
-    """Load a single CLIP text encoder (SD2 uses a single ViT-H encoder, hidden_size=1024)."""
-    from transformers import CLIPTextModel, CLIPTokenizer
-    te_dir = os.path.join(model_path, "text_encoder")
-    te_path = te_dir if os.path.isdir(te_dir) else model_path
-    tok_path = te_path
-    print(f"  Loading SD2 text encoder from: {te_path}")
-    tokenizer = CLIPTokenizer.from_pretrained(tok_path)
-    text_encoder = CLIPTextModel.from_pretrained(te_path, torch_dtype=dtype)
-    text_encoder.eval().to(device)
-    return tokenizer, text_encoder
-
-
-def load_text_encoders_sdxl(model_path: str, device: str, dtype: torch.dtype):
-    """Load both SDXL text encoders (CLIP-L + OpenCLIP-ViT-G)."""
-    from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-
-    te1_dir = os.path.join(model_path, "text_encoder")
-    te2_dir = os.path.join(model_path, "text_encoder_2")
-    tok1_dir = te1_dir
-    tok2_dir = te2_dir
-
-    print(f"  Loading SDXL text_encoder from: {te1_dir}")
-    tokenizer1 = CLIPTokenizer.from_pretrained(tok1_dir)
-    te1 = CLIPTextModel.from_pretrained(te1_dir, torch_dtype=dtype)
-    te1.eval().to(device)
-
-    print(f"  Loading SDXL text_encoder_2 from: {te2_dir}")
-    tokenizer2 = CLIPTokenizer.from_pretrained(tok2_dir)
-    te2 = CLIPTextModelWithProjection.from_pretrained(te2_dir, torch_dtype=dtype)
-    te2.eval().to(device)
-
-    return (tokenizer1, te1), (tokenizer2, te2)
-
-
-# ---------------------------------------------------------------------------
-# Conditioning helpers
-# ---------------------------------------------------------------------------
-
-def get_sd2_conditioning(prompt: str, tokenizer, text_encoder, device, dtype):
-    """Returns encoder_hidden_states [1, 77, 1024] for SD2."""
-    with torch.no_grad():
-        tokens = tokenizer(
-            [prompt],
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids.to(device)
-        enc_out = text_encoder(tokens, return_dict=True)
-        hidden_states = enc_out.last_hidden_state.to(dtype=dtype)
-    return hidden_states
-
-
-def get_sdxl_conditioning(
-    prompt: str,
-    tokenizer1, te1,
-    tokenizer2, te2,
-    device, dtype,
-    target_size=(1024, 1024),
-    original_size=(1024, 1024),
-    crop_top_left=(0, 0),
-):
-    """
-    Returns (encoder_hidden_states, pooled_embeds, add_time_ids) for SDXL.
-    encoder_hidden_states : [1, 77, 2048]  (concat of hidden1 + hidden2)
-    pooled_embeds          : [1, 1280]
-    add_time_ids           : [1, 6]
-    """
-    with torch.no_grad():
-        def encode(tok, enc, prompt):
-            tokens = tok(
-                [prompt],
-                padding="max_length",
-                max_length=tok.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            ).input_ids.to(device)
-            out = enc(tokens, output_hidden_states=True, return_dict=True)
-            # Use penultimate layer hidden state (standard diffusers SDXL practice)
-            return out.hidden_states[-2], getattr(out, "text_embeds", None)
-
-        h1, _    = encode(tokenizer1, te1, prompt)  # [1, 77, 768]
-        h2, pool = encode(tokenizer2, te2, prompt)  # [1, 77, 1280], [1, 1280]
-
-        encoder_hidden_states = torch.cat([h1, h2], dim=-1).to(dtype=dtype)  # [1, 77, 2048]
-        pooled_embeds = pool.to(dtype=dtype) if pool is not None else torch.zeros(1, 1280, device=device, dtype=dtype)
-
-        # Build add_time_ids: [original_h, original_w, crop_top, crop_left, target_h, target_w]
-        add_time_ids = torch.tensor(
-            [list(original_size) + list(crop_top_left) + list(target_size)],
-            dtype=dtype, device=device,
-        )  # [1, 6]
-
-    return encoder_hidden_states, pooled_embeds, add_time_ids
+def vae_scale(model: TrainingModel) -> float:
+    return float(getattr(model.vae.config, 'scaling_factor',
+                         0.13025 if model.is_sdxl else 0.18215))
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +88,6 @@ def get_sdxl_conditioning(
 
 def load_image(path: str, size: int) -> torch.Tensor:
     """Load image → [1, 3, H, W] float32 in [-1, 1]."""
-    from PIL import Image
     img = Image.open(path).convert("RGB")
     w, h = img.size
     short = min(w, h)
@@ -204,18 +97,21 @@ def load_image(path: str, size: int) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
 
 
-def encode_image(vae, pixel_tensor, scaling_factor: float, device: str, dtype: torch.dtype):
-    """pixel_tensor: [1,3,H,W] in [-1,1]. Returns scaled latents [1,4,h,w]."""
+def encode_image(model: TrainingModel, pixel_tensor: torch.Tensor) -> torch.Tensor:
+    """Returns scaled latents [1, 4, h, w]."""
+    scale = vae_scale(model)
+    device, dtype = model.device, model.vae.dtype
     with torch.no_grad():
-        dist = vae.encode(pixel_tensor.to(device=device, dtype=dtype), return_dict=False)[0]
-        return dist.sample() * scaling_factor
+        dist = model.vae.encode(pixel_tensor.to(device=device, dtype=dtype), return_dict=False)[0]
+        return dist.sample() * scale
 
 
-def decode_latents_to_numpy(vae, scaled_latents, scaling_factor: float) -> np.ndarray:
+def decode_latents_to_numpy(model: TrainingModel, scaled_latents: torch.Tensor) -> np.ndarray:
     """Returns [H, W, 3] uint8."""
+    scale = vae_scale(model)
     with torch.no_grad():
-        unscaled = scaled_latents.to(vae.dtype) / scaling_factor
-        decoded  = vae.decode(unscaled, return_dict=False)[0].float().cpu()
+        unscaled = scaled_latents.to(model.vae.dtype) / scale
+        decoded  = model.vae.decode(unscaled, return_dict=False)[0].float().cpu()
     arr = (decoded.squeeze(0).permute(1, 2, 0).clamp(-1, 1).numpy() + 1.0) / 2.0 * 255
     return arr.clip(0, 255).astype(np.uint8)
 
@@ -227,7 +123,6 @@ def pixel_tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
 
 
 def make_diff_panel(a: np.ndarray, b: np.ndarray, amplify: float = 3.0) -> np.ndarray:
-    """Compute amplified absolute difference between two uint8 images."""
     diff = np.abs(a.astype(np.float32) - b.astype(np.float32)) * amplify
     return diff.clip(0, 255).astype(np.uint8)
 
@@ -251,7 +146,6 @@ def make_strip(panels: list, labels: list, label_height: int = 24) -> Image.Imag
 
 
 def make_grid(strips: list) -> Image.Image:
-    """Vertically stack a list of PIL strips."""
     total_h = sum(s.height for s in strips)
     total_w = max(s.width for s in strips)
     grid = Image.new("RGB", (total_w, total_h), (200, 200, 200))
@@ -263,77 +157,138 @@ def make_grid(strips: list) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# Conditioning
+# ---------------------------------------------------------------------------
+
+def get_conditioning(prompt: str, model: TrainingModel, size: int) -> dict:
+    """
+    Build UNet conditioning for *model*.
+
+    Returns a dict with:
+      'encoder_hidden_states' : [1, 77, D]
+      'added_cond_kwargs'      : dict (SDXL only, else None)
+    """
+    device = model.device
+    dtype  = model.unet.dtype
+
+    with torch.no_grad():
+        def _encode(tokenizer, encoder):
+            tokens = tokenizer(
+                [prompt],
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            out = encoder(tokens, output_hidden_states=True, return_dict=True)
+            return out.hidden_states[-2], getattr(out, "text_embeds", None)
+
+        h1, _     = _encode(model.tokenizer, model.text_encoder)  # [1, 77, D1]
+
+        if model.is_sdxl:
+            h2, pool  = _encode(model.tokenizer_2, model.text_encoder_2)  # [1, 77, D2], [1, 1280]
+            encoder_hidden_states = torch.cat([h1, h2], dim=-1).to(dtype)  # [1, 77, D1+D2]
+            pooled = pool.to(dtype) if pool is not None else torch.zeros(1, 1280, device=device, dtype=dtype)
+            add_time_ids = torch.tensor(
+                [[size, size, 0, 0, size, size]], dtype=dtype, device=device
+            )  # [1, 6]
+            added_cond_kwargs = {"text_embeds": pooled, "time_ids": add_time_ids}
+        else:
+            # SD1/SD2: single encoder, use last hidden state directly
+            tokens = model.tokenizer(
+                [prompt],
+                padding="max_length",
+                max_length=model.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            ).input_ids.to(device)
+            enc_out = model.text_encoder(tokens, return_dict=True)
+            encoder_hidden_states = enc_out.last_hidden_state.to(dtype)
+            added_cond_kwargs = None
+
+    return {"encoder_hidden_states": encoder_hidden_states,
+            "added_cond_kwargs": added_cond_kwargs}
+
+
+def run_unet(model: TrainingModel, noisy_latents: torch.Tensor,
+             t_tensor: torch.Tensor, cond: dict) -> torch.Tensor:
+    """Run model.unet and return the velocity prediction as float32."""
+    return model.unet(
+        noisy_latents.to(dtype=model.unet.dtype),
+        t_tensor.to(model.device, dtype=model.unet.dtype),
+        encoder_hidden_states=cond["encoder_hidden_states"].to(model.device, dtype=model.unet.dtype),
+        added_cond_kwargs=(
+            {k: v.to(model.device, dtype=model.unet.dtype)
+             for k, v in cond["added_cond_kwargs"].items()}
+            if cond["added_cond_kwargs"] is not None else None
+        ),
+    ).sample.float().to(model.device)
+
+
+# ---------------------------------------------------------------------------
 # Core cycle logic
 # ---------------------------------------------------------------------------
 
 def run_one_sample(
     *,
-    pixel_tensor,       # [1, 3, H, W] float32 in [-1, 1]
-    timestep: int,      # integer in [0, 999]
-    sdxl_vae,
-    sd2_vae,
-    sdxl_unet,
-    sd2_unet,
-    sdxl_cond: tuple,   # (encoder_hidden_states, pooled_embeds, add_time_ids)
-    sd2_cond,           # encoder_hidden_states [1, 77, 1024]
-    sdxl_scale: float,
-    sd2_scale: float,
+    pixel_tensor,           # [1, 3, H, W] float32 in [-1, 1]
+    timestep: int,          # integer in [0, 999]
+    sdxl_model: TrainingModel,
+    sd2_model: TrainingModel,
+    sdxl_cond: dict,
+    sd2_cond: dict,
     interposer: LatentInterposer,
     device: str,
     dtype: torch.dtype,
-    size: int,
 ):
     """
     Run the full distillation cycle for one image at one timestep.
     Returns a dict of named numpy images (uint8) for each phase.
     """
-    # σ = t/T, linear FM schedule; clamp slightly away from endpoints
     sigma = max(0.01, min(0.99, timestep / 1000.0))
     print(f"    σ = {sigma:.4f} (timestep={timestep})")
 
+    sdxl_scale = vae_scale(sdxl_model)
+    sd2_scale  = vae_scale(sd2_model)
+
     # ---- SDXL: encode clean image ----
-    x_1_xl = encode_image(sdxl_vae, pixel_tensor, sdxl_scale, device, dtype)  # [1,4,h,w]
+    x_1_xl = encode_image(sdxl_model, pixel_tensor)   # scaled [1,4,h,w]
 
     # ---- Student noise (shared) ----
     x_0_xl = torch.randn_like(x_1_xl)
 
     # ---- Build student's noisy latent ----
-    x_t_xl = (1.0 - sigma) * x_1_xl + sigma * x_0_xl  # [1,4,h,w]
+    x_t_xl = (1.0 - sigma) * x_1_xl + sigma * x_0_xl
 
     # ========= TEACHER PATH (no grad) =========
     with torch.no_grad():
 
-        # 1. Map clean student latent → teacher VAE space
+        # 1. Map clean student latent → teacher VAE space.
+        #    Unscale before interposer (expects raw VAE latents), re-scale after.
         x_1_v1 = interposer.convert(
-            x_1_xl.float(), src=LatentSpaceType.SDXL, dst=LatentSpaceType.SD1
-        ).to(device=device, dtype=dtype)
+            (x_1_xl / sdxl_scale).float(), src=LatentSpaceType.SDXL, dst=LatentSpaceType.SD1
+        ).to(device=device, dtype=dtype) * sd2_scale
 
         # 2. Option A: independent noise in teacher space
         x_0_v1 = torch.randn_like(x_1_v1)
 
         # 3. Build teacher's noisy latent
-        x_t_v1 = (1.0 - sigma) * x_1_v1 + sigma * x_0_v1  # [1,4,h,w]
+        x_t_v1 = (1.0 - sigma) * x_1_v1 + sigma * x_0_v1
 
         # 4. Run SD2 teacher UNet
-        #    SD2 expects timestep as a float tensor in the range the scheduler's timesteps cover.
-        #    Flow-matching schedulers use timesteps like 999.0 → 1.0 (high=noisy).
-        #    Here sigma ∈ [0,1] from clean→noise, so teacher timestep = sigma * 1000.
         t_tensor = torch.tensor([sigma * 1000.0], device=device, dtype=dtype)
+        v_hat_v1 = run_unet(sd2_model, x_t_v1, t_tensor, sd2_cond)
 
-        v_hat_v1 = sd2_unet(
-            x_t_v1.to(dtype=sd2_unet.dtype),
-            t_tensor.to(dtype=sd2_unet.dtype),
-            encoder_hidden_states=sd2_cond.to(device=device, dtype=sd2_unet.dtype),
-        ).sample.float().to(device)
-
-        # 5. Recover teacher's predicted clean endpoint in SD2 space
+        # 5. Recover teacher's predicted clean endpoint in SD2 space (scaled)
         #    Convention (code): v = x_0 − x_1  ⟹  x_1 = x_t − σ·v
         x_1_hat_v1 = x_t_v1.float() - sigma * v_hat_v1
 
-        # 6. Map teacher's predicted clean → SDXL space
+        # 6. Map teacher's predicted clean → SDXL space.
+        #    Unscale before interposer, re-scale with sdxl_scale afterwards.
         x_1_hat_xl_teacher = interposer.convert(
-            x_1_hat_v1.to(dtype=torch.float32), src=LatentSpaceType.SD1, dst=LatentSpaceType.SDXL
-        ).to(device=device, dtype=dtype)
+            (x_1_hat_v1 / sd2_scale).to(dtype=torch.float32),
+            src=LatentSpaceType.SD1, dst=LatentSpaceType.SDXL
+        ).to(device=device, dtype=dtype) * sdxl_scale
 
         # 7. Compute distillation velocity target (for reference / logging)
         v_target_xl = x_0_xl.float() - x_1_hat_xl_teacher.float()
@@ -341,38 +296,26 @@ def run_one_sample(
 
     # ========= STUDENT PATH (no grad for visual test) =========
     with torch.no_grad():
-        enc_hs, pooled, add_time_ids = sdxl_cond
         t_tensor_xl = torch.tensor([sigma * 1000.0], device=device, dtype=dtype)
-
-        v_hat_xl = sdxl_unet(
-            x_t_xl.to(dtype=sdxl_unet.dtype),
-            t_tensor_xl.to(dtype=sdxl_unet.dtype),
-            encoder_hidden_states=enc_hs.to(device=device, dtype=sdxl_unet.dtype),
-            added_cond_kwargs={
-                "text_embeds": pooled.to(device=device, dtype=sdxl_unet.dtype),
-                "time_ids":    add_time_ids.to(device=device, dtype=sdxl_unet.dtype),
-            },
-        ).sample.float().to(device)
-
-        # Recover student's predicted clean endpoint
+        v_hat_xl = run_unet(sdxl_model, x_t_xl, t_tensor_xl, sdxl_cond)
         x_1_hat_xl_student = x_t_xl.float() - sigma * v_hat_xl
         print(f"    v_hat_xl norm:    {v_hat_xl.norm().item():.4f}")
 
     # ========= Decode all phases =========
-    panel_orig      = pixel_tensor_to_numpy(pixel_tensor)
-    panel_noisy     = decode_latents_to_numpy(sdxl_vae,  x_t_xl,                sdxl_scale)
-    panel_teach_v1  = decode_latents_to_numpy(sd2_vae,   x_1_hat_v1.to(dtype=sd2_vae.dtype),   sd2_scale)
-    panel_teach_xl  = decode_latents_to_numpy(sdxl_vae,  x_1_hat_xl_teacher,    sdxl_scale)
-    panel_stud_xl   = decode_latents_to_numpy(sdxl_vae,  x_1_hat_xl_student.to(dtype=sdxl_vae.dtype), sdxl_scale)
-    panel_diff      = make_diff_panel(panel_teach_xl, panel_stud_xl, amplify=3.0)
+    panel_orig     = pixel_tensor_to_numpy(pixel_tensor)
+    panel_noisy    = decode_latents_to_numpy(sdxl_model, x_t_xl)
+    panel_teach_v1 = decode_latents_to_numpy(sd2_model,  x_1_hat_v1.to(dtype=sd2_model.vae.dtype))
+    panel_teach_xl = decode_latents_to_numpy(sdxl_model, x_1_hat_xl_teacher)
+    panel_stud_xl  = decode_latents_to_numpy(sdxl_model, x_1_hat_xl_student.to(dtype=sdxl_model.vae.dtype))
+    panel_diff     = make_diff_panel(panel_teach_xl, panel_stud_xl, amplify=3.0)
 
     return {
-        "orig":      panel_orig,
-        "noisy":     panel_noisy,
-        "teach_v1":  panel_teach_v1,
-        "teach_xl":  panel_teach_xl,
-        "stud_xl":   panel_stud_xl,
-        "diff":      panel_diff,
+        "orig":     panel_orig,
+        "noisy":    panel_noisy,
+        "teach_v1": panel_teach_v1,
+        "teach_xl": panel_teach_xl,
+        "stud_xl":  panel_stud_xl,
+        "diff":     panel_diff,
     }
 
 
@@ -389,26 +332,20 @@ def collect_images(images_dir: str, count: int) -> list:
 
 def run_distillation_cycle_test(args):
     device = args.device
-    dtype  = torch.float16 if "cuda" in device else torch.float32
+    dtype  = torch.bfloat16# if "cuda" in device else torch.float32
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=== Loading SDXL components ===")
-    sdxl_vae  = load_vae(args.sdxl_model,  device, dtype)
-    sdxl_unet = load_unet(args.sdxl_model, device, dtype)
-    (tok1, te1), (tok2, te2) = load_text_encoders_sdxl(args.sdxl_model, device, dtype)
-    sdxl_scale = getattr(sdxl_vae.config, "scaling_factor", 0.13025)
-    print(f"  SDXL VAE scaling_factor = {sdxl_scale}")
+    print("=== Loading SDXL model ===")
+    sdxl_model = load_model(args.sdxl_model, device, dtype)
+    print(f"  is_sdxl={sdxl_model.is_sdxl}  VAE scale={vae_scale(sdxl_model)}")
 
-    print("=== Loading SD2 components ===")
-    sd2_vae  = load_vae(args.sd2_model,  device, dtype)
-    sd2_unet = load_unet(args.sd2_model, device, dtype)
-    tok_sd2, te_sd2 = load_text_encoder_sd2(args.sd2_model, device, dtype)
-    sd2_scale = getattr(sd2_vae.config, "scaling_factor", 0.18215)
-    print(f"  SD2  VAE scaling_factor = {sd2_scale}")
+    print("=== Loading SD2 model ===")
+    sd2_model = load_model(args.sd2_model, device, dtype)
+    print(f"  is_sdxl={sd2_model.is_sdxl}   VAE scale={vae_scale(sd2_model)}")
 
     # Sanity-check UNet input channel counts
-    sdxl_in_ch = sdxl_unet.config.get("in_channels", 4)
-    sd2_in_ch  = sd2_unet.config.get("in_channels",  4)
+    sdxl_in_ch = sdxl_model.unet.config.get("in_channels", 4)
+    sd2_in_ch  = sd2_model.unet.config.get("in_channels",  4)
     print(f"\n  SDXL UNet in_channels={sdxl_in_ch}  |  SD2 UNet in_channels={sd2_in_ch}")
     assert sdxl_in_ch == 4, f"Expected SDXL UNet to have 4 in_channels, got {sdxl_in_ch}"
     assert sd2_in_ch  == 4, f"Expected SD2  UNet to have 4 in_channels, got {sd2_in_ch}"
@@ -419,15 +356,10 @@ def run_distillation_cycle_test(args):
     print("=== Building text conditioning ===")
     prompt = args.prompt or ""
     print(f"  Prompt: {repr(prompt)}")
-    # SDXL size conditioning
-    target_sz = (args.size, args.size)
-    sdxl_cond = get_sdxl_conditioning(
-        prompt, tok1, te1, tok2, te2, device, dtype,
-        target_size=target_sz, original_size=target_sz,
-    )
-    sd2_cond = get_sd2_conditioning(prompt, tok_sd2, te_sd2, device, dtype)
-    print(f"  SDXL hidden_states: {sdxl_cond[0].shape}  pooled: {sdxl_cond[1].shape}")
-    print(f"  SD2  hidden_states: {sd2_cond.shape}")
+    sdxl_cond = get_conditioning(prompt, sdxl_model, args.size)
+    sd2_cond  = get_conditioning(prompt, sd2_model,  args.size)
+    print(f"  SDXL encoder_hidden_states: {sdxl_cond['encoder_hidden_states'].shape}")
+    print(f"  SD2  encoder_hidden_states: {sd2_cond['encoder_hidden_states'].shape}")
 
     images = collect_images(args.images_dir, args.count)
     if not images:
@@ -447,18 +379,13 @@ def run_distillation_cycle_test(args):
             phases = run_one_sample(
                 pixel_tensor=pixel_tensor,
                 timestep=ts,
-                sdxl_vae=sdxl_vae,
-                sd2_vae=sd2_vae,
-                sdxl_unet=sdxl_unet,
-                sd2_unet=sd2_unet,
+                sdxl_model=sdxl_model,
+                sd2_model=sd2_model,
                 sdxl_cond=sdxl_cond,
                 sd2_cond=sd2_cond,
-                sdxl_scale=sdxl_scale,
-                sd2_scale=sd2_scale,
                 interposer=interposer,
                 device=device,
                 dtype=dtype,
-                size=args.size,
             )
 
             strip = make_strip(

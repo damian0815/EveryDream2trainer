@@ -276,21 +276,22 @@ def run_roundtrip_test(args):
 
         with torch.no_grad():
             dist = src_vae.encode(pixel_tensor, return_dict=False)[0]
-        src_latents = dist.sample() * src_scale          # scaled src latents [1,C,h,w]
+        src_latents = dist.sample() * src_scale   # scaled [1,C,h,w]
         print(f"  src latents : shape={list(src_latents.shape)}  "
               f"mean={src_latents.mean().item():.4f}  std={src_latents.std().item():.4f}")
 
         # ---- Forward: src → dst ----
+        # Unscale before interposer (expects raw VAE latents), re-scale after.
         dst_latents = interposer.convert(
-            src_latents.float(), src=src_type, dst=dst_type
-        ).to(device=device, dtype=dtype)
+            (src_latents / src_scale).float(), src=src_type, dst=dst_type
+        ).to(device=device, dtype=dtype) * dst_scale
         print(f"  dst latents : shape={list(dst_latents.shape)}  "
               f"mean={dst_latents.mean().item():.4f}  std={dst_latents.std().item():.4f}")
 
-        # ---- Reverse: dst → src (round-trip) ----
+        # ---- Reverse: dst → src round-trip ----
         src_latents_rt = interposer.convert(
-            dst_latents.float(), src=dst_type, dst=src_type
-        ).to(device=device, dtype=dtype)
+            (dst_latents / dst_scale).float(), src=dst_type, dst=src_type
+        ).to(device=device, dtype=dtype) * src_scale
         print(f"  src rt      : shape={list(src_latents_rt.shape)}  "
               f"mean={src_latents_rt.mean().item():.4f}  std={src_latents_rt.std().item():.4f}")
 
