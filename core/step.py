@@ -137,7 +137,7 @@ def train_step(
 
             # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
             if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] > tv.max_backward_slice_size:
-                with torch.cuda.amp.autocast(enabled=args.amp):
+                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or getattr(args, 'force_bfloat16', False)) else torch.float16):
 
                     optimizer_backward(ed_optimizer, tv, plugin_runner, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
                     record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
@@ -331,7 +331,7 @@ def train_step(
                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                 t_backward_start = time.perf_counter()
-                with torch.cuda.amp.autocast(enabled=args.amp):
+                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or getattr(args, 'force_bfloat16', False)) else torch.float16):
                     optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
                 record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
