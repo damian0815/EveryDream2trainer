@@ -519,7 +519,6 @@ def get_model_prediction_and_target(
     mask=None,
     lcf_mask=None,
     self_flow_s_timesteps: torch.Tensor | None = None,
-    latent_bridge=None,
 ) -> ModelPredictionAndTargetReturnType:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
@@ -535,9 +534,8 @@ def get_model_prediction_and_target(
         target = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
-        # When the latent bridge is active it replaces latents upstream, so no
-        # separate teacher_target tensor is needed.
-        teacher_target = None if (teacher_mask is None or latent_bridge is not None) else torch.zeros_like(
+        # When teacher_mask is None no separate teacher_target tensor is needed.
+        teacher_target = None if teacher_mask is None else torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         noisy_latents = torch.zeros_like(
@@ -598,7 +596,6 @@ def get_model_prediction_and_target(
             mask=None,
             lcf_mask=lcf_mask_masked,
             self_flow_s_timesteps=self_flow_s_timesteps_masked,
-            latent_bridge=latent_bridge,
         )
         model_pred[mask] += masked_result.model_pred
         target[mask] += masked_result.target
@@ -626,24 +623,6 @@ def get_model_prediction_and_target(
             if is_cond_dropout_noise[sample_index]:
                 latents[sample_index] = torch.randn_like(latents[sample_index])
 
-    # ── Latent bridge: replace teacher-masked latents with teacher-generated x0 ──
-    # When the bridge is active the teacher is used as a "clean-latent factory":
-    # run its FM ODE from noise → x0^teacher, convert to student space, and use
-    # the result as the clean latent for standard FM training.  No separate
-    # teacher_target is needed – the ordinary FM target (noise - x0_bridge) is
-    # already teacher-guided.
-    if latent_bridge is not None and teacher_mask is not None and teacher_mask.any():
-        if teacher_conditioning is None:
-            teacher_conditioning = conditioning
-        with torch.no_grad():
-            bridge_x0 = latent_bridge.generate_clean_latents_in_student_space(
-                latent_shape=latents[teacher_mask].shape,
-                teacher_model=teacher_model,
-                teacher_conditioning=teacher_conditioning.get_masked(teacher_mask),
-                num_steps=4,
-            )
-        latents = latents.clone()
-        latents[teacher_mask] = bridge_x0.to(device=latents.device, dtype=latents.dtype)
 
     # logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(
@@ -684,11 +663,8 @@ def get_model_prediction_and_target(
                 handle.remove()
 
     teacher_target = None
-    if teacher_mask is None or latent_bridge is not None:
-        # No supplementary teacher_target needed:
-        # - teacher_mask is None → no teacher guidance this step
-        # - latent_bridge active → standard `target` already encodes the teacher's
-        #   clean-latent distribution (latents were replaced upstream)
+    if teacher_mask is None:
+        # No supplementary teacher_target needed: no teacher guidance this step.
         pass
     elif teacher_mask.sum() == 0:
         teacher_target = torch.zeros_like(
@@ -1123,6 +1099,32 @@ def get_teacher_target(
 ):
     teacher_prediction_type = 'flow_prediction' if type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler else teacher_model.noise_scheduler.config.get('prediction_type', '<unknown teacher prediction type>')
     student_prediction_type = 'flow_prediction' if type(student_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler else student_model.noise_scheduler.config.get('prediction_type', '<unknown student prediction type>')
+
+    # ---- Cross-VAE-space distillation via bidirectional interposer ----
+    # When teacher and student live in different VAE latent spaces (e.g. SD2 teacher →
+    # SDXL student) the interposer is required to bridge them.  This path implements
+    # the full Step 3 forward pass from the plan:
+    #   x_1_vS → interp_S2T → x_1_vT → teacher → v_hat_vT
+    #   → x_1_hat_vT → interp_T2S → x_1_hat_vS → v_target_vS
+    latent_interposer = getattr(student_model, 'latent_interposer', None)
+    if latent_interposer is not None and teacher_prediction_type == 'flow_prediction' and student_prediction_type == 'flow_prediction':
+        from core.latent_interposer import infer_latent_space_type
+        src_space = infer_latent_space_type(student_model)  # e.g. "xl"
+        dst_space = infer_latent_space_type(teacher_model)  # e.g. "v1"
+        if src_space is not None and dst_space is not None and src_space != dst_space:
+            return _teacher_target_via_interposer(
+                teacher_model=teacher_model,
+                teacher_conditioning=teacher_conditioning,
+                student_model=student_model,
+                timesteps=student_unet_timesteps,  # already shifted floats
+                clean_image_latents=clean_image_latents,
+                student_noise=noise,
+                latent_interposer=latent_interposer,
+                src_space=src_space,
+                dst_space=dst_space,
+            )
+
+    # ---- Same-VAE-space distillation (original path) ----
     if (
         teacher_prediction_type in ["v_prediction", "v-prediction"]
         and student_prediction_type == "flow_prediction"
@@ -1180,6 +1182,84 @@ def get_teacher_target(
         student_prediction_type=student_prediction_type,
         student_timesteps=student_unet_timesteps,
     )
+
+
+def _teacher_target_via_interposer(
+    teacher_model: TrainingModel,
+    teacher_conditioning: Conditioning,
+    student_model: TrainingModel,
+    timesteps: torch.Tensor,       # shifted float timesteps, shape [B]
+    clean_image_latents: torch.Tensor,  # x_1_vS — scaled SDXL latents, shape [B,4,H,W]
+    student_noise: torch.Tensor,   # x_0_vS, shape [B,4,H,W]
+    latent_interposer,
+    src_space: str,                # e.g. "xl"
+    dst_space: str,                # e.g. "v1"
+) -> torch.Tensor:
+    """
+    Cross-VAE-space velocity target via the bidirectional interposer.
+
+    Implements the plan's Step 3 forward pass using code-convention velocity
+    (v = noise − clean_latent):
+
+      1. x_1_vT  = interp_S2T(x_1_vS)
+      2. x_0_vT  = randn_like(x_1_vT)          [Option A: independent noise]
+      3. x_t_vT  = (1−σ)·x_1_vT + σ·x_0_vT    [teacher's noisy input]
+      4. v̂_vT   = teacher_unet(x_t_vT, t, ...)
+      5. x̂_1_vT = x_t_vT − σ·v̂_vT            [recover clean endpoint]
+      6. x̂_1_vS = interp_T2S(x̂_1_vT)
+      7. v_tgt_vS = x_0_vS − x̂_1_vS            [student velocity target]
+
+    Returns v_target_vS with same dtype as student_model.unet.
+    """
+    # ---- 1. Convert clean student latents → teacher VAE space ----
+    x_1_vT = latent_interposer.convert(
+        clean_image_latents.float(), src=src_space, dst=dst_space
+    )  # shape [B, 4, H, W], restored to original device
+
+    # ---- 2. Get σ for the current timestep batch ----
+    # Both schedulers share the same shift config, so student's lookup is fine.
+    # get_sigmas_for_timesteps requires timesteps to match the scheduler's device.
+    sched = student_model.noise_scheduler
+    sigmas = sched.get_sigmas_for_timesteps(
+        timesteps.to(sched.timesteps.device)
+    ).to(x_1_vT.device).float()  # shape [B]
+    sigma_b = sigmas.view(-1, 1, 1, 1)  # broadcast over spatial dims
+
+    # ---- 3. Option A: independent noise in teacher space ----
+    x_0_vT = torch.randn_like(x_1_vT)  # fresh, not interposed — avoids OOD interposer input
+
+    # ---- 4. Build teacher's noisy latent ----
+    # Flow-matching interpolant: x_t = (1−σ)·x_1 + σ·x_0
+    x_t_vT = (1.0 - sigma_b) * x_1_vT.float() + sigma_b * x_0_vT.float()
+
+    # ---- 5. Run teacher UNet (SD2: no added_cond_kwargs) ----
+    v_hat_vT = teacher_model.unet(
+        x_t_vT.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+        timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+        teacher_conditioning.prompt_embeds.to(
+            teacher_model.device, dtype=teacher_model.unet.dtype
+        ),
+        added_cond_kwargs=(
+            teacher_conditioning.get_added_cond_kwargs(dtype=teacher_model.unet.dtype)
+            if teacher_model.is_sdxl
+            else None
+        ),
+    ).sample.to(x_t_vT.device).float()
+
+    # ---- 6. Recover predicted clean endpoint in teacher space ----
+    # Code convention: v = x_0 − x_1  ⟹  x_1 = x_t − σ·v
+    x_1_hat_vT = x_t_vT - sigma_b * v_hat_vT
+
+    # ---- 7. Map predicted clean endpoint back to student VAE space ----
+    x_1_hat_vS = latent_interposer.convert(
+        x_1_hat_vT.to(clean_image_latents.dtype), src=dst_space, dst=src_space
+    ).to(student_noise.device).float()
+
+    # ---- 8. Build student-space distillation velocity target ----
+    # Code convention: target = x_0_vS − x_1_hat_vS  (noise − clean)
+    v_target_vS = student_noise.float() - x_1_hat_vS
+
+    return v_target_vS.to(dtype=student_model.unet.dtype)
 
 
 def _convert_model_output(

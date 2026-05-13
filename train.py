@@ -39,6 +39,7 @@ from compel.embeddings_provider import SplitLongTextMode
 from tqdm.auto import tqdm
 
 from diffusers import (
+    AutoPipelineForText2Image,
     StableDiffusionPipeline,
     FlowMatchEulerDiscreteScheduler,
 )
@@ -56,7 +57,7 @@ from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeB
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
-from core.latent_interposer import TeacherLatentBridge
+from core.latent_interposer import LatentInterposer, infer_latent_space_type  # used for cross-VAE distillation
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
@@ -79,6 +80,7 @@ from model.training_model import (
     TrainingModel,
     Conditioning, load_clip_model,
 )
+from model.teacher import load_teacher_model
 from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, \
     WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE, \
     SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE, SAVE_FULL_AND_STOP_SEMAPHORE_FILE
@@ -549,8 +551,6 @@ def main(args):
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
 
-    latent_bridge = None
-
     if args.debug_no_load_model:
         logging.warning("--debug_no_load_model passed - not loading model!")
         model = TrainingModel(
@@ -585,71 +585,31 @@ def main(args):
                 model.clip_model = clip_model
                 model.clip_processor = clip_processor
 
-        if args.teacher is not None and args.teacher_p > 0:
-            logging.info(f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}")
-            teacher_pipeline = StableDiffusionPipeline.from_pretrained(args.teacher).to(device, dtype=torch.float16)
-            if isinstance(teacher_pipeline.scheduler, FlowMatchEulerDiscreteScheduler):
-                teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler.from_config(teacher_pipeline.scheduler.config,
-                                                                                   use_dynamic_shifting=args.flow_match_shift_dynamic,
-                                                                                   time_shift_type='linear',
-                                                                                   shift=args.flow_match_shift)
+        teacher_model = load_teacher_model(args, device, model)
 
-            if type(teacher_pipeline.scheduler) != type(model.noise_scheduler):
-                logging.warning(f" * Teacher and training model schedulers are different classes - support may be experimental. Teacher type {type(teacher_pipeline.scheduler)}, training model {type(model.noise_scheduler)}")
-            if teacher_pipeline.scheduler.config.get('prediction_type', None) != model.noise_scheduler.config.get('prediction_type', None):
-                logging.warning(f" * Teacher and training model use different prediction types (teacher {teacher_pipeline.scheduler.config.get('prediction_type')}, training model {model.noise_scheduler.config.get('prediction_type')} - support is experimental")
-
-            teacher_unet = teacher_pipeline.unet
-            teacher_unet.eval()
-
-            # check if we should use the teacher's text encoder
-            teacher_te_sd = teacher_pipeline.text_encoder.state_dict()
-            base_te_sd = model.text_encoder.state_dict()
-            delta = 0
-            epsilon = 1e-2
-            with torch.no_grad():
-                for k in teacher_te_sd.keys():
-                    if k == 'text_model.embeddings.token_embedding.weight':
-                        # may have different token counts
-                        if base_te_sd[k].shape != teacher_te_sd[k].shape:
-                            # different token counts -> use the shorter
-                            min_len = min(base_te_sd[k].shape[0], teacher_te_sd[k].shape[0])
-                            teacher_te_sd[k] = teacher_te_sd[k][:min_len]
-                            base_te_sd[k] = base_te_sd[k][:min_len]
-                    if k not in base_te_sd.keys():
-                        # different!
-                        delta = 1+epsilon
-                        break
-                    delta += torch.mean(base_te_sd[k].cpu() - teacher_te_sd[k].cpu()) ** 2
-            if delta > epsilon:
-                logging.info("* Teacher text encoder is different from base model -> using teacher text encoder too")
-                teacher_text_encoder = teacher_pipeline.text_encoder
-                teacher_text_encoder.eval()
-                teacher_text_encoder_2 = getattr(teacher_pipeline, 'text_encoder_2', None)
-                if teacher_text_encoder_2 is not None:
-                    teacher_text_encoder_2.eval()
+        # ---- Cross-VAE-space distillation: attach interposer to student ----
+        # When teacher and student live in different VAE latent spaces (e.g. SD2 teacher
+        # → SDXL student) a bidirectional LatentInterposer is needed to bridge them.
+        # The interposer is stored on the student model so that get_teacher_target() can
+        # use it without threading extra arguments through the entire call stack.
+        if teacher_model is not None:
+            _student_vae_space = infer_latent_space_type(model)
+            _teacher_vae_space = infer_latent_space_type(teacher_model)
+            if (_student_vae_space is not None and _teacher_vae_space is not None
+                    and _student_vae_space != _teacher_vae_space
+                    and LatentInterposer.is_supported_static(_student_vae_space, _teacher_vae_space)):
+                logging.info(
+                    f" * Cross-VAE distillation: {_student_vae_space} → {_teacher_vae_space}.  "
+                    f"Loading bidirectional LatentInterposer …"
+                )
+                _interposer_dir = getattr(args, 'interposer_model_dir', None)
+                model.latent_interposer = LatentInterposer(model_dir=_interposer_dir)
+                logging.info(" * LatentInterposer ready (S2T and T2S models will be loaded lazily on first use).")
             else:
-                logging.info("* Teacher text encoder is the same as base -> using base text encoder for teacher")
-                teacher_text_encoder = None
-                teacher_text_encoder_2 = None
-            del teacher_te_sd, base_te_sd, delta
-
-            teacher_model = TrainingModel(
-                noise_scheduler=teacher_pipeline.scheduler,
-                unet=teacher_unet,
-                text_encoder=teacher_text_encoder,
-                text_encoder_2=teacher_text_encoder_2,
-                tokenizer=teacher_pipeline.tokenizer,
-                tokenizer_2=getattr(teacher_pipeline, 'tokenizer_2', None),
-                vae=None,
-                compel=None,
-                yaml=None
-            )
-            del teacher_pipeline
-        else:
-            teacher_model = None
-
-        latent_bridge = TeacherLatentBridge.for_models(teacher_model, model)
+                logging.info(
+                    f" * Teacher/student share VAE space ({_student_vae_space}); "
+                    f"no interposer needed."
+                )
 
         model.cond_dropout_tokens = torch.tensor(model.tokenizer(model.cond_dropout_caption,
                                                                truncation=True,
@@ -889,6 +849,8 @@ def main(args):
         conditional_dropout=args.cond_dropout,
         tokenizer=model.tokenizer,
         tokenizer_2=model.tokenizer_2,
+        teacher_tokenizer=teacher_model.tokenizer if teacher_model is not None else None,
+        teacher_tokenizer_2=teacher_model.tokenizer_2 if teacher_model is not None else None,
         seed = seed,
         shuffle_tags=args.shuffle_tags,
         keep_tags=args.keep_tags,
@@ -1393,7 +1355,6 @@ def main(args):
                         did_step_optimizer_cb=None,
                         vae_dtype=vae_dtype,
                         args=args,
-                        latent_bridge=latent_bridge,
                     )
 
                     ed_optimizer.step_schedulers(tv.global_step)
@@ -1862,6 +1823,10 @@ if __name__ == "__main__":
     argparser.add_argument("--teacher_p", type=float, default=1.0, help="Probability of teacher model being used as target")
     argparser.add_argument("--teacher_lambda", type=float, default=1.0, help="When teacher is used, the scale factor for teacher loss when added to regular loss")
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
+    argparser.add_argument("--teacher_prediction_type", type=str, default="auto", choices=["auto", "flow_prediction", "v_prediction", "epsilon"],
+                           help="Override the teacher scheduler prediction type. 'auto' uses whatever the saved config says. 'flow_prediction' forces a FlowMatch scheduler regardless of saved config.")
+    argparser.add_argument("--flow_match_t_clamp_min", type=int, default=None, help="Clamp sampled FM timestep indices to at least this value (0–999). Helps bf16 stability near t=0.")
+    argparser.add_argument("--flow_match_t_clamp_max", type=int, default=None, help="Clamp sampled FM timestep indices to at most this value (0–999). Helps bf16 stability near t=999.")
 
     argparser.add_argument("--local_contrastive_flow_loss_p", type=float, default=0, help="Probability that a given batch will have Local Contrastive Flow loss (Zeng & Yan, 'Flow Matching in the Low-Noise Regime: Pathologies and a Contrastive Remedy', Sept 2025) applied. Suggested value=0.2 - LCF forces all timesteps to <200 for the batch in question. Timestep stratification is applied (alpha/beta are truncated to <200). The value 200 can be overriden with --local_contrastive_flow_timestep_threshold .")
     argparser.add_argument("--local_contrastive_flow_timestep_threshold", type=int, default=200, help="Timesteps smaller than this (ie low noise timesteps) will be subject to local contrastive flow (LCF) loss")

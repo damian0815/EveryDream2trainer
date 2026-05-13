@@ -64,7 +64,6 @@ def train_step(
     plugin_runner: PluginRunner,
     did_step_optimizer_cb: Callable|None,
     args: argparse.Namespace,
-    latent_bridge=None,
 ):
     if did_step_optimizer_cb is None:
         did_step_optimizer_cb = lambda: True
@@ -156,6 +155,17 @@ def train_step(
             # apply shift
             if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
                 timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
+                # bf16 stability: clamp timestep indices if requested
+                t_clamp_min = getattr(args, 'flow_match_t_clamp_min', None)
+                t_clamp_max = getattr(args, 'flow_match_t_clamp_max', None)
+                if t_clamp_min is not None or t_clamp_max is not None:
+                    num_ts = model.noise_scheduler.timesteps.shape[0]
+                    idx = torch.bucketize(timesteps, model.noise_scheduler.timesteps.flip(0))
+                    idx = idx.clamp(
+                        min=t_clamp_min if t_clamp_min is not None else 0,
+                        max=t_clamp_max if t_clamp_max is not None else num_ts - 1,
+                    )
+                    timesteps = model.noise_scheduler.timesteps.flip(0)[idx]
             record_performance_timing("5_timesteps_generation", time.perf_counter() - t_timesteps_start, num_images/len(caption_variants))
 
             # Conditional dropout
@@ -205,7 +215,6 @@ def train_step(
                         forward_slice_size=slice_size,
                         tv=tv,
                         args=args,
-                        latent_bridge=latent_bridge,
                     ), oom_log_info=f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} for full batch size {batch_size}. "
                 f"loss images accumulated: {tv.accumulated_loss_images_count}")
             record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images/len(caption_variants))
@@ -826,11 +835,15 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
         caption_str = []
         tokens = []
         tokens_2 = []
+        teacher_tokens = []
+        teacher_tokens_2 = []
         add_time_ids = []
 
         for key in caption_variant:
             this_tokens_2 = None
             this_add_time_ids = None
+            this_teacher_tokens = None
+            this_teacher_tokens_2 = None
             if key is None:
                 # empty variant half
                 this_caption_str = [model.cond_dropout_caption] * batch_size
@@ -843,6 +856,10 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                 this_tokens = torch.stack([batch["tokens"][key][i] for i in range(batch_size)])
                 if model.is_sdxl:
                     this_tokens_2 = torch.stack([batch["tokens_2"][key][i] for i in range(batch_size)])
+                if "tokens_teacher" in batch:
+                    this_teacher_tokens = torch.stack([batch["tokens_teacher"][key][i] for i in range(batch_size)])
+                if "tokens_teacher_2" in batch:
+                    this_teacher_tokens_2 = torch.stack([batch["tokens_teacher_2"][key][i] for i in range(batch_size)])
 
             if model.is_sdxl:
                 this_add_time_ids = batch["add_time_ids"].to(model.unet.device)
@@ -857,6 +874,8 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
             caption_str.append(this_caption_str)
             tokens.append(this_tokens)
             tokens_2.append(this_tokens_2)
+            teacher_tokens.append(this_teacher_tokens)
+            teacher_tokens_2.append(this_teacher_tokens_2)
             add_time_ids.append(this_add_time_ids)
 
         conditioning_list = []
@@ -874,8 +893,11 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                 pass
             else:
                 with torch.no_grad():
+                    # Use teacher-specific tokens when available (separate tokenization for teacher encoder)
+                    t_tokens = teacher_tokens[i] if teacher_tokens[i] is not None else tokens[i]
+                    t_tokens_2 = teacher_tokens_2[i] if teacher_tokens_2[i] is not None else tokens_2[i]
                     teacher_encoder_hidden_states, teacher_encoder_pooled_embeds, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
-                        tokens[i], tokens_2[i], caption_str[i], teacher_model, args
+                        t_tokens, t_tokens_2, caption_str[i], teacher_model, args
                     )
 
                     teacher_conditioning_list.append(Conditioning(teacher_encoder_hidden_states,
@@ -917,7 +939,6 @@ def _do_model_forward(
     teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
     forward_slice_size: int,
     tv: TrainingVariables, args: Namespace,
-    latent_bridge=None,
 ) -> ModelForwardReturnType:
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
@@ -989,7 +1010,6 @@ def _do_model_forward(
                 teacher_conditioning=teacher_conditioning_slice,
                 lcf_mask=lcf_mask_slice,
                 self_flow_s_timesteps=self_flow_s_timesteps_slice,
-                latent_bridge=latent_bridge,
             )
 
             model_pred_all.append(model_pred_result.model_pred)

@@ -49,6 +49,8 @@ class EveryDreamBatch(Dataset):
                  crop_jitter=0.02,
                  seed=555,
                  tokenizer_2=None,
+                 teacher_tokenizer=None,
+                 teacher_tokenizer_2=None,
                  shuffle_tags=False,
                  keep_tags=0,
                  normalize_image=True,
@@ -76,6 +78,10 @@ class EveryDreamBatch(Dataset):
         self.unloaded_to_idx = 0
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
+        # Teacher tokenizers: only stored when distinct from student tokenizers.
+        # Identical tokenizer → same token IDs, no need to re-tokenize.
+        self.teacher_tokenizer = teacher_tokenizer if (teacher_tokenizer is not None and teacher_tokenizer is not tokenizer) else None
+        self.teacher_tokenizer_2 = teacher_tokenizer_2 if (teacher_tokenizer_2 is not None and teacher_tokenizer_2 is not tokenizer_2) else None
         self.max_token_length = None
         self.shuffle_tags = shuffle_tags
         self.keep_tags = keep_tags
@@ -188,6 +194,20 @@ class EveryDreamBatch(Dataset):
                                                     truncation=True,
                                                     padding="max_length",
                                                     max_length=self.tokenizer_2.model_max_length,
+                                                  ).input_ids)
+                                     for k in caption_keys}
+            if self.teacher_tokenizer is not None:
+                example["tokens_teacher"] = {k: torch.tensor(self.teacher_tokenizer(example["caption"][k],
+                                                    truncation=True,
+                                                    padding="max_length",
+                                                    max_length=self.teacher_tokenizer.model_max_length,
+                                                  ).input_ids)
+                                     for k in caption_keys}
+            if self.teacher_tokenizer_2 is not None:
+                example["tokens_teacher_2"] = {k: torch.tensor(self.teacher_tokenizer_2(example["caption"][k],
+                                                    truncation=True,
+                                                    padding="max_length",
+                                                    max_length=self.teacher_tokenizer_2.model_max_length,
                                                   ).input_ids)
                                      for k in caption_keys}
         except (ValueError, TypeError) as e:
@@ -399,6 +419,8 @@ def collapse_captions(batch):
     captions = {}
     tokens = {}
     tokens_2 = {} if "tokens_2" in batch[0] else None
+    tokens_teacher = {} if "tokens_teacher" in batch[0] else None
+    tokens_teacher_2 = {} if "tokens_teacher_2" in batch[0] else None
     # map from caption variant to source caption per example
     for k, source_map in caption_source_map.items():
         #print("k:", k, "source_map:", source_map)
@@ -413,8 +435,14 @@ def collapse_captions(batch):
         if tokens_2 is not None:
             tokens_2[k] = [example["tokens_2"].get(source_map.get(i, None), None)
                             for i, example in enumerate(batch)]
+        if tokens_teacher is not None:
+            tokens_teacher[k] = [example["tokens_teacher"].get(source_map.get(i, None), None)
+                            for i, example in enumerate(batch)]
+        if tokens_teacher_2 is not None:
+            tokens_teacher_2[k] = [example["tokens_teacher_2"].get(source_map.get(i, None), None)
+                            for i, example in enumerate(batch)]
 
-    return captions, tokens, tokens_2
+    return captions, tokens, tokens_2, tokens_teacher, tokens_teacher_2
 
 
 def collate_fn(batch):
@@ -438,7 +466,7 @@ def collate_fn(batch):
 
     # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     # replace all 'default' with the most common
-    captions, tokens, tokens_2 = collapse_captions(batch)
+    captions, tokens, tokens_2, tokens_teacher, tokens_teacher_2 = collapse_captions(batch)
 
     add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
 
@@ -481,6 +509,10 @@ def collate_fn(batch):
     if tokens_2:
         ret["tokens_2"] = tokens_2
         ret["add_time_ids"] = add_time_ids
+    if tokens_teacher:
+        ret["tokens_teacher"] = tokens_teacher
+    if tokens_teacher_2:
+        ret["tokens_teacher_2"] = tokens_teacher_2
     del batch
     return ret
 

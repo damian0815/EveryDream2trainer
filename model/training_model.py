@@ -305,6 +305,10 @@ class TrainingModel:
     self_flow_teacher_unet = None   # UNet2DConditionModel|None – frozen EMA copy
     self_flow_proj_head = None      # SelfFlowProjectionHead|None – trainable 1×1 conv
 
+    # Cross-VAE-space distillation (set in train.py when teacher and student live in
+    # different latent spaces; e.g. SD2 teacher → SDXL student).
+    latent_interposer = None        # LatentInterposer|None
+
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
         return TrainingModel(
