@@ -323,6 +323,19 @@ class TrainingModel:
             yaml=None,
         )
 
+    def setup_cond_dropout_tokens(self):
+        self.cond_dropout_tokens = torch.tensor(self.tokenizer(self.cond_dropout_caption,
+                                                               truncation=True,
+                                                               padding="max_length",
+                                                               max_length=self.tokenizer.model_max_length,
+                                                               ).input_ids)
+        if self.tokenizer_2 is not None:
+            self.cond_dropout_tokens_2 = torch.tensor(self.tokenizer_2(self.cond_dropout_caption,
+                                                                       truncation=True,
+                                                                       padding="max_length",
+                                                                       max_length=self.tokenizer_2.model_max_length,
+                                                                       ).input_ids)
+
     def set_noise_scheduler_shift(self, shift):
         assert isinstance(self.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler), "Noise scheduler is not TrainFlowMatchEulerDiscreteScheduler"
         self.noise_scheduler.set_timesteps(num_inference_steps=self.noise_scheduler.config.num_train_timesteps,

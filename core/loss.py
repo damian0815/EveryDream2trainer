@@ -547,7 +547,7 @@ def get_model_prediction_and_target(
         do_self_flow = (self_flow_s_timesteps is not None
                   and model.self_flow_teacher_unet is not None)
         if do_self_flow:
-            sf_mode = getattr(args, 'self_flow_mode', 'shallow')
+            sf_mode = args.self_flow_mode
             sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model, sf_mode)
             self_flow_student_features = torch.zeros(sf_student_shape, dtype=model.unet.dtype, device=model.unet.device)
             self_flow_teacher_features = torch.zeros(sf_teacher_shape, dtype=model.unet.dtype, device=model.unet.device)
@@ -692,7 +692,7 @@ def get_model_prediction_and_target(
     sf_teacher_unet = model.self_flow_teacher_unet
     if self_flow_s_timesteps is not None and sf_teacher_unet is not None:
         sf_mask_ratio = args.self_flow_mask_ratio
-        sf_mode = getattr(args, 'self_flow_mode', 'shallow')
+        sf_mode = argsself_flow_mode
 
         # Build heterogeneously noised latents for student and teacher
         x_tau, x_tau_min, tau_min_ts = build_self_flow_latents(
@@ -1102,12 +1102,11 @@ def get_teacher_target(
 
     # ---- Cross-VAE-space distillation via bidirectional interposer ----
     # When teacher and student live in different VAE latent spaces (e.g. SD2 teacher →
-    # SDXL student) the interposer is required to bridge them.  This path implements
-    # the full Step 3 forward pass from the plan:
-    #   x_1_vS → interp_S2T → x_1_vT → teacher → v_hat_vT
-    #   → x_1_hat_vT → interp_T2S → x_1_hat_vS → v_target_vS
+    # SDXL student) the interposer is required to bridge them.  This path handles both
+    # FM and v-pred teachers; the internal branching in _teacher_target_via_interposer
+    # selects the appropriate noisy-latent construction and clean-endpoint recovery.
     latent_interposer = getattr(student_model, 'latent_interposer', None)
-    if latent_interposer is not None and teacher_prediction_type == 'flow_prediction' and student_prediction_type == 'flow_prediction':
+    if latent_interposer is not None and student_prediction_type == 'flow_prediction':
         from core.latent_interposer import infer_latent_space_type
         src_space = infer_latent_space_type(student_model)  # e.g. "xl"
         dst_space = infer_latent_space_type(teacher_model)  # e.g. "v1"
@@ -1120,8 +1119,8 @@ def get_teacher_target(
                 clean_image_latents=clean_image_latents,
                 student_noise=noise,
                 latent_interposer=latent_interposer,
-                src_space=src_space,
-                dst_space=dst_space,
+                student_vae_space=src_space,
+                teacher_vae_space=dst_space,
             )
 
     # ---- Same-VAE-space distillation (original path) ----
@@ -1192,8 +1191,8 @@ def _teacher_target_via_interposer(
     clean_image_latents: torch.Tensor,  # x_1_vS — scaled SDXL latents, shape [B,4,H,W]
     student_noise: torch.Tensor,   # x_0_vS, shape [B,4,H,W]
     latent_interposer,
-    src_space: str,                # e.g. "xl"
-    dst_space: str,                # e.g. "v1"
+    student_vae_space: str,                # e.g. "xl"
+    teacher_vae_space: str,                # e.g. "v1"
 ) -> torch.Tensor:
     """
     Cross-VAE-space velocity target via the bidirectional interposer.
@@ -1216,42 +1215,64 @@ def _teacher_target_via_interposer(
     # We unscale before converting and re-scale after, so that every tensor
     # that touches a UNet or VAE is in the expected scaled representation.
     def _vae_scale(model: TrainingModel) -> float:
-        vae = getattr(model, 'vae', None)
+        vae = model.vae
         if vae is not None:
             sf = getattr(vae.config, 'scaling_factor', None)
             if sf is not None:
                 return float(sf)
-        return 0.13025 if getattr(model, 'is_sdxl', False) else 0.18215
+        return 0.13025 if model.is_sdxl else 0.18215
 
-    src_scale = _vae_scale(student_model)
-    dst_scale = _vae_scale(teacher_model)
+    student_vae_scale = _vae_scale(student_model)
+    teacher_vae_scale = _vae_scale(teacher_model)
+
+    teacher_prediction_type = (
+        'flow_prediction'
+        if type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler
+        else teacher_model.noise_scheduler.config.get('prediction_type', 'unknown')
+    )
+    is_vpred_teacher = teacher_prediction_type in ('v_prediction', 'v-prediction')
 
     # ---- 1. Convert clean student latents → teacher VAE space ----
-    # Unscale first (interposer expects raw latents), then re-scale with dst_scale.
+    # Unscale first (interposer expects raw latents), then re-scale with teacher_vae_scale.
     x_1_vT = latent_interposer.convert(
-        (clean_image_latents / src_scale).float(), src=src_space, dst=dst_space
-    ) * dst_scale  # shape [B, 4, H, W], now scaled in teacher VAE space
+        (clean_image_latents / student_vae_scale).float(), src=student_vae_space, dst=teacher_vae_space
+    ) * teacher_vae_scale  # shape [B, 4, H, W], now scaled in teacher VAE space
 
-    # ---- 2. Get σ for the current timestep batch ----
-    # Both schedulers share the same shift config, so student's lookup is fine.
-    # get_sigmas_for_timesteps requires timesteps to match the scheduler's device.
+    # ---- 2/3. Build teacher noisy latent (formula depends on teacher type) ----
+    # Option A throughout: fresh independent noise in teacher space.
+    x_0_vT = torch.randn_like(x_1_vT)
+
     sched = student_model.noise_scheduler
-    sigmas = sched.get_sigmas_for_timesteps(
-        timesteps.to(sched.timesteps.device)
-    ).to(x_1_vT.device).float()  # shape [B]
-    sigma_b = sigmas.view(-1, 1, 1, 1)  # broadcast over spatial dims
+    teacher_timesteps_ddpm = None  # set below if is_vpred_teacher
+    sigma_b = None                 # set below if FM teacher
 
-    # ---- 3. Option A: independent noise in teacher space ----
-    x_0_vT = torch.randn_like(x_1_vT)  # fresh, not interposed — avoids OOD interposer input
+    if is_vpred_teacher:
+        # (a) V-pred teacher: SNR-match FM timestep → DDPM integer timestep,
+        #     then build noisy latent with the DDPM interpolant α_t·x_1 + σ_t·ε.
+        teacher_timesteps_ddpm = _get_ddpm_timesteps_for_flowmatch_timesteps(
+            flowmatch_timesteps=timesteps.to(sched.timesteps.device),
+            ddpm_scheduler=teacher_model.noise_scheduler,
+            flowmatch_scheduler=sched,
+        ).to(x_1_vT.device)
+        x_t_vT = _get_noisy_latents(
+            x_1_vT, x_0_vT, teacher_model.noise_scheduler, teacher_timesteps_ddpm,
+            latents_perturbation=0.0,
+        )
+        teacher_unet_timesteps = teacher_timesteps_ddpm
+    else:
+        # (b) FM teacher: use the same sigma as the student, FM interpolant
+        #     x_t = (1−σ)·x_1 + σ·x_0.
+        sigmas = sched.get_sigmas_for_timesteps(
+            timesteps.to(sched.timesteps.device)
+        ).to(x_1_vT.device).float()
+        sigma_b = sigmas.view(-1, 1, 1, 1)
+        x_t_vT = (1.0 - sigma_b) * x_1_vT.float() + sigma_b * x_0_vT.float()
+        teacher_unet_timesteps = timesteps
 
-    # ---- 4. Build teacher's noisy latent ----
-    # Flow-matching interpolant: x_t = (1−σ)·x_1 + σ·x_0
-    x_t_vT = (1.0 - sigma_b) * x_1_vT.float() + sigma_b * x_0_vT.float()
-
-    # ---- 5. Run teacher UNet (SD2: no added_cond_kwargs) ----
+    # ---- 4. Run teacher UNet ----
     v_hat_vT = teacher_model.unet(
         x_t_vT.to(teacher_model.device, dtype=teacher_model.unet.dtype),
-        timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+        teacher_unet_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
         teacher_conditioning.prompt_embeds.to(
             teacher_model.device, dtype=teacher_model.unet.dtype
         ),
@@ -1262,18 +1283,25 @@ def _teacher_target_via_interposer(
         ),
     ).sample.to(x_t_vT.device).float()
 
-    # ---- 6. Recover predicted clean endpoint in teacher space ----
-    # Code convention: v = x_0 − x_1  ⟹  x_1 = x_t − σ·v
-    x_1_hat_vT = x_t_vT - sigma_b * v_hat_vT
+    # ---- 5. Recover predicted clean endpoint in teacher space ----
+    if is_vpred_teacher:
+        # V-pred: v = α_t·ε − σ_t·x_1  →  x_1 = α_t·x_t − σ_t·v
+        ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_t_vT.device)
+        alpha_t = ac[teacher_timesteps_ddpm].sqrt().view(-1, 1, 1, 1).float()
+        sigma_t = (1.0 - ac[teacher_timesteps_ddpm]).sqrt().view(-1, 1, 1, 1).float()
+        x_1_hat_vT = alpha_t * x_t_vT.float() - sigma_t * v_hat_vT
+    else:
+        # FM: code convention v = x_0 − x_1  →  x_1 = x_t − σ·v
+        x_1_hat_vT = x_t_vT - sigma_b * v_hat_vT
 
-    # ---- 7. Map predicted clean endpoint back to student VAE space ----
+    # ---- 6. Map predicted clean endpoint back to student VAE space ----
     # Unscale from teacher space, convert, then re-scale to student space.
     x_1_hat_vS = latent_interposer.convert(
-        (x_1_hat_vT / dst_scale).to(clean_image_latents.dtype), src=dst_space, dst=src_space
-    ) * src_scale
+        (x_1_hat_vT / teacher_vae_scale).to(clean_image_latents.dtype), src=teacher_vae_space, dst=student_vae_space
+    ) * student_vae_scale
     x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
 
-    # ---- 8. Build student-space distillation velocity target ----
+    # ---- 7. Build student-space distillation velocity target ----
     # Code convention: target = x_0_vS − x_1_hat_vS  (noise − clean)
     v_target_vS = student_noise.float() - x_1_hat_vS
 

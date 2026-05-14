@@ -78,8 +78,8 @@ def load_teacher_model(
     ):
         logging.warning(
             f" * Teacher and student use different prediction types — "
-            f"teacher={teacher_pipeline.scheduler.config.get('prediction_type')}, "
-            f"student={student_model.noise_scheduler.config.get('prediction_type')}"
+            f"teacher={teacher_pipeline.scheduler.config.get('prediction_type')} ({type(student_model.noise_scheduler)}), "
+            f"student={student_model.noise_scheduler.config.get('prediction_type')} ({type(student_model.noise_scheduler)})"
         )
 
     teacher_unet = teacher_pipeline.unet
@@ -97,7 +97,7 @@ def load_teacher_model(
                     min_len = min(base_te_sd[k].shape[0], teacher_te_sd[k].shape[0])
                     teacher_te_sd[k] = teacher_te_sd[k][:min_len]
                     base_te_sd[k] = base_te_sd[k][:min_len]
-            if k not in base_te_sd:
+            if k not in base_te_sd or base_te_sd[k].shape != teacher_te_sd[k].shape:
                 delta = 1.0 + epsilon
                 break
             delta += torch.mean(

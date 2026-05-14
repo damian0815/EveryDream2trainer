@@ -136,7 +136,7 @@ def train_step(
 
             # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
             if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] > tv.max_backward_slice_size:
-                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or getattr(args, 'force_bfloat16', False)) else torch.float16):
+                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
 
                     optimizer_backward(ed_optimizer, tv, plugin_runner, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
                     record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
@@ -340,7 +340,7 @@ def train_step(
                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                 # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                 t_backward_start = time.perf_counter()
-                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or getattr(args, 'force_bfloat16', False)) else torch.float16):
+                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
                     optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
                 record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
@@ -509,6 +509,25 @@ def compute_train_process_01(
         total_steps = min(total_steps, max_global_steps)
     steps_completed = steps_per_epoch * epoch + step
     return min(1, steps_completed / total_steps)
+
+
+def get_teacher_lambda(timesteps: torch.Tensor, args) -> torch.Tensor:
+    """
+    Returns a per-sample teacher lambda tensor.
+    If --teacher_lambda_falloff is enabled:
+      - timestep > tmax  -> args.teacher_lambda
+      - timestep < tmin  -> 0
+      - between tmin/tmax -> linear ramp
+    Otherwise returns a scalar tensor with args.teacher_lambda.
+    """
+    base = args.teacher_lambda
+    if not getattr(args, 'teacher_lambda_falloff', False):
+        return torch.full((timesteps.shape[0],), base, dtype=torch.float32, device=timesteps.device)
+    tmin = args.teacher_lambda_falloff_tmin
+    tmax = args.teacher_lambda_falloff_tmax
+    t = timesteps.float()
+    scale = torch.clamp((t - tmin) / max(1, tmax - tmin), 0.0, 1.0)
+    return scale * base
 
 
 def get_exponential_scaled_value(progress_01, initial_value, final_value, alpha=3.0):
@@ -850,6 +869,10 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                 this_tokens = model.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
                 if model.is_sdxl:
                     this_tokens_2 = model.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
+                if teacher_model is not None:
+                    this_teacher_tokens = teacher_model.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
+                    if teacher_model.is_sdxl:
+                        this_teacher_tokens_2 = teacher_model.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
             else:
                 this_caption_str = [batch["captions"][key][i] for i in range(batch_size)]
                 assert all(c is not None for c in caption_str)
@@ -857,6 +880,10 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                 if model.is_sdxl:
                     this_tokens_2 = torch.stack([batch["tokens_2"][key][i] for i in range(batch_size)])
                 if "tokens_teacher" in batch:
+                    for i in range(batch_size):
+                        if batch["tokens_teacher"][key][i] is None:
+                            print("** None in tokens_teacher?")
+                            batch["tokens_teacher"][key][i] = batch["tokens"][key][i]
                     this_teacher_tokens = torch.stack([batch["tokens_teacher"][key][i] for i in range(batch_size)])
                 if "tokens_teacher_2" in batch:
                     this_teacher_tokens_2 = torch.stack([batch["tokens_teacher_2"][key][i] for i in range(batch_size)])
@@ -870,6 +897,10 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                     this_tokens[i] = model.cond_dropout_tokens
                     if model.is_sdxl:
                         this_tokens_2[i] = model.cond_dropout_tokens_2
+                    if teacher_model is not None:
+                        this_teacher_tokens[i] = teacher_model.cond_dropout_tokens
+                        if teacher_model.is_sdxl:
+                            this_teacher_tokens_2[i] = teacher_model.cond_dropout_tokens_2
 
             caption_str.append(this_caption_str)
             tokens.append(this_tokens)
@@ -1167,8 +1198,11 @@ def _do_loss(
         ).to(dtype=model.dtype)
         # only the masked entries
         teacher_loss[~teacher_mask] = 0
-        loss += teacher_loss * args.teacher_lambda
-        del teacher_loss
+        teacher_lambda = get_teacher_lambda(timesteps, args).to(dtype=teacher_loss.dtype, device=teacher_loss.device)
+        # reshape for broadcast: [B] -> [B, 1, 1, 1]
+        teacher_lambda = teacher_lambda.view(-1, *([1] * (teacher_loss.dim() - 1)))
+        loss += teacher_loss * teacher_lambda
+        del teacher_loss, teacher_lambda
 
     if model_forward_result.lcf_midblock_out is not None:
         # doing local contrastive flow loss

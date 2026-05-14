@@ -611,17 +611,9 @@ def main(args):
                     f"no interposer needed."
                 )
 
-        model.cond_dropout_tokens = torch.tensor(model.tokenizer(model.cond_dropout_caption,
-                                                               truncation=True,
-                                                               padding="max_length",
-                                                               max_length=model.tokenizer.model_max_length,
-                                                               ).input_ids)
-        if model.tokenizer_2 is not None:
-            model.cond_dropout_tokens_2 = torch.tensor(model.tokenizer_2(model.cond_dropout_caption,
-                                                                       truncation=True,
-                                                                       padding="max_length",
-                                                                       max_length=model.tokenizer_2.model_max_length,
-                                                                       ).input_ids)
+        model.setup_cond_dropout_tokens()
+        if teacher_model is not None:
+            teacher_model.setup_cond_dropout_tokens()
 
         compel = None
         if args.use_compel:
@@ -1822,6 +1814,9 @@ if __name__ == "__main__":
     argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
     argparser.add_argument("--teacher_p", type=float, default=1.0, help="Probability of teacher model being used as target")
     argparser.add_argument("--teacher_lambda", type=float, default=1.0, help="When teacher is used, the scale factor for teacher loss when added to regular loss")
+    argparser.add_argument("--teacher_lambda_falloff", action=argparse.BooleanOptionalAction, default=False, help="When enabled, teacher_lambda falls off linearly to 0 below teacher_lambda_falloff_tmax down to teacher_lambda_falloff_tmin")
+    argparser.add_argument("--teacher_lambda_falloff_tmin", type=int, default=50, help="Timestep below which teacher_lambda is 0 (used with --teacher_lambda_falloff)")
+    argparser.add_argument("--teacher_lambda_falloff_tmax", type=int, default=150, help="Timestep above which teacher_lambda is at full value (used with --teacher_lambda_falloff)")
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
     argparser.add_argument("--teacher_prediction_type", type=str, default="auto", choices=["auto", "flow_prediction", "v_prediction", "epsilon"],
                            help="Override the teacher scheduler prediction type. 'auto' uses whatever the saved config says. 'flow_prediction' forces a FlowMatch scheduler regardless of saved config.")

@@ -256,7 +256,7 @@ class LatentInterposer:
                 f"No interposer model exists for '{src}' → '{dst}'.  "
                 f"Available conversions: {sorted(INTERPOSER_CONFIGS.keys())}"
             )
-        print('get model', key)
+        #print('get model', key)
 
         model = self._load_model(key)
         original_device = latents.device
@@ -282,7 +282,7 @@ class LatentInterposer:
 
     def _load_model(self, key: str) -> InterposerModel:
         if key in self._cache:
-            print('cached:', key)
+            #print('cached:', key)
             return self._cache[key]
 
         path = self._resolve_model_path(key)
@@ -362,10 +362,10 @@ def infer_latent_space_type(model) -> Optional[str]:
         return None
 
     # SDXL is identified by the presence of a second text encoder
-    if getattr(model, "is_sdxl", False):
+    if model.is_sdxl:
         return LatentSpaceType.SDXL
 
-    unet = getattr(model, "unet", None)
+    unet = model.unet
     if unet is not None:
         in_ch = unet.config.get("in_channels", 4)
         if in_ch == 16:
