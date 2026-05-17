@@ -463,14 +463,15 @@ def build_cond_dropout_mask(batch: dict, timesteps: torch.Tensor, model: Trainin
 
 def get_nibble_size(training_variables: TrainingVariables) -> int:
     if training_variables.desired_effective_batch_size - training_variables.backwarded_images_count <= 0:
-        raise ValueError(f"get_nibble_size: no nibble left? desired effective batch size {training_variables.desired_effective_batch_size} - current accumulated backward images count {training_variables.backwarded_images_count}")
+        # The optimizer step threshold has already been reached in this train_step
+        # call (deferred-step DDP mode).  Drain the remaining images using the
+        # backward-slice size so their gradients fold into the pending step.
+        return max(1, training_variables.max_backward_slice_size - training_variables.accumulated_loss_images_count)
     if training_variables.interleaved_bs1_count is not None:
         return 1
 
     permitted_until_optimizer_step = training_variables.desired_effective_batch_size - (training_variables.accumulated_loss_images_count + training_variables.backwarded_images_count)
     permitted_until_backward_step = training_variables.max_backward_slice_size - training_variables.accumulated_loss_images_count
-    #print(f'ebs {training_variables.desired_effective_batch_size}, acc loss {training_variables.accumulated_loss_images_count} -> permitted until optimizer step: {permitted_until_optimizer_step}')
-    #print(f'curr acc bwd {training_variables.backwarded_images_count}, max bwd slice {training_variables.max_backward_slice_size} -> permitted until backward step: {permitted_until_backward_step}')
     return max(1, min(permitted_until_optimizer_step, permitted_until_backward_step))
 
 
