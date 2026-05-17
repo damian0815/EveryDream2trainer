@@ -361,6 +361,19 @@ def train_step(
             if should_step_optimizer and tv.backwarded_images_count > 0:
                 _locally_wants_step = True
 
+    # --- Flush stale accumulated_loss before the optimizer step ---
+    # After _locally_wants_step becomes True, subsequent nibbles in the while
+    # loop above may have added more forward-pass graphs into tv.accumulated_loss
+    # without calling backward on them.  If we let step_optimizer call
+    # optimizer.step() first (modifying weights in-place), those live graphs
+    # would reference the old weight version and the next backward would raise a
+    # "version mismatch" / "modified by an inplace operation" error.
+    # Fix: if we are about to step, flush any remaining accumulated_loss now,
+    # while the weights are still untouched.
+    if _locally_wants_step and tv.accumulated_loss_images_count > 0:
+        with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
+            optimizer_backward(ed_optimizer, tv, plugin_runner, 'pre-step flush backward: ')
+
     # --- want_to_step MAX vote (ONCE per train_step call = once per dataloader step) ---
     # dist.all_reduce must be called the same number of times on every rank.
     # Placing it here, outside the while/for loops, guarantees that: every rank
@@ -779,9 +792,9 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             plugin_runner.run_on_optimizer_backward(loss=tv.accumulated_loss)
             gc.collect()
             torch.cuda.empty_cache()
-            print(f"optimizer backward rank {get_rank()} (why: '{log_hint}')")
+            #print(f"optimizer backward rank {get_rank()} (why: '{log_hint}')")
             optimizer.backward(tv.accumulated_loss)
-            print(f"optimizer backward rank {get_rank()} done")
+            #print(f"optimizer backward rank {get_rank()} done")
             if not optimizer.use_grad_scaler:
                 # if we have a grad scaler it suppresses NaN/Inf for us.
                 # otherwise, we have to suppress NaN/Inf manually
@@ -802,7 +815,7 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             tv.register_backward_oom_or_not(oomed=True)
 
         tv.clear_accumulated_loss()
-        print(f"leaving {optimizer_backward} rank {get_rank()}")
+        #print(f"leaving optimizer_backward rank {get_rank()}")
 
 
 def _encode_latents(
