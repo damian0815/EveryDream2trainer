@@ -17,6 +17,7 @@ from scipy.stats import beta as sp_beta
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
+from core.prediction_bridge import get_prediction_bridge, _ddpm_timesteps_matching_fm_sigma
 from core.loss_softrepa import (
     text_weighted_infonce_loss,
     text_weighted_infonce_loss_with_softrepa,
@@ -1189,8 +1190,8 @@ def _teacher_target_via_interposer(
     (v = noise − clean_latent):
 
       1. x_1_vT  = interp_S2T(x_1_vS)
-      2. x_0_vT  = randn_like(x_1_vT)          [Option A: independent noise]
-      3. x_t_vT  = (1−σ)·x_1_vT + σ·x_0_vT    [teacher's noisy input]
+      2. x_0_vT  = interp_S2T(x_0_vS)          [map student noise → teacher space]
+      3. x_t_vT  = (1−σ)·x_1_vT + σ·x_0_vT    [teacher's noisy input, consistent noise dir]
       4. v̂_vT   = teacher_unet(x_t_vT, t, ...)
       5. x̂_1_vT = x_t_vT − σ·v̂_vT            [recover clean endpoint]
       6. x̂_1_vS = interp_T2S(x̂_1_vT)
@@ -1227,8 +1228,14 @@ def _teacher_target_via_interposer(
     ) * teacher_vae_scale  # shape [B, 4, H, W], now scaled in teacher VAE space
 
     # ---- 2/3. Build teacher noisy latent (formula depends on teacher type) ----
-    # Option A throughout: fresh independent noise in teacher space.
-    x_0_vT = torch.randn_like(x_1_vT)
+    # Map the *student* noise into teacher VAE space so that the teacher and student
+    # are both working with the same underlying noise direction.  Using independent
+    # noise (randn_like) would cause the teacher to predict a clean latent for a
+    # completely different noise sample than the one the student is trying to denoise,
+    # making the cross-space velocity target incoherent.
+    x_0_vT = latent_interposer.convert(
+        (student_noise / student_vae_scale).float(), src=student_vae_space, dst=teacher_vae_space
+    ) * teacher_vae_scale
 
     sched = student_model.noise_scheduler
     teacher_timesteps_ddpm = None  # set below if is_vpred_teacher
@@ -1237,10 +1244,12 @@ def _teacher_target_via_interposer(
     if is_vpred_teacher:
         # (a) V-pred teacher: SNR-match FM timestep → DDPM integer timestep,
         #     then build noisy latent with the DDPM interpolant α_t·x_1 + σ_t·ε.
-        teacher_timesteps_ddpm = _get_ddpm_timesteps_for_flowmatch_timesteps(
-            flowmatch_timesteps=timesteps.to(sched.timesteps.device),
+        fm_sigmas = sched.get_sigmas_for_timesteps(
+            timesteps.to(sched.timesteps.device)
+        ).to(x_1_vT.device).float()
+        teacher_timesteps_ddpm = _ddpm_timesteps_matching_fm_sigma(
+            fm_sigmas=fm_sigmas,
             ddpm_scheduler=teacher_model.noise_scheduler,
-            flowmatch_scheduler=sched,
         ).to(x_1_vT.device)
         x_t_vT = _get_noisy_latents(
             x_1_vT, x_0_vT, teacher_model.noise_scheduler, teacher_timesteps_ddpm,
@@ -1255,7 +1264,25 @@ def _teacher_target_via_interposer(
         ).to(x_1_vT.device).float()
         sigma_b = sigmas.view(-1, 1, 1, 1)
         x_t_vT = (1.0 - sigma_b) * x_1_vT.float() + sigma_b * x_0_vT.float()
-        teacher_unet_timesteps = timesteps
+        # Look up the *teacher's own* shifted timestep that corresponds to
+        # this sigma — the teacher may have a different flow_match_shift than
+        # the student, so we must NOT pass the student's timestep values.
+        teacher_sched = teacher_model.noise_scheduler
+        if (
+            isinstance(teacher_sched, TrainFlowMatchEulerDiscreteScheduler)
+            and hasattr(teacher_sched, 'sigmas')
+            and teacher_sched.sigmas is not None
+        ):
+            # sigmas: [B]; teacher_sched.sigmas: [T+1] (trailing 0.0)
+            t_sigmas = teacher_sched.sigmas[:-1].to(sigmas.device).float()  # [T]
+            diff = (t_sigmas.unsqueeze(0) - sigmas.unsqueeze(-1)).abs()     # [B, T]
+            idx = diff.argmin(dim=-1)                                         # [B]
+            teacher_unet_timesteps = teacher_sched.timesteps[
+                idx.to(teacher_sched.timesteps.device)
+            ]
+        else:
+            # Fallback: use student timesteps (compatible when shifts are equal)
+            teacher_unet_timesteps = timesteps
 
     # ---- 4. Run teacher UNet ----
     v_hat_vT = teacher_model.unet(
@@ -1294,6 +1321,7 @@ def _teacher_target_via_interposer(
     v_target_vS = student_noise.float() - x_1_hat_vS
 
     return v_target_vS.to(dtype=student_model.unet.dtype)
+
 
 
 

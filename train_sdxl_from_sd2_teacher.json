@@ -27,6 +27,8 @@
   "teacher_p": 0.5,
   "teacher_lambda": 1.0,
   "teacher_prediction_type": "flow_prediction",
+  "_comment_teacher_shift": "Set this to the shift the teacher was trained with (1.0 for SD2-FM at 512px, 3.0 for SDXL-FM at 1024px). Do NOT set to student's shift if different.",
+  "teacher_flow_match_shift": 1.0,
 
   "optimizer_config": "optimizer-1e-5-cosine.json",
 

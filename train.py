@@ -1330,8 +1330,8 @@ def main(args):
                             shift = 1.0
                         #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
                         model.set_noise_scheduler_shift(shift)
-                        if teacher_model and type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
-                            teacher_model.set_noise_scheduler_shift(shift)
+                        # Teacher uses its own fixed shift; do NOT override it with the
+                        # student's dynamic per-resolution shift.
 
                     train_step(
                         full_batch=full_batch,

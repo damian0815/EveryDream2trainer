@@ -54,15 +54,26 @@ def load_teacher_model(
 
     # ── Scheduler: force FM when requested or already FM ────────────────────
     teacher_prediction_type = getattr(args, 'teacher_prediction_type', 'auto')
+
+    # Resolve the teacher's own shift.  Priority:
+    #  1. Explicit --teacher_flow_match_shift arg
+    #  2. The shift already baked into the teacher's saved scheduler config
+    #  3. Fall back to the student's --flow_match_shift
+    teacher_shift: float = float(
+        getattr(args, 'teacher_flow_match_shift', None)
+        or teacher_pipeline.scheduler.config.get('shift', None)
+        or getattr(args, 'flow_match_shift', 1.0)
+    )
+
     if (
         teacher_prediction_type == 'flow_prediction'
         or isinstance(teacher_pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
     ):
         teacher_pipeline.scheduler = TrainFlowMatchEulerDiscreteScheduler.from_config(
             teacher_pipeline.scheduler.config,
-            use_dynamic_shifting=getattr(args, 'flow_match_shift_dynamic', False),
+            use_dynamic_shifting=False,   # teacher uses fixed shift, not dynamic
             time_shift_type='linear',
-            shift=getattr(args, 'flow_match_shift', 3.0),
+            shift=teacher_shift,          # teacher's OWN shift
         )
         teacher_pipeline.scheduler.config.prediction_type = 'flow_prediction'
 
@@ -138,9 +149,8 @@ def load_teacher_model(
     # ── BUG 1: initialise scheduler timestep table ───────────────────────────
     # `get_sigmas_for_timesteps` (used by the bridge) needs self.sigmas and
     # self.timesteps, which are populated by set_timesteps() / set_noise_scheduler_shift().
+    # Use the teacher's OWN shift (resolved above), not the student's.
     if isinstance(teacher_model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
-        teacher_model.set_noise_scheduler_shift(
-            getattr(args, 'flow_match_shift', 3.0)
-        )
+        teacher_model.set_noise_scheduler_shift(teacher_shift)
 
     return teacher_model
