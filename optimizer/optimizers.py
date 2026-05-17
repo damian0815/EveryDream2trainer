@@ -43,6 +43,7 @@ from optimizer.per_unet_layer_scales import ParamGroupBuilder
 from plugins.plugins import PluginRunner
 import re
 
+from utils.distributed import get_rank
 
 BETAS_DEFAULT = [0.9, 0.999]
 EPSILON_DEFAULT = 1e-8

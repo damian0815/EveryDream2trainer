@@ -9,10 +9,12 @@ Usage (multi-GPU, 2 GPUs):
 """
 import logging
 import os
+from contextlib import contextmanager, ExitStack
 from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +96,45 @@ def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
         return tensor
     dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
     return tensor
+
+
+# ---------------------------------------------------------------------------
+# DDP gradient-accumulation helpers
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def ddp_no_sync_ctx(*modules):
+    """
+    Context manager that puts every DistributedDataParallel module in
+    ``no_sync()`` mode simultaneously.
+
+    Use this for **intermediate** backward passes (gradient accumulation,
+    pre-emptive / emergency / truncated backwardS) so that DDP does NOT
+    launch an ALLREDUCE for those passes.  Only the **final** backward
+    immediately before ``optimizer.step()`` should run outside this context
+    so that gradients are averaged across ranks exactly once per step.
+
+    Non-DDP modules (and ``None``) are silently ignored, making this safe
+    to call in single-GPU mode.
+
+    Example::
+
+        # intermediate backward – no cross-rank sync
+        with ddp_no_sync_ctx(model.unet, model.text_encoder):
+            optimizer.backward(accumulated_loss)
+
+        # final backward – triggers ALLREDUCE
+        optimizer.backward(final_loss)
+    """
+    ddp_mods = [m for m in modules
+                if m is not None and isinstance(m, DistributedDataParallel)]
+    if not ddp_mods:
+        yield
+        return
+    with ExitStack() as stack:
+        for m in ddp_mods:
+            stack.enter_context(m.no_sync())
+        yield
 
 
 # ---------------------------------------------------------------------------

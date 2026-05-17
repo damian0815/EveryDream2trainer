@@ -1,5 +1,6 @@
 """
 Copyright [2022-2023] Victor C Hall
+Copyright [2023-2026] Damian Stewart
 
 Licensed under the GNU Affero General Public License;
 You may not use this code except in compliance with the License.
@@ -27,6 +28,18 @@ import random
 import traceback
 
 from typing import Optional
+
+import torch.distributed as dist
+from utils.distributed import (
+    is_distributed as _check_is_distributed,
+    init_distributed,
+    cleanup_distributed,
+    barrier as dist_barrier,
+    all_reduce_mean,
+    shard_items,
+    DDPWrapper,
+    ddp_no_sync_ctx,
+)
 
 from colorama import Fore, Style
 import numpy as np
@@ -100,6 +113,15 @@ from plugins.plugins import PluginRunner
 
 _SIGTERM_EXIT_CODE = 130
 _VERY_LARGE_NUMBER = 1e9
+
+
+class _NopWriter:
+    """Drop-in replacement for SummaryWriter used on non-main ranks."""
+    def add_scalar(self, *a, **kw): pass
+    def add_image(self, *a, **kw): pass
+    def add_histogram(self, *a, **kw): pass
+    def flush(self): pass
+    def close(self): pass
 
 
 def _epoch_step_source(
@@ -517,10 +539,31 @@ def main(args):
     import faulthandler
     faulthandler.enable()  # by default will dump on sys.stderr, but can also print to a regular file
 
-    log_time, log_folder = setup_local_logger(args)
+    # -----------------------------------------------------------------------
+    # Phase 1 – Distributed bootstrap
+    # -----------------------------------------------------------------------
+    _is_dist = _check_is_distributed()
+    if _is_dist:
+        _rank, _local_rank, _world_size = init_distributed()
+    else:
+        _rank, _local_rank, _world_size = 0, 0, 1
+    _is_main = (_rank == 0)
+
+    if _is_main:
+        log_time, log_folder = setup_local_logger(args)
+    else:
+        # Non-main ranks: minimal console-only logging at WARNING level
+        logging.basicConfig(
+            level=logging.WARNING,
+            format=f"%(asctime)s [rank{_rank}] %(message)s",
+        )
+        log_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_folder = os.path.join(args.logdir, f"{args.project_name}-{log_time}")
+
     args = setup_args(args)
-    print(f" Args:")
-    pprint.pprint(vars(args))
+    if _is_main:
+        print(f" Args:")
+        pprint.pprint(vars(args))
 
     if args.debug_log_on_nan:
         torch.autograd.set_detect_anomaly(True)
@@ -531,7 +574,11 @@ def main(args):
     logging.info(f" Seed: {seed}")
     set_seed(seed)
     if torch.cuda.is_available():
-        device = torch.device(f"cuda:{args.gpuid}")
+        if _is_dist:
+            # Phase 1: per-rank device overrides --gpuid
+            device = torch.device(f"cuda:{_local_rank}")
+        else:
+            device = torch.device(f"cuda:{args.gpuid}")
         gpu = GPU(device)
         torch.backends.cudnn.benchmark = True
     else:
@@ -1306,8 +1353,10 @@ def main(args):
                     tv.max_backward_slice_size = _choose_backward_slice_size(tv)
                     tv.forward_slice_size = _get_default_forward_slice_size(tv)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
-                        # do backward now
-                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ')
+                        # do backward now — intermediate pass, no DDP sync
+                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ',
+                                           no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
+                                                                        getattr(model, 'text_encoder_2', None)))
                         gc.collect()
                         torch.cuda.empty_cache()
 
@@ -1325,8 +1374,11 @@ def main(args):
                                 # maybe not enough memory. if we can, do an emergency backward pass if we have any loss pending
                                 accumulated_loss_images_count_before_emergency_backward = tv.accumulated_loss_images_count
                                 if tv.accumulated_loss_images_count > 0:
-                                    with torch.cuda.amp.autocast(enabled=args.amp):
-                                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ')
+                                    with torch.amp.autocast('cuda', enabled=args.amp):
+                                        # Emergency pass — intermediate, no DDP sync
+                                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ',
+                                                           no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
+                                                                                       getattr(model, 'text_encoder_2', None)))
                                     torch.cuda.empty_cache()
                                     gc.collect()
                                     max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
@@ -1381,9 +1433,25 @@ def main(args):
 
                     ed_optimizer.step_schedulers(tv.global_step)
 
-                    if sample_generator.should_generate_samples(tv.global_step, local_step=step) or check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE):
+                    # ------------------------------------------------------------------
+                    # Samples
+                    # step-based condition is deterministic (same on every rank).
+                    # Semaphore check is rank-0 only; decision is broadcast so the
+                    # dist_barrier() is always entered or skipped by ALL ranks.
+                    # ------------------------------------------------------------------
+                    _do_samples = sample_generator.should_generate_samples(tv.global_step, local_step=step)
+                    if _is_main:
+                        _do_samples = _do_samples or bool(check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE))
+                    if _is_dist:
+                        _sync_samples = torch.tensor(int(_do_samples), dtype=torch.int32, device=device)
+                        dist.all_reduce(_sync_samples, op=dist.ReduceOp.MAX)
+                        _do_samples = bool(_sync_samples.item())
+
+                    if _do_samples:
+                        dist_barrier()
                         if _is_main:
                             generate_samples(global_step=tv.global_step, batch=full_batch)
+                        dist_barrier()
 
                     if args.ema_decay_rate != None:
                         if ((tv.global_step + 1) % args.ema_update_interval) == 0:
@@ -1393,7 +1461,6 @@ def main(args):
 
                                 if args.disable_textenc_training != True:
                                     update_ema(model.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
-
 
                     # Self-Flow EMA teacher update (independent interval from main EMA)
                     if model.self_flow_teacher_unet is not None:
@@ -1407,54 +1474,55 @@ def main(args):
                                 ema_device=device,
                             )
 
-
                     steps_pbar.update(1)
 
                     images_per_sec = full_batch['image'].shape[0] / (time.time() - step_start_time)
                     log_data.images_per_sec_log_step.append(images_per_sec)
 
-                    # Phase 5 – all-reduce loss scalar across ranks for accurate logging
-                    if _is_dist and len(log_data.loss_log_step) > 0:
-                        _loss_t = torch.tensor(log_data.loss_log_step[-1], device=device)
-                        _loss_t = all_reduce_mean(_loss_t)
-                        log_data.loss_log_step[-1] = float(_loss_t.item())
-                        if len(log_data.loss_epoch) > 0:
-                            log_data.loss_epoch[-1] = float(_loss_t.item())
-
                     if (tv.global_step + 1) % args.log_step == 0:
                         if _is_main:
                             logs = do_log_step(args, ed_optimizer, log_data, log_folder,
                                                log_writer, model, tv)
-
                             append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer,
                                              **logs)
-
                         torch.cuda.empty_cache()
 
-                    # -- validation
-                    if validator and (
-                            step in validation_steps
-                            or check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE)
-                    ):
-                        dist_barrier()  # all ranks reach here before rank-0 validates
+                    # ------------------------------------------------------------------
+                    # Validation
+                    # step-based condition is deterministic (same on every rank).
+                    # Semaphore check is rank-0 only; decision is broadcast so the
+                    # dist_barrier() is always entered or skipped by ALL ranks.
+                    # ------------------------------------------------------------------
+                    _do_validate = bool(validator and step in validation_steps)
+                    if _is_main and validator:
+                        _do_validate = _do_validate or bool(check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE))
+                    if _is_dist and validator:
+                        _sync_val = torch.tensor(int(_do_validate), dtype=torch.int32, device=device)
+                        dist.all_reduce(_sync_val, op=dist.ReduceOp.MAX)
+                        _do_validate = bool(_sync_val.item())
+
+                    if _do_validate:
+                        dist_barrier()
                         if _is_main:
                             try:
                                 validator.do_validation(
                                     model=model,
                                     global_step=tv.global_step,
-                                    get_model_prediction_and_target_callable =get_model_prediction_and_target_validation_wrapper,
-                                    pipe_factory=make_inference_pipe
+                                    get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
+                                    pipe_factory=make_inference_pipe,
                                 )
                             except Exception as e:
                                 logging.error("Validation raised an exception: " + str(e))
                                 traceback.print_exc()
-                                # continue training even if validation fails
-                        dist_barrier()  # non-0 ranks wait for rank-0 validation to finish
+                        dist_barrier()
 
-
-                    min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
-
-                    # -- saving
+                    # ------------------------------------------------------------------
+                    # Saving
+                    # Time / epoch conditions are deterministic.  Semaphore checks are
+                    # rank-0 only.  All flags are broadcast before the barrier so every
+                    # rank agrees on whether to enter it.
+                    # ------------------------------------------------------------------
+                    min_since_last_ckpt = (time.time() - last_epoch_saved_time) / 60
 
                     needs_save = False
                     needs_optimizer_save = args.save_optimizer
@@ -1463,16 +1531,17 @@ def main(args):
                         logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {tv.global_step}")
                         needs_save = True
 
-                    if check_semaphore_file_and_unlink(SAVE_FULL_SEMAPHORE_FILE):
-                        needs_save = True
-                    if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
-                        needs_save = True
-                        needs_optimizer_save = True
-                    if check_semaphore_file_and_unlink(SAVE_FULL_AND_STOP_SEMAPHORE_FILE):
-                        wants_stop = True
-                    if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
-                        wants_stop = True
-                        force_save_optimizer = True
+                    if _is_main:
+                        if check_semaphore_file_and_unlink(SAVE_FULL_SEMAPHORE_FILE):
+                            needs_save = True
+                        if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
+                            needs_save = True
+                            needs_optimizer_save = True
+                        if check_semaphore_file_and_unlink(SAVE_FULL_AND_STOP_SEMAPHORE_FILE):
+                            wants_stop = True
+                        if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
+                            wants_stop = True
+                            force_save_optimizer = True
 
                     def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
                         return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
@@ -1481,8 +1550,23 @@ def main(args):
                     if is_first_step_of_save_epoch(args.save_every_n_epochs, start_epoch=args.save_ckpts_from_n_epochs):
                         logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
                         needs_save = True
+
+                    # Broadcast all save/stop decisions from rank-0 so barriers are safe
+                    if _is_dist:
+                        _sync_flags = torch.zeros(4, dtype=torch.int32, device=device)
+                        if _is_main:
+                            _sync_flags[0] = int(needs_save)
+                            _sync_flags[1] = int(needs_optimizer_save)
+                            _sync_flags[2] = int(wants_stop)
+                            _sync_flags[3] = int(force_save_optimizer)
+                        dist.all_reduce(_sync_flags, op=dist.ReduceOp.MAX)
+                        needs_save           = bool(_sync_flags[0].item())
+                        needs_optimizer_save = bool(_sync_flags[1].item())
+                        wants_stop           = bool(_sync_flags[2].item())
+                        force_save_optimizer = bool(_sync_flags[3].item())
+
                     if needs_save:
-                        dist_barrier()  # sync all ranks before save
+                        dist_barrier()
                         if _is_main:
                             save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
                             save_model(save_path,
@@ -1493,7 +1577,7 @@ def main(args):
                                        save_optimizer_flag=needs_optimizer_save,
                                        save_ckpt=not args.no_save_ckpt,
                                        plugin_runner=plugin_runner)
-                        dist_barrier()  # non-0 ranks wait for rank-0 save to finish
+                        dist_barrier()
 
                     if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
                         if _is_main:
@@ -1533,7 +1617,7 @@ def main(args):
 
                     # end of step
 
-                except Exception as e:
+                except Exception:
                     try:
                         current_timesteps = timesteps
                     except NameError:
@@ -1544,6 +1628,7 @@ def main(args):
                     except NameError:
                         batch_idx0 = {}
                         image_shape = []
+                    traceback.print_exc()
                     logging.error(f"step {tv.global_step} failed. image shape {image_shape}, full batch idx0: {batch_idx0}")
                     logging.error(f"  timesteps: {current_timesteps}, training values: {pprint.pformat(tv.filtered_for_log())}")
                     raise

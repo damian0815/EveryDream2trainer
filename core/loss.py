@@ -9,7 +9,7 @@ from typing import Optional, Literal
 import torch
 import torchvision
 from diffusers.training_utils import compute_loss_weighting_for_sd3
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 import torch.nn.functional as F
 
 from scipy.stats import beta as sp_beta
@@ -37,9 +37,7 @@ alpha<1: Quick advance (spread hugs final_value)
 
 def get_latents(image, model: TrainingModel, device, args):
     with torch.no_grad():
-        with autocast(
-            enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16
-        ):
+        with autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16):
             pixel_values = image.to(memory_format=torch.contiguous_format).to(
                 device, dtype=model.vae.dtype
             )
@@ -1095,6 +1093,18 @@ def _get_prediction_type(model: TrainingModel) -> str:
     return model.noise_scheduler.config.get('prediction_type', '<unknown>')
 
 
+def _sched_shift(sched) -> str:
+    """Return the shift value of a scheduler as a string, or 'n/a'."""
+    shift = getattr(sched, 'config', {}).get('shift', None)
+    if shift is None:
+        shift = getattr(sched, 'shift', None)
+    return str(shift) if shift is not None else 'n/a'
+
+
+# Set of config tuples that have already been logged — prevents log spam on every step.
+_teacher_target_logged_configs: set = set()
+
+
 def get_teacher_target(
     teacher_model: TrainingModel,
     teacher_conditioning: Conditioning,
@@ -1113,9 +1123,9 @@ def get_teacher_target(
     latent_interposer = getattr(student_model, 'latent_interposer', None)
     if latent_interposer is not None and student_pred_type == 'flow_prediction':
         from core.latent_interposer import infer_latent_space_type
-        src_space = infer_latent_space_type(student_model)
-        dst_space = infer_latent_space_type(teacher_model)
-        if src_space is not None and dst_space is not None and src_space != dst_space:
+        student_vae_space = infer_latent_space_type(student_model)
+        teacher_vae_space = infer_latent_space_type(teacher_model)
+        if student_vae_space is not None and teacher_vae_space is not None and student_vae_space != teacher_vae_space:
             return _teacher_target_via_interposer(
                 teacher_model=teacher_model,
                 teacher_conditioning=teacher_conditioning,
@@ -1124,13 +1134,27 @@ def get_teacher_target(
                 clean_image_latents=clean_image_latents,
                 student_noise=noise,
                 latent_interposer=latent_interposer,
-                student_vae_space=src_space,
-                teacher_vae_space=dst_space,
+                student_vae_space=student_vae_space,
+                teacher_vae_space=teacher_vae_space,
             )
 
     # ── Unified bridge-based distillation ──────────────────────────────────────
     teacher_pred_type = _get_prediction_type(teacher_model)
     bridge = get_prediction_bridge(teacher_pred_type, student_pred_type)
+
+    _log_key = ('bridge', teacher_pred_type, student_pred_type, type(bridge).__name__)
+    if _log_key not in _teacher_target_logged_configs:
+        _teacher_target_logged_configs.add(_log_key)
+        t_shift = _sched_shift(teacher_model.noise_scheduler)
+        s_shift = _sched_shift(student_model.noise_scheduler)
+        logging.info(
+            f"\n*** Teacher distillation bridge (first call) ***\n"
+            f"  bridge class    : {type(bridge).__name__}\n"
+            f"  teacher pred    : {teacher_pred_type}  |  scheduler: {type(teacher_model.noise_scheduler).__name__}  |  shift: {t_shift}\n"
+            f"  student pred    : {student_pred_type}  |  scheduler: {type(student_model.noise_scheduler).__name__}  |  shift: {s_shift}\n"
+            f"  timestep remap  : {bridge.__class__.__name__}.remap_timesteps (SNR-matched if crossing FM↔DDPM, else identity)\n"
+            f"  VAE latent space: shared (same VAE, no interposer)\n"
+        )
 
     # Step 1: map student timesteps → teacher timesteps (SNR-matched or identity)
     teacher_timesteps = bridge.remap_timesteps(
@@ -1220,6 +1244,34 @@ def _teacher_target_via_interposer(
         else teacher_model.noise_scheduler.config.get('prediction_type', 'unknown')
     )
     is_vpred_teacher = teacher_prediction_type in ('v_prediction', 'v-prediction')
+
+    # ---- One-time diagnostic log ----
+    _log_key = ('interposer', student_vae_space, teacher_vae_space, teacher_prediction_type)
+    if _log_key not in _teacher_target_logged_configs:
+        _teacher_target_logged_configs.add(_log_key)
+        t_shift = _sched_shift(teacher_model.noise_scheduler)
+        s_shift = _sched_shift(student_model.noise_scheduler)
+        if is_vpred_teacher:
+            ts_method = (
+                f"SNR-matched: student FM sigma → nearest DDPM integer timestep\n"
+                f"             using _ddpm_timesteps_matching_fm_sigma() on teacher's DDPM scheduler"
+            )
+        else:
+            ts_method = (
+                f"Sigma-lookup: student sigma → nearest sigma in teacher's own shifted table\n"
+                f"              (teacher shift={t_shift}, student shift={s_shift})"
+            )
+        logging.info(
+            f"\n*** Teacher distillation via interposer (first call) ***\n"
+            f"  student VAE space : {student_vae_space}  |  scale: {student_vae_scale}\n"
+            f"  teacher VAE space : {teacher_vae_space}  |  scale: {teacher_vae_scale}\n"
+            f"  interposer        : {type(latent_interposer).__name__}  "
+            f"[{student_vae_space} → {teacher_vae_space} for x_1 and x_0, {teacher_vae_space} → {student_vae_space} for x̂_1]\n"
+            f"  teacher pred type : {teacher_prediction_type}  |  scheduler: {type(teacher_model.noise_scheduler).__name__}\n"
+            f"  student pred type : flow_prediction  |  scheduler: {type(student_model.noise_scheduler).__name__}\n"
+            f"  timestep mapping  : {ts_method}\n"
+            f"  noise handling    : student_noise passed through interposer ({student_vae_space}→{teacher_vae_space}) for coherent velocity target\n"
+        )
 
     # ---- 1. Convert clean student latents → teacher VAE space ----
     # Unscale first (interposer expects raw latents), then re-scale with teacher_vae_scale.

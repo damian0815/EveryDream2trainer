@@ -12,7 +12,7 @@ from typing import Callable
 import math
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 import line_profiler
 
@@ -26,6 +26,7 @@ from data.dataset import select_caption_variants
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 from plugins.plugins import PluginRunner
+from utils.distributed import get_rank, ddp_no_sync_ctx
 
 # Global performance profiling storage
 # Structure: {<label>: [duration_per_image, duration_per_image, ...]}
@@ -136,9 +137,13 @@ def train_step(
 
             # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
             if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] > tv.max_backward_slice_size:
-                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-
-                    optimizer_backward(ed_optimizer, tv, plugin_runner, f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
+                with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
+                    # Intermediate backward → never sync DDP gradients here; the
+                    # final backward (when should_step_optimizer fires) will sync.
+                    optimizer_backward(ed_optimizer, tv, plugin_runner,
+                                       f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ',
+                                       no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
+                                                                    getattr(model, 'text_encoder_2', None)))
                     record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
 
             # Timesteps generation
@@ -315,6 +320,7 @@ def train_step(
 
             steps_pbar.set_postfix(
                 {
+                    "rank": get_rank(),
                     "loss/step": loss_step,
                     "_f": tv.forward_slice_size,
                     "_l": loss_1d.shape[0],
@@ -338,10 +344,19 @@ def train_step(
                                     ) or tv.interleaved_bs1_count is not None
             if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
-                # accumulated_loss = accumulated_loss.mean() * (accumulated_loss_images_count / desired_effective_batch_size)
                 t_backward_start = time.perf_counter()
-                with torch.cuda.amp.autocast(enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-                    optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
+                with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
+                    # Only sync DDP gradients on the FINAL backward before optimizer.step().
+                    # Intermediate accumulation passes (accumulated >= max_backward_slice_size
+                    # but not yet at desired_effective_batch_size) use no_sync so they don't
+                    # issue an unsolicited ALLREDUCE that would deadlock the other rank.
+                    _bwd_no_sync = (
+                        None if should_step_optimizer
+                        else ddp_no_sync_ctx(model.unet, model.text_encoder,
+                                             getattr(model, 'text_encoder_2', None))
+                    )
+                    optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ',
+                                       no_sync_ctx=_bwd_no_sync)
                 record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
             # if tv.global_step >= 653 and tv.global_step < 656:
@@ -570,7 +585,7 @@ def get_timestep_curriculum_range(
 
 def get_image_from_latents(latents, model: TrainingModel, args):
     with torch.no_grad():
-        with autocast(
+        with autocast('cuda',
             enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16
         ):
             scaling_factor = 0.13025 if model.is_sdxl else 0.18215
@@ -728,7 +743,24 @@ def _get_step_timesteps_internal(
 
 
 
-def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, plugin_runner: PluginRunner, log_hint=''):
+def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, plugin_runner: PluginRunner, log_hint='', no_sync_ctx=None):
+    """
+    Run a backward pass on the currently-accumulated loss.
+
+    Parameters
+    ----------
+    no_sync_ctx:
+        Optional context manager (typically from ``ddp_no_sync_ctx``) that
+        disables DDP gradient ALLREDUCE for this pass.  Pass ``None``
+        (default) for the **final** backward before each optimizer step so
+        that gradients are synchronised across ranks.  Pass a no-sync
+        context for every **intermediate** backward (gradient accumulation,
+        pre-emptive / emergency / truncated passes) so they do NOT trigger
+        an extra ALLREDUCE that would deadlock against the other rank's
+        different accumulation schedule.
+    """
+    import contextlib
+    ctx = no_sync_ctx if no_sync_ctx is not None else contextlib.nullcontext()
     if tv.accumulated_loss_images_count == 0:
         logging.warning("no accumulated loss images, not doing backward")
     else:
@@ -736,7 +768,9 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             plugin_runner.run_on_optimizer_backward(loss=tv.accumulated_loss)
             gc.collect()
             torch.cuda.empty_cache()
-            optimizer.backward(tv.accumulated_loss)
+            with ctx:
+                print(f"optimizer backward rank {get_rank()} (why: {log_hint}")
+                optimizer.backward(tv.accumulated_loss)
             if not optimizer.use_grad_scaler:
                 # if we have a grad scaler it suppresses NaN/Inf for us.
                 # otherwise, we have to suppress NaN/Inf manually
@@ -770,7 +804,7 @@ def _encode_latents(
     forward_slice_size = tv.forward_slice_size
     batch_size = image.shape[0]
     pixel_values = image.to(memory_format=torch.contiguous_format).to(model.unet.device)
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp):
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=amp):
         successfully_encoded_latents = False
         enable_vae_attention_slicing = False
         while not successfully_encoded_latents:

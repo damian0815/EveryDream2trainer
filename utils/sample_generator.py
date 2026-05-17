@@ -26,7 +26,7 @@ from diffusers import (
     StableDiffusionXLPipeline, FlowMatchHeunDiscreteScheduler,
 )
 
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -244,7 +244,7 @@ class SampleGenerator:
             print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts")
 
         sample_index = 0
-        with autocast():
+        with autocast('cuda'):
             try:
                 do_regular_samples = self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts
                 if do_regular_samples:

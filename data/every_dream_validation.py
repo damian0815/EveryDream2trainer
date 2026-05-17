@@ -778,7 +778,7 @@ class EveryDreamValidator:
                             prompts = caption_list[:n_take]
 
                             # single generation call — shared by both metrics
-                            with torch.autocast(device_type='cuda'):
+                            with torch.amp.autocast(device_type='cuda'):
                                 pipe_output = pipe(
                                     prompt=prompts,
                                     num_inference_steps=20,
