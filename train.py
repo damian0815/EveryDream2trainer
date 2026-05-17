@@ -812,6 +812,16 @@ def main(args):
     report_image_train_item_problems(log_folder, image_train_items, batch_size=args.batch_size,
                                      check_load_all=args.test_images, model=model)
 
+    # -----------------------------------------------------------------------
+    # Phase 2 – Data sharding: each rank trains on a non-overlapping subset
+    # -----------------------------------------------------------------------
+    if _is_dist:
+        pre_shard_count = len(image_train_items)
+        image_train_items = shard_items(image_train_items, _rank, _world_size)
+        logging.warning(
+            f"[rank {_rank}/{_world_size}] Data shard: {len(image_train_items)} / {pre_shard_count} items"
+        )
+
     from plugins.plugins import load_plugin
     if args.plugins is not None:
         plugins = [load_plugin(name) for name in args.plugins]
@@ -984,6 +994,11 @@ def main(args):
                 global_step = tv.global_step
                 interrupted_checkpoint_path = os.path.join(f"{log_folder}/ckpts/interrupted-gs{global_step:05}")
                 print()
+                if not _is_main:
+                    # Non-main ranks: just exit cleanly without saving
+                    logging.warning(f"[rank {_rank}] CTRL-C received, exiting (rank 0 will handle save)")
+                    cleanup_distributed()
+                    exit(_SIGTERM_EXIT_CODE)
                 if args.no_save_on_error:
                    logging.error(f"{Fore.LIGHTRED_EX} CTRL-C received, but NOT saving because --no_save_on_error was passed{Style.RESET_ALL}")
                 else:
@@ -994,6 +1009,7 @@ def main(args):
                     save_model(interrupted_checkpoint_path, global_step=global_step, ed_state=make_current_ed_state(),
                                save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
                                save_optimizer_flag=True, save_ckpt=not args.no_save_ckpt)
+            cleanup_distributed()
             exit(_SIGTERM_EXIT_CODE)
         else:
             # non-main threads (i.e. dataloader workers) should exit cleanly
@@ -1030,6 +1046,20 @@ def main(args):
         logging.info(f" text_encoder_2 device: {model.text_encoder_2.device}, precision: {model.text_encoder_2.dtype}, training: {model.text_encoder_2.training}")
     logging.info(f" vae device: {model.vae.device}, precision: {model.vae.dtype}, training: {model.vae.training}")
     logging.info(f" scheduler: {model.noise_scheduler.__class__}")
+
+    # -----------------------------------------------------------------------
+    # Phase 3 – DDP module wrapping (trainable modules only)
+    # -----------------------------------------------------------------------
+    if _is_dist:
+        if not args.disable_unet_training:
+            model.unet = DDPWrapper(model.unet, device_ids=[_local_rank])
+            logging.warning(f"[rank {_rank}] UNet wrapped in DDP")
+        if not args.disable_textenc_training:
+            model.text_encoder = DDPWrapper(model.text_encoder, device_ids=[_local_rank])
+            logging.warning(f"[rank {_rank}] TextEncoder wrapped in DDP")
+            if model.is_sdxl and model.text_encoder_2 is not None:
+                model.text_encoder_2 = DDPWrapper(model.text_encoder_2, device_ids=[_local_rank])
+                logging.warning(f"[rank {_rank}] TextEncoder2 wrapped in DDP")
 
     logging.info(f" {Fore.GREEN}Project name: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.project_name}{Style.RESET_ALL}")
     logging.info(f" {Fore.GREEN}grad_accum: {Style.RESET_ALL}{Fore.LIGHTGREEN_EX}{args.grad_accum}{Style.RESET_ALL}"),
@@ -1151,7 +1181,7 @@ def main(args):
         ).to(device)
 
     # Pre-train validation to establish a starting point on the loss graph
-    if validator and not args.no_initial_validation:
+    if validator and not args.no_initial_validation and _is_main:
         try:
             validator.do_validation(
                 model=model,
@@ -1164,7 +1194,7 @@ def main(args):
             logging.warning(f"Validation failed during initial validation step, continuing anyway. Exception: {ex}")
 
     # the sample generator might be configured to generate samples before step 0
-    if sample_generator.generate_pretrain_samples:
+    if _is_main and sample_generator.generate_pretrain_samples:
         _, batch = next(enumerate(train_dataloader))
         generate_samples(global_step=0, batch=batch)
 
@@ -1352,21 +1382,18 @@ def main(args):
                     ed_optimizer.step_schedulers(tv.global_step)
 
                     if sample_generator.should_generate_samples(tv.global_step, local_step=step) or check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE):
-                        generate_samples(global_step=tv.global_step, batch=full_batch)
+                        if _is_main:
+                            generate_samples(global_step=tv.global_step, batch=full_batch)
 
                     if args.ema_decay_rate != None:
                         if ((tv.global_step + 1) % args.ema_update_interval) == 0:
-                            # debug_start_time = time.time() # Measure time
+                            if _is_main:  # EMA is rank-0 only
+                                if args.disable_unet_training != True:
+                                    update_ema(model.unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
 
-                            if args.disable_unet_training != True:
-                                update_ema(model.unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
+                                if args.disable_textenc_training != True:
+                                    update_ema(model.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
 
-                            if args.disable_textenc_training != True:
-                                update_ema(model.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
-
-                            # debug_end_time = time.time() # Measure time
-                            # debug_elapsed_time = debug_end_time - debug_start_time # Measure time
-                            # print(f"Command update_EMA unet and TE took {debug_elapsed_time:.3f} seconds.") # Measure time
 
                     # Self-Flow EMA teacher update (independent interval from main EMA)
                     if model.self_flow_teacher_unet is not None:
@@ -1386,12 +1413,21 @@ def main(args):
                     images_per_sec = args.batch_size / (time.time() - step_start_time)
                     log_data.images_per_sec_log_step.append(images_per_sec)
 
-                    if (tv.global_step + 1) % args.log_step == 0:
-                        logs = do_log_step(args, ed_optimizer, log_data, log_folder,
-                                           log_writer, model, tv)
+                    # Phase 5 – all-reduce loss scalar across ranks for accurate logging
+                    if _is_dist and len(log_data.loss_log_step) > 0:
+                        _loss_t = torch.tensor(log_data.loss_log_step[-1], device=device)
+                        _loss_t = all_reduce_mean(_loss_t)
+                        log_data.loss_log_step[-1] = float(_loss_t.item())
+                        if len(log_data.loss_epoch) > 0:
+                            log_data.loss_epoch[-1] = float(_loss_t.item())
 
-                        append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer,
-                                         **logs)
+                    if (tv.global_step + 1) % args.log_step == 0:
+                        if _is_main:
+                            logs = do_log_step(args, ed_optimizer, log_data, log_folder,
+                                               log_writer, model, tv)
+
+                            append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer,
+                                             **logs)
 
                         torch.cuda.empty_cache()
 
@@ -1400,17 +1436,20 @@ def main(args):
                             step in validation_steps
                             or check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE)
                     ):
-                        try:
-                            validator.do_validation(
-                                model=model,
-                                global_step=tv.global_step,
-                                get_model_prediction_and_target_callable =get_model_prediction_and_target_validation_wrapper,
-                                pipe_factory=make_inference_pipe
-                            )
-                        except Exception as e:
-                            logging.error("Validation raised an exception: " + str(e))
-                            traceback.print_exc()
-                            # continue training even if validation fails
+                        dist_barrier()  # all ranks reach here before rank-0 validates
+                        if _is_main:
+                            try:
+                                validator.do_validation(
+                                    model=model,
+                                    global_step=tv.global_step,
+                                    get_model_prediction_and_target_callable =get_model_prediction_and_target_validation_wrapper,
+                                    pipe_factory=make_inference_pipe
+                                )
+                            except Exception as e:
+                                logging.error("Validation raised an exception: " + str(e))
+                                traceback.print_exc()
+                                # continue training even if validation fails
+                        dist_barrier()  # non-0 ranks wait for rank-0 validation to finish
 
 
                     min_since_last_ckpt =  (time.time() - last_epoch_saved_time) / 60
@@ -1443,20 +1482,24 @@ def main(args):
                         logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
                         needs_save = True
                     if needs_save:
-                        save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
-                        save_model(save_path,
-                                   global_step=tv.global_step,
-                                   ed_state=make_current_ed_state(),
-                                   save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
-                                   save_full_precision=args.save_full_precision,
-                                   save_optimizer_flag=needs_optimizer_save,
-                                   save_ckpt=not args.no_save_ckpt,
-                                   plugin_runner=plugin_runner)
+                        dist_barrier()  # sync all ranks before save
+                        if _is_main:
+                            save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
+                            save_model(save_path,
+                                       global_step=tv.global_step,
+                                       ed_state=make_current_ed_state(),
+                                       save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
+                                       save_full_precision=args.save_full_precision,
+                                       save_optimizer_flag=needs_optimizer_save,
+                                       save_ckpt=not args.no_save_ckpt,
+                                       plugin_runner=plugin_runner)
+                        dist_barrier()  # non-0 ranks wait for rank-0 save to finish
 
                     if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
-                        logging.info(f" Saving lora")
-                        save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
-                        save_model_lora(model=model, save_path=save_path)
+                        if _is_main:
+                            logging.info(f" Saving lora")
+                            save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
+                            save_model_lora(model=model, save_path=save_path)
 
                     # -- step end
 
@@ -1559,18 +1602,20 @@ def main(args):
 
         plugin_runner.run_on_training_end(ed_state=make_current_ed_state(), log_folder=log_folder, project_name=args.project_name, global_step=tv.global_step)
 
-        save_path = make_save_path(
-            epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count, prepend=("" if args.no_prepend_last else "last-")
-        )
-        if not args.lora:
-            save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
-                       save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
-                       save_optimizer_flag=args.save_optimizer or force_save_optimizer, save_ckpt=not args.no_save_ckpt,
-                       plugin_runner=plugin_runner)
-        if args.lora:
-            save_model_lora(model=model, save_path=save_path)
+        dist_barrier()  # sync before final save
+        if _is_main:
+            save_path = make_save_path(
+                epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count, prepend=("" if args.no_prepend_last else "last-")
+            )
+            if not args.lora:
+                save_model(save_path, global_step=tv.global_step, ed_state=make_current_ed_state(),
+                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=model.yaml, save_full_precision=args.save_full_precision,
+                           save_optimizer_flag=args.save_optimizer or force_save_optimizer, save_ckpt=not args.no_save_ckpt,
+                           plugin_runner=plugin_runner)
+            if args.lora:
+                save_model_lora(model=model, save_path=save_path)
 
-        if validator:
+        if validator and _is_main:
             print("doing final validation pass")
             try:
                 validator.do_validation(
@@ -1583,7 +1628,7 @@ def main(args):
                 logging.error("Validation threw an exception: " + str(e))
                 traceback.print_exc()
 
-        if not sample_generator.should_generate_samples(global_step=tv.global_step-1, local_step=step):
+        if _is_main and not sample_generator.should_generate_samples(global_step=tv.global_step-1, local_step=step):
             print("generating final samples")
             # free up memory we might need for samples
             tv.clear_accumulated_loss()
@@ -1601,12 +1646,9 @@ def main(args):
     except Exception as ex:
         logging.error(f"{Fore.LIGHTYELLOW_EX}Something went wrong, attempting to save model{Style.RESET_ALL}")
         logging.error(f"{Fore.LIGHTYELLOW_EX}NOT attempting to save model{Style.RESET_ALL}")
-        # save_path = make_save_path(epoch, global_step, prepend="errored-")
-        # save_model(save_path, global_step=global_step, ed_state=make_current_ed_state(),
-        #           save_ckpt_dir=args.save_ckpt_dir, yaml_name=yaml, save_full_precision=args.save_full_precision,
-        #           save_optimizer_flag=args.save_optimizer, save_ckpt=not args.no_save_ckpt)
-        # logging.info(f"{Fore.LIGHTYELLOW_EX}Model saved, re-raising exception and exiting.  Exception was:{Style.RESET_ALL}{Fore.LIGHTRED_EX} {ex} {Style.RESET_ALL}")
         raise ex
+    finally:
+        cleanup_distributed()
 
     logging.info(f"{Fore.LIGHTWHITE_EX} ***************************{Style.RESET_ALL}")
     logging.info(f"{Fore.LIGHTWHITE_EX} **** Finished training ****{Style.RESET_ALL}")

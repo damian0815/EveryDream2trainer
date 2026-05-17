@@ -1,3 +1,53 @@
+## Testing: Unit and Integration Coverage
+
+To ensure correctness and stability of the new multi-GPU features, add the following unit and integration tests. All tests should be runnable in the `everydream2trainer` conda environment.
+
+### Unit Tests
+
+- **Distributed Bootstrap**
+  - Test that `init_distributed()` correctly sets up rank, world size, and device assignment from environment variables.
+  - Test that `is_main_process` and `is_distributed` helpers return correct values for various env settings.
+- **Data Sharding**
+  - Test that the data sharding logic (`image_train_items[rank::world_size]`) produces non-overlapping, collectively exhaustive splits for various dataset sizes and world sizes.
+  - Test that each rank receives the expected number of samples.
+- **Rank-0 Gating**
+  - Test that rank-0 gating functions (e.g., for logging, checkpointing) only execute on rank 0.
+- **DDP Wrapping**
+  - Test that model wrapping preserves access to expected attributes (e.g., `.config`, `.dtype`).
+  - Test that forward pass through DDP-wrapped modules matches the raw module output (on CPU or with `torch.no_grad()` for determinism).
+
+### Integration Tests
+
+- **Single-GPU Baseline**
+  - Run a short training loop (e.g., 1 epoch, small dataset) and verify loss decreases and checkpoint is saved.
+- **Multi-GPU DDP Launch**
+  - Use `torchrun --nproc_per_node=2` (or 3) to launch training for 1 epoch with a small dataset.
+  - Verify:
+    - All ranks start and complete without error.
+    - Only rank 0 writes checkpoints, logs, and validation outputs.
+    - Loss curves are comparable across ranks and to single-GPU baseline.
+    - Checkpoint can be resumed in single-GPU mode.
+- **Data Sharding Consistency**
+  - For a known dataset, verify that the union of all rank splits covers the full dataset with no overlap.
+- **Exit Safety**
+  - Simulate SIGINT/KeyboardInterrupt during training and verify only rank 0 writes a checkpoint and all ranks exit cleanly.
+
+### Example Test Cases
+
+- `tests/test_distributed_bootstrap.py`: Unit tests for distributed helpers and device assignment.
+- `tests/test_data_sharding.py`: Unit tests for sharding logic with various dataset sizes and world sizes.
+- `tests/test_rank0_gating.py`: Unit tests for rank-0 gating utilities.
+- `tests/test_ddp_wrapper.py`: Unit tests for DDP wrapping and attribute access.
+- `tests/integration/test_train_single_gpu.py`: Integration test for single-GPU training.
+- `tests/integration/test_train_ddp.py`: Integration test for multi-GPU DDP training (can be run with 2 processes on a single GPU for CI).
+
+### Notes
+
+- Use `pytest` as the test runner; add any required test dependencies to `requirements-test.txt`.
+- For integration tests, use small dummy datasets and short epochs to minimize runtime.
+- For CI or local testing without multiple GPUs, use `torchrun --nproc_per_node=2` on a single GPU (PyTorch will assign both ranks to the same device).
+
+---
 # Multi-GPU Plan (Throughput-Focused)
 
 ## Goals and constraints

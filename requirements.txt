@@ -14,7 +14,7 @@ pytorch-lightning
 OmegaConf==2.2.3
 dowg
 lion-pytorch
-compel~=2.1
+compel==2.1
 OmegaConf==2.2.3
 numpy==1.26.4
 wandb
