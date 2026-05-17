@@ -26,7 +26,8 @@ from data.dataset import select_caption_variants
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 from plugins.plugins import PluginRunner
-from utils.distributed import get_rank, ddp_no_sync_ctx
+from utils.distributed import get_rank, is_distributed as _is_distributed
+import torch.distributed as dist
 
 # Global performance profiling storage
 # Structure: {<label>: [duration_per_image, duration_per_image, ...]}
@@ -71,6 +72,12 @@ def train_step(
     remaining_batch = full_batch
 
     t_step_start = time.perf_counter()
+
+    # Tracks whether this rank is locally ready to step the optimizer.
+    # Set inside the inner loop; the actual collective vote+step happens ONCE,
+    # after the while loop, so that dist.all_reduce is called exactly once per
+    # dataloader iteration on every rank (guaranteed equal count → no deadlock).
+    _locally_wants_step = False
 
     while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
         t_nibble_start = time.perf_counter()
@@ -138,12 +145,10 @@ def train_step(
             # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
             if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] > tv.max_backward_slice_size:
                 with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-                    # Intermediate backward → never sync DDP gradients here; the
-                    # final backward (when should_step_optimizer fires) will sync.
+                    # Intermediate backward — the persistent DDPPersistentNoSync outer context
+                    # (held open by train.py) suppresses the DDP all-reduce automatically.
                     optimizer_backward(ed_optimizer, tv, plugin_runner,
-                                       f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ',
-                                       no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
-                                                                    getattr(model, 'text_encoder_2', None)))
+                                       f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
                     record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
 
             # Timesteps generation
@@ -346,53 +351,67 @@ def train_step(
                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                 t_backward_start = time.perf_counter()
                 with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-                    # Always suppress DDP's automatic gradient all-reduce here.
-                    # sync_ddp_gradients() is called inside step_optimizer()
-                    # just before optimizer.step(), which is the single explicit
-                    # synchronisation point for all ranks.  This avoids deadlocks
-                    # when ranks reach their step threshold at different times
-                    # (uneven data sharding, emergency passes, etc.).
-                    optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ',
-                                       no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
-                                                                    getattr(model, 'text_encoder_2', None)))
+                    # The persistent DDPPersistentNoSync context suppresses DDP
+                    # all-reduce for these intermediate passes; the single collective
+                    # sync happens in the want_to_step gate AFTER the while loop.
+                    optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
                 record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
-            # if tv.global_step >= 653 and tv.global_step < 656:
-            #    print("step:", tv.global_step, "caption:", caption_variant, " - batch:", [os.readlink(x) for x in batch["pathnames"]], batch["captions"][caption_variant], "; timestep slice:", consumed_timesteps)
+            # Record local intent; the collective vote fires ONCE after the while loop.
+            if should_step_optimizer and tv.backwarded_images_count > 0:
+                _locally_wants_step = True
 
-            if should_step_optimizer:
-                if tv.backwarded_images_count == 0:
-                    print("Batch has 0 images, not stepping optimizer")
-                else:
-                    # print(f'\nstepping optimizer - backwarded_images_count '
-                    #      f'{tv.backwarded_images_count}, '
-                    #      f'accumulated_loss_images_count {tv.accumulated_loss_images_count}')
+    # --- want_to_step MAX vote (ONCE per train_step call = once per dataloader step) ---
+    # dist.all_reduce must be called the same number of times on every rank.
+    # Placing it here, outside the while/for loops, guarantees that: every rank
+    # calls it exactly once per call to train_step(), regardless of how many
+    # nibbles or caption variants it processed (which can vary due to per-rank
+    # OOM history changing forward_slice_size / max_backward_slice_size).
+    local_vote = int(tv.is_final_step or _locally_wants_step)
+    want_to_step_t = torch.tensor(local_vote, dtype=torch.int32, device=model.unet.device)
+    if _is_distributed():
+        dist.all_reduce(want_to_step_t, op=dist.ReduceOp.MAX)
+    any_rank_wants_to_step = want_to_step_t.item() > 0
 
-                    t_optimizer_step_start = time.perf_counter()
-                    ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
-                    record_performance_timing("12_optimizer_step", time.perf_counter() - t_optimizer_step_start, num_images)
+    if any_rank_wants_to_step:
+        # Exit no_sync briefly so sync_ddp_gradients (inside step_optimizer)
+        # can fire its all-reduce with all ranks guaranteed to be here.
+        if tv.ddp_no_sync is not None:
+            tv.ddp_no_sync.exit()
+        try:
+            t_optimizer_step_start = time.perf_counter()
+            # step_optimizer calls sync_ddp_gradients (collective) then
+            # optimizer.step() — guarded by backwarded_images_count > 0 inside.
+            ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
+            record_performance_timing("12_optimizer_step", time.perf_counter() - t_optimizer_step_start, full_batch['image'].shape[0])
+        finally:
+            # Re-suppress all-reduces immediately, even if step_optimizer raised.
+            if tv.ddp_no_sync is not None:
+                tv.ddp_no_sync.enter()
 
-                    tv.last_effective_batch_size = tv.backwarded_images_count
-                    tv.total_trained_samples_count += tv.backwarded_images_count
-                    tv.optimizer_step += 1
-                    tv.current_timestep_interval = None   # draw a new SNR interval next step
-                    tv.backwarded_images_count = 0
+        # Bookkeeping only for ranks that were locally ready.
+        if _locally_wants_step and tv.backwarded_images_count > 0:
+            tv.last_effective_batch_size = tv.backwarded_images_count
+            tv.total_trained_samples_count += tv.backwarded_images_count
+            tv.optimizer_step += 1
+            tv.current_timestep_interval = None   # draw a new SNR interval next step
+            tv.backwarded_images_count = 0
 
-                    # if we are interleaving BS1, increment counter
-                    if tv.interleaved_bs1_count is not None:
-                        tv.interleaved_bs1_count += 1
+            # if we are interleaving BS1, increment counter
+            if tv.interleaved_bs1_count is not None:
+                tv.interleaved_bs1_count += 1
 
-                    # if we are *not* interleaving BS1, or we've reached the end of interleaving BS1, then step and perhaps toggle interleave BS1
-                    if tv.interleaved_bs1_count is None or tv.interleaved_bs1_count >= max(1,
-                                                                                           tv.desired_effective_batch_size ** args.interleave_batch_size_1_alpha):
-                        tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
-                        if args.interleave_batch_size_1:
-                            if tv.interleaved_bs1_count is None:
-                                tv.interleaved_bs1_count = 0
-                            else:
-                                tv.interleaved_bs1_count = None
+            # if not interleaving BS1, or we've reached the end of the BS1 run
+            if tv.interleaved_bs1_count is None or tv.interleaved_bs1_count >= max(1,
+                                                                                   tv.desired_effective_batch_size ** args.interleave_batch_size_1_alpha):
+                tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                if args.interleave_batch_size_1:
+                    if tv.interleaved_bs1_count is None:
+                        tv.interleaved_bs1_count = 0
+                    else:
+                        tv.interleaved_bs1_count = None
 
-                did_step_optimizer_cb()
+            did_step_optimizer_cb()
 
     t_step_end = time.perf_counter()
     record_performance_timing("0_total_step_time", t_step_end - t_step_start, full_batch['image'].shape[0])
@@ -741,23 +760,17 @@ def _get_step_timesteps_internal(
 
 
 
-def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, plugin_runner: PluginRunner, log_hint='', no_sync_ctx=None):
+def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, plugin_runner: PluginRunner, log_hint=''):
     """
     Run a backward pass on the currently-accumulated loss.
 
-    Parameters
-    ----------
-    no_sync_ctx:
-        Optional context manager (typically from ``ddp_no_sync_ctx``) that
-        disables DDP gradient ALLREDUCE for this pass.  Should always be
-        provided for every backward pass (intermediate or final).  Gradient
-        synchronisation across ranks is handled explicitly by
-        ``sync_ddp_gradients()`` inside ``step_optimizer()``, which avoids
-        deadlocks from ranks reaching their step threshold at different times.
-        Pass ``None`` only in single-GPU mode where no DDP wrapping exists.
+    The caller is responsible for holding an active :class:`DDPPersistentNoSync`
+    context so that DDP's automatic gradient all-reduce is suppressed for this
+    pass.  Gradient synchronisation across ranks is handled explicitly by
+    ``sync_ddp_gradients()`` inside ``step_optimizer()``, which is the single
+    collective sync point (the ``want_to_step`` MAX gate ensures all ranks
+    enter it simultaneously).
     """
-    import contextlib
-    ctx = no_sync_ctx if no_sync_ctx is not None else contextlib.nullcontext()
     if tv.accumulated_loss_images_count == 0:
         logging.warning("no accumulated loss images, not doing backward")
     else:
@@ -765,20 +778,15 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             plugin_runner.run_on_optimizer_backward(loss=tv.accumulated_loss)
             gc.collect()
             torch.cuda.empty_cache()
-            print(f"optimizer backward rank {get_rank()} (why: '{log_hint}', ctx class: {type(ctx)})")
-            with ctx:
-                print(f"optimizer backward rank {get_rank()} entered context")
-                optimizer.backward(tv.accumulated_loss)
-                print(f"optimizer backward rank {get_rank()} done")
-            print(f"optimizer backward rank {get_rank()} exited context")
+            print(f"optimizer backward rank {get_rank()} (why: '{log_hint}')")
+            optimizer.backward(tv.accumulated_loss)
+            print(f"optimizer backward rank {get_rank()} done")
             if not optimizer.use_grad_scaler:
                 # if we have a grad scaler it suppresses NaN/Inf for us.
                 # otherwise, we have to suppress NaN/Inf manually
                 optimizer.check_for_inf_or_nan(tv, log_hint + 'after backward')
             tv.effective_backward_size = tv.accumulated_loss_images_count
             tv.backwarded_images_count += tv.accumulated_loss_images_count
-            # print(f"\nbackward on {tv.accumulated_loss_images_count} -> "
-            #      f"backward accumulated {tv.backwarded_images_count}")
             tv.clear_accumulated_loss()
             tv.register_backward_oom_or_not(oomed=False)
         except InfOrNanException:

@@ -39,6 +39,7 @@ from utils.distributed import (
     shard_items,
     DDPWrapper,
     ddp_no_sync_ctx,
+    DDPPersistentNoSync,
 )
 
 from colorama import Fore, Style
@@ -1123,6 +1124,19 @@ def main(args):
     training_start_time = time.time()
     last_epoch_saved_time = training_start_time
 
+    # Create the persistent no_sync context that suppresses DDP gradient
+    # all-reduces across all backward passes.  It is entered here and exited
+    # only briefly around each optimizer.step() (via the want_to_step gate in
+    # train_step) so that sync_ddp_gradients() can fire its collective with
+    # all ranks guaranteed to participate at the same time.
+    _ddp_no_sync = DDPPersistentNoSync(
+        model.unet,
+        model.text_encoder,
+        getattr(model, 'text_encoder_2', None),
+    )
+    _ddp_no_sync.enter()
+    tv.ddp_no_sync = _ddp_no_sync
+
     append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
 
     log_data = LogData()
@@ -1334,6 +1348,14 @@ def main(args):
 
                     step_start_time = time.time()
 
+                    # Compute is_final_step for the want_to_step MAX vote in train_step.
+                    # A rank that reaches its last dataloader step votes 1 unconditionally
+                    # so that a peer waiting at the all_reduce is never left stranded.
+                    _is_last_epoch = (epoch == args.max_epochs - 1)
+                    _is_last_step_of_epoch = (step == epoch_len - 1)
+                    _at_max_steps = (args.max_steps is not None and tv.global_step + 1 >= args.max_steps)
+                    tv.is_final_step = (_is_last_epoch and _is_last_step_of_epoch) or _at_max_steps
+
                     plugin_runner.run_on_step_start(epoch=epoch,
                                                     local_step=step,
                                                     global_step=tv.global_step,
@@ -1353,10 +1375,9 @@ def main(args):
                     tv.max_backward_slice_size = _choose_backward_slice_size(tv)
                     tv.forward_slice_size = _get_default_forward_slice_size(tv)
                     if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
-                        # do backward now — intermediate pass, no DDP sync
-                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ',
-                                           no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
-                                                                        getattr(model, 'text_encoder_2', None)))
+                        # do backward now — intermediate pass; the persistent DDPPersistentNoSync
+                        # context suppresses the DDP all-reduce automatically.
+                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ')
                         gc.collect()
                         torch.cuda.empty_cache()
 
@@ -1375,10 +1396,9 @@ def main(args):
                                 accumulated_loss_images_count_before_emergency_backward = tv.accumulated_loss_images_count
                                 if tv.accumulated_loss_images_count > 0:
                                     with torch.amp.autocast('cuda', enabled=args.amp):
-                                        # Emergency pass — intermediate, no DDP sync
-                                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ',
-                                                           no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
-                                                                                       getattr(model, 'text_encoder_2', None)))
+                                        # Emergency pass — intermediate; the persistent DDPPersistentNoSync
+                                        # context suppresses the DDP all-reduce automatically.
+                                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ')
                                     torch.cuda.empty_cache()
                                     gc.collect()
                                     max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
@@ -1686,6 +1706,9 @@ def main(args):
         epoch = args.max_epochs
 
         plugin_runner.run_on_training_end(ed_state=make_current_ed_state(), log_folder=log_folder, project_name=args.project_name, global_step=tv.global_step)
+
+        # Exit persistent no_sync — re-arm DDP hooks before the final barrier/save.
+        _ddp_no_sync.exit()
 
         dist_barrier()  # sync before final save
         if _is_main:

@@ -108,24 +108,14 @@ def ddp_no_sync_ctx(*modules):
     Context manager that puts every DistributedDataParallel module in
     ``no_sync()`` mode simultaneously.
 
-    Use this for **all** backward passes — both intermediate and final.
-    Gradient synchronisation across ranks is handled explicitly by calling
-    ``sync_ddp_gradients()`` once, just before ``optimizer.step()``.
-    This avoids deadlocks when different ranks reach their backward trigger
-    points at different times (irregular batch sizes, emergency passes, etc.)
+    .. deprecated::
+        For the main training loop use :class:`DDPPersistentNoSync` instead,
+        which holds no_sync open across many backward passes and only exits it
+        for the brief window around ``optimizer.step()``.  This one-shot helper
+        is kept for any isolated one-off uses (e.g. tests).
 
     Non-DDP modules (and ``None``) are silently ignored, making this safe
     to call in single-GPU mode.
-
-    Example::
-
-        # every backward — no automatic cross-rank sync
-        with ddp_no_sync_ctx(model.unet, model.text_encoder):
-            optimizer.backward(accumulated_loss)
-
-        # once, just before optimizer.step()
-        sync_ddp_gradients(model.unet, model.text_encoder)
-        optimizer.step()
     """
     ddp_mods = [m for m in modules
                 if m is not None and isinstance(m, DistributedDataParallel)]
@@ -134,13 +124,62 @@ def ddp_no_sync_ctx(*modules):
         return
     prefix = f'ddp_no_sync_ctx rank {get_rank()}'
     with ExitStack() as stack:
-        print(f"{prefix} entering contexts on {len(ddp_mods)} DDP modules")
+        logging.debug(f"{prefix} entering contexts on {len(ddp_mods)} DDP modules")
         for m in ddp_mods:
-            print(f"{prefix} entering context on {type(m).__name__}")
             stack.enter_context(m.no_sync())
-        print(f"{prefix} entered all contexts")
         yield
-    print(f"{prefix} exits")
+
+
+class DDPPersistentNoSync:
+    """
+    Persistent no_sync context that can be manually entered and exited
+    multiple times across the training loop.
+
+    Enter once before the epoch loop and exit once at the very end of
+    training.  The only time DDP gradient all-reduces are allowed to fire
+    is inside the brief window around ``optimizer.step()``:
+
+    .. code-block:: python
+
+        no_sync.exit()          # re-arm DDP hooks
+        try:
+            step_optimizer(...)  # sync_ddp_gradients fires here
+        finally:
+            no_sync.enter()     # suppress again immediately
+
+    Non-DDP modules (and ``None``) are silently ignored, making this
+    a no-op in single-GPU mode.  Can also be used as a regular context
+    manager (``with DDPPersistentNoSync(...): ...``).
+    """
+
+    def __init__(self, *modules):
+        self._ddp_mods = [m for m in modules
+                          if m is not None and isinstance(m, DistributedDataParallel)]
+        self._ctxs: list = []
+
+    def enter(self):
+        if not self._ddp_mods:
+            return
+        self._ctxs = [m.no_sync() for m in self._ddp_mods]
+        for ctx in self._ctxs:
+            ctx.__enter__()
+        logging.debug(f"[rank {get_rank()}] DDPPersistentNoSync: entered ({len(self._ctxs)} modules)")
+
+    def exit(self):
+        if not self._ctxs:
+            return
+        for ctx in reversed(self._ctxs):
+            ctx.__exit__(None, None, None)
+        self._ctxs = []
+        logging.debug(f"[rank {get_rank()}] DDPPersistentNoSync: exited")
+
+    # Allow use as a regular context manager too (e.g. in tests)
+    def __enter__(self):
+        self.enter()
+        return self
+
+    def __exit__(self, *args):
+        self.exit()
 
 
 def sync_ddp_gradients(*modules) -> None:
@@ -148,23 +187,15 @@ def sync_ddp_gradients(*modules) -> None:
     Manually all-reduce (average) gradients across all ranks for every
     DDP-wrapped module in *modules*.
 
-    Call this **once**, immediately before ``optimizer.step()``, after all
-    backward passes for this step are complete.  This replaces DDP's built-in
-    backward hook all-reduce and is the correct companion to wrapping every
-    backward in ``ddp_no_sync_ctx()``.
-
-    Using this explicit sync point avoids deadlocks that occur when different
-    ranks reach their step threshold at different times (uneven batch sharding,
-    emergency backwards, OOM-triggered drops, etc.).
+    **Must** be called inside the brief window where
+    :class:`DDPPersistentNoSync` has been exited (guaranteed by the
+    ``want_to_step`` gate in the training loop).  All ranks must enter
+    this function simultaneously.
 
     Non-DDP modules (and ``None``) are silently ignored.  No-op in
     single-GPU mode.
 
     The all-reduce uses ``ReduceOp.AVG``, matching DDP's default behaviour.
-    If the loss is already divided by ``desired_effective_batch_size`` (i.e.
-    ``--loss_mean_over_full_effective_batch`` is on), the combined effect is
-    normalisation by ``desired_effective_batch_size × world_size``, which is
-    the true global effective batch size.
     """
     if not dist.is_initialized():
         return

@@ -439,11 +439,16 @@ class EveryDreamOptimizer:
                 self.scaler.unscale_(optimizer)
 
         # Manually all-reduce gradients across ranks BEFORE clipping/stepping.
-        # All backward passes are wrapped in no_sync(), so DDP's built-in
-        # all-reduce hooks never fire.  This single explicit sync point replaces
-        # them and avoids deadlocks from ranks reaching their step threshold at
-        # different times (uneven data sharding, emergency backwards, etc.).
+        # Called inside the brief window where DDPPersistentNoSync has been exited;
+        # the want_to_step gate in the training loop guarantees all ranks participate.
         sync_ddp_gradients(self.unet, self.text_encoder, self.text_encoder_2)
+
+        # Guard: skip weight update if this rank contributed no gradients this step.
+        # This happens when another rank's MAX vote forced a collective step but this
+        # rank had not yet accumulated enough images (or is_final_step fired early).
+        if tv.backwarded_images_count == 0:
+            self.zero_grad(set_to_none=True)
+            return
 
         if self.log_grad_norm:
             with torch.no_grad():

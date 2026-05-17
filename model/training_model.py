@@ -2,6 +2,7 @@ import argparse
 import copy
 import logging
 from collections import defaultdict
+from typing import Any, Optional
 
 import diffusers
 import math
@@ -143,6 +144,16 @@ class TrainingVariables:
     _backward_size_hint_logged: set = field(default_factory=set)      # resolutions for which the "could do backward=N" hint has already been printed
 
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
+
+    # DDP persistent no_sync context – set by train.py before the epoch loop.
+    # The training step exits it briefly around optimizer.step() so that
+    # sync_ddp_gradients() can fire its all-reduce with all ranks present.
+    ddp_no_sync: Optional[Any] = None  # DDPPersistentNoSync | None
+
+    # Set to True on the very last dataloader step of training so that
+    # the want_to_step MAX vote forces all ranks to step together and
+    # no rank is left stranded at the all_reduce.
+    is_final_step: bool = False
 
     prev_accumulated_pathnames: list[str] = field(default_factory=list)
     prev_accumulated_captions: list[str] = field(default_factory=list)
