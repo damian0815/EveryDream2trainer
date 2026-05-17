@@ -1099,7 +1099,7 @@ def main(args):
     # -----------------------------------------------------------------------
     if _is_dist:
         if not args.disable_unet_training:
-            model.unet = DDPWrapper(model.unet, device_ids=[_local_rank])
+            model.unet = DDPWrapper(model.unet, device_ids=[_local_rank], find_unused_parameters=True, gradient_as_bucket_view=True)
             logging.warning(f"[rank {_rank}] UNet wrapped in DDP")
         if not args.disable_textenc_training:
             model.text_encoder = DDPWrapper(model.text_encoder, device_ids=[_local_rank])

@@ -39,6 +39,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
 from optimizer.block_order_unet import ProgressiveUnlock
+from utils.distributed import sync_ddp_gradients
 from optimizer.per_unet_layer_scales import ParamGroupBuilder
 from plugins.plugins import PluginRunner
 import re
@@ -436,6 +437,13 @@ class EveryDreamOptimizer:
         if self.scaler is not None:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
+
+        # Manually all-reduce gradients across ranks BEFORE clipping/stepping.
+        # All backward passes are wrapped in no_sync(), so DDP's built-in
+        # all-reduce hooks never fire.  This single explicit sync point replaces
+        # them and avoids deadlocks from ranks reaching their step threshold at
+        # different times (uneven data sharding, emergency backwards, etc.).
+        sync_ddp_gradients(self.unet, self.text_encoder, self.text_encoder_2)
 
         if self.log_grad_norm:
             with torch.no_grad():

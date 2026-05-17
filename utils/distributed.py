@@ -108,33 +108,72 @@ def ddp_no_sync_ctx(*modules):
     Context manager that puts every DistributedDataParallel module in
     ``no_sync()`` mode simultaneously.
 
-    Use this for **intermediate** backward passes (gradient accumulation,
-    pre-emptive / emergency / truncated backwardS) so that DDP does NOT
-    launch an ALLREDUCE for those passes.  Only the **final** backward
-    immediately before ``optimizer.step()`` should run outside this context
-    so that gradients are averaged across ranks exactly once per step.
+    Use this for **all** backward passes — both intermediate and final.
+    Gradient synchronisation across ranks is handled explicitly by calling
+    ``sync_ddp_gradients()`` once, just before ``optimizer.step()``.
+    This avoids deadlocks when different ranks reach their backward trigger
+    points at different times (irregular batch sizes, emergency passes, etc.)
 
     Non-DDP modules (and ``None``) are silently ignored, making this safe
     to call in single-GPU mode.
 
     Example::
 
-        # intermediate backward – no cross-rank sync
+        # every backward — no automatic cross-rank sync
         with ddp_no_sync_ctx(model.unet, model.text_encoder):
             optimizer.backward(accumulated_loss)
 
-        # final backward – triggers ALLREDUCE
-        optimizer.backward(final_loss)
+        # once, just before optimizer.step()
+        sync_ddp_gradients(model.unet, model.text_encoder)
+        optimizer.step()
     """
     ddp_mods = [m for m in modules
                 if m is not None and isinstance(m, DistributedDataParallel)]
     if not ddp_mods:
         yield
         return
+    prefix = f'ddp_no_sync_ctx rank {get_rank()}'
     with ExitStack() as stack:
+        print(f"{prefix} entering contexts on {len(ddp_mods)} DDP modules")
         for m in ddp_mods:
+            print(f"{prefix} entering context on {type(m).__name__}")
             stack.enter_context(m.no_sync())
+        print(f"{prefix} entered all contexts")
         yield
+    print(f"{prefix} exits")
+
+
+def sync_ddp_gradients(*modules) -> None:
+    """
+    Manually all-reduce (average) gradients across all ranks for every
+    DDP-wrapped module in *modules*.
+
+    Call this **once**, immediately before ``optimizer.step()``, after all
+    backward passes for this step are complete.  This replaces DDP's built-in
+    backward hook all-reduce and is the correct companion to wrapping every
+    backward in ``ddp_no_sync_ctx()``.
+
+    Using this explicit sync point avoids deadlocks that occur when different
+    ranks reach their step threshold at different times (uneven batch sharding,
+    emergency backwards, OOM-triggered drops, etc.).
+
+    Non-DDP modules (and ``None``) are silently ignored.  No-op in
+    single-GPU mode.
+
+    The all-reduce uses ``ReduceOp.AVG``, matching DDP's default behaviour.
+    If the loss is already divided by ``desired_effective_batch_size`` (i.e.
+    ``--loss_mean_over_full_effective_batch`` is on), the combined effect is
+    normalisation by ``desired_effective_batch_size × world_size``, which is
+    the true global effective batch size.
+    """
+    if not dist.is_initialized():
+        return
+    for m in modules:
+        if m is None or not isinstance(m, DistributedDataParallel):
+            continue
+        for p in m.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
 
 # ---------------------------------------------------------------------------

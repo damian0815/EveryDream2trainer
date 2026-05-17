@@ -346,17 +346,15 @@ def train_step(
                 tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
                 t_backward_start = time.perf_counter()
                 with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-                    # Only sync DDP gradients on the FINAL backward before optimizer.step().
-                    # Intermediate accumulation passes (accumulated >= max_backward_slice_size
-                    # but not yet at desired_effective_batch_size) use no_sync so they don't
-                    # issue an unsolicited ALLREDUCE that would deadlock the other rank.
-                    _bwd_no_sync = (
-                        None if should_step_optimizer
-                        else ddp_no_sync_ctx(model.unet, model.text_encoder,
-                                             getattr(model, 'text_encoder_2', None))
-                    )
+                    # Always suppress DDP's automatic gradient all-reduce here.
+                    # sync_ddp_gradients() is called inside step_optimizer()
+                    # just before optimizer.step(), which is the single explicit
+                    # synchronisation point for all ranks.  This avoids deadlocks
+                    # when ranks reach their step threshold at different times
+                    # (uneven data sharding, emergency passes, etc.).
                     optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ',
-                                       no_sync_ctx=_bwd_no_sync)
+                                       no_sync_ctx=ddp_no_sync_ctx(model.unet, model.text_encoder,
+                                                                    getattr(model, 'text_encoder_2', None)))
                 record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
 
             # if tv.global_step >= 653 and tv.global_step < 656:
@@ -751,13 +749,12 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
     ----------
     no_sync_ctx:
         Optional context manager (typically from ``ddp_no_sync_ctx``) that
-        disables DDP gradient ALLREDUCE for this pass.  Pass ``None``
-        (default) for the **final** backward before each optimizer step so
-        that gradients are synchronised across ranks.  Pass a no-sync
-        context for every **intermediate** backward (gradient accumulation,
-        pre-emptive / emergency / truncated passes) so they do NOT trigger
-        an extra ALLREDUCE that would deadlock against the other rank's
-        different accumulation schedule.
+        disables DDP gradient ALLREDUCE for this pass.  Should always be
+        provided for every backward pass (intermediate or final).  Gradient
+        synchronisation across ranks is handled explicitly by
+        ``sync_ddp_gradients()`` inside ``step_optimizer()``, which avoids
+        deadlocks from ranks reaching their step threshold at different times.
+        Pass ``None`` only in single-GPU mode where no DDP wrapping exists.
     """
     import contextlib
     ctx = no_sync_ctx if no_sync_ctx is not None else contextlib.nullcontext()
@@ -768,9 +765,12 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             plugin_runner.run_on_optimizer_backward(loss=tv.accumulated_loss)
             gc.collect()
             torch.cuda.empty_cache()
+            print(f"optimizer backward rank {get_rank()} (why: '{log_hint}', ctx class: {type(ctx)})")
             with ctx:
-                print(f"optimizer backward rank {get_rank()} (why: {log_hint}")
+                print(f"optimizer backward rank {get_rank()} entered context")
                 optimizer.backward(tv.accumulated_loss)
+                print(f"optimizer backward rank {get_rank()} done")
+            print(f"optimizer backward rank {get_rank()} exited context")
             if not optimizer.use_grad_scaler:
                 # if we have a grad scaler it suppresses NaN/Inf for us.
                 # otherwise, we have to suppress NaN/Inf manually
@@ -793,6 +793,7 @@ def optimizer_backward(optimizer: EveryDreamOptimizer, tv: TrainingVariables, pl
             tv.register_backward_oom_or_not(oomed=True)
 
         tv.clear_accumulated_loss()
+        print(f"leaving {optimizer_backward} rank {get_rank()}")
 
 
 def _encode_latents(
