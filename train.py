@@ -1410,7 +1410,7 @@ def main(args):
 
                     steps_pbar.update(1)
 
-                    images_per_sec = args.batch_size / (time.time() - step_start_time)
+                    images_per_sec = full_batch['image'].shape[0] / (time.time() - step_start_time)
                     log_data.images_per_sec_log_step.append(images_per_sec)
 
                     # Phase 5 – all-reduce loss scalar across ranks for accurate logging

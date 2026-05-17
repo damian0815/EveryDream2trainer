@@ -78,6 +78,7 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
 
     images_per_sec_avg = sum(log_data.images_per_sec_log_step) / (len(log_data.images_per_sec_log_step) if log_data.images_per_sec_log_step else 1)
     log_writer.add_scalar(tag="performance/images per second", scalar_value=images_per_sec_avg, global_step=global_step)
+    log_data.images_per_sec_log_step = []
 
     # For progress bar, use first unet LR or 0 if none
     lr_unet_for_display = list(lr_unet.values())[0] if lr_unet else 0
