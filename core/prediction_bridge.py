@@ -221,8 +221,8 @@ class PredictionBridge(ABC):
         teacher_timesteps: torch.Tensor,       # [B], teacher-domain
         student_timesteps: torch.Tensor,       # [B], student-domain
         noise: torch.Tensor,                   # [B, C, H, W]  (shared ε)
-        teacher_scheduler,
-        student_scheduler,
+        teacher_sched,
+        student_sched,
     ) -> torch.Tensor:
         """Convert the teacher's raw UNet output into the student's target tensor."""
 
@@ -238,9 +238,9 @@ class IdentityBridge(PredictionBridge):
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
-        return teacher_out
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
+        return teacher_output
 
 
 # ─── DDPM → FM crossings (SNR-match integer ts → FM float ts) ─────────────────
@@ -257,11 +257,11 @@ class VPredToFMBridge(PredictionBridge):
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
-        ac = teacher_sched.alphas_cumprod.to(teacher_ts.device)
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
+        ac = teacher_sched.alphas_cumprod.to(teacher_timesteps.device)
         x0 = _recover_x0_from_vpred(
-            teacher_noisy.float(), teacher_out.float(), ac[teacher_ts].float()
+            teacher_noisy_latents.float(), teacher_output.float(), ac[teacher_timesteps].float()
         )
         return _x0_to_fm_velocity(noise.float(), x0)
 
@@ -278,11 +278,11 @@ class EpsilonToFMBridge(PredictionBridge):
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
-        ac = teacher_sched.alphas_cumprod.to(teacher_ts.device)
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
+        ac = teacher_sched.alphas_cumprod.to(teacher_timesteps.device)
         x0 = _recover_x0_from_epsilon(
-            teacher_noisy.float(), teacher_out.float(), ac[teacher_ts].float()
+            teacher_noisy_latents.float(), teacher_output.float(), ac[teacher_timesteps].float()
         )
         return _x0_to_fm_velocity(noise.float(), x0)
 
@@ -300,17 +300,17 @@ class FMToVPredBridge(PredictionBridge):
         # teacher_ts are FM-shifted floats after remap_timesteps
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
         fm_sigmas = teacher_sched.get_sigmas_for_timesteps(
-            teacher_ts.to(teacher_sched.timesteps.device)
+            teacher_timesteps.to(teacher_sched.timesteps.device)
         ).float()
         x0 = _recover_x0_from_fm_velocity(
-            teacher_noisy.float(), teacher_out.float(), fm_sigmas
+            teacher_noisy_latents.float(), teacher_output.float(), fm_sigmas
         )
-        # student_ts are DDPM integer indices → look up student alpha_bar
-        ac = student_sched.alphas_cumprod.to(student_ts.device)
-        return _x0_to_vpred(noise.float(), x0, ac[student_ts].float())
+        # student_timesteps are DDPM integer indices → look up student alpha_bar
+        ac = student_sched.alphas_cumprod.to(student_timesteps.device)
+        return _x0_to_vpred(noise.float(), x0, ac[student_timesteps].float())
 
 
 class FMToEpsilonBridge(PredictionBridge):
@@ -322,20 +322,16 @@ class FMToEpsilonBridge(PredictionBridge):
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
         fm_sigmas = teacher_sched.get_sigmas_for_timesteps(
-            teacher_ts.to(teacher_sched.timesteps.device)
+            teacher_timesteps.to(teacher_sched.timesteps.device)
         ).float()
         x0 = _recover_x0_from_fm_velocity(
-            teacher_noisy.float(), teacher_out.float(), fm_sigmas
+            teacher_noisy_latents.float(), teacher_output.float(), fm_sigmas
         )
-        # Reconstruct student DDPM noisy latent, then solve for ε:
-        #   x_t_student = √ᾱ·x₁ + √(1-ᾱ)·ε
-        #   ε = (x_t_student − √ᾱ·x₀) / √(1-ᾱ)
-        # (simplifies to 'noise' for a clean teacher, kept general for consistency)
-        ac = student_sched.alphas_cumprod.to(student_ts.device)
-        ab = ac[student_ts].float()
+        ac = student_sched.alphas_cumprod.to(student_timesteps.device)
+        ab = ac[student_timesteps].float()
         sqrt_ab   = ab.sqrt().view(-1, 1, 1, 1)
         sqrt_1mab = (1.0 - ab).sqrt().view(-1, 1, 1, 1)
         x_t_student = sqrt_ab * x0.detach() + sqrt_1mab * noise.float()
@@ -353,13 +349,13 @@ class EpsilonToVPredBridge(PredictionBridge):
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
-        ac = teacher_sched.alphas_cumprod.to(teacher_ts.device)
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
+        ac = teacher_sched.alphas_cumprod.to(teacher_timesteps.device)
         x0 = _recover_x0_from_epsilon(
-            teacher_noisy.float(), teacher_out.float(), ac[teacher_ts].float()
+            teacher_noisy_latents.float(), teacher_output.float(), ac[teacher_timesteps].float()
         )
-        return _x0_to_vpred(noise.float(), x0, ac[teacher_ts].float())
+        return _x0_to_vpred(noise.float(), x0, ac[teacher_timesteps].float())
 
 
 class VPredToEpsilonBridge(PredictionBridge):
@@ -371,13 +367,13 @@ class VPredToEpsilonBridge(PredictionBridge):
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
 
-    def convert_output(self, teacher_out, teacher_noisy, teacher_ts, student_ts,
-                       noise, teacher_sched, student_sched):
-        ac = teacher_sched.alphas_cumprod.to(teacher_ts.device)
+    def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
+                       student_timesteps, noise, teacher_sched, student_sched):
+        ac = teacher_sched.alphas_cumprod.to(teacher_timesteps.device)
         x0 = _recover_x0_from_vpred(
-            teacher_noisy.float(), teacher_out.float(), ac[teacher_ts].float()
+            teacher_noisy_latents.float(), teacher_output.float(), ac[teacher_timesteps].float()
         )
-        return _x0_to_epsilon(teacher_noisy.float(), x0, ac[teacher_ts].float())
+        return _x0_to_epsilon(teacher_noisy_latents.float(), x0, ac[teacher_timesteps].float())
 
 
 # ─── Factory ──────────────────────────────────────────────────────────────────

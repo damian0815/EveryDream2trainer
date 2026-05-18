@@ -1670,23 +1670,6 @@ def main(args):
 
             steps_pbar.close()
 
-            # Drain: participate in the remaining want_to_step all_reduces from
-            # any rank whose epoch was longer than ours.  Each drain iteration
-            # matches exactly one train_step() call on the longer-epoch rank.
-            # If that rank's vote fires a step (MAX=1) we must also participate
-            # in step_optimizer (which contains a collective inside).
-            if _is_dist and _epoch_drain_steps > 0:
-                logging.info(f"[rank {_rank}] epoch drain: {_epoch_drain_steps} extra step(s)")
-                for _drain_i in range(_epoch_drain_steps):
-                    _drain_vote = torch.tensor(0, dtype=torch.int32, device=device)
-                    dist.all_reduce(_drain_vote, op=dist.ReduceOp.MAX)
-                    if _drain_vote.item() > 0:
-                        _ddp_no_sync.exit()
-                        try:
-                            ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
-                        finally:
-                            _ddp_no_sync.enter()
-
             elapsed_epoch_time = (time.time() - epoch_start_time) / 60
             epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
             log_writer.add_scalar(

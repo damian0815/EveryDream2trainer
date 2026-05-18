@@ -10,6 +10,7 @@ Usage (multi-GPU, 2 GPUs):
 import logging
 import os
 from contextlib import contextmanager, ExitStack
+from enum import Enum
 from typing import Optional
 
 import torch
@@ -85,6 +86,26 @@ def barrier() -> None:
     """Synchronise all ranks.  No-op in single-GPU mode."""
     if dist.is_initialized():
         dist.barrier()
+
+
+class StateSignal(Enum):
+    ACCUMULATING = 0  # still processing training items, not yet ready to optimizer.step()
+    READY = 1         # ready to optimizer.step()
+    DONE = 2          # no more data available
+
+def get_distributed_state_signal(local_signal: StateSignal, device) -> StateSignal:
+    """
+    Get state signal from all ranks across multiple GPUs.
+    | Rank 0 | Rank 1 | Rank 2 | Global signal (all ranks) | Interpretation |
+    | 0 | 1 | 2 | 0 | 0 is still accumulating (everybody else no-op then ask again) |
+    | 1 | 1 | 2 | 1 | everybody is ready or done -> step optimizer |
+    | 2 | 2 | 2 | 2 | everybody is done -> exit training loop |
+    | 0 | 0 | 2 | 0 | one done, others still working -> 0 and 1 continue, 2 should no-op |
+    """
+    sig = torch.tensor(local_signal, dtype=torch.int, device=device)
+    dist.all_reduce(sig, op=dist.ReduceOp.MIN)
+    global_sig = sig.item()
+    return global_sig
 
 
 def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
