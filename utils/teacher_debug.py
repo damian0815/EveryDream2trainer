@@ -23,6 +23,13 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from core.prediction_bridge import (
+    _recover_x0_from_epsilon,
+    _recover_x0_from_vpred,
+    _recover_x0_from_fm_velocity,
+    _x0_to_fm_velocity,
+)
+
 # ---------------------------------------------------------------------------
 # Latent → RGB preview helpers
 # (technique by @erucipe / @keturn / @torridgristle / @StAlKeR7779)
@@ -133,20 +140,23 @@ def latents_to_preview_image(latents: torch.Tensor, *, is_sdxl: bool = False) ->
 
 # ---------------------------------------------------------------------------
 # Tensor-recovery helpers
+# Delegates to the canonical implementations in core.prediction_bridge to
+# avoid duplicating maths.
 # ---------------------------------------------------------------------------
 
-def _get_fm_sigma(timesteps: torch.Tensor, scheduler) -> torch.Tensor:
+def _get_fm_sigma(timesteps: torch.Tensor, scheduler, *, device: torch.device) -> torch.Tensor:
     """
-    Return flow-match sigma ∈ (0, 1) for each timestep in *timesteps*.
+    Return flow-match sigma ∈ (0, 1) for each timestep in *timesteps*,
+    always on *device*.
     Falls back to ``timestep / 1000`` if the scheduler doesn't expose
     ``get_sigmas_for_timesteps``.
     """
     try:
         return scheduler.get_sigmas_for_timesteps(
             timesteps.to(scheduler.timesteps.device)
-        ).to(timesteps.device).float()
+        ).to(device=device, dtype=torch.float32)
     except (AttributeError, RuntimeError):
-        return (timesteps.float() / 1000.0).clamp(1e-6, 1.0 - 1e-6)
+        return (timesteps.float().to(device) / 1000.0).clamp(1e-6, 1.0 - 1e-6)
 
 
 def _recover_x0(
@@ -158,30 +168,28 @@ def _recover_x0(
 ) -> torch.Tensor:
     """
     Recover the predicted clean-image latent x₀ from a raw UNet prediction.
-
-    Works for FM velocity, epsilon, and v-prediction heads.
+    Delegates to the canonical helpers in :mod:`core.prediction_bridge`.
+    All intermediate tensors are moved to the same device as *pred*.
     """
     pred_type = pred_type.lower().replace("-", "_")
+    device = pred.device
     p = pred.float()
-    x_t = noisy.float()
+    x_t = noisy.float().to(device)
+    ts = timesteps.to(device)
 
     if pred_type in ("flow_prediction", "flow_match", "flow_matching"):
-        # x_t = (1-σ)·x₀ + σ·ε  →  x₁ = x_t − σ·v  (v = ε − x₁)
-        sigma = _get_fm_sigma(timesteps, scheduler).view(-1, 1, 1, 1)
-        return x_t - sigma * p
+        sigma = _get_fm_sigma(ts, scheduler, device=device)
+        return _recover_x0_from_fm_velocity(x_t, p, sigma)
 
     if pred_type == "epsilon":
-        ac = scheduler.alphas_cumprod.to(timesteps.device)
-        ab = ac[timesteps].float().view(-1, 1, 1, 1)
-        return (x_t - (1.0 - ab).sqrt() * p) / ab.sqrt().clamp(min=1e-8)
+        ab = scheduler.alphas_cumprod[ts.cpu()].float().to(device)
+        return _recover_x0_from_epsilon(x_t, p, ab)
 
     if pred_type in ("v_prediction", "v_pred"):
-        ac = scheduler.alphas_cumprod.to(timesteps.device)
-        ab = ac[timesteps].float().view(-1, 1, 1, 1)
-        return ab.sqrt() * x_t - (1.0 - ab).sqrt() * p
+        ab = scheduler.alphas_cumprod[ts.cpu()].float().to(device)
+        return _recover_x0_from_vpred(x_t, p, ab)
 
-    # Unknown type — return raw prediction unchanged
-    logging.debug(f"[teacher_debug] Unknown pred_type '{pred_type}', skipping x0 recovery.")
+    logging.debug(f"[teacher_debug] Unknown pred_type '{pred_type}', returning raw prediction.")
     return p
 
 
@@ -194,10 +202,11 @@ def _recover_fm_velocity(
     noise: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Compute the FM-convention velocity (ε − x₀) from any raw prediction.
+    Compute FM-convention velocity (ε − x₀) from any raw prediction.
+    Delegates to :func:`core.prediction_bridge._x0_to_fm_velocity`.
     """
     x0 = _recover_x0(pred, noisy, timesteps, scheduler, pred_type)
-    return noise.float() - x0
+    return _x0_to_fm_velocity(noise.float(), x0)
 
 
 # ---------------------------------------------------------------------------
@@ -353,4 +362,6 @@ def log_teacher_debug(
                     f.write(img_bytes)
             except Exception as exc:
                 logging.warning(f"[teacher_debug] Could not save preview '{name}': {exc}")
+
+
 
