@@ -17,7 +17,13 @@ from scipy.stats import beta as sp_beta
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
-from core.prediction_bridge import get_prediction_bridge, _ddpm_timesteps_matching_fm_sigma
+from core.prediction_bridge import (
+    get_prediction_bridge,
+    _ddpm_timesteps_matching_fm_sigma,
+    _recover_x0_from_epsilon,
+    _recover_x0_from_vpred,
+    _recover_x0_from_fm_velocity,
+)
 from core.loss_softrepa import (
     text_weighted_infonce_loss,
     text_weighted_infonce_loss_with_softrepa,
@@ -700,6 +706,7 @@ def get_model_prediction_and_target(
             global_step=global_step,
             output_dir=_debug_output_dir,
             is_sdxl=model.is_sdxl,
+            log_writer=log_writer,
             student_pred_type=_get_prediction_type(model),
             student_scheduler=model.noise_scheduler,
             teacher_pred_type=_teacher_pred_type,
@@ -1154,8 +1161,7 @@ def get_teacher_target(
     student_pred_type = _get_prediction_type(student_model)
 
     # ── Cross-VAE interposer (highest priority, unchanged) ─────────────────────
-    latent_interposer = getattr(student_model, 'latent_interposer', None)
-    if latent_interposer is not None and student_pred_type == 'flow_prediction':
+    if student_model.latent_interposer is not None and student_pred_type == 'flow_prediction':
         from core.latent_interposer import infer_latent_space_type
         student_vae_space = infer_latent_space_type(student_model)
         teacher_vae_space = infer_latent_space_type(teacher_model)
@@ -1167,7 +1173,7 @@ def get_teacher_target(
                 timesteps=student_timesteps,
                 clean_image_latents=clean_image_latents,
                 student_noise=noise,
-                latent_interposer=latent_interposer,
+                latent_interposer=student_model.latent_interposer,
                 student_vae_space=student_vae_space,
                 teacher_vae_space=teacher_vae_space,
             )
@@ -1285,6 +1291,7 @@ def _teacher_target_via_interposer(
         else teacher_model.noise_scheduler.config.get('prediction_type', 'unknown')
     )
     is_vpred_teacher = teacher_prediction_type in ('v_prediction', 'v-prediction')
+    is_epsilon_teacher = teacher_prediction_type == 'epsilon'
 
     # ---- One-time diagnostic log ----
     _log_key = ('interposer', student_vae_space, teacher_vae_space, teacher_prediction_type)
@@ -1292,7 +1299,7 @@ def _teacher_target_via_interposer(
         _teacher_target_logged_configs.add(_log_key)
         t_shift = _sched_shift(teacher_model.noise_scheduler)
         s_shift = _sched_shift(student_model.noise_scheduler)
-        if is_vpred_teacher:
+        if is_vpred_teacher or is_epsilon_teacher:
             ts_method = (
                 f"SNR-matched: student FM sigma → nearest DDPM integer timestep\n"
                 f"             using _ddpm_timesteps_matching_fm_sigma() on teacher's DDPM scheduler"
@@ -1334,9 +1341,9 @@ def _teacher_target_via_interposer(
     teacher_timesteps_ddpm = None  # set below if is_vpred_teacher
     sigma_b = None                 # set below if FM teacher
 
-    if is_vpred_teacher:
-        # (a) V-pred teacher: SNR-match FM timestep → DDPM integer timestep,
-        #     then build noisy latent with the DDPM interpolant α_t·x_1 + σ_t·ε.
+    if is_vpred_teacher or is_epsilon_teacher:
+        # (a) DDPM teacher (v-pred or epsilon): SNR-match FM timestep → DDPM integer
+        #     timestep, then build noisy latent with the DDPM interpolant α_t·x_1 + σ_t·ε.
         fm_sigmas = sched.get_sigmas_for_timesteps(
             timesteps.to(sched.timesteps.device)
         ).to(x_1_vT.device).float()
@@ -1393,14 +1400,17 @@ def _teacher_target_via_interposer(
 
     # ---- 5. Recover predicted clean endpoint in teacher space ----
     if is_vpred_teacher:
-        # V-pred: v = α_t·ε − σ_t·x_1  →  x_1 = α_t·x_t − σ_t·v
         ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_t_vT.device)
-        alpha_t = ac[teacher_timesteps_ddpm].sqrt().view(-1, 1, 1, 1).float()
-        sigma_t = (1.0 - ac[teacher_timesteps_ddpm]).sqrt().view(-1, 1, 1, 1).float()
-        x_1_hat_vT = alpha_t * x_t_vT.float() - sigma_t * v_hat_vT
+        x_1_hat_vT = _recover_x0_from_vpred(
+            x_t_vT.float(), v_hat_vT, ac[teacher_timesteps_ddpm].float()
+        )
+    elif is_epsilon_teacher:
+        ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_t_vT.device)
+        x_1_hat_vT = _recover_x0_from_epsilon(
+            x_t_vT.float(), v_hat_vT, ac[teacher_timesteps_ddpm].float()
+        )
     else:
-        # FM: code convention v = x_0 − x_1  →  x_1 = x_t − σ·v
-        x_1_hat_vT = x_t_vT - sigma_b * v_hat_vT
+        x_1_hat_vT = _recover_x0_from_fm_velocity(x_t_vT, v_hat_vT, sigma_b.squeeze())
 
     # ---- 6. Map predicted clean endpoint back to student VAE space ----
     # Unscale from teacher space, convert, then re-scale to student space.

@@ -269,11 +269,17 @@ class VPredToFMBridge(PredictionBridge):
 class EpsilonToFMBridge(PredictionBridge):
     """epsilon teacher  →  flow-matching student"""
 
+    # Epsilon models are unreliable below this DDPM timestep — x₀ recovery
+    # blows up because √(1-ᾱ) → 0 makes the division numerically unstable.
+    #_MIN_TEACHER_TIMESTEP = 50  # tune: 20–100 depending on your teacher
+    _MIN_TEACHER_TIMESTEP = 0
+
     def remap_timesteps(self, student_ts, student_sched, teacher_sched):
         fm_sigmas = student_sched.get_sigmas_for_timesteps(
             student_ts.to(student_sched.timesteps.device)
         )
-        return _ddpm_timesteps_matching_fm_sigma(fm_sigmas, teacher_sched)
+        ts = _ddpm_timesteps_matching_fm_sigma(fm_sigmas, teacher_sched)
+        return ts.clamp(min=self._MIN_TEACHER_TIMESTEP)  # clamp to avoid unstable timesteps
 
     def build_noisy_latents(self, clean, noise, teacher_ts, teacher_sched):
         return _build_noisy_latents(clean, noise, teacher_sched, teacher_ts)
@@ -281,10 +287,26 @@ class EpsilonToFMBridge(PredictionBridge):
     def convert_output(self, teacher_output, teacher_noisy_latents, teacher_timesteps,
                        student_timesteps, noise, teacher_sched, student_sched):
         ac = teacher_sched.alphas_cumprod.to(teacher_timesteps.device)
+        ab = ac[teacher_timesteps].float()
+
+        # Guard: at very low t, √(1-ᾱ) is tiny and amplifies error catastrophically.
+        # Fall back to a scaled noise target rather than blowing up x₀ recovery.
+        sqrt_1mab = (1.0 - ab).sqrt().view(-1, 1, 1, 1)
+        safe_mask = (sqrt_1mab > 0.1).squeeze()  # [B] bool
+
         x0 = _recover_x0_from_epsilon(
-            teacher_noisy_latents.float(), teacher_output.float(), ac[teacher_timesteps].float()
+            teacher_noisy_latents.float(), teacher_output.float(), ab
         )
-        return _x0_to_fm_velocity(noise.float(), x0)
+        fm_vel = _x0_to_fm_velocity(noise.float(), x0)
+
+        # For unsafe (very low noise) samples, substitute clean-latent target
+        # (velocity ≈ ε − x₀_true, use teacher x₀ directly without amplification)
+        if not safe_mask.all():
+            # x₀ ≈ teacher_noisy_latents at very low t — use it directly
+            fallback = _x0_to_fm_velocity(noise.float(), teacher_noisy_latents.float())
+            fm_vel[~safe_mask] = fallback[~safe_mask]
+
+        return fm_vel
 
 
 # ─── FM → DDPM crossings (SNR-match FM float ts → integer ts) ─────────────────

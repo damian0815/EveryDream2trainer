@@ -19,11 +19,14 @@ import logging
 import os
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+import torchvision.utils as vutils
+from PIL import Image, ImageDraw, ImageFont
 
 from core.prediction_bridge import (
+    _normalise_pred_type,
     _recover_x0_from_epsilon,
     _recover_x0_from_vpred,
     _recover_x0_from_fm_velocity,
@@ -138,6 +141,36 @@ def latents_to_preview_image(latents: torch.Tensor, *, is_sdxl: bool = False) ->
     return buf.getvalue()
 
 
+def _latent_to_chw_float(latent_1chw: torch.Tensor, *, is_sdxl: bool) -> torch.Tensor:
+    """
+    Project a single (1, C, H, W) latent to a (3, H, W) float32 tensor in [0, 1].
+    Used for TensorBoard grid assembly.
+    """
+    with torch.no_grad():
+        if is_sdxl:
+            rgb_factors = torch.tensor(
+                _SDXL_LATENT_RGB_FACTORS,
+                dtype=latent_1chw.dtype,
+                device=latent_1chw.device,
+            )
+            smooth = torch.tensor(
+                _SDXL_SMOOTH_MATRIX,
+                dtype=latent_1chw.dtype,
+                device=latent_1chw.device,
+            )
+            img = _sample_to_lowres_estimated_image(latent_1chw, rgb_factors, smooth)
+        else:
+            rgb_factors = torch.tensor(
+                _SD1_LATENT_RGB_FACTORS,
+                dtype=latent_1chw.dtype,
+                device=latent_1chw.device,
+            )
+            img = _sample_to_lowres_estimated_image(latent_1chw, rgb_factors)
+    # img is uint8 (H, W, 3) numpy → (3, H, W) float [0,1]
+    arr = np.array(img).astype("float32") / 255.0          # H×W×3
+    return torch.from_numpy(arr).permute(2, 0, 1)           # 3×H×W
+
+
 # ---------------------------------------------------------------------------
 # Tensor-recovery helpers
 # Delegates to the canonical implementations in core.prediction_bridge to
@@ -171,13 +204,18 @@ def _recover_x0(
     Delegates to the canonical helpers in :mod:`core.prediction_bridge`.
     All intermediate tensors are moved to the same device as *pred*.
     """
-    pred_type = pred_type.lower().replace("-", "_")
+    try:
+        pred_type = _normalise_pred_type(pred_type)
+    except ValueError:
+        logging.debug(f"[teacher_debug] Unknown pred_type '{pred_type}', returning raw prediction.")
+        return pred.float()
+
     device = pred.device
     p = pred.float()
     x_t = noisy.float().to(device)
     ts = timesteps.to(device)
 
-    if pred_type in ("flow_prediction", "flow_match", "flow_matching"):
+    if pred_type == "flow_prediction":
         sigma = _get_fm_sigma(ts, scheduler, device=device)
         return _recover_x0_from_fm_velocity(x_t, p, sigma)
 
@@ -185,11 +223,11 @@ def _recover_x0(
         ab = scheduler.alphas_cumprod[ts.cpu()].float().to(device)
         return _recover_x0_from_epsilon(x_t, p, ab)
 
-    if pred_type in ("v_prediction", "v_pred"):
+    if pred_type == "v_prediction":
         ab = scheduler.alphas_cumprod[ts.cpu()].float().to(device)
         return _recover_x0_from_vpred(x_t, p, ab)
 
-    logging.debug(f"[teacher_debug] Unknown pred_type '{pred_type}', returning raw prediction.")
+    logging.debug(f"[teacher_debug] Unhandled normalised pred_type '{pred_type}', returning raw prediction.")
     return p
 
 
@@ -237,6 +275,7 @@ def log_teacher_debug(
     global_step: int,
     output_dir: str,
     is_sdxl: bool,
+    log_writer=None,
     # Scheduler / prediction-type info
     student_pred_type: str,
     student_scheduler,
@@ -257,9 +296,15 @@ def log_teacher_debug(
 ) -> None:
     """
     Log teacher-distillation debug information for *global_step* (no-op after
-    step 9).  Writes a ``stats.txt`` and JPEG previews under::
+    step 9).
 
-        <output_dir>/debug_teacher/step_NNNNN/
+    Produces a single TensorBoard image ``debug_teacher/latents`` at
+    *global_step* where:
+      - **columns** (X-axis) = one labelled tensor type per column
+      - **rows**    (Y-axis) = one batch sample per row
+
+    A text stats summary is logged via :mod:`logging`.  No disk image files
+    are written.
 
     Each step is logged at most once (deduplication against multiple slices).
     """
@@ -271,9 +316,6 @@ def log_teacher_debug(
         return
     _logged_steps.add(dedup_key)
 
-    step_dir = os.path.join(output_dir, "debug_teacher", f"step_{global_step:05d}")
-    os.makedirs(step_dir, exist_ok=True)
-
     with torch.no_grad():
         # ── Derive student predicted-clean and predicted-velocity ─────────
         s_x0 = _recover_x0(model_pred, noisy_latents, student_timesteps,
@@ -282,11 +324,14 @@ def log_teacher_debug(
                                      student_scheduler, student_pred_type, noise)
 
         # ── Derive teacher predicted-clean and predicted-velocity ──────────
-        if (teacher_output is not None
-                and teacher_scheduler is not None
-                and teacher_noisy is not None
-                and teacher_timesteps is not None
-                and teacher_pred_type is not None):
+        have_teacher = (
+            teacher_output is not None
+            and teacher_scheduler is not None
+            and teacher_noisy is not None
+            and teacher_timesteps is not None
+            and teacher_pred_type is not None
+        )
+        if have_teacher:
             t_x0 = _recover_x0(teacher_output, teacher_noisy, teacher_timesteps,
                                 teacher_scheduler, teacher_pred_type)
             t_vel = _recover_fm_velocity(teacher_output, teacher_noisy, teacher_timesteps,
@@ -318,7 +363,7 @@ def log_teacher_debug(
             f"  clean_latents (actual x₀): {_stats(clean_latents)}",
             "",
             "─── TEACHER ───────────────────────────────────────────────────",
-            f"  teacher_noise (shared ε) : {_stats(noise) if teacher_output is not None else 'N/A'}",
+            f"  teacher_noise (shared ε) : {_stats(noise) if have_teacher else 'N/A'}",
             f"  teacher_noisy_latents    : {_stats(teacher_noisy) if teacher_noisy is not None else 'N/A'}",
             f"  teacher_output (raw)     : {_stats(teacher_output) if teacher_output is not None else 'N/A'}",
             f"  teacher_pred_clean (x₀)  : {_stats(t_x0) if t_x0 is not None else 'N/A'}",
@@ -328,40 +373,109 @@ def log_teacher_debug(
         ]
         summary = "\n".join(lines)
         logging.info(summary)
-        with open(os.path.join(step_dir, "stats.txt"), "w", encoding="utf-8") as f:
-            f.write(summary + "\n")
 
-        # ── Preview images ─────────────────────────────────────────────────
-        previews: dict[str, Optional[torch.Tensor]] = {
-            "01_student_noise":          noise,
-            "02_student_noisy_latents":  noisy_latents,
-            "03_student_model_pred_raw": model_pred,
-            "04_student_pred_clean_x0":  s_x0,
-            "05_student_pred_velocity":  s_vel,
-            "06_student_target_actual":  target,
-            "07_actual_image_latents":   clean_latents,
-            "08_teacher_noisy_latents":  teacher_noisy,
-            "09_teacher_output_raw":     teacher_output,
-            "10_teacher_pred_clean_x0":  t_x0,
-            "11_teacher_pred_velocity":  t_vel,
-            "12_teacher_target_student": teacher_target,
-        }
+        # ── Build TensorBoard grid ─────────────────────────────────────────
+        if log_writer is None:
+            return
 
-        for name, tensor in previews.items():
-            if tensor is None:
-                continue
-            path = os.path.join(step_dir, f"{name}.jpg")
-            try:
-                t = tensor.detach().float().cpu()
-                if t.dim() == 3:
-                    t = t.unsqueeze(0)
-                elif t.dim() == 4 and t.shape[0] > 1:
-                    t = t[:1]           # first item in batch only
-                img_bytes = latents_to_preview_image(t, is_sdxl=is_sdxl)
-                with open(path, "wb") as f:
-                    f.write(img_bytes)
-            except Exception as exc:
-                logging.warning(f"[teacher_debug] Could not save preview '{name}': {exc}")
+        # Ordered columns: (short_label, tensor_or_None)
+        columns: list[tuple[str, Optional[torch.Tensor]]] = [
+            ("student\nnoise",       noise),
+            ("student\nnoisy-lat",   noisy_latents),
+            ("student\npred-raw",    model_pred),
+            ("student\npred-x0",     s_x0),
+            ("student\npred-vel",    s_vel),
+            ("student\ntarget",      target),
+            ("actual\nclean-lat",    clean_latents),
+            ("teacher\nnoise",       noise if have_teacher else None),
+            ("teacher\nnoisy-lat",   teacher_noisy),
+            ("teacher\npred-raw",    teacher_output),
+            ("teacher\npred-x0",     t_x0),
+            ("teacher\npred-vel",    t_vel),
+            ("teacher\ntarget",      teacher_target),
+        ]
+
+        batch_size = noise.shape[0]
+        # Infer cell dimensions from the first available tensor
+        ref = noise  # always present
+        _, _, lH, lW = ref.shape
+        cell_h, cell_w = lH, lW   # preview at native latent resolution
+
+        LABEL_H = 28          # pixels reserved above each column for the text label
+        PAD     = 2           # padding between cells (make_grid padding)
+        num_cols = len(columns)
+
+        # ── Render every cell: shape (3, cell_h, cell_w) float [0,1] ──────
+        # Grid is row-major: [col0_row0, col1_row0, ..., col(N-1)_row0, col0_row1, ...]
+        cells: list[torch.Tensor] = []
+        blank = torch.zeros(3, cell_h, cell_w)  # placeholder for missing tensors
+
+        for b in range(batch_size):
+            for _label, tensor in columns:
+                if tensor is None:
+                    cells.append(blank)
+                else:
+                    try:
+                        sample = tensor[b].detach().float().cpu()
+                        if sample.dim() == 3:
+                            sample = sample.unsqueeze(0)   # → (1, C, H, W)
+                        cells.append(_latent_to_chw_float(sample, is_sdxl=is_sdxl))
+                    except Exception as exc:
+                        logging.warning(f"[teacher_debug] cell render failed: {exc}")
+                        cells.append(blank)
+
+        # make_grid with nrow=num_cols → each row in the grid = one batch item
+        grid = vutils.make_grid(
+            cells,
+            nrow=num_cols,
+            padding=PAD,
+            normalize=False,
+            pad_value=0.15,     # grey separator
+        )
+        # grid: (3, H_grid, W_grid) float [0,1]
+
+        # ── Prepend a label row at the top ─────────────────────────────────
+        grid_w = grid.shape[2]
+        label_strip = Image.new("RGB", (grid_w, LABEL_H), color=(30, 30, 30))
+        draw = ImageDraw.Draw(label_strip)
+
+        # Try to get a small bitmap font; fall back to default if unavailable
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
+        except (IOError, OSError):
+            font = ImageFont.load_default()
+
+        # Column centres in the grid image
+        # make_grid pads PAD on left before each image block
+        col_x_start = PAD  # first cell starts after PAD border
+        cell_stride = cell_w + PAD
+        for col_idx, (label, _t) in enumerate(columns):
+            cx = col_x_start + col_idx * cell_stride + cell_w // 2
+            # Multi-line label: split on \n
+            parts = label.split("\n")
+            y = 1
+            for part in parts:
+                try:
+                    bbox = draw.textbbox((0, 0), part, font=font)
+                    tw = bbox[2] - bbox[0]
+                except AttributeError:
+                    tw = len(part) * 6  # rough fallback
+                draw.text((cx - tw // 2, y), part, fill=(220, 220, 220), font=font)
+                y += 10
+
+        # Convert label strip to tensor (3, LABEL_H, grid_w)
+        label_tensor = torch.from_numpy(
+            np.array(label_strip).astype("float32") / 255.0
+        ).permute(2, 0, 1)
+
+        # Stack: label row on top, then the cell grid
+        final_grid = torch.cat([label_tensor, grid], dim=1)  # (3, LABEL_H+H_grid, W_grid)
+
+        log_writer.add_image(
+            "debug_teacher/latents",
+            final_grid,
+            global_step=global_step,
+        )
 
 
 
