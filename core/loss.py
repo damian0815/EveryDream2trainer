@@ -694,8 +694,8 @@ def get_model_prediction_and_target(
                 _debug_capture=_teacher_debug_capture if debug_teacher else None,
             )
 
-    # ── Teacher debug logging (first 10 steps) ────────────────────────────
-    if debug_teacher and global_step < 10:
+    # ── Teacher debug logging (first 20 steps) ────────────────────────────
+    if debug_teacher and global_step < 20:
         _debug_output_dir = getattr(args, "logdir", None) or "."
         _teacher_pred_type: Optional[str] = None
         _teacher_sched = None
@@ -1160,12 +1160,16 @@ def get_teacher_target(
     """
     student_pred_type = _get_prediction_type(student_model)
 
-    # ── Cross-VAE interposer (highest priority, unchanged) ─────────────────────
-    if student_model.latent_interposer is not None and student_pred_type == 'flow_prediction':
-        from core.latent_interposer import infer_latent_space_type
+    # ── Cross-VAE interposer (highest priority) ────────────────────────────────
+    # Detect cross-VAE on demand; no need for the interposer to be pre-attached
+    # to the model.  The shared singleton in latent_interposer is cheap to
+    # create and loads model weights lazily.
+    if student_pred_type == 'flow_prediction':
+        from core.latent_interposer import infer_latent_space_type, get_shared_interposer, LatentInterposer
         student_vae_space = infer_latent_space_type(student_model)
         teacher_vae_space = infer_latent_space_type(teacher_model)
-        if student_vae_space is not None and teacher_vae_space is not None and student_vae_space != teacher_vae_space:
+        if (student_vae_space is not None and teacher_vae_space is not None
+                and LatentInterposer.is_supported(student_vae_space, teacher_vae_space)):
             return _teacher_target_via_interposer(
                 teacher_model=teacher_model,
                 teacher_conditioning=teacher_conditioning,
@@ -1173,9 +1177,10 @@ def get_teacher_target(
                 timesteps=student_timesteps,
                 clean_image_latents=clean_image_latents,
                 student_noise=noise,
-                latent_interposer=student_model.latent_interposer,
+                latent_interposer=get_shared_interposer(),
                 student_vae_space=student_vae_space,
                 teacher_vae_space=teacher_vae_space,
+                _debug_capture=_debug_capture,
             )
 
     # ── Unified bridge-based distillation ──────────────────────────────────────
@@ -1223,7 +1228,6 @@ def get_teacher_target(
             ),
         ).sample.float()
 
-    # Step 4: convert to student target space
     student_target = bridge.convert_output(
         teacher_output=teacher_output,
         teacher_noisy_latents=teacher_noisy,
@@ -1234,7 +1238,6 @@ def get_teacher_target(
         student_sched=student_model.noise_scheduler,
     )
 
-    # Populate debug capture dict if requested (filled by get_model_prediction_and_target)
     if _debug_capture is not None:
         _debug_capture["teacher_noisy"] = teacher_noisy.detach()
         _debug_capture["teacher_output"] = teacher_output.detach()
@@ -1253,6 +1256,7 @@ def _teacher_target_via_interposer(
     latent_interposer,
     student_vae_space: str,                # e.g. "xl"
     teacher_vae_space: str,                # e.g. "v1"
+    _debug_capture: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """
     Cross-VAE-space velocity target via the bidirectional interposer.
@@ -1343,7 +1347,14 @@ def _teacher_target_via_interposer(
 
     if is_vpred_teacher or is_epsilon_teacher:
         # (a) DDPM teacher (v-pred or epsilon): SNR-match FM timestep → DDPM integer
-        #     timestep, then build noisy latent with the DDPM interpolant α_t·x_1 + σ_t·ε.
+        #     timestep, then build noisy latent with the VP interpolant √ᾱ·x₁ + √(1−ᾱ)·ε.
+        #
+        # IMPORTANT: we compute x_t explicitly from alphas_cumprod instead of calling
+        # scheduler.add_noise().  SDXL epsilon models often ship with EulerDiscreteScheduler
+        # whose add_noise() uses the VE/ODE formula (x_t = x₀ + σ·ε), which produces
+        # variance-preserving *inconsistent* noisy latents for the VP recovery formula
+        # used in step 5.  By computing the VP interpolant directly we guarantee that
+        # the noising and recovery formulas are always consistent.
         fm_sigmas = sched.get_sigmas_for_timesteps(
             timesteps.to(sched.timesteps.device)
         ).to(x_1_vT.device).float()
@@ -1351,10 +1362,10 @@ def _teacher_target_via_interposer(
             fm_sigmas=fm_sigmas,
             ddpm_scheduler=teacher_model.noise_scheduler,
         ).to(x_1_vT.device)
-        x_t_vT = _get_noisy_latents(
-            x_1_vT, x_0_vT, teacher_model.noise_scheduler, teacher_timesteps_ddpm,
-            latents_perturbation=0.0,
-        )
+        # VP interpolant: x_t = √ᾱ · x₁ + √(1−ᾱ) · ε
+        ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_1_vT.device)
+        ab = ac[teacher_timesteps_ddpm].float().view(-1, 1, 1, 1)
+        x_t_vT = ab.sqrt() * x_1_vT.float() + (1.0 - ab).sqrt() * x_0_vT.float()
         teacher_unet_timesteps = teacher_timesteps_ddpm
     else:
         # (b) FM teacher: use the same sigma as the student, FM interpolant
@@ -1422,6 +1433,11 @@ def _teacher_target_via_interposer(
     # ---- 7. Build student-space distillation velocity target ----
     # Code convention: target = x_0_vS − x_1_hat_vS  (noise − clean)
     v_target_vS = student_noise.float() - x_1_hat_vS
+
+    if _debug_capture is not None:
+        _debug_capture["teacher_noisy"] = x_t_vT.detach()
+        _debug_capture["teacher_output"] = v_hat_vT.detach()
+        _debug_capture["teacher_timesteps"] = teacher_unet_timesteps.detach()
 
     return v_target_vS.to(dtype=student_model.unet.dtype)
 

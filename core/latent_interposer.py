@@ -247,7 +247,6 @@ class LatentInterposer:
             If no pretrained model exists for the requested conversion.
         """
         if src == dst:
-            print("returning unchanged")
             return latents
 
         key = f"{src}-to-{dst}"
@@ -267,14 +266,10 @@ class LatentInterposer:
 
         return result.to(device=original_device, dtype=original_dtype)
 
-    def is_supported(self, src: str, dst: str) -> bool:
-        """Return ``True`` if a pretrained model exists for the ``src`` → ``dst`` pair."""
-        return src != dst and f"{src}-to-{dst}" in INTERPOSER_CONFIGS
-
     @staticmethod
-    def is_supported_static(src: str, dst: str) -> bool:
+    def is_supported(src: str, dst: str) -> bool:
         """Class-level check — does not require an instance."""
-        return src != dst and f"{src}-to-{dst}" in INTERPOSER_CONFIGS
+        return src == dst or f"{src}-to-{dst}" in INTERPOSER_CONFIGS
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -345,6 +340,30 @@ class LatentInterposer:
 # ---------------------------------------------------------------------------
 # Helper: infer latent space type from a TrainingModel
 # ---------------------------------------------------------------------------
+
+_shared_interposer: Optional["LatentInterposer"] = None
+
+
+def get_shared_interposer(model_dir: Optional[str] = None) -> "LatentInterposer":
+    """
+    Return the process-level shared :class:`LatentInterposer` instance,
+    creating it lazily on first call.
+
+    Models are loaded on first :meth:`~LatentInterposer.convert` call and then
+    cached inside the singleton, so repeated calls to this function are cheap.
+
+    Parameters
+    ----------
+    model_dir:
+        Optional path to pre-downloaded weight files.  Only honoured on the
+        very first call; subsequent calls return the already-created instance
+        regardless of *model_dir*.
+    """
+    global _shared_interposer
+    if _shared_interposer is None:
+        _shared_interposer = LatentInterposer(model_dir=model_dir)
+    return _shared_interposer
+
 
 def infer_latent_space_type(model) -> Optional[str]:
     """

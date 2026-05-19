@@ -219,6 +219,7 @@ def train_step(
                         tv=tv,
                         args=args,
                         debug_teacher=getattr(args, "debug_teacher", False),
+                        log_writer=log_writer,
                     ), oom_log_info=f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} for full batch size {batch_size}. "
                 f"loss images accumulated: {tv.accumulated_loss_images_count}")
             record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images/len(caption_variants))
@@ -992,6 +993,7 @@ def _do_model_forward(
     forward_slice_size: int,
     tv: TrainingVariables, args: Namespace,
     debug_teacher: bool = False,
+    log_writer: SummaryWriter|None = None,
 ) -> ModelForwardReturnType:
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
@@ -1065,6 +1067,7 @@ def _do_model_forward(
                 self_flow_s_timesteps=self_flow_s_timesteps_slice,
                 global_step=tv.global_step,
                 debug_teacher=debug_teacher,
+                log_writer=log_writer
             )
 
             model_pred_all.append(model_pred_result.model_pred)

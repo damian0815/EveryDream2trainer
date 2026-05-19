@@ -69,7 +69,6 @@ from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeB
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
 from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
-from core.latent_interposer import LatentInterposer, infer_latent_space_type  # used for cross-VAE distillation
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
@@ -632,30 +631,6 @@ def main(args):
                 model.clip_processor = clip_processor
 
         teacher_model = load_teacher_model(args, device, model)
-
-        # ---- Cross-VAE-space distillation: attach interposer to student ----
-        # When teacher and student live in different VAE latent spaces (e.g. SD2 teacher
-        # → SDXL student) a bidirectional LatentInterposer is needed to bridge them.
-        # The interposer is stored on the student model so that get_teacher_target() can
-        # use it without threading extra arguments through the entire call stack.
-        if teacher_model is not None:
-            _student_vae_space = infer_latent_space_type(model)
-            _teacher_vae_space = infer_latent_space_type(teacher_model)
-            if (_student_vae_space is not None and _teacher_vae_space is not None
-                    and _student_vae_space != _teacher_vae_space
-                    and LatentInterposer.is_supported_static(_student_vae_space, _teacher_vae_space)):
-                logging.info(
-                    f" * Cross-VAE distillation: {_student_vae_space} → {_teacher_vae_space}.  "
-                    f"Loading bidirectional LatentInterposer …"
-                )
-                _interposer_dir = getattr(args, 'interposer_model_dir', None)
-                model.latent_interposer = LatentInterposer(model_dir=_interposer_dir)
-                logging.info(" * LatentInterposer ready (S2T and T2S models will be loaded lazily on first use).")
-            else:
-                logging.info(
-                    f" * Teacher/student share VAE space ({_student_vae_space}); "
-                    f"no interposer needed."
-                )
 
         model.setup_cond_dropout_tokens()
         if teacher_model is not None:

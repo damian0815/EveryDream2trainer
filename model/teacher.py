@@ -10,7 +10,7 @@ import torch
 from diffusers import AutoPipelineForText2Image, FlowMatchEulerDiscreteScheduler
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
-from model.training_model import TrainingModel
+from model.training_model import TrainingModel, get_training_noise_scheduler
 
 
 def load_teacher_model(
@@ -133,8 +133,12 @@ def load_teacher_model(
 
     del teacher_te_sd, base_te_sd
 
+    teacher_sampler = 'flow-matching' if isinstance(teacher_pipeline.scheduler, TrainFlowMatchEulerDiscreteScheduler) else 'ddpm'
+    teacher_scheduler = get_training_noise_scheduler(
+        teacher_pipeline.scheduler, train_sampler=teacher_sampler
+    )
     teacher_model = TrainingModel(
-        noise_scheduler=teacher_pipeline.scheduler,
+        noise_scheduler=teacher_scheduler,
         unet=teacher_unet,
         text_encoder=teacher_text_encoder,
         text_encoder_2=teacher_text_encoder_2,
