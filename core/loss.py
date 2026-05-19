@@ -4,7 +4,7 @@ import line_profiler
 import math
 import random
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict, Any
 
 import torch
 import torchvision
@@ -24,6 +24,7 @@ from core.loss_softrepa import (
 )
 from core.self_flow import get_self_flow_modules, get_self_flow_channels, get_self_flow_spatial_divisors
 from model.training_model import TrainingModel, Conditioning
+from utils.teacher_debug import log_teacher_debug
 
 # from train import pyramid_noise_like, compute_snr
 
@@ -518,6 +519,7 @@ def get_model_prediction_and_target(
     mask=None,
     lcf_mask=None,
     self_flow_s_timesteps: torch.Tensor | None = None,
+    debug_teacher: bool = False,
 ) -> ModelPredictionAndTargetReturnType:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
@@ -595,6 +597,7 @@ def get_model_prediction_and_target(
             mask=None,
             lcf_mask=lcf_mask_masked,
             self_flow_s_timesteps=self_flow_s_timesteps_masked,
+            debug_teacher=debug_teacher,
         )
         model_pred[mask] += masked_result.model_pred
         target[mask] += masked_result.target
@@ -662,6 +665,7 @@ def get_model_prediction_and_target(
                 handle.remove()
 
     teacher_target = None
+    _teacher_debug_capture: Dict[str, Any] = {}
     if teacher_mask is None:
         # No supplementary teacher_target needed: no teacher guidance this step.
         pass
@@ -681,7 +685,36 @@ def get_model_prediction_and_target(
                 student_timesteps=timesteps,
                 clean_image_latents=latents,
                 noise=noise,
+                _debug_capture=_teacher_debug_capture if debug_teacher else None,
             )
+
+    # ── Teacher debug logging (first 10 steps) ────────────────────────────
+    if debug_teacher and global_step < 10:
+        _debug_output_dir = getattr(args, "logdir", None) or "."
+        _teacher_pred_type: Optional[str] = None
+        _teacher_sched = None
+        if teacher_model is not None:
+            _teacher_pred_type = _get_prediction_type(teacher_model)
+            _teacher_sched = teacher_model.noise_scheduler
+        log_teacher_debug(
+            global_step=global_step,
+            output_dir=_debug_output_dir,
+            is_sdxl=model.is_sdxl,
+            student_pred_type=_get_prediction_type(model),
+            student_scheduler=model.noise_scheduler,
+            teacher_pred_type=_teacher_pred_type,
+            teacher_scheduler=_teacher_sched,
+            noise=noise,
+            noisy_latents=noisy_latents,
+            model_pred=model_pred,
+            target=target,
+            clean_latents=latents,
+            student_timesteps=timesteps,
+            teacher_noisy=_teacher_debug_capture.get("teacher_noisy"),
+            teacher_output=_teacher_debug_capture.get("teacher_output"),
+            teacher_timesteps=_teacher_debug_capture.get("teacher_timesteps"),
+            teacher_target=teacher_target,
+        )
 
 
     # ---- Self-Flow representation learning ----
@@ -1112,6 +1145,7 @@ def get_teacher_target(
     student_timesteps: torch.Tensor,    # [B], student-domain
     clean_image_latents: torch.Tensor,  # [B, C, H, W]
     noise: torch.Tensor,                # [B, C, H, W]
+    _debug_capture: Optional[Dict[str, Any]] = None,  # filled when debug_teacher is active
 ) -> torch.Tensor:
     """
     Unified teacher-target function.  Handles all 9 objective crossings via
@@ -1193,6 +1227,13 @@ def get_teacher_target(
         teacher_sched=teacher_model.noise_scheduler,
         student_sched=student_model.noise_scheduler,
     )
+
+    # Populate debug capture dict if requested (filled by get_model_prediction_and_target)
+    if _debug_capture is not None:
+        _debug_capture["teacher_noisy"] = teacher_noisy.detach()
+        _debug_capture["teacher_output"] = teacher_output.detach()
+        _debug_capture["teacher_timesteps"] = teacher_timesteps.detach()
+
     return student_target.to(dtype=student_model.unet.dtype)
 
 

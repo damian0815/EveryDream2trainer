@@ -438,11 +438,6 @@ class EveryDreamOptimizer:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
 
-        # Manually all-reduce gradients across ranks BEFORE clipping/stepping.
-        # Called inside the brief window where DDPPersistentNoSync has been exited;
-        # the want_to_step gate in the training loop guarantees all ranks participate.
-        sync_ddp_gradients(self.unet, self.text_encoder, self.text_encoder_2)
-
         # Guard: skip weight update if this rank contributed no gradients this step.
         # This happens when another rank's MAX vote forced a collective step but this
         # rank had not yet accumulated enough images (or is_final_step fired early).

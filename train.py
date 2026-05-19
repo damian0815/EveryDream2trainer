@@ -35,11 +35,9 @@ from utils.distributed import (
     init_distributed,
     cleanup_distributed,
     barrier as dist_barrier,
-    all_reduce_mean,
     shard_items,
     DDPWrapper,
-    ddp_no_sync_ctx,
-    DDPPersistentNoSync,
+    get_distributed_state_signal, StateSignal, ddp_no_sync_ctx, sync_ddp_gradients,
 )
 
 from colorama import Fore, Style
@@ -1074,7 +1072,10 @@ def main(args):
     logging.info(f" saving ckpts every {args.ckpt_every_n_minutes} minutes")
     logging.info(f" saving ckpts every {args.save_every_n_epochs } epochs")
 
-    train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size, num_workers=args.num_dataloader_workers)
+    num_dataloader_workers = max(1, args.num_dataloader_workers // _world_size)
+    if _world_size > 1:
+        logging.info(f"Using {num_dataloader_workers} dataloader workers per rank (total {num_dataloader_workers * _world_size} across {_world_size} ranks)")
+    train_dataloader = build_torch_dataloader(train_batch, batch_size=args.batch_size, num_workers=num_dataloader_workers)
 
     model.unet.train() if (args.gradient_checkpointing or not args.disable_unet_training) else model.unet.eval()
     if args.disable_unet_training:
@@ -1123,19 +1124,6 @@ def main(args):
     tv.global_step = 0
     training_start_time = time.time()
     last_epoch_saved_time = training_start_time
-
-    # Create the persistent no_sync context that suppresses DDP gradient
-    # all-reduces across all backward passes.  It is entered here and exited
-    # only briefly around each optimizer.step() (via the want_to_step gate in
-    # train_step) so that sync_ddp_gradients() can fire its collective with
-    # all ranks guaranteed to participate at the same time.
-    _ddp_no_sync = DDPPersistentNoSync(
-        model.unet,
-        model.text_encoder,
-        getattr(model, 'text_encoder_2', None),
-    )
-    _ddp_no_sync.enter()
-    tv.ddp_no_sync = _ddp_no_sync
 
     append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer)
 
@@ -1290,438 +1278,389 @@ def main(args):
         wants_stop = False
         force_save_optimizer = False
 
-        for epoch in range(args.max_epochs):
-            write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
-            if args.load_settings_every_epoch:
-                load_train_json_from_file(args)
+        with ddp_no_sync_ctx(
+            model.unet,
+            model.text_encoder,
+            model.text_encoder_2
+        ):
+            for epoch in range(args.max_epochs):
+                write_batch_schedule(log_folder, train_batch, epoch) if args.write_schedule else None
+                if args.load_settings_every_epoch:
+                    load_train_json_from_file(args)
 
-            epoch_len = math.ceil(len(train_batch) / args.batch_size)
+                epoch_len = math.ceil(len(train_batch) / args.batch_size)
 
-            # In distributed mode, dataset shards may differ in size by ±1
-            # item, which causes different epoch_len values on different ranks.
-            # Find the longest epoch so the shorter-epoch ranks know how many
-            # drain iterations to run after their for-loop ends.
-            if _is_dist:
-                _max_epoch_len_t = torch.tensor(epoch_len, dtype=torch.int32, device=device)
-                dist.all_reduce(_max_epoch_len_t, op=dist.ReduceOp.MAX)
-                _epoch_drain_steps = int(_max_epoch_len_t.item()) - epoch_len
-            else:
-                _epoch_drain_steps = 0
+                def update_arg(arg: str, newValue):
+                    if arg == "grad_accum":
+                        args.grad_accum = newValue
+                        data_loader.grad_accum = newValue
+                    else:
+                        raise("Unrecognized arg: " + arg)
 
-            def update_arg(arg: str, newValue):
-                if arg == "grad_accum":
-                    args.grad_accum = newValue
-                    data_loader.grad_accum = newValue
-                else:
-                    raise("Unrecognized arg: " + arg)
+                plugin_runner.run_on_epoch_start(
+                    epoch=0 if epoch is None else epoch,
+                    global_step=tv.global_step,
+                    epoch_length=epoch_len,
+                    project_name=args.project_name,
+                    log_folder=log_folder,
+                    data_root=args.data_root,
+                    arg_update_callback=update_arg
+                )
 
-            plugin_runner.run_on_epoch_start(
-                epoch=0 if epoch is None else epoch,
-                global_step=tv.global_step,
-                epoch_length=epoch_len,
-                project_name=args.project_name,
-                log_folder=log_folder,
-                data_root=args.data_root,
-                arg_update_callback=update_arg
-            )
+                sample_generator.on_epoch_start(
+                    epoch=epoch,
+                    global_step=tv.global_step,
+                    epoch_length=epoch_len
+                )
 
-            sample_generator.on_epoch_start(
-                epoch=epoch,
-                global_step=tv.global_step,
-                epoch_length=epoch_len
-            )
+                epoch_start_time = time.time()
 
-            epoch_start_time = time.time()
+                steps_pbar = tqdm(range(epoch_len), position=1, leave=False, dynamic_ncols=True)
+                steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
 
-            steps_pbar = tqdm(range(epoch_len), position=1, leave=False, dynamic_ncols=True)
-            steps_pbar.set_description(f"{Fore.LIGHTCYAN_EX}Steps{Style.RESET_ALL}")
+                validation_steps = (
+                    [] if validator is None
+                    else validator.get_validation_step_indices(epoch, len(train_dataloader))
+                )
 
-            validation_steps = (
-                [] if validator is None
-                else validator.get_validation_step_indices(epoch, len(train_dataloader))
-            )
-
-            timesteps = None
-            #logging.info("fetching batch...")
-
-            _dataloader_pre_time = time.perf_counter()
-
-            for step, full_batch in enumerate(train_dataloader):
-                #logging.info("... fetched.")
-
-                _dataloader_post_time = time.perf_counter()
-                record_performance_timing('_dataloader_fetch', _dataloader_post_time - _dataloader_pre_time, full_batch['image'].shape[0])
-
-
-                try:
-                    train_progress_01 = compute_train_process_01(epoch=epoch, step=step, steps_per_epoch=epoch_len,
-                                                                 max_epochs=args.max_epochs, max_global_steps=args.max_steps)
-
-                    step_start_time = time.time()
-
-                    # Compute is_final_step for the want_to_step MAX vote in train_step.
-                    # A rank that reaches its last dataloader step votes 1 unconditionally
-                    # so that a peer waiting at the all_reduce is never left stranded.
-                    _is_last_epoch = (epoch == args.max_epochs - 1)
-                    _is_last_step_of_epoch = (step == epoch_len - 1)
-                    _at_max_steps = (args.max_steps is not None and tv.global_step + 1 >= args.max_steps)
-                    tv.is_final_step = (_is_last_epoch and _is_last_step_of_epoch) or _at_max_steps
-
-                    plugin_runner.run_on_step_start(epoch=epoch,
-                                                    local_step=step,
-                                                    global_step=tv.global_step,
-                                                    project_name=args.project_name,
-                                                    log_folder=log_folder,
-                                                    batch=full_batch,
-                                                    ed_state=make_current_ed_state())
-
-                    # for k in full_batch['captions'].keys():
-                    #    if any(c is not None and len(c.strip()) == 0 for c in full_batch['captions'][k]):
-                    #        print('a caption was already empty before cond dropout. paths:', full_batch['pathnames'], 'captions:', full_batch['captions'])
-
-                    image_pixel_count = full_batch["image"].shape[2] * full_batch["image"].shape[3]
-                    tv.batch_resolution = get_best_match_resolution(
-                        args.resolution, image_pixel_count=image_pixel_count
-                    )
-                    tv.max_backward_slice_size = _choose_backward_slice_size(tv)
-                    tv.forward_slice_size = _get_default_forward_slice_size(tv)
-                    if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
-                        # do backward now — intermediate pass; the persistent DDPPersistentNoSync
-                        # context suppresses the DDP all-reduce automatically.
-                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ')
-                        gc.collect()
-                        torch.cuda.empty_cache()
-
-                    safe_backward_size = _get_safe_backward_size(gpu, model.device, image_pixel_count // 64)
-                    if safe_backward_size > tv.max_backward_slice_size and tv.batch_resolution not in tv._backward_size_hint_logged:
-                        logging.info(f"at resolution {tv.batch_resolution} you could probably do backward={safe_backward_size} (you requested max {tv.max_backward_slice_size})")
-                        tv._backward_size_hint_logged.add(tv.batch_resolution)
-
-                    if not args.disable_backward_memsafe and tv.batch_resolution not in args.disable_backward_memsafe_resolutions:
-                        if gpu is not None:
-                            torch.cuda.empty_cache()
-                            gc.collect()
-                            max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
-                            if max_safe_forward_size == 0:
-                                # maybe not enough memory. if we can, do an emergency backward pass if we have any loss pending
-                                accumulated_loss_images_count_before_emergency_backward = tv.accumulated_loss_images_count
-                                if tv.accumulated_loss_images_count > 0:
-                                    with torch.amp.autocast('cuda', enabled=args.amp):
-                                        # Emergency pass — intermediate; the persistent DDPPersistentNoSync
-                                        # context suppresses the DDP all-reduce automatically.
-                                        optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ')
-                                    torch.cuda.empty_cache()
-                                    gc.collect()
-                                    max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
-                                if max_safe_forward_size == 0:
-                                    logging.warning(f" * Unable to free enough ram even after emergency backward of {accumulated_loss_images_count_before_emergency_backward} samples worth of accumulated loss @res {tv.batch_resolution} - possible OOM follows")
-                                    max_safe_forward_size = 1
-                            #if max_safe_forward_size < _get_default_forward_slice_size(tv):
-                            #    logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
-                            tv.forward_slice_size = min([_get_default_forward_slice_size(tv), max_safe_forward_size])
-                        else:
-                            gpu_used_mem, gpu_total_mem = 0, 0
-
-                    if (tv.desired_effective_batch_size > 1
-                            and args.everything_contrastive_learning_p > 0
-                            and not full_batch["do_contrastive_learning"]
-                    ):
-                        if args.everything_contrastive_learning_curriculum_alpha > 0:
-                            everything_contrastive_learning_p = get_exponential_scaled_value(train_progress_01,
-                                                                                             initial_value=args.everything_contrastive_learning_p,
-                                                                                             final_value=0,
-                                                                                             alpha=args.everything_contrastive_learning_curriculum_alpha)
-                        else:
-                            everything_contrastive_learning_p = args.everything_contrastive_learning_p
-                        full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
-
-                    if args.flow_match_shift_dynamic and type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
-                        # gentle shift, randomly falling back to no shift
-                        assert model.noise_scheduler.config.time_shift_type == 'linear'
-                        shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
-                        if random.random() < args.flow_match_shift_dropout_p:
-                            shift = 1.0
-                        #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
-                        model.set_noise_scheduler_shift(shift)
-                        # Teacher uses its own fixed shift; do NOT override it with the
-                        # student's dynamic per-resolution shift.
-
-                    train_step(
-                        full_batch=full_batch,
-                        model=model,
-                        teacher_model=teacher_model,
-                        tv=tv,
-                        train_progress_01=train_progress_01,
-                        ed_optimizer=ed_optimizer,
-                        log_writer=log_writer,
-                        log_data=log_data,
-                        steps_pbar=steps_pbar,
-                        plugin_runner=plugin_runner,
-                        did_step_optimizer_cb=None,
-                        vae_dtype=vae_dtype,
-                        args=args,
-                    )
-
-                    ed_optimizer.step_schedulers(tv.global_step)
-
-                    # ------------------------------------------------------------------
-                    # Samples
-                    # step-based condition is deterministic (same on every rank).
-                    # Semaphore check is rank-0 only; decision is broadcast so the
-                    # dist_barrier() is always entered or skipped by ALL ranks.
-                    # ------------------------------------------------------------------
-                    _do_samples = sample_generator.should_generate_samples(tv.global_step, local_step=step)
-                    if _is_main:
-                        _do_samples = _do_samples or bool(check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE))
-                    if _is_dist:
-                        _sync_samples = torch.tensor(int(_do_samples), dtype=torch.int32, device=device)
-                        dist.all_reduce(_sync_samples, op=dist.ReduceOp.MAX)
-                        _do_samples = bool(_sync_samples.item())
-
-                    if _do_samples:
-                        dist_barrier()
-                        if _is_main:
-                            generate_samples(global_step=tv.global_step, batch=full_batch)
-                        dist_barrier()
-
-                    if args.ema_decay_rate != None:
-                        if ((tv.global_step + 1) % args.ema_update_interval) == 0:
-                            if _is_main:  # EMA is rank-0 only
-                                if args.disable_unet_training != True:
-                                    update_ema(model.unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
-
-                                if args.disable_textenc_training != True:
-                                    update_ema(model.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
-
-                    # Self-Flow EMA teacher update (independent interval from main EMA)
-                    if model.self_flow_teacher_unet is not None:
-                        sf_interval = getattr(args, 'self_flow_ema_update_interval', 1)
-                        if ((tv.global_step + 1) % sf_interval) == 0:
-                            update_ema(
-                                model.unet,
-                                model.self_flow_teacher_unet,
-                                args.self_flow_ema_decay,
-                                default_device=device,
-                                ema_device=device,
-                            )
-
-                    steps_pbar.update(1)
-
-                    images_per_sec = full_batch['image'].shape[0] / (time.time() - step_start_time)
-                    log_data.images_per_sec_log_step.append(images_per_sec)
-
-                    if (tv.global_step + 1) % args.log_step == 0:
-                        if _is_main:
-                            logs = do_log_step(args, ed_optimizer, log_data, log_folder,
-                                               log_writer, model, tv)
-                            append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer,
-                                             **logs)
-                        torch.cuda.empty_cache()
-
-                    # ------------------------------------------------------------------
-                    # Validation
-                    # step-based condition is deterministic (same on every rank).
-                    # Semaphore check is rank-0 only; decision is broadcast so the
-                    # dist_barrier() is always entered or skipped by ALL ranks.
-                    # ------------------------------------------------------------------
-                    _do_validate = bool(validator and step in validation_steps)
-                    if _is_main and validator:
-                        _do_validate = _do_validate or bool(check_semaphore_file_and_unlink(WANT_VALIDATION_SEMAPHORE_FILE))
-                    if _is_dist and validator:
-                        _sync_val = torch.tensor(int(_do_validate), dtype=torch.int32, device=device)
-                        dist.all_reduce(_sync_val, op=dist.ReduceOp.MAX)
-                        _do_validate = bool(_sync_val.item())
-
-                    if _do_validate:
-                        dist_barrier()
-                        if _is_main:
-                            try:
-                                validator.do_validation(
-                                    model=model,
-                                    global_step=tv.global_step,
-                                    get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
-                                    pipe_factory=make_inference_pipe,
-                                )
-                            except Exception as e:
-                                logging.error("Validation raised an exception: " + str(e))
-                                traceback.print_exc()
-                        dist_barrier()
-
-                    # ------------------------------------------------------------------
-                    # Saving
-                    # Time / epoch conditions are deterministic.  Semaphore checks are
-                    # rank-0 only.  All flags are broadcast before the barrier so every
-                    # rank agrees on whether to enter it.
-                    # ------------------------------------------------------------------
-                    min_since_last_ckpt = (time.time() - last_epoch_saved_time) / 60
-
-                    needs_save = False
-                    needs_optimizer_save = args.save_optimizer
-                    if args.ckpt_every_n_minutes is not None and (min_since_last_ckpt > args.ckpt_every_n_minutes):
-                        last_epoch_saved_time = time.time()
-                        logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {tv.global_step}")
-                        needs_save = True
-
-                    if _is_main:
-                        if check_semaphore_file_and_unlink(SAVE_FULL_SEMAPHORE_FILE):
-                            needs_save = True
-                        if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
-                            needs_save = True
-                            needs_optimizer_save = True
-                        if check_semaphore_file_and_unlink(SAVE_FULL_AND_STOP_SEMAPHORE_FILE):
-                            wants_stop = True
-                        if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
-                            wants_stop = True
-                            force_save_optimizer = True
-
-                    def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
-                        return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
-                                epoch < args.max_epochs and epoch >= start_epoch)
-
-                    if is_first_step_of_save_epoch(args.save_every_n_epochs, start_epoch=args.save_ckpts_from_n_epochs):
-                        logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
-                        needs_save = True
-
-                    # Broadcast all save/stop decisions from rank-0 so barriers are safe
-                    if _is_dist:
-                        _sync_flags = torch.zeros(4, dtype=torch.int32, device=device)
-                        if _is_main:
-                            _sync_flags[0] = int(needs_save)
-                            _sync_flags[1] = int(needs_optimizer_save)
-                            _sync_flags[2] = int(wants_stop)
-                            _sync_flags[3] = int(force_save_optimizer)
-                        dist.all_reduce(_sync_flags, op=dist.ReduceOp.MAX)
-                        needs_save           = bool(_sync_flags[0].item())
-                        needs_optimizer_save = bool(_sync_flags[1].item())
-                        wants_stop           = bool(_sync_flags[2].item())
-                        force_save_optimizer = bool(_sync_flags[3].item())
-
-                    if needs_save:
-                        dist_barrier()
-                        if _is_main:
-                            save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
-                            save_model(save_path,
-                                       global_step=tv.global_step,
-                                       ed_state=make_current_ed_state(),
-                                       save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
-                                       save_full_precision=args.save_full_precision,
-                                       save_optimizer_flag=needs_optimizer_save,
-                                       save_ckpt=not args.no_save_ckpt,
-                                       plugin_runner=plugin_runner)
-                        dist_barrier()
-
-                    if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
-                        if _is_main:
-                            logging.info(f" Saving lora")
-                            save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
-                            save_model_lora(model=model, save_path=save_path)
-
-                    # -- step end
-
-                    plugin_runner.run_on_step_end(epoch=epoch,
-                                          global_step=tv.global_step,
-                                          local_step=step,
-                                          num_samples=tv.total_trained_samples_count,
-                                          project_name=args.project_name,
-                                          log_writer=log_writer,
-                                          log_folder=log_folder,
-                                          data_root=args.data_root,
-                                          batch=full_batch,
-                                          ed_state=make_current_ed_state())
-
-                    if (epoch == args.max_epochs-1
-                            and ed_optimizer.will_do_grad_accum_step(step, tv.global_step)
-                            and epoch_len-step < args.grad_accum
-                    ):
-                        logging.info(f"* only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
-                        break
-
-                    tv.global_step += 1
-
-                    if wants_stop:
-                        logging.info(f"* Stop requested, stopping")
-                        break
-
-                    if args.max_steps is not None and tv.global_step >= args.max_steps:
-                        logging.info(f"* max_steps reached, stopping")
-                        break
-
-                    # end of step
-
-                except Exception:
-                    try:
-                        current_timesteps = timesteps
-                    except NameError:
-                        current_timesteps = None
-                    try:
-                        batch_idx0 = nibble_batch(full_batch, 1)[0]
-                        image_shape = batch_idx0['image'].shape
-                    except NameError:
-                        batch_idx0 = {}
-                        image_shape = []
-                    traceback.print_exc()
-                    logging.error(f"step {tv.global_step} failed. image shape {image_shape}, full batch idx0: {batch_idx0}")
-                    logging.error(f"  timesteps: {current_timesteps}, training values: {pprint.pformat(tv.filtered_for_log())}")
-                    raise
-
-                #logging.info("fetching...")
+                timesteps = None
+                #logging.info("fetching batch...")
 
                 _dataloader_pre_time = time.perf_counter()
 
-            steps_pbar.close()
+                for step, full_batch in enumerate(train_dataloader):
+                    #logging.info("... fetched.")
 
-            elapsed_epoch_time = (time.time() - epoch_start_time) / 60
-            epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
-            log_writer.add_scalar(
-                "performance/minutes per epoch", elapsed_epoch_time, tv.global_step
-            )
+                    _dataloader_post_time = time.perf_counter()
+                    record_performance_timing('_dataloader_fetch', _dataloader_post_time - _dataloader_pre_time, full_batch['image'].shape[0])
 
-            plugin_runner.run_on_epoch_end(epoch=epoch,
+
+                    try:
+                        train_progress_01 = compute_train_process_01(epoch=epoch, step=step, steps_per_epoch=epoch_len,
+                                                                     max_epochs=args.max_epochs, max_global_steps=args.max_steps)
+
+                        step_start_time = time.time()
+
+                        plugin_runner.run_on_step_start(epoch=epoch,
+                                                        local_step=step,
+                                                        global_step=tv.global_step,
+                                                        project_name=args.project_name,
+                                                        log_folder=log_folder,
+                                                        batch=full_batch,
+                                                        ed_state=make_current_ed_state())
+
+                        # for k in full_batch['captions'].keys():
+                        #    if any(c is not None and len(c.strip()) == 0 for c in full_batch['captions'][k]):
+                        #        print('a caption was already empty before cond dropout. paths:', full_batch['pathnames'], 'captions:', full_batch['captions'])
+
+                        image_pixel_count = full_batch["image"].shape[2] * full_batch["image"].shape[3]
+                        tv.batch_resolution = get_best_match_resolution(
+                            args.resolution, image_pixel_count=image_pixel_count
+                        )
+                        tv.max_backward_slice_size = _choose_backward_slice_size(tv)
+                        tv.forward_slice_size = _get_default_forward_slice_size(tv)
+                        if tv.max_backward_slice_size <= tv.accumulated_loss_images_count:
+                            optimizer_backward(ed_optimizer, tv, plugin_runner, 'truncated backward: ')
+                            gc.collect()
+                            torch.cuda.empty_cache()
+
+                        safe_backward_size = _get_safe_backward_size(gpu, model.device, image_pixel_count // 64)
+                        if safe_backward_size > tv.max_backward_slice_size and tv.batch_resolution not in tv._backward_size_hint_logged:
+                            logging.info(f"at resolution {tv.batch_resolution} you could probably do backward={safe_backward_size} (you requested max {tv.max_backward_slice_size})")
+                            tv._backward_size_hint_logged.add(tv.batch_resolution)
+
+                        if not args.disable_backward_memsafe and tv.batch_resolution not in args.disable_backward_memsafe_resolutions:
+                            if gpu is not None:
+                                torch.cuda.empty_cache()
+                                gc.collect()
+                                max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
+                                if max_safe_forward_size == 0:
+                                    # maybe not enough memory. if we can, do an emergency backward pass if we have any loss pending
+                                    accumulated_loss_images_count_before_emergency_backward = tv.accumulated_loss_images_count
+                                    if tv.accumulated_loss_images_count > 0:
+                                        with torch.amp.autocast('cuda', enabled=args.amp):
+                                            optimizer_backward(ed_optimizer, tv, plugin_runner, 'emergency backward: ')
+                                        torch.cuda.empty_cache()
+                                        gc.collect()
+                                        max_safe_forward_size = _get_safe_forward_size(gpu, model.device, image_pixel_count, is_sdxl=model.is_sdxl)
+                                    if max_safe_forward_size == 0:
+                                        logging.warning(f" * Unable to free enough ram even after emergency backward of {accumulated_loss_images_count_before_emergency_backward} samples worth of accumulated loss @res {tv.batch_resolution} - possible OOM follows")
+                                        max_safe_forward_size = 1
+                                #if max_safe_forward_size < _get_default_forward_slice_size(tv):
+                                #    logging.info(f" * forward slice size clamped from {tv.forward_slice_size} to {max_safe_forward_size} for image size {full_batch['image'].shape[2]}x{full_batch['image'].shape[3]}; num accumulated images: {tv.accumulated_loss_images_count}")
+                                tv.forward_slice_size = min([_get_default_forward_slice_size(tv), max_safe_forward_size])
+                            else:
+                                gpu_used_mem, gpu_total_mem = 0, 0
+
+                        if (tv.desired_effective_batch_size > 1
+                                and args.everything_contrastive_learning_p > 0
+                                and not full_batch["do_contrastive_learning"]
+                        ):
+                            if args.everything_contrastive_learning_curriculum_alpha > 0:
+                                everything_contrastive_learning_p = get_exponential_scaled_value(train_progress_01,
+                                                                                                 initial_value=args.everything_contrastive_learning_p,
+                                                                                                 final_value=0,
+                                                                                                 alpha=args.everything_contrastive_learning_curriculum_alpha)
+                            else:
+                                everything_contrastive_learning_p = args.everything_contrastive_learning_p
+                            full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
+
+                        if args.flow_match_shift_dynamic and type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
+                            # gentle shift, randomly falling back to no shift
+                            assert model.noise_scheduler.config.time_shift_type == 'linear'
+                            shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
+                            if random.random() < args.flow_match_shift_dropout_p:
+                                shift = 1.0
+                            #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
+                            model.set_noise_scheduler_shift(shift)
+                            # Teacher uses its own fixed shift; do NOT override it with the
+                            # student's dynamic per-resolution shift.
+
+                        train_step(
+                            full_batch=full_batch,
+                            model=model,
+                            teacher_model=teacher_model,
+                            tv=tv,
+                            train_progress_01=train_progress_01,
+                            ed_optimizer=ed_optimizer,
+                            log_writer=log_writer,
+                            log_data=log_data,
+                            steps_pbar=steps_pbar,
+                            plugin_runner=plugin_runner,
+                            did_step_optimizer_cb=None,
+                            vae_dtype=vae_dtype,
+                            args=args,
+                        )
+
+                        ed_optimizer.step_schedulers(tv.global_step)
+
+                        if sample_generator.should_generate_samples(tv.global_step, local_step=step):
+                            if _is_main:
+                                generate_samples(global_step=tv.global_step, batch=full_batch)
+
+                        if args.ema_decay_rate != None:
+                            if ((tv.global_step + 1) % args.ema_update_interval) == 0:
+                                if _is_main:  # EMA is rank-0 only
+                                    if args.disable_unet_training != True:
+                                        update_ema(model.unet, unet_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
+
+                                    if args.disable_textenc_training != True:
+                                        update_ema(model.text_encoder, text_encoder_ema, args.ema_decay_rate, default_device=device, ema_device=args.ema_device)
+
+                        # Self-Flow EMA teacher update (independent interval from main EMA)
+                        if model.self_flow_teacher_unet is not None:
+                            sf_interval = getattr(args, 'self_flow_ema_update_interval', 1)
+                            if ((tv.global_step + 1) % sf_interval) == 0:
+                                update_ema(
+                                    model.unet,
+                                    model.self_flow_teacher_unet,
+                                    args.self_flow_ema_decay,
+                                    default_device=device,
+                                    ema_device=device,
+                                )
+
+                        steps_pbar.update(1)
+
+                        images_per_sec = full_batch['image'].shape[0] / (time.time() - step_start_time)
+                        log_data.images_per_sec_log_step.append(images_per_sec)
+
+                        if (tv.global_step + 1) % args.log_step == 0:
+                            if _is_main:
+                                logs = do_log_step(args, ed_optimizer, log_data, log_folder,
+                                                   log_writer, model, tv)
+                                append_epoch_log(global_step=tv.global_step, epoch_pbar=epoch_pbar, gpu=gpu, log_writer=log_writer,
+                                                 **logs)
+                            torch.cuda.empty_cache()
+
+                        # ------------------------------------------------------------------
+                        # Validation
+                        # step-based condition is deterministic (same on every rank).
+                        # Semaphore check is rank-0 only; decision is broadcast so the
+                        # dist_barrier() is always entered or skipped by ALL ranks.
+                        # ------------------------------------------------------------------
+                        _do_validate = bool(validator and step in validation_steps)
+
+                        if _do_validate:
+                            dist_barrier()
+                            if _is_main:
+                                try:
+                                    validator.do_validation(
+                                        model=model,
+                                        global_step=tv.global_step,
+                                        get_model_prediction_and_target_callable=get_model_prediction_and_target_validation_wrapper,
+                                        pipe_factory=make_inference_pipe,
+                                    )
+                                except Exception as e:
+                                    logging.error("Validation raised an exception: " + str(e))
+                                    traceback.print_exc()
+                            dist_barrier()
+
+                        # ------------------------------------------------------------------
+                        # Saving
+                        # Time / epoch conditions are deterministic.  Semaphore checks are
+                        # rank-0 only.  All flags are broadcast before the barrier so every
+                        # rank agrees on whether to enter it.
+                        # ------------------------------------------------------------------
+                        min_since_last_ckpt = (time.time() - last_epoch_saved_time) / 60
+
+                        needs_save = False
+                        needs_optimizer_save = args.save_optimizer
+                        if args.ckpt_every_n_minutes is not None and (min_since_last_ckpt > args.ckpt_every_n_minutes):
+                            last_epoch_saved_time = time.time()
+                            logging.info(f"Saving model, {args.ckpt_every_n_minutes} mins at step {tv.global_step}")
+                            needs_save = True
+
+                        if _is_main:
+                            if check_semaphore_file_and_unlink(SAVE_FULL_SEMAPHORE_FILE):
+                                needs_save = True
+                            if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE):
+                                needs_save = True
+                                needs_optimizer_save = True
+                            if check_semaphore_file_and_unlink(SAVE_FULL_AND_STOP_SEMAPHORE_FILE):
+                                wants_stop = True
+                            if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
+                                wants_stop = True
+                                force_save_optimizer = True
+
+                        def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
+                            return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
+                                    epoch < args.max_epochs and epoch >= start_epoch)
+
+                        if is_first_step_of_save_epoch(args.save_every_n_epochs, start_epoch=args.save_ckpts_from_n_epochs):
+                            logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
+                            needs_save = True
+
+                        if needs_save:
+                            if _is_main:
+                                save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
+                                save_model(save_path,
                                            global_step=tv.global_step,
-                                           project_name=args.project_name,
-                                           log_folder=log_folder,
-                                           data_root=args.data_root,
-                                           arg_update_callback=update_arg,
                                            ed_state=make_current_ed_state(),
-                                           training_variables=tv,
-                                           sample_generator_cb=generate_samples)
+                                           save_ckpt_dir=args.save_ckpt_dir, yaml_name=None,
+                                           save_full_precision=args.save_full_precision,
+                                           save_optimizer_flag=needs_optimizer_save,
+                                           save_ckpt=not args.no_save_ckpt,
+                                           plugin_runner=plugin_runner)
 
-            epoch_pbar.update(1)
-            if epoch < args.max_epochs - 1:
-                # -- DifficultyEstimator epoch-end update --------------------
-                if difficulty_estimator is not None:
-                    difficulty_estimator.ingest_epoch_losses(log_data)
-                    difficulty_estimator.update_item_schedule(
-                        train_batch.data_loader.prepared_train_data
-                    )
-                    train_batch.data_loader.recompute_expected_epoch_size()
-                    difficulty_estimator.save(args.difficulty_estimator)
-                # ------------------------------------------------------------
-                train_batch.shuffle(epoch_n=epoch, max_epochs=args.max_epochs)
+                        if args.lora and is_first_step_of_save_epoch(args.lora_save_every_n_epochs, start_epoch=0):
+                            if _is_main:
+                                logging.info(f" Saving lora")
+                                save_path = make_save_path(epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count)
+                                save_model_lora(model=model, save_path=save_path)
 
-            if len(log_data.loss_epoch) > 0:
-                loss_epoch = sum(log_data.loss_epoch) / len(log_data.loss_epoch)
-                log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_epoch, global_step=tv.global_step)
+                        # -- step end
 
-            gc.collect()
+                        plugin_runner.run_on_step_end(epoch=epoch,
+                                              global_step=tv.global_step,
+                                              local_step=step,
+                                              num_samples=tv.total_trained_samples_count,
+                                              project_name=args.project_name,
+                                              log_writer=log_writer,
+                                              log_folder=log_folder,
+                                              data_root=args.data_root,
+                                              batch=full_batch,
+                                              ed_state=make_current_ed_state())
 
-            if wants_stop:
-                break
+                        if (epoch == args.max_epochs-1
+                                and ed_optimizer.will_do_grad_accum_step(step, tv.global_step)
+                                and epoch_len-step < args.grad_accum
+                        ):
+                            logging.info(f"* only {epoch_len-step} steps remaining at grad accum {args.grad_accum} -> early stop")
+                            break
 
-            if args.max_steps is not None and tv.global_step >= args.max_steps:
-                break
+                        tv.global_step += 1
 
-            # end of epoch
+                        if wants_stop:
+                            logging.info(f"* Stop requested, stopping")
+                            break
 
-        # end of training
-        epoch = args.max_epochs
+                        if args.max_steps is not None and tv.global_step >= args.max_steps:
+                            logging.info(f"* max_steps reached, stopping")
+                            break
 
-        plugin_runner.run_on_training_end(ed_state=make_current_ed_state(), log_folder=log_folder, project_name=args.project_name, global_step=tv.global_step)
+                        # end of step
 
-        # Exit persistent no_sync — re-arm DDP hooks before the final barrier/save.
-        _ddp_no_sync.exit()
+                    except Exception:
+                        try:
+                            current_timesteps = timesteps
+                        except NameError:
+                            current_timesteps = None
+                        try:
+                            batch_idx0 = nibble_batch(full_batch, 1)[0]
+                            image_shape = batch_idx0['image'].shape
+                        except NameError:
+                            batch_idx0 = {}
+                            image_shape = []
+                        traceback.print_exc()
+                        logging.error(f"step {tv.global_step} failed. image shape {image_shape}, full batch idx0: {batch_idx0}")
+                        logging.error(f"  timesteps: {current_timesteps}, training values: {pprint.pformat(tv.filtered_for_log())}")
+                        raise
 
-        dist_barrier()  # sync before final save
+                    #logging.info("fetching...")
+
+                    _dataloader_pre_time = time.perf_counter()
+
+                steps_pbar.close()
+
+                elapsed_epoch_time = (time.time() - epoch_start_time) / 60
+                epoch_times.append(dict(epoch=epoch, time=elapsed_epoch_time))
+                log_writer.add_scalar(
+                    "performance/minutes per epoch", elapsed_epoch_time, tv.global_step
+                )
+
+                plugin_runner.run_on_epoch_end(epoch=epoch,
+                                               global_step=tv.global_step,
+                                               project_name=args.project_name,
+                                               log_folder=log_folder,
+                                               data_root=args.data_root,
+                                               arg_update_callback=update_arg,
+                                               ed_state=make_current_ed_state(),
+                                               training_variables=tv,
+                                               sample_generator_cb=generate_samples)
+
+                epoch_pbar.update(1)
+                if epoch < args.max_epochs - 1:
+                    # -- DifficultyEstimator epoch-end update --------------------
+                    if difficulty_estimator is not None:
+                        difficulty_estimator.ingest_epoch_losses(log_data)
+                        difficulty_estimator.update_item_schedule(
+                            train_batch.data_loader.prepared_train_data
+                        )
+                        train_batch.data_loader.recompute_expected_epoch_size()
+                        difficulty_estimator.save(args.difficulty_estimator)
+                    # ------------------------------------------------------------
+                    train_batch.shuffle(epoch_n=epoch, max_epochs=args.max_epochs)
+
+                if len(log_data.loss_epoch) > 0:
+                    loss_epoch = sum(log_data.loss_epoch) / len(log_data.loss_epoch)
+                    log_writer.add_scalar(tag="loss/epoch", scalar_value=loss_epoch, global_step=tv.global_step)
+
+                gc.collect()
+
+                if wants_stop:
+                    break
+
+                if args.max_steps is not None and tv.global_step >= args.max_steps:
+                    break
+
+                # end of epoch
+
+            # end of training
+            epoch = args.max_epochs
+
+            plugin_runner.run_on_training_end(ed_state=make_current_ed_state(), log_folder=log_folder, project_name=args.project_name, global_step=tv.global_step)
+
+            # training is done
+            # block until everyone is done
+            while True:
+                global_state_signal = get_distributed_state_signal(StateSignal.DONE, model.device)
+                if global_state_signal == StateSignal.DONE:
+                    break
+                else:
+                    raise ValueError(f"Unrecognized global state signal: {global_state_signal}")
+
+        # exit no-sync context
+
         if _is_main:
             save_path = make_save_path(
                 epoch, tv.global_step, num_trained_samples=tv.total_trained_samples_count, prepend=("" if args.no_prepend_last else "last-")
@@ -2055,7 +1994,7 @@ if __name__ == "__main__":
     argparser.add_argument("--clip_vision_contrastive_loss_lambda", type=float, default=0.1, help="Lambda scaling factor for contrastive loss between text encoder and CLIP vision model features")
 
     argparser.add_argument("--debug_no_load_model", action="store_true", help="If passed, do not load model weights (for testing purposes only)")
-
+    argparser.add_argument("--debug_teacher", action="store_true", default=False, help="If passed, log detailed teacher/student latent stats and preview images for the first 10 training steps into <logdir>/debug_teacher/")
     argparser.add_argument("--debug_log_on_nan", action=argparse.BooleanOptionalAction, help="If specified, use set_detect_anomaly to find NaNs in autograd. Slow.")
 
     # load CLI args to overwrite existing config args

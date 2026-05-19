@@ -145,20 +145,9 @@ class TrainingVariables:
 
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
 
-    # DDP persistent no_sync context – set by train.py before the epoch loop.
-    # The training step exits it briefly around optimizer.step() so that
-    # sync_ddp_gradients() can fire its all-reduce with all ranks present.
-    ddp_no_sync: Optional[Any] = None  # DDPPersistentNoSync | None
-
-    # Set to True on the very last dataloader step of training so that
-    # the want_to_step MAX vote forces all ranks to step together and
-    # no rank is left stranded at the all_reduce.
-    is_final_step: bool = False
-
     prev_accumulated_pathnames: list[str] = field(default_factory=list)
     prev_accumulated_captions: list[str] = field(default_factory=list)
     prev_accumulated_timesteps: list[int] = field(default_factory=list)
-
 
     def setup_default_slice_sizes(self, args: argparse.Namespace):
         for index, resolution in enumerate(args.resolution):
@@ -635,14 +624,24 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
 
     noise_scheduler = diffusers.FlowMatchEulerDiscreteScheduler.from_config(ed_state.model.noise_scheduler.config) if isinstance(ed_state.model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler) else ed_state.model.noise_scheduler
 
+    def unwrap_ddp(module):
+        if isinstance(module, torch.nn.parallel.DistributedDataParallel):
+            return module.module
+        else:
+            return module
+
+    unet = unwrap_ddp(ed_state.model.unet)
+    text_encoder = unwrap_ddp(ed_state.model.text_encoder)
+    text_encoder_2 = unwrap_ddp(ed_state.model.text_encoder_2)
+
     if ed_state.model.is_sdxl:
         pipeline = StableDiffusionXLPipeline(
             vae=ed_state.model.vae,
-            text_encoder=ed_state.model.text_encoder,
-            text_encoder_2=ed_state.model.text_encoder_2,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
             tokenizer=ed_state.model.tokenizer,
             tokenizer_2=ed_state.model.tokenizer_2,
-            unet=ed_state.model.unet,
+            unet=unet,
             scheduler=noise_scheduler,
             feature_extractor=None,  # must be none of no safety checker
             add_watermarker=None
@@ -650,9 +649,9 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     else:
         pipeline = StableDiffusionPipeline(
             vae=ed_state.model.vae,
-            text_encoder=ed_state.model.text_encoder,
+            text_encoder=text_encoder,
             tokenizer=ed_state.model.tokenizer,
-            unet=ed_state.model.unet,
+            unet=unet,
             scheduler=noise_scheduler,
             safety_checker=None,  # save vram
             requires_safety_checker=None,  # avoid nag
