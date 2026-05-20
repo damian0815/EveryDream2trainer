@@ -1409,8 +1409,9 @@ def main(args):
 
                         ed_optimizer.step_schedulers(tv.global_step)
 
-                        if sample_generator.should_generate_samples(tv.global_step, local_step=step):
-                            if _is_main:
+                        if _is_main:
+                            user_wants_samples = check_semaphore_file_and_unlink(GENERATE_SAMPLES_SEMAPHORE_FILE)
+                            if user_wants_samples or sample_generator.should_generate_samples(tv.global_step, local_step=step):
                                 generate_samples(global_step=tv.global_step, batch=full_batch)
 
                         if args.ema_decay_rate != None:

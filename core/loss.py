@@ -1363,9 +1363,30 @@ def _teacher_target_via_interposer(
             ddpm_scheduler=teacher_model.noise_scheduler,
         ).to(x_1_vT.device)
         # VP interpolant: x_t = √ᾱ · x₁ + √(1−ᾱ) · ε
+        #
+        # We want teacher_epsilon to:
+        #   1. Have unit-normal statistics (so alphas_cumprod is correctly calibrated).
+        #   2. Preserve the spatial/semantic direction of student_noise (so both models
+        #      are "hallucinating" in the same direction at high noise levels — the same
+        #      Gaussian vector decoded through different VAEs gives different image content,
+        #      so we need the interposer to bridge the semantic gap for noise too).
+        #
+        # Method: run student_noise (scaled to raw-latent magnitude for interposer
+        # compatibility) through the interposer, then normalise per-sample to unit variance.
+        # For same-VAE the interposer is a passthrough, so normalisation returns
+        # approximately student_noise directly.  For cross-VAE the interposer maps the
+        # noise direction to the teacher's semantic space.
+        #
+        # We do NOT multiply by teacher_vae_scale here: noise is not a VAE latent and
+        # must not be scaled that way; we normalise instead.
+        teacher_epsilon_raw = latent_interposer.convert(
+            (student_noise / student_vae_scale).float(), src=student_vae_space, dst=teacher_vae_space
+        )
+        per_sample_std = teacher_epsilon_raw.view(teacher_epsilon_raw.shape[0], -1).std(dim=1).view(-1, 1, 1, 1)
+        teacher_epsilon = teacher_epsilon_raw / per_sample_std.clamp(min=1e-8)
         ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_1_vT.device)
         ab = ac[teacher_timesteps_ddpm].float().view(-1, 1, 1, 1)
-        x_t_vT = ab.sqrt() * x_1_vT.float() + (1.0 - ab).sqrt() * x_0_vT.float()
+        x_t_vT = ab.sqrt() * x_1_vT.float() + (1.0 - ab).sqrt() * teacher_epsilon
         teacher_unet_timesteps = teacher_timesteps_ddpm
     else:
         # (b) FM teacher: use the same sigma as the student, FM interpolant
