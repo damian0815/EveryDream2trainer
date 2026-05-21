@@ -525,23 +525,21 @@ def compute_train_process_01(
     return min(1, steps_completed / total_steps)
 
 
-def get_teacher_lambda(timesteps: torch.Tensor, args) -> torch.Tensor:
-    """
-    Returns a per-sample teacher lambda tensor.
-    If --teacher_lambda_falloff is enabled:
-      - timestep > tmax  -> args.teacher_lambda
-      - timestep < tmin  -> 0
-      - between tmin/tmax -> linear ramp
-    Otherwise returns a scalar tensor with args.teacher_lambda.
-    """
-    base = args.teacher_lambda
-    if not getattr(args, 'teacher_lambda_falloff', False):
-        return torch.full((timesteps.shape[0],), base, dtype=torch.float32, device=timesteps.device)
-    tmin = args.teacher_lambda_falloff_tmin
-    tmax = args.teacher_lambda_falloff_tmax
-    t = timesteps.float()
-    scale = torch.clamp((t - tmin) / max(1, tmax - tmin), 0.0, 1.0)
-    return scale * base
+# ---------------------------------------------------------------------------
+# Teacher distillation λ rolloff  (re-exported from core.teacher_lambda)
+# ---------------------------------------------------------------------------
+# The constants and get_teacher_lambda() function live in core/teacher_lambda.py
+# so they can be imported by lightweight test modules without pulling in the
+# full training stack.  Re-export everything from here so that existing call
+# sites within core/step.py and elsewhere are unaffected.
+
+from core.teacher_lambda import (   # noqa: F401  (re-exports)
+    TEACHER_LAMBDA_SNR_ZERO_LO,
+    TEACHER_LAMBDA_SNR_FULL_LO,
+    TEACHER_LAMBDA_SNR_FULL_HI,
+    TEACHER_LAMBDA_SNR_ZERO_HI,
+    get_teacher_lambda,
+)
 
 
 def get_exponential_scaled_value(progress_01, initial_value, final_value, alpha=3.0):
@@ -1225,7 +1223,9 @@ def _do_loss(
         ).to(dtype=model.dtype)
         # only the masked entries
         teacher_loss[~teacher_mask] = 0
-        teacher_lambda = get_teacher_lambda(timesteps, args).to(dtype=teacher_loss.dtype, device=teacher_loss.device)
+        teacher_lambda = get_teacher_lambda(
+            timesteps, args, noise_scheduler=model.noise_scheduler
+        ).to(dtype=teacher_loss.dtype, device=teacher_loss.device)
         # reshape for broadcast: [B] -> [B, 1, 1, 1]
         teacher_lambda = teacher_lambda.view(-1, *([1] * (teacher_loss.dim() - 1)))
         loss += teacher_loss * teacher_lambda

@@ -1410,7 +1410,7 @@ def main(args):
                         ed_optimizer.step_schedulers(tv.global_step)
 
                         if _is_main:
-                            user_wants_samples = check_semaphore_file_and_unlink(GENERATE_SAMPLES_SEMAPHORE_FILE)
+                            user_wants_samples = check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE)
                             if user_wants_samples or sample_generator.should_generate_samples(tv.global_step, local_step=step):
                                 generate_samples(global_step=tv.global_step, batch=full_batch)
 
@@ -1891,8 +1891,6 @@ if __name__ == "__main__":
     argparser.add_argument("--teacher_p", type=float, default=1.0, help="Probability of teacher model being used as target")
     argparser.add_argument("--teacher_lambda", type=float, default=1.0, help="When teacher is used, the scale factor for teacher loss when added to regular loss")
     argparser.add_argument("--teacher_lambda_falloff", action=argparse.BooleanOptionalAction, default=False, help="When enabled, teacher_lambda falls off linearly to 0 below teacher_lambda_falloff_tmax down to teacher_lambda_falloff_tmin")
-    argparser.add_argument("--teacher_lambda_falloff_tmin", type=int, default=50, help="Timestep below which teacher_lambda is 0 (used with --teacher_lambda_falloff)")
-    argparser.add_argument("--teacher_lambda_falloff_tmax", type=int, default=150, help="Timestep above which teacher_lambda is at full value (used with --teacher_lambda_falloff)")
     argparser.add_argument("--teacher_timestep_max", type=int, default=None, help="Maximum timestep where the teacher model will be used (if set, p ramps from 0 to teacher_p linearly starting from here).")
     argparser.add_argument("--teacher_prediction_type", type=str, default="auto", choices=["auto", "flow_prediction", "v_prediction", "epsilon"],
                            help="Override the teacher scheduler prediction type. 'auto' uses whatever the saved config says. 'flow_prediction' forces a FlowMatch scheduler regardless of saved config.")
