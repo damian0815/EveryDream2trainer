@@ -2,36 +2,38 @@
 Latent Space Interposer for EveryDream2trainer
 ===============================================
 
-Integrates the SD-Latent-Interposer (city96/SD-Latent-Interposer) to allow
-cross-latent-space teacher → student knowledge distillation.
+Provides two backends for cross-latent-space conversion:
 
-Primary use-case:  SD1.x / SD2  **Flow Matching** teacher
-                   →  SDXL       **Flow Matching** student.
+1. **TaesdLatentConverter** *(default)* — routes through pixel space using the
+   ``taesd/`` submodule (madebyollin/taesd).  Converts:
+   ``raw_src_latents → TAESD_src.decoder → pixels[0,1] → TAESD_dst.encoder → raw_dst_latents``
+   No extra weight downloads needed — the ``.pth`` files ship with the submodule.
 
-The ``get_teacher_target`` path in ``core/loss.py`` uses the teacher UNet for a
-single-step velocity prediction, using the interposer to convert between latent
-spaces when needed.
+2. **LatentInterposer** *(legacy)* — uses the city96/SD-Latent-Interposer learned
+   latent-to-latent CNN.  Requires separate ``.safetensors`` weight files.
 
-Public API
-----------
+Both classes expose the same public API::
 
-.. code-block:: python
+    converter.convert(latents, src=LatentSpaceType.SDXL, dst=LatentSpaceType.SD1)
+    ConverterClass.is_supported(src, dst)
 
-    from core.latent_interposer import (
-        LatentSpaceType,
-        LatentInterposer,
-        infer_latent_space_type,
-    )
+``get_shared_interposer()`` returns the process-level :class:`TaesdLatentConverter`
+singleton (created lazily).
 
-    # Simple latent conversion
-    interposer = LatentInterposer()
-    xl_as_v1 = interposer.convert(xl_latents, src=LatentSpaceType.SDXL, dst=LatentSpaceType.SD1)
+Supported latent-space codes (``LatentSpaceType``)
+---------------------------------------------------
+  ``"v1"``  SD1 / SD2  →  ``taesd_*``     weights
+  ``"xl"``  SDXL       →  ``taesdxl_*``   weights
+  ``"v3"``  SD3        →  ``taesd3_*``    weights
+  ``"fx"``  Flux.1     →  ``taef1_*``     weights
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
+import types
 from typing import Optional
 
 import torch
@@ -185,7 +187,186 @@ class LatentSpaceType:
 
 
 # ---------------------------------------------------------------------------
-# LatentInterposer
+# TAESD  –  tiny autoencoder-based latent converter  (primary backend)
+# ---------------------------------------------------------------------------
+
+#: Maps LatentSpaceType code → TAESD weight-file prefix and (latent_channels, arch_variant).
+#: arch_variant values mirror those in taesd/taesd.py:
+#:   None     → standard Encoder/Decoder  (8× spatial compression)
+#:   "flux_2" → midblock GroupNorm enabled
+#:   "f32"    → F32Encoder/F32Decoder     (32× spatial compression, Sana DC-AE)
+_TAESD_SPECS: dict[str, tuple[str, int, str | None]] = {
+    # space code  : (file prefix,  latent_channels, arch_variant)
+    "v1":          ("taesd",    4,  None),
+    "xl":          ("taesdxl",  4,  None),
+    "v3":          ("taesd3",   16, None),
+    "fx":          ("taef1",    16, None),
+}
+
+_taesd_module_cache: Optional[types.ModuleType] = None
+
+
+def _import_taesd_module() -> types.ModuleType:
+    """Lazily import ``taesd/taesd.py`` from the submodule directory."""
+    global _taesd_module_cache
+    if _taesd_module_cache is not None:
+        return _taesd_module_cache
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    taesd_py = os.path.join(repo_root, "taesd", "taesd.py")
+    if not os.path.isfile(taesd_py):
+        raise FileNotFoundError(
+            f"TAESD submodule not found at {taesd_py}.\n"
+            "Run:  git submodule update --init taesd"
+        )
+    spec = importlib.util.spec_from_file_location("_taesd_submodule", taesd_py)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _taesd_module_cache = mod
+    return mod
+
+
+def _load_taesd_encoder(path: str, latent_channels: int, arch_variant: str | None) -> nn.Module:
+    """Build and weight-load a TAESD encoder from a ``.pth`` checkpoint."""
+    taesd = _import_taesd_module()
+    if arch_variant == "f32":
+        net = taesd.F32Encoder(latent_channels)
+    else:
+        net = taesd.Encoder(latent_channels, use_midblock_gn=(arch_variant == "flux_2"))
+    net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    net.eval()
+    return net
+
+
+def _load_taesd_decoder(path: str, latent_channels: int, arch_variant: str | None) -> nn.Module:
+    """Build and weight-load a TAESD decoder from a ``.pth`` checkpoint."""
+    taesd = _import_taesd_module()
+    if arch_variant == "f32":
+        net = taesd.F32Decoder(latent_channels)
+    else:
+        net = taesd.Decoder(latent_channels, use_midblock_gn=(arch_variant == "flux_2"))
+    net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+    net.eval()
+    return net
+
+
+class TaesdLatentConverter:
+    """
+    Cross-latent-space converter backed by TAESD tiny autoencoders.
+
+    Conversion path::
+
+        raw_src_latents
+            → TAESD_src.decoder  →  pixel image [0, 1]
+            → TAESD_dst.encoder  →  raw_dst_latents
+
+    TAESD operates on **raw** (unscaled) VAE latents — i.e. before the
+    SD ``scaling_factor`` is applied.  The call-sites in ``core/loss.py``
+    already unscale before calling ``convert()`` and re-scale the result,
+    so no extra scaling is needed here.
+
+    Supported latent-space codes
+    ----------------------------
+    ``"v1"``  SD1 / SD2  —  ``taesd_*``   weights
+    ``"xl"``  SDXL       —  ``taesdxl_*`` weights
+    ``"v3"``  SD3        —  ``taesd3_*``  weights
+    ``"fx"``  Flux.1     —  ``taef1_*``   weights
+
+    Parameters
+    ----------
+    taesd_dir:
+        Path to the directory containing the ``*_encoder.pth`` /
+        ``*_decoder.pth`` weight files.  Defaults to the ``taesd/``
+        submodule directory next to the repo root.
+    """
+
+    #: Set of supported latent-space codes.
+    SUPPORTED_SPACES: frozenset[str] = frozenset(_TAESD_SPECS.keys())
+
+    def __init__(self, taesd_dir: Optional[str] = None):
+        if taesd_dir is None:
+            repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+            taesd_dir = os.path.join(repo_root, "taesd")
+        self._taesd_dir = taesd_dir
+        self._encoders: dict[str, nn.Module] = {}
+        self._decoders: dict[str, nn.Module] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def convert(
+        self,
+        latents: torch.Tensor,
+        src: str,
+        dst: str,
+    ) -> torch.Tensor:
+        """
+        Convert **raw** (unscaled) *latents* from *src* space to *dst* space
+        by routing through TAESD's pixel-space representation.
+
+        Parameters
+        ----------
+        latents:  ``[B, C, H, W]`` raw latent tensor (no VAE scaling_factor applied).
+        src:      Source latent-space code, e.g. ``"xl"`` / ``LatentSpaceType.SDXL``.
+        dst:      Destination latent-space code, e.g. ``"v1"`` / ``LatentSpaceType.SD1``.
+
+        Returns a tensor on the **same device and dtype** as the input.
+        """
+        if src == dst:
+            return latents
+
+        for space in (src, dst):
+            if space not in _TAESD_SPECS:
+                raise ValueError(
+                    f"TaesdLatentConverter: unsupported latent space '{space}'.  "
+                    f"Supported: {sorted(_TAESD_SPECS.keys())}"
+                )
+
+        original_device = latents.device
+        original_dtype  = latents.dtype
+
+        # Move the cached encoder/decoder to the same device as the input.
+        # .to() is a no-op when the module is already on that device, so this
+        # is free after the first call.
+        decoder = self._get_decoder(src).to(original_device)
+        encoder = self._get_encoder(dst).to(original_device)
+
+        with torch.no_grad():
+            x      = latents.float()               # stay on original_device
+            pixels = decoder(x).clamp(0.0, 1.0)   # raw src latents → pixel [0,1]
+            out    = encoder(pixels)               # pixel [0,1]    → raw dst latents
+
+        return out.to(dtype=original_dtype)        # already on original_device
+
+    @classmethod
+    def is_supported(cls, src: str, dst: str) -> bool:
+        """Return ``True`` when both *src* and *dst* are supported spaces."""
+        return src == dst or (src in _TAESD_SPECS and dst in _TAESD_SPECS)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_decoder(self, space: str) -> nn.Module:
+        if space not in self._decoders:
+            prefix, ch, arch = _TAESD_SPECS[space]
+            path = os.path.join(self._taesd_dir, f"{prefix}_decoder.pth")
+            logging.info(f"TaesdLatentConverter: loading decoder for '{space}' from {path}")
+            self._decoders[space] = _load_taesd_decoder(path, ch, arch)
+        return self._decoders[space]
+
+    def _get_encoder(self, space: str) -> nn.Module:
+        if space not in self._encoders:
+            prefix, ch, arch = _TAESD_SPECS[space]
+            path = os.path.join(self._taesd_dir, f"{prefix}_encoder.pth")
+            logging.info(f"TaesdLatentConverter: loading encoder for '{space}' from {path}")
+            self._encoders[space] = _load_taesd_encoder(path, ch, arch)
+        return self._encoders[space]
+
+
+# ---------------------------------------------------------------------------
+# LatentInterposer  (legacy backend — city96/SD-Latent-Interposer)
 # ---------------------------------------------------------------------------
 
 class LatentInterposer:
@@ -262,9 +443,9 @@ class LatentInterposer:
         original_dtype = latents.dtype
 
         with torch.no_grad():
-            result = model(latents.cpu().float())
+            result = model.to(original_device)(latents.float())
 
-        return result.to(device=original_device, dtype=original_dtype)
+        return result.to(dtype=original_dtype)
 
     @staticmethod
     def is_supported(src: str, dst: str) -> bool:
@@ -341,27 +522,29 @@ class LatentInterposer:
 # Helper: infer latent space type from a TrainingModel
 # ---------------------------------------------------------------------------
 
-_shared_interposer: Optional["LatentInterposer"] = None
+_shared_interposer: Optional["TaesdLatentConverter"] = None
 
 
-def get_shared_interposer(model_dir: Optional[str] = None) -> "LatentInterposer":
+def get_shared_interposer(taesd_dir: Optional[str] = None) -> "TaesdLatentConverter":
     """
-    Return the process-level shared :class:`LatentInterposer` instance,
+    Return the process-level shared :class:`TaesdLatentConverter` instance,
     creating it lazily on first call.
 
-    Models are loaded on first :meth:`~LatentInterposer.convert` call and then
-    cached inside the singleton, so repeated calls to this function are cheap.
+    TAESD encoder/decoder weights are loaded on the first
+    :meth:`~TaesdLatentConverter.convert` call for each conversion direction
+    and cached inside the singleton, so repeated calls to this function are cheap.
 
     Parameters
     ----------
-    model_dir:
-        Optional path to pre-downloaded weight files.  Only honoured on the
-        very first call; subsequent calls return the already-created instance
-        regardless of *model_dir*.
+    taesd_dir:
+        Optional path to the directory containing TAESD ``*.pth`` files.
+        Defaults to the ``taesd/`` submodule next to the repo root.
+        Only honoured on the very first call; subsequent calls return the
+        already-created instance.
     """
     global _shared_interposer
     if _shared_interposer is None:
-        _shared_interposer = LatentInterposer(model_dir=model_dir)
+        _shared_interposer = TaesdLatentConverter(taesd_dir=taesd_dir)
     return _shared_interposer
 
 

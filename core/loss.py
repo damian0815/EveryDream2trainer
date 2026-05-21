@@ -699,9 +699,18 @@ def get_model_prediction_and_target(
         _debug_output_dir = getattr(args, "logdir", None) or "."
         _teacher_pred_type: Optional[str] = None
         _teacher_sched = None
+        _teacher_latent_type: Optional[str] = None
         if teacher_model is not None:
             _teacher_pred_type = _get_prediction_type(teacher_model)
             _teacher_sched = teacher_model.noise_scheduler
+        # Infer latent space types for correct per-column rendering in the debug grid.
+        try:
+            from core.latent_interposer import infer_latent_space_type
+            _student_latent_type = infer_latent_space_type(model)
+            if teacher_model is not None:
+                _teacher_latent_type = infer_latent_space_type(teacher_model)
+        except Exception:
+            _student_latent_type = "xl" if model.is_sdxl else "v1"
         log_teacher_debug(
             global_step=global_step,
             output_dir=_debug_output_dir,
@@ -721,6 +730,8 @@ def get_model_prediction_and_target(
             teacher_output=_teacher_debug_capture.get("teacher_output"),
             teacher_timesteps=_teacher_debug_capture.get("teacher_timesteps"),
             teacher_target=teacher_target,
+            student_latent_type=_student_latent_type,
+            teacher_latent_type=_teacher_latent_type,
         )
 
 
@@ -1165,11 +1176,11 @@ def get_teacher_target(
     # to the model.  The shared singleton in latent_interposer is cheap to
     # create and loads model weights lazily.
     if student_pred_type == 'flow_prediction':
-        from core.latent_interposer import infer_latent_space_type, get_shared_interposer, LatentInterposer
+        from core.latent_interposer import infer_latent_space_type, get_shared_interposer, TaesdLatentConverter
         student_vae_space = infer_latent_space_type(student_model)
         teacher_vae_space = infer_latent_space_type(teacher_model)
         if (student_vae_space is not None and teacher_vae_space is not None
-                and LatentInterposer.is_supported(student_vae_space, teacher_vae_space)):
+                and TaesdLatentConverter.is_supported(student_vae_space, teacher_vae_space)):
             return _teacher_target_via_interposer(
                 teacher_model=teacher_model,
                 teacher_conditioning=teacher_conditioning,

@@ -2,15 +2,18 @@
 Teacher distillation debugging utilities.
 
 When --debug_teacher is passed, logs detailed per-tensor statistics and
-low-resolution RGB preview images for the first 10 training steps.
-Previews are written to:
-    <logdir>/debug_teacher/step_NNNNN/<name>.jpg
-A text summary is logged via :mod:`logging` and also written to
-    <logdir>/debug_teacher/step_NNNNN/stats.txt
+RGB preview images for the first 10 training steps via TensorBoard.
 
-No VAE is used; latents are projected to RGB via a fixed linear colour
-matrix (technique originally by @erucipe / @keturn / @torridgristle /
-@StAlKeR7779).
+Rendering strategy
+------------------
+* **True-latent** tensors (noisy x_t, predicted x₀, clean latents) are decoded
+  with TAESD (from the ``taesd/`` submodule) to give proper pixel previews.
+* **Velocity / noise** tensors (raw UNet output, FM velocity, noise ε, targets)
+  cannot be passed through TAESD meaningfully; they are shown using the classic
+  per-channel linear colour-projection matrix (@erucipe / @keturn / @torridgristle
+  / @StAlKeR7779) with the *per-column* correct latent-space factors.
+* In cross-VAE mode the teacher velocity ``t_vel`` is suppressed because it
+  would mix tensors from two incompatible latent spaces.
 """
 from __future__ import annotations
 
@@ -35,7 +38,6 @@ from core.prediction_bridge import (
 
 # ---------------------------------------------------------------------------
 # Latent → RGB preview helpers
-# (technique by @erucipe / @keturn / @torridgristle / @StAlKeR7779)
 # ---------------------------------------------------------------------------
 
 # SD 1.x per-channel RGB projection factors (updated for v1.5 by @torridgristle)
@@ -144,7 +146,9 @@ def latents_to_preview_image(latents: torch.Tensor, *, is_sdxl: bool = False) ->
 def _latent_to_chw_float(latent_1chw: torch.Tensor, *, is_sdxl: bool) -> torch.Tensor:
     """
     Project a single (1, C, H, W) latent to a (3, H, W) float32 tensor in [0, 1].
-    Used for TensorBoard grid assembly.
+    Uses the correct SD1 or SDXL colour-projection factors.
+    Used for TensorBoard grid assembly of *velocity / noise* tensors that cannot
+    be decoded through TAESD.
     """
     with torch.no_grad():
         if is_sdxl:
@@ -169,6 +173,86 @@ def _latent_to_chw_float(latent_1chw: torch.Tensor, *, is_sdxl: bool) -> torch.T
     # img is uint8 (H, W, 3) numpy → (3, H, W) float [0,1]
     arr = np.array(img).astype("float32") / 255.0          # H×W×3
     return torch.from_numpy(arr).permute(2, 0, 1)           # 3×H×W
+
+
+# ---------------------------------------------------------------------------
+# TAESD-based latent decoder for debug previews
+# ---------------------------------------------------------------------------
+
+def _decode_latent_taesd(
+    latent_1chw: torch.Tensor,
+    latent_type: str,
+    out_h: int,
+    out_w: int,
+) -> Optional[torch.Tensor]:
+    """
+    Decode a single (1, C, H, W) latent to a (3, out_h, out_w) float32 [0,1]
+    tensor using the TAESD tiny autoencoder for *latent_type*.
+
+    Returns ``None`` if TAESD is unavailable or decoding fails.
+    """
+    try:
+        from core.latent_interposer import TaesdLatentConverter, get_shared_interposer
+        if latent_type not in TaesdLatentConverter.SUPPORTED_SPACES:
+            return None
+        converter = get_shared_interposer()
+        # Run on the same device as the input; .to() is a no-op if already there.
+        device = latent_1chw.device
+        decoder = converter._get_decoder(latent_type).to(device)
+        with torch.no_grad():
+            px = decoder(latent_1chw.float()).clamp(0.0, 1.0)  # [1, 3, H*8, W*8]
+            px = px.squeeze(0)                                   # [3, H*8, W*8]
+            if px.shape[-2] != out_h or px.shape[-1] != out_w:
+                px = F.interpolate(
+                    px.unsqueeze(0),
+                    size=(out_h, out_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+        return px.cpu()  # grid assembly requires CPU tensors
+    except Exception as exc:
+        logging.debug(f"[teacher_debug] TAESD decode failed ({latent_type}): {exc}")
+        return None
+
+
+def _render_cell(
+    sample_1chw: torch.Tensor,
+    *,
+    is_latent: bool,
+    latent_type: Optional[str],
+    cell_h: int,
+    cell_w: int,
+) -> torch.Tensor:
+    """
+    Render a single (1, C, H, W) tensor to a (3, cell_h, cell_w) float32 [0,1]
+    display tile.
+
+    * If *is_latent* and *latent_type* is a supported TAESD space, decode with
+      TAESD for a proper pixel preview.
+    * Otherwise fall back to the linear colour-projection matrix, choosing the
+      correct SD1 / SDXL factors based on *latent_type*.
+    """
+    if is_latent and latent_type is not None:
+        taesd_result = _decode_latent_taesd(sample_1chw, latent_type, cell_h, cell_w)
+        if taesd_result is not None:
+            return taesd_result
+
+    # Linear-projection fallback — use the right colour matrix for the space
+    is_sdxl_proj = (latent_type == "xl")
+    try:
+        chw = _latent_to_chw_float(sample_1chw, is_sdxl=is_sdxl_proj)
+        # Resize to cell dimensions so all cells in the grid are the same size.
+        # _latent_to_chw_float returns at native latent resolution (lH × lW),
+        # but TAESD cells and the blank placeholder are at (cell_h × cell_w).
+        if chw.shape[-2] != cell_h or chw.shape[-1] != cell_w:
+            chw = F.interpolate(
+                chw.unsqueeze(0).float(),
+                size=(cell_h, cell_w),
+                mode="nearest",
+            ).squeeze(0)
+        return chw
+    except Exception:
+        return torch.zeros(3, cell_h, cell_w)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +377,10 @@ def log_teacher_debug(
     teacher_output: Optional[torch.Tensor] = None,      # [B, C, H, W]  raw teacher UNet output
     teacher_timesteps: Optional[torch.Tensor] = None,   # [B]
     teacher_target: Optional[torch.Tensor] = None,      # [B, C, H, W]  teacher→student target
+    # Latent-space type codes ("v1", "xl", "v3", "fx") for TAESD decoding
+    # and per-column colour-projection selection.
+    student_latent_type: Optional[str] = None,
+    teacher_latent_type: Optional[str] = None,
 ) -> None:
     """
     Log teacher-distillation debug information for *global_step* (no-op after
@@ -303,9 +391,16 @@ def log_teacher_debug(
       - **columns** (X-axis) = one labelled tensor type per column
       - **rows**    (Y-axis) = one batch sample per row
 
-    A text stats summary is logged via :mod:`logging`.  No disk image files
-    are written.
+    True-latent columns (noisy x_t, predicted x₀, clean x₁) are decoded via
+    TAESD for a proper pixel preview when *student_latent_type* /
+    *teacher_latent_type* are provided.  Velocity / noise tensors fall back to
+    the classic per-channel linear colour-projection.
 
+    In cross-VAE mode (``student_latent_type != teacher_latent_type``) the
+    teacher velocity column (``t_vel``) is suppressed because it would mix
+    tensors from two incompatible latent spaces.
+
+    A text stats summary is logged via :mod:`logging`.
     Each step is logged at most once (deduplication against multiple slices).
     """
     if global_step >= 10:
@@ -315,6 +410,16 @@ def log_teacher_debug(
     if dedup_key in _logged_steps:
         return
     _logged_steps.add(dedup_key)
+
+    # Infer latent types from is_sdxl when explicit types are not supplied.
+    if student_latent_type is None:
+        student_latent_type = "xl" if is_sdxl else "v1"
+
+    cross_vae = (
+        student_latent_type is not None
+        and teacher_latent_type is not None
+        and student_latent_type != teacher_latent_type
+    )
 
     with torch.no_grad():
         # ── Derive student predicted-clean and predicted-velocity ─────────
@@ -334,8 +439,14 @@ def log_teacher_debug(
         if have_teacher:
             t_x0 = _recover_x0(teacher_output, teacher_noisy, teacher_timesteps,
                                 teacher_scheduler, teacher_pred_type)
-            t_vel = _recover_fm_velocity(teacher_output, teacher_noisy, teacher_timesteps,
-                                         teacher_scheduler, teacher_pred_type, noise)
+            # t_vel requires noise and x0 in the same latent space.
+            # In cross-VAE mode the student noise is in student space while
+            # t_x0 is in teacher space — the subtraction is meaningless.
+            if cross_vae:
+                t_vel = None   # suppressed; would mix incompatible spaces
+            else:
+                t_vel = _recover_fm_velocity(teacher_output, teacher_noisy, teacher_timesteps,
+                                             teacher_scheduler, teacher_pred_type, noise)
         else:
             t_x0 = None
             t_vel = None
@@ -350,6 +461,9 @@ def log_teacher_debug(
             f"╔══ Teacher Debug  step={global_step} ══╗",
             f"  student_pred_type  : {student_pred_type}",
             f"  teacher_pred_type  : {teacher_pred_type or 'N/A'}",
+            f"  student_latent_type: {student_latent_type or 'N/A (inferred from is_sdxl)'}",
+            f"  teacher_latent_type: {teacher_latent_type or 'N/A (same as student)'}",
+            f"  cross_vae          : {cross_vae}",
             f"  student_timesteps  : {_ts_list(student_timesteps)}",
             f"  teacher_timesteps  : {_ts_list(teacher_timesteps)}",
             "",
@@ -367,7 +481,7 @@ def log_teacher_debug(
             f"  teacher_noisy_latents    : {_stats(teacher_noisy) if teacher_noisy is not None else 'N/A'}",
             f"  teacher_output (raw)     : {_stats(teacher_output) if teacher_output is not None else 'N/A'}",
             f"  teacher_pred_clean (x₀)  : {_stats(t_x0) if t_x0 is not None else 'N/A'}",
-            f"  teacher_pred_velocity    : {_stats(t_vel) if t_vel is not None else 'N/A'}",
+            f"  teacher_pred_velocity    : {_stats(t_vel) if t_vel is not None else ('N/A (cross-VAE)' if cross_vae else 'N/A')}",
             f"  teacher_target (→student): {_stats(teacher_target) if teacher_target is not None else 'N/A'}",
             "╚══════════════════════════════════════════════════════════════╝",
         ]
@@ -378,28 +492,41 @@ def log_teacher_debug(
         if log_writer is None:
             return
 
-        # Ordered columns: (short_label, tensor_or_None)
-        columns: list[tuple[str, Optional[torch.Tensor]]] = [
-            ("student\nnoise",       noise),
-            ("student\nnoisy-lat",   noisy_latents),
-            ("student\npred-raw",    model_pred),
-            ("student\npred-x0",     s_x0),
-            ("student\npred-vel",    s_vel),
-            ("student\ntarget",      target),
-            ("actual\nclean-lat",    clean_latents),
-            ("teacher\nnoise",       noise if have_teacher else None),
-            ("teacher\nnoisy-lat",   teacher_noisy),
-            ("teacher\npred-raw",    teacher_output),
-            ("teacher\npred-x0",     t_x0),
-            ("teacher\npred-vel",    t_vel),
-            ("teacher\ntarget",      teacher_target),
+        # Column definitions:
+        #   (short_label, tensor_or_None, latent_type_for_this_col, is_true_latent)
+        #
+        # is_true_latent=True  → TAESD decoder attempted (noisy, x0, clean)
+        # is_true_latent=False → linear colour-projection (velocity, noise, target)
+        #
+        # teacher_target is in *student* space (already converted back by the
+        # interposer), so it uses student_latent_type.
+        # t_vel is None in cross-VAE mode (suppressed above).
+        slt = student_latent_type
+        tlt = teacher_latent_type or student_latent_type  # same space when no cross-VAE
+        columns: list[tuple[str, Optional[torch.Tensor], Optional[str], bool]] = [
+            ("student\nnoise",       noise,                              slt,  False),
+            ("student\nnoisy-lat",   noisy_latents,                      slt,  True),
+            ("student\npred-raw",    model_pred,                         slt,  False),
+            ("student\npred-x0",     s_x0,                               slt,  True),
+            ("student\npred-vel",    s_vel,                              slt,  False),
+            ("student\ntarget",      target,                             slt,  False),
+            ("actual\nclean-lat",    clean_latents,                      slt,  True),
+            ("teacher\nnoise",       noise if have_teacher else None,    slt,  False),
+            ("teacher\nnoisy-lat",   teacher_noisy,                      tlt,  True),
+            ("teacher\npred-raw",    teacher_output,                     tlt,  False),
+            ("teacher\npred-x0",     t_x0,                               tlt,  True),
+            ("teacher\npred-vel",    t_vel,                              tlt,  False),
+            ("teacher\ntarget",      teacher_target,                     slt,  False),
         ]
 
         batch_size = noise.shape[0]
         # Infer cell dimensions from the first available tensor
         ref = noise  # always present
         _, _, lH, lW = ref.shape
-        cell_h, cell_w = lH, lW   # preview at native latent resolution
+        # Use 8× the latent size so TAESD-decoded cells are not downsampled heavily.
+        # Cap at 128 px per side to keep the TensorBoard image manageable.
+        cell_h = min(lH * 8, 128)
+        cell_w = min(lW * 8, 128)
 
         LABEL_H = 28          # pixels reserved above each column for the text label
         PAD     = 2           # padding between cells (make_grid padding)
@@ -411,15 +538,23 @@ def log_teacher_debug(
         blank = torch.zeros(3, cell_h, cell_w)  # placeholder for missing tensors
 
         for b in range(batch_size):
-            for _label, tensor in columns:
+            for _label, tensor, col_lt, is_latent in columns:
                 if tensor is None:
                     cells.append(blank)
                 else:
                     try:
-                        sample = tensor[b].detach().float().cpu()
+                        sample = tensor[b].detach().float()  # keep on original device
                         if sample.dim() == 3:
                             sample = sample.unsqueeze(0)   # → (1, C, H, W)
-                        cells.append(_latent_to_chw_float(sample, is_sdxl=is_sdxl))
+                        cells.append(
+                            _render_cell(
+                                sample,
+                                is_latent=is_latent,
+                                latent_type=col_lt,
+                                cell_h=cell_h,
+                                cell_w=cell_w,
+                            )
+                        )
                     except Exception as exc:
                         logging.warning(f"[teacher_debug] cell render failed: {exc}")
                         cells.append(blank)
@@ -449,7 +584,7 @@ def log_teacher_debug(
         # make_grid pads PAD on left before each image block
         col_x_start = PAD  # first cell starts after PAD border
         cell_stride = cell_w + PAD
-        for col_idx, (label, _t) in enumerate(columns):
+        for col_idx, (label, _t, _lt, _il) in enumerate(columns):
             cx = col_x_start + col_idx * cell_stride + cell_w // 2
             # Multi-line label: split on \n
             parts = label.split("\n")
