@@ -28,8 +28,8 @@ import torch.nn.functional as F
 import torchvision.utils as vutils
 from PIL import Image, ImageDraw, ImageFont
 
+from core.latent_interposer import get_shared_interposer
 from core.prediction_bridge import (
-    _normalise_pred_type,
     _recover_x0_from_epsilon,
     _recover_x0_from_vpred,
     _recover_x0_from_fm_velocity,
@@ -147,8 +147,6 @@ def _latent_to_chw_float(latent_1chw: torch.Tensor, *, is_sdxl: bool) -> torch.T
     """
     Project a single (1, C, H, W) latent to a (3, H, W) float32 tensor in [0, 1].
     Uses the correct SD1 or SDXL colour-projection factors.
-    Used for TensorBoard grid assembly of *velocity / noise* tensors that cannot
-    be decoded through TAESD.
     """
     with torch.no_grad():
         if is_sdxl:
@@ -179,7 +177,15 @@ def _latent_to_chw_float(latent_1chw: torch.Tensor, *, is_sdxl: bool) -> torch.T
 # TAESD-based latent decoder for debug previews
 # ---------------------------------------------------------------------------
 
-def _decode_latent_taesd(
+
+def _decode_scaled_latent_taesd(latent_1chw: torch.Tensor,
+                        latent_type: str,
+                        out_h: int,
+                        out_w: int) -> torch.Tensor:
+    pass
+
+
+def _decode_latent_taesd_broken(
     latent_1chw: torch.Tensor,
     latent_type: str,
     out_h: int,
@@ -226,33 +232,122 @@ def _render_cell(
     """
     Render a single (1, C, H, W) tensor to a (3, cell_h, cell_w) float32 [0,1]
     display tile.
-
-    * If *is_latent* and *latent_type* is a supported TAESD space, decode with
-      TAESD for a proper pixel preview.
-    * Otherwise fall back to the linear colour-projection matrix, choosing the
-      correct SD1 / SDXL factors based on *latent_type*.
     """
-    if is_latent and latent_type is not None:
-        taesd_result = _decode_latent_taesd(sample_1chw, latent_type, cell_h, cell_w)
-        if taesd_result is not None:
-            return taesd_result
+    converter = get_shared_interposer()
+    # Run on the same device as the input; .to() is a no-op if already there.
+    device = sample_1chw.device
+    decoder = converter._get_decoder(latent_type).to(device)
 
-    # Linear-projection fallback — use the right colour matrix for the space
-    is_sdxl_proj = (latent_type == "xl")
+    px = decoder(sample_1chw.float()).clamp(0.0, 1.0)  # [1, 3, H*8, W*8]
+    px = px.squeeze(0)  # [3, H*8, W*8]
+    if px.shape[-2] != cell_h or px.shape[-1] != cell_w:
+        px = F.interpolate(
+            px.unsqueeze(0),
+            size=(cell_h, cell_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+    return px
+
+
+
+# ---------------------------------------------------------------------------
+# Generic grid builder
+# ---------------------------------------------------------------------------
+
+def _build_labelled_grid(
+    columns: list,   # list of (label: str, tensor: Tensor|None, latent_type: str|None, is_true_latent: bool)
+    batch_size: int,
+    cell_h: int,
+    cell_w: int,
+    label_h: int = 28,
+    pad: int = 2,
+) -> "Image.Image":
+    """
+    Render *columns* into a labelled PIL Image grid.
+
+    Each column is a 4-tuple ``(label, tensor, latent_type, is_true_latent)``:
+
+    * *label*          – column header text (``\\n`` for line-breaks).
+    * *tensor*         – ``[B, C, H, W]`` (or ``None`` → blank cell).
+    * *latent_type*    – ``"v1"``, ``"xl"``, etc.  Used by :func:`_render_cell`
+                         to choose between TAESD decoding and linear projection.
+    * *is_true_latent* – ``True`` for noisy/clean latents (TAESD attempted),
+                         ``False`` for velocity/noise tensors (linear projection).
+
+    Returns a ``PIL.Image.Image`` with one row per batch element and one column
+    per entry in *columns*.
+    """
+    blank = torch.zeros(3, cell_h, cell_w)
+    num_cols = len(columns)
+
+    cells: list[torch.Tensor] = []
+    for b in range(batch_size):
+        for _label, tensor, col_lt, is_latent in columns:
+            if tensor is None:
+                cells.append(blank)
+            else:
+                try:
+                    sample = tensor[b].detach().float()   # keep on original device
+                    if sample.dim() == 3:
+                        sample = sample.unsqueeze(0)       # → (1, C, H, W)
+                    cells.append(
+                        _render_cell(sample, is_latent=is_latent,
+                                     latent_type=col_lt, cell_h=cell_h, cell_w=cell_w)
+                    )
+                except Exception as exc:
+                    logging.warning(f"[teacher_debug] cell render failed: {exc}")
+                    cells.append(blank)
+
+    grid = vutils.make_grid([c.cpu() for c in cells], nrow=num_cols, padding=pad,
+                            normalize=False, pad_value=0.15)
+
+    # ── label strip ────────────────────────────────────────────────────────
+    grid_w = grid.shape[2]
+    label_strip = Image.new("RGB", (grid_w, label_h), color=(30, 30, 30))
+    draw = ImageDraw.Draw(label_strip)
     try:
-        chw = _latent_to_chw_float(sample_1chw, is_sdxl=is_sdxl_proj)
-        # Resize to cell dimensions so all cells in the grid are the same size.
-        # _latent_to_chw_float returns at native latent resolution (lH × lW),
-        # but TAESD cells and the blank placeholder are at (cell_h × cell_w).
-        if chw.shape[-2] != cell_h or chw.shape[-1] != cell_w:
-            chw = F.interpolate(
-                chw.unsqueeze(0).float(),
-                size=(cell_h, cell_w),
-                mode="nearest",
-            ).squeeze(0)
-        return chw
-    except Exception:
-        return torch.zeros(3, cell_h, cell_w)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
+    except (IOError, OSError):
+        # Try common macOS font paths before giving up
+        _mac_candidates = [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Geneva.ttf",
+        ]
+        font = None
+        for _p in _mac_candidates:
+            try:
+                font = ImageFont.truetype(_p, 9)
+                break
+            except (IOError, OSError):
+                pass
+        if font is None:
+            font = ImageFont.load_default()
+
+    col_x_start = pad
+    cell_stride  = cell_w + pad
+    for col_idx, (label, _t, _lt, _il) in enumerate(columns):
+        cx = col_x_start + col_idx * cell_stride + cell_w // 2
+        parts = label.split("\n")
+        y = 1
+        for part in parts:
+            try:
+                bbox = draw.textbbox((0, 0), part, font=font)
+                tw = bbox[2] - bbox[0]
+            except AttributeError:
+                tw = len(part) * 6
+            draw.text((cx - tw // 2, y), part, fill=(220, 220, 220), font=font)
+            y += 10
+
+    label_tensor = torch.from_numpy(
+        np.array(label_strip).astype("float32") / 255.0
+    ).permute(2, 0, 1)
+
+    final = torch.cat([label_tensor, grid], dim=1)   # (3, label_h + H_grid, W_grid)
+    final_np = final.permute(1, 2, 0).clamp(0, 1).mul(255).byte().cpu().numpy()
+    return Image.fromarray(final_np)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +369,18 @@ def _get_fm_sigma(timesteps: torch.Tensor, scheduler, *, device: torch.device) -
         ).to(device=device, dtype=torch.float32)
     except (AttributeError, RuntimeError):
         return (timesteps.float().to(device) / 1000.0).clamp(1e-6, 1.0 - 1e-6)
+
+
+
+
+def _normalise_pred_type(t: str) -> str:
+    if t in ("v-prediction", "v_prediction"):
+        return "v_prediction"
+    if t in ("flow-matching", "flow_prediction", "flow_match"):
+        return "flow_prediction"
+    if t == "epsilon":
+        return "epsilon"
+    raise ValueError(f"Unrecognised prediction type: {t!r}")
 
 
 def _recover_x0(
@@ -528,83 +635,13 @@ def log_teacher_debug(
         cell_h = min(lH * 8, 128)
         cell_w = min(lW * 8, 128)
 
-        LABEL_H = 28          # pixels reserved above each column for the text label
-        PAD     = 2           # padding between cells (make_grid padding)
-        num_cols = len(columns)
+        pil_img = _build_labelled_grid(columns, batch_size, cell_h, cell_w)
 
-        # ── Render every cell: shape (3, cell_h, cell_w) float [0,1] ──────
-        # Grid is row-major: [col0_row0, col1_row0, ..., col(N-1)_row0, col0_row1, ...]
-        cells: list[torch.Tensor] = []
-        blank = torch.zeros(3, cell_h, cell_w)  # placeholder for missing tensors
-
-        for b in range(batch_size):
-            for _label, tensor, col_lt, is_latent in columns:
-                if tensor is None:
-                    cells.append(blank)
-                else:
-                    try:
-                        sample = tensor[b].detach().float()  # keep on original device
-                        if sample.dim() == 3:
-                            sample = sample.unsqueeze(0)   # → (1, C, H, W)
-                        cells.append(
-                            _render_cell(
-                                sample,
-                                is_latent=is_latent,
-                                latent_type=col_lt,
-                                cell_h=cell_h,
-                                cell_w=cell_w,
-                            )
-                        )
-                    except Exception as exc:
-                        logging.warning(f"[teacher_debug] cell render failed: {exc}")
-                        cells.append(blank)
-
-        # make_grid with nrow=num_cols → each row in the grid = one batch item
-        grid = vutils.make_grid(
-            cells,
-            nrow=num_cols,
-            padding=PAD,
-            normalize=False,
-            pad_value=0.15,     # grey separator
-        )
-        # grid: (3, H_grid, W_grid) float [0,1]
-
-        # ── Prepend a label row at the top ─────────────────────────────────
-        grid_w = grid.shape[2]
-        label_strip = Image.new("RGB", (grid_w, LABEL_H), color=(30, 30, 30))
-        draw = ImageDraw.Draw(label_strip)
-
-        # Try to get a small bitmap font; fall back to default if unavailable
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
-        except (IOError, OSError):
-            font = ImageFont.load_default()
-
-        # Column centres in the grid image
-        # make_grid pads PAD on left before each image block
-        col_x_start = PAD  # first cell starts after PAD border
-        cell_stride = cell_w + PAD
-        for col_idx, (label, _t, _lt, _il) in enumerate(columns):
-            cx = col_x_start + col_idx * cell_stride + cell_w // 2
-            # Multi-line label: split on \n
-            parts = label.split("\n")
-            y = 1
-            for part in parts:
-                try:
-                    bbox = draw.textbbox((0, 0), part, font=font)
-                    tw = bbox[2] - bbox[0]
-                except AttributeError:
-                    tw = len(part) * 6  # rough fallback
-                draw.text((cx - tw // 2, y), part, fill=(220, 220, 220), font=font)
-                y += 10
-
-        # Convert label strip to tensor (3, LABEL_H, grid_w)
-        label_tensor = torch.from_numpy(
-            np.array(label_strip).astype("float32") / 255.0
+        # TensorBoard wants a (3, H, W) float32 tensor in [0, 1].
+        final_grid = torch.from_numpy(
+            np.array(pil_img).astype("float32") / 255.0
         ).permute(2, 0, 1)
 
-        # Stack: label row on top, then the cell grid
-        final_grid = torch.cat([label_tensor, grid], dim=1)  # (3, LABEL_H+H_grid, W_grid)
 
         log_writer.add_image(
             "debug_teacher/latents",
@@ -613,4 +650,462 @@ def log_teacher_debug(
         )
 
 
+# ---------------------------------------------------------------------------
+# Private: infer prediction-type without importing from core.loss
+# (avoids a circular import — core.loss already imports log_teacher_debug)
+# ---------------------------------------------------------------------------
 
+def _get_pred_type(model) -> str:
+    """Return ``'flow_prediction'``, ``'v_prediction'``, or ``'epsilon'``."""
+    try:
+        from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
+        if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+            return "flow_prediction"
+    except ImportError:
+        pass
+    return model.noise_scheduler.config.get("prediction_type", "epsilon")
+
+
+# ---------------------------------------------------------------------------
+# Notebook-friendly helpers
+# ---------------------------------------------------------------------------
+
+def prepare_teacher_target_inputs(
+    image_path: str,
+    seed: int,
+    teacher_model: "TrainingModel",
+    caption: str,
+    *,
+    student_model: "Optional[TrainingModel]" = None,
+    resolution: Optional[int] = None,
+    timestep_index: int = 500,
+) -> tuple:
+    """
+    Build the arguments required by :func:`core.loss.get_teacher_target` from
+    raw materials, for use in Jupyter notebooks and interactive debugging.
+
+    Parameters
+    ----------
+    image_path:
+        Path to any image file (JPEG, PNG, …).  It is centre-cropped to a
+        square and resized to *resolution*.
+    seed:
+        RNG seed for reproducible noise.
+    teacher_model:
+        Loaded teacher :class:`~model.training_model.TrainingModel`.  Its text
+        encoder(s) are used to produce *teacher_conditioning*.
+    caption:
+        Text prompt to condition the teacher on.
+    student_model:
+        Loaded student :class:`~model.training_model.TrainingModel`.  Its VAE
+        encodes the image into student latent space and its scheduler provides
+        *student_timesteps*.  When ``None`` the teacher model is used as a
+        stand-in (convenient for same-VAE debugging).
+    resolution:
+        Square pixel resolution.  Defaults to ``1024`` for SDXL students and
+        ``512`` for SD1/2.
+    timestep_index:
+        Index into ``student_model.noise_scheduler.timesteps``
+        (``0`` = highest noise, ``-1`` = nearly clean).  Default ``500``
+        (midpoint).
+
+    Returns
+    -------
+    ``(teacher_conditioning, clean_image_latents, noise, student_timesteps)``
+        Exactly the four positional inputs needed by ``get_teacher_target()``.
+
+    Typical Jupyter usage::
+
+        from utils.teacher_debug import prepare_teacher_target_inputs, get_teacher_debug_grid_image
+        from core.loss import get_teacher_target
+
+        t_cond, clean_lat, noise, ts = prepare_teacher_target_inputs(
+            "photo.jpg", seed=42,
+            teacher_model=teacher_model, caption="a cat",
+            student_model=student_model,
+        )
+        debug_capture = {}
+        teacher_target = get_teacher_target(
+            teacher_model=teacher_model,
+            teacher_conditioning=t_cond,
+            student_model=student_model,
+            student_timesteps=ts,
+            clean_image_latents=clean_lat,
+            noise=noise,
+            _debug_capture=debug_capture,
+        )
+        debug_capture.update(clean_image_latents=clean_lat, noise=noise,
+                             teacher_target=teacher_target)
+        img = get_teacher_debug_grid_image(debug_capture,
+                                           teacher_model=teacher_model,
+                                           student_model=student_model)
+        display(img)   # inline in Jupyter
+    """
+    from PIL import Image as _PIL
+    import torchvision.transforms.functional as _TF
+    from model.training_model import get_text_conditioning, Conditioning
+
+    vae_model = student_model if student_model is not None else teacher_model
+
+    # ── 1. Resolve target resolution ─────────────────────────────────────────
+    if resolution is None:
+        resolution = 1024 if vae_model.is_sdxl else 512
+
+    # ── 2. Load and centre-crop image to (resolution × resolution) ───────────
+    img = _PIL.open(image_path).convert("RGB")
+    w, h = img.size
+    short = min(w, h)
+    img = img.crop(((w - short) // 2, (h - short) // 2,
+                    (w + short) // 2, (h + short) // 2))
+    img = img.resize((resolution, resolution), _PIL.LANCZOS)
+
+    # ── 3. Encode image with student (or teacher) VAE → scaled latents ────────
+    device = vae_model.unet.device
+    # Training dataloader uses [-1, 1] pixel values
+    pixel_values = (_TF.to_tensor(img) * 2.0 - 1.0).unsqueeze(0)
+    pixel_values = pixel_values.to(device=device, dtype=vae_model.vae.dtype)
+
+    vae_scale = float(
+        getattr(vae_model.vae.config, "scaling_factor",
+                0.13025 if vae_model.is_sdxl else 0.18215)
+    )
+    with torch.no_grad():
+        dist = vae_model.vae.encode(pixel_values, return_dict=False)[0]
+        clean_image_latents = dist.sample() * vae_scale    # [1, C, H, W]
+
+    # ── 4. Generate reproducible noise ───────────────────────────────────────
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+    noise = torch.randn(clean_image_latents.shape, generator=rng,
+                        device=device, dtype=clean_image_latents.dtype)
+
+    # ── 5. Pick a student timestep ────────────────────────────────────────────
+    sched = vae_model.noise_scheduler
+    idx = max(0, min(timestep_index, len(sched.timesteps) - 1))
+    student_timesteps = sched.timesteps[idx: idx + 1].to(device)   # [1]
+
+    # ── 6. Tokenise caption and build teacher conditioning ────────────────────
+    t_device = teacher_model.unet.device
+    teacher_model.load_textenc_to_device(t_device)
+
+    def _tok(tokenizer, text: str) -> torch.Tensor:
+        ids = tokenizer(
+            text, truncation=True, padding="max_length",
+            max_length=tokenizer.model_max_length,
+        ).input_ids
+        return torch.tensor(ids).unsqueeze(0).to(teacher_model.text_encoder.device)
+
+    tokens   = _tok(teacher_model.tokenizer, caption)
+    tokens_2 = (
+        _tok(teacher_model.tokenizer_2, caption)
+        if teacher_model.is_sdxl and getattr(teacher_model, "tokenizer_2", None) is not None
+        else None
+    )
+
+    with torch.no_grad():
+        enc_hs, enc_pe, enc_2_hs, enc_2_pe = get_text_conditioning(
+            tokens, tokens_2, [caption], teacher_model, args=None
+        )
+
+    if teacher_model.is_sdxl:
+        # Standard SDXL add_time_ids: (orig_h, orig_w, crop_y, crop_x, tgt_h, tgt_w)
+        add_time_ids = torch.tensor(
+            [[resolution, resolution, 0, 0, resolution, resolution]],
+            dtype=torch.float32, device=t_device,
+        )
+        teacher_conditioning = Conditioning.sdxl_conditioning(
+            text_encoder_hidden_states=enc_hs,
+            text_encoder_pooled_embeds=enc_pe,
+            text_encoder_2_hidden_states=enc_2_hs,
+            text_encoder_2_pooled_embeds=enc_2_pe,
+            add_time_ids=add_time_ids,
+        )
+    else:
+        teacher_conditioning = Conditioning.sd12_conditioning(
+            text_encoder_hidden_states=enc_hs,
+            text_encoder_pooled_embeds=enc_pe,
+        )
+
+    return teacher_conditioning, clean_image_latents, noise, student_timesteps
+
+
+def prepare_conditioning(
+    caption: str,
+    model: "TrainingModel",
+    resolution: Optional[int] = None,
+) -> "Conditioning":
+    """
+    Build a :class:`~model.training_model.Conditioning` object for *model*
+    from a text *caption*.  Useful in notebooks when you need student
+    conditioning to run the student UNet forward pass.
+
+    Parameters
+    ----------
+    caption:
+        Text prompt.
+    model:
+        Any loaded :class:`~model.training_model.TrainingModel`.
+    resolution:
+        Square pixel resolution used to build SDXL ``add_time_ids``.
+        Defaults to ``1024`` for SDXL, ``512`` otherwise.
+
+    Returns
+    -------
+    :class:`~model.training_model.Conditioning`
+
+    Example::
+
+        from utils.teacher_debug import prepare_conditioning
+        s_cond = prepare_conditioning("a cat", student_model)
+        img = get_teacher_debug_grid_image(
+            debug_capture,
+            teacher_model=teacher_model,
+            student_model=student_model,
+            student_conditioning=s_cond,
+        )
+        display(img)
+    """
+    from model.training_model import get_text_conditioning, Conditioning
+
+    if resolution is None:
+        resolution = 1024 if model.is_sdxl else 512
+
+    device = model.unet.device
+    model.load_textenc_to_device(device)
+
+    def _tok(tokenizer, text: str) -> torch.Tensor:
+        ids = tokenizer(
+            text, truncation=True, padding="max_length",
+            max_length=tokenizer.model_max_length,
+        ).input_ids
+        return torch.tensor(ids).unsqueeze(0).to(model.text_encoder.device)
+
+    tokens   = _tok(model.tokenizer, caption)
+    tokens_2 = (
+        _tok(model.tokenizer_2, caption)
+        if model.is_sdxl and getattr(model, "tokenizer_2", None) is not None
+        else None
+    )
+
+    with torch.no_grad():
+        enc_hs, enc_pe, enc_2_hs, enc_2_pe = get_text_conditioning(
+            tokens, tokens_2, [caption], model, args=None
+        )
+
+    if model.is_sdxl:
+        add_time_ids = torch.tensor(
+            [[resolution, resolution, 0, 0, resolution, resolution]],
+            dtype=torch.float32, device=device,
+        )
+        return Conditioning.sdxl_conditioning(
+            text_encoder_hidden_states=enc_hs,
+            text_encoder_pooled_embeds=enc_pe,
+            text_encoder_2_hidden_states=enc_2_hs,
+            text_encoder_2_pooled_embeds=enc_2_pe,
+            add_time_ids=add_time_ids,
+        )
+    else:
+        return Conditioning.sd12_conditioning(
+            text_encoder_hidden_states=enc_hs,
+            text_encoder_pooled_embeds=enc_pe,
+        )
+
+
+def get_teacher_debug_grid_image(
+    debug_capture: dict,
+    *,
+    teacher_model: "Optional[TrainingModel]" = None,
+    student_model: "Optional[TrainingModel]" = None,
+    student_conditioning: "Optional[Conditioning]" = None,
+) -> "Image.Image":
+    """
+    Build a ``PIL.Image`` debug grid from a *debug_capture* dict.
+
+    Build a debug grid showing all student and teacher intermediate tensors.
+
+    Parameters
+    ----------
+    debug_capture:
+        Dict populated by :func:`core.loss.get_teacher_target` (via
+        ``_debug_capture``) plus manual additions.  All keys are optional —
+        missing tensors render as blank grey cells.
+
+        Keys read:
+
+        ``"clean_image_latents"``  – clean student-space latents  ``[B,C,H,W]``
+        ``"noise"``                – shared noise ε               ``[B,C,H,W]``
+        ``"student_timesteps"``    – student timesteps            ``[B]``
+        ``"teacher_noisy"``        – teacher noisy input          ``[B,C,H,W]``
+        ``"teacher_output"``       – raw teacher UNet output      ``[B,C,H,W]``
+        ``"teacher_timesteps"``    – teacher timesteps            ``[B]``
+        ``"teacher_target"``       – distillation target (student space) ``[B,C,H,W]``
+        ``"model_pred"``           – raw student UNet output      ``[B,C,H,W]``
+                                     (auto-computed when *student_conditioning*
+                                     is supplied and this key is missing)
+
+    teacher_model:
+        Loaded teacher :class:`~model.training_model.TrainingModel`.
+    student_model:
+        Loaded student :class:`~model.training_model.TrainingModel`.
+    student_conditioning:
+        :class:`~model.training_model.Conditioning` for the student UNet.
+        When provided *and* ``"model_pred"`` is absent from *debug_capture*,
+        the student UNet is run automatically so that the ``student pred-raw``
+        and ``student pred-x0`` columns are populated.
+        Build it with :func:`prepare_conditioning`::
+
+            s_cond = prepare_conditioning("a cat", student_model)
+            img = get_teacher_debug_grid_image(
+                debug_capture,
+                teacher_model=teacher_model,
+                student_model=student_model,
+                student_conditioning=s_cond,
+            )
+            display(img)
+
+    :func:`prepare_teacher_target_inputs` builds all ``get_teacher_target``
+    inputs and pre-populates ``clean_image_latents`` and ``noise``::
+
+        debug_capture = {}
+        teacher_target = get_teacher_target(..., _debug_capture=debug_capture)
+        debug_capture.update(
+            clean_image_latents=clean_latents,
+            noise=noise,
+            teacher_target=teacher_target,
+            student_timesteps=ts,
+        )
+        s_cond = prepare_conditioning("a cat", student_model)
+        img = get_teacher_debug_grid_image(
+            debug_capture,
+            teacher_model=teacher_model,
+            student_model=student_model,
+            student_conditioning=s_cond,
+        )
+        display(img)   # inline in Jupyter
+    """
+    dc = debug_capture
+
+    # ── Infer latent-space types ──────────────────────────────────────────────
+    def _safe_infer(model):
+        try:
+            from core.latent_interposer import infer_latent_space_type
+            return infer_latent_space_type(model)
+        except Exception:
+            return None
+
+    slt = _safe_infer(student_model) or ("xl" if (student_model is not None and student_model.is_sdxl) else "v1")
+    tlt = _safe_infer(teacher_model) or ("xl" if (teacher_model is not None and teacher_model.is_sdxl) else slt)
+
+    # ── Derive teacher predicted clean-latent (t_x0) ─────────────────────────
+    t_x0: Optional[torch.Tensor] = None
+    t_out = dc.get("teacher_output")
+    t_nsy = dc.get("teacher_noisy")
+    t_ts  = dc.get("teacher_timesteps")
+    if t_out is not None and t_nsy is not None and t_ts is not None and teacher_model is not None:
+        try:
+            with torch.no_grad():
+                t_x0 = _recover_x0(t_out, t_nsy, t_ts,
+                                    teacher_model.noise_scheduler,
+                                    _get_pred_type(teacher_model))
+        except Exception as exc:
+            logging.debug(f"[teacher_debug] t_x0 derivation failed: {exc}")
+
+    # ── Compute student noisy latent (x_t) if not already in capture ─────────
+    # Requires "clean_image_latents", "noise", and "student_timesteps" in dc
+    # plus student_model for its scheduler.
+    student_noisy: Optional[torch.Tensor] = dc.get("student_noisy")
+    if (student_noisy is None
+            and student_model is not None
+            and all(k in dc for k in ("clean_image_latents", "noise", "student_timesteps"))):
+        try:
+            with torch.no_grad():
+                sn = student_model.noise_scheduler.add_noise(
+                    dc["clean_image_latents"].float(),
+                    dc["noise"].float(),
+                    dc["student_timesteps"],
+                )
+                student_noisy = sn.to(dc["clean_image_latents"].dtype)
+        except Exception as exc:
+            logging.debug(f"[teacher_debug] student_noisy computation failed: {exc}")
+
+    # ── Auto-run student UNet when conditioning is provided ───────────────────
+    # Populates dc["model_pred"] so the student pred-raw / pred-x0 columns show.
+    model_pred: Optional[torch.Tensor] = dc.get("model_pred")
+    if (model_pred is None
+            and student_model is not None
+            and student_conditioning is not None
+            and student_noisy is not None
+            and "student_timesteps" in dc):
+        try:
+            with torch.no_grad():
+                unet = student_model.unet
+                unet_dtype = unet.dtype
+                noisy_in  = student_noisy.to(dtype=unet_dtype)
+                ts_in     = dc["student_timesteps"].to(device=unet.device, dtype=unet_dtype)
+                hs        = student_conditioning.prompt_embeds.to(device=unet.device, dtype=unet_dtype)
+                added_kw  = (
+                    student_conditioning.get_added_cond_kwargs(dtype=unet_dtype)
+                    if student_model.is_sdxl else None
+                )
+                model_pred = unet(
+                    noisy_in, ts_in,
+                    encoder_hidden_states=hs,
+                    added_cond_kwargs=added_kw,
+                ).sample.float()
+        except Exception as exc:
+            logging.warning(f"[teacher_debug] student UNet forward failed: {exc}")
+
+    # ── Derive student predicted-clean latent (s_x0) ────────────────────────
+    s_x0: Optional[torch.Tensor] = None
+    if (model_pred is not None
+            and student_noisy is not None
+            and "student_timesteps" in dc
+            and student_model is not None):
+        try:
+            with torch.no_grad():
+                s_x0 = _recover_x0(
+                    model_pred, student_noisy, dc["student_timesteps"],
+                    student_model.noise_scheduler,
+                    _get_pred_type(student_model),
+                )
+        except Exception as exc:
+            logging.debug(f"[teacher_debug] s_x0 derivation failed: {exc}")
+
+    # ── Find a reference tensor for shape/batch-size ──────────────────────────
+    _ref = next(
+        (v for v in [dc.get("clean_image_latents"), dc.get("noise"),
+                     t_nsy, t_out] if v is not None),
+        None,
+    )
+    if _ref is None:
+        raise ValueError(
+            "debug_capture contains no tensors to visualise.  "
+            "Add at least one of: clean_image_latents, noise, "
+            "teacher_noisy, teacher_output."
+        )
+    batch_size = _ref.shape[0]
+    lH, lW = _ref.shape[-2], _ref.shape[-1]
+    cell_h  = min(lH * 8, 128)
+    cell_w  = min(lW * 8, 128)
+
+    # ── Column definitions ────────────────────────────────────────────────────
+    # (label, tensor, latent_type, is_true_latent)
+    # is_true_latent=True  → TAESD decoder attempted (noisy / x0 / clean)
+    # is_true_latent=False → linear colour-projection (velocity / noise / target)
+    #
+    # Student side first, then teacher side.
+    columns: list = [
+        # ── Student ────────────────────────────────────────────────────────
+        ("student\nclean",      dc.get("clean_image_latents"), slt, True),
+        ("student\nnoisy",      student_noisy,                  slt, True),
+        ("student\nnoise/eps",  dc.get("noise"),                slt, False),
+        ("student\npred-raw",   model_pred,                     slt, False),
+        ("student\npred-x0",    s_x0,                           slt, True),
+        ("student\ntarget",     dc.get("teacher_target"),       slt, False),
+        # ── Teacher ────────────────────────────────────────────────────────
+        ("teacher\nnoisy",      t_nsy,                          tlt, True),
+        ("teacher\npred-raw",   t_out,                          tlt, False),
+        ("teacher\npred-x0",    t_x0,                           tlt, True),
+    ]
+
+    return _build_labelled_grid(columns, batch_size, cell_h, cell_w)

@@ -400,16 +400,6 @@ class VPredToEpsilonBridge(PredictionBridge):
 
 # ─── Factory ──────────────────────────────────────────────────────────────────
 
-def _normalise_pred_type(t: str) -> str:
-    if t in ("v-prediction", "v_prediction"):
-        return "v_prediction"
-    if t in ("flow-matching", "flow_prediction", "flow_match"):
-        return "flow_prediction"
-    if t == "epsilon":
-        return "epsilon"
-    raise ValueError(f"Unrecognised prediction type: {t!r}")
-
-
 def get_prediction_bridge(
     teacher_prediction_type: str,
     student_prediction_type: str,
