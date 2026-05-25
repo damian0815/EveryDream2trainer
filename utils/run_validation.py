@@ -183,12 +183,12 @@ def _make_validation_callable(model, device, timestep_start: int = 0, timestep_e
         )
 
         # get latents
-        from core.loss import get_latents
+        from core.loss import encode_with_vae_to_scaled_latents
         from types import SimpleNamespace
         # amp=False: no autocast during standalone eval (safe on any hardware).
         # latents_perturbation=0: referenced unconditionally inside core/loss.py.
         dummy_args = SimpleNamespace(amp=False, latents_perturbation=0.0)
-        latents = get_latents(image, model, device=device, args=dummy_args)
+        latents = encode_with_vae_to_scaled_latents(image, model, device=device, args=dummy_args)
 
         noise = get_noise(
             latents.shape, device, image.dtype,

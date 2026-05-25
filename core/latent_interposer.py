@@ -34,11 +34,13 @@ import importlib.util
 import logging
 import os
 import types
-from typing import Optional
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
+from diffusers import AutoencoderKL
 from safetensors.torch import load_file
+from torchvision import transforms
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +250,32 @@ def _load_taesd_decoder(path: str, latent_channels: int, arch_variant: str | Non
     net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     net.eval()
     return net
+
+
+def _encode_to_scaled_latent_vae(vae, image):
+    scale = vae.config.scaling_factor
+    x = (image * 2.0) - 1.0
+    return scale * vae.encode(x)[0].sample()
+
+
+def _decode_scaled_latent_vae(vae, latent):
+    scale = vae.config.scaling_factor
+    x = vae.decode(latent / scale).sample   # (1, 3, H, W), range [-1,1]
+    return (x + 1.0) / 2.0
+
+
+def convert_latents_slow_vae_roundtrip(
+    latents: torch.Tensor,
+    from_vae: AutoencoderKL,
+    to_vae: AutoencoderKL,
+    normalization: Literal['none', 'imagenet', '0.5']
+) -> torch.Tensor:
+    intermediate = _decode_scaled_latent_vae(from_vae, latents.to(dtype=from_vae.dtype))
+    if normalization == 'imagenet':
+        intermediate = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(intermediate)
+    elif normalization == '0.5':
+        intermediate = transforms.Normalize(mean=[0.5], std=[0.5])(intermediate)
+    return _encode_to_scaled_latent_vae(to_vae, intermediate)
 
 
 class TaesdLatentConverter:

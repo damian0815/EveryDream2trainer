@@ -511,7 +511,8 @@ def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, b
             else:
                 path = os.path.join(intermediates_folder, f"intermediate_{i//chunk_size}.ckpt")
                 print(f"saving intermediate to {path}")
-                save_merge(intermediate, path, half=False)
+                is_sdxl = getattr(intermediate, 'text_encoder_2') is not None
+                save_merge(intermediate, path, half=not is_sdxl)
                 merged_intermediates.append(path)
                 merged_intermediates_weights.append(sum(chunk_weights))
                 print("done merging chunk")

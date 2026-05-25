@@ -15,6 +15,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 import line_profiler
+from torchvision import transforms
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import LogData
@@ -127,10 +128,17 @@ def train_step(
         # VAE encoding
         t_vae_start = time.perf_counter()
         assert batch["runt_size"] == 0 # _encode_latents assumption
-        model.vae.to(vae_dtype)
-        latents = _encode_latents(model=model, image=batch["image"], amp=args.amp, tv=tv)
-        if args.offload_vae:
-            model.load_vae_to_device('cpu')
+        def _do_encode_latents(model_for_vae: TrainingModel):
+            model_for_vae.vae.to(vae_dtype)
+            these_latents = _encode_latents(model=model_for_vae, image=batch["image"], amp=args.amp, tv=tv)
+            if args.offload_vae:
+                model_for_vae.load_vae_to_device('cpu')
+            return these_latents
+        latents = _do_encode_latents(model)
+        if teacher_model is not None and teacher_model.is_sdxl != model.is_sdxl:
+            teacher_latents = _do_encode_latents(teacher_model)
+        else:
+            teacher_latents = None
         record_performance_timing("4_vae_encoding", time.perf_counter() - t_vae_start, batch_size)
 
         for caption_variant in caption_variants:
@@ -212,6 +220,7 @@ def train_step(
                         caption_variant=caption_variant,
 
                         teacher_model=teacher_model,
+                        teacher_latents=teacher_latents,
                         teacher_mask=teacher_mask,
                         teacher_conditioning=teacher_conditioning,
 
@@ -363,7 +372,6 @@ def train_step(
                         raise RuntimeError(f"unknown state signal {global_state_signal}")
 
                 # gather grads (no-op on non-multi)
-                print(f"rank {get_rank()} syncing grads before optimizer step")
                 sync_ddp_gradients(model.unet, model.text_encoder, model.text_encoder_2)
 
                 t_optimizer_step_start = time.perf_counter()
@@ -786,6 +794,9 @@ def _encode_latents(
     forward_slice_size = tv.forward_slice_size
     batch_size = image.shape[0]
     pixel_values = image.to(memory_format=torch.contiguous_format).to(model.unet.device)
+    imagenet_normalize = False #model.is_sdxl
+    if imagenet_normalize:
+        pixel_values = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(pixel_values)
     with torch.no_grad(), torch.amp.autocast('cuda', enabled=amp):
         successfully_encoded_latents = False
         enable_vae_attention_slicing = False
@@ -987,7 +998,7 @@ def _do_model_forward(
     model: TrainingModel,
     batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning, is_cond_dropout_noise: torch.Tensor,
     timesteps: torch.Tensor, caption_variant: str|tuple[str, str],
-    teacher_model: TrainingModel|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
+    teacher_model: TrainingModel|None, teacher_latents: torch.Tensor|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
     forward_slice_size: int,
     tv: TrainingVariables, args: Namespace,
     debug_teacher: bool = False,
@@ -1014,14 +1025,14 @@ def _do_model_forward(
     slices = list(get_slices(batch_size, forward_slice_size))
     for slice_index, (slice_start, slice_end) in enumerate(slices):
         # print(f'slice {slice_index} @ res {image_shape[2:4]} (base {args.resolution[0]}), sssf {slice_size_scale_factor}, bs {batch_size}, slice size {forward_slice_size}')
+        def _safe_slice(x):
+            return None if x is None else x[slice_start:slice_end]
         latents_slice = latents[slice_start:slice_end]
+        teacher_latents_slice = _safe_slice(teacher_latents)
         noise_slice = noise[slice_start:slice_end]
         timesteps_slice = timesteps[slice_start:slice_end]
         is_cond_dropout_noise_slice = is_cond_dropout_noise[slice_start:slice_end]
-        if teacher_mask is None:
-            teacher_mask_slice = None
-        else:
-            teacher_mask_slice = teacher_mask[slice_start:slice_end]
+        teacher_mask_slice = _safe_slice(teacher_mask)
 
         conditioning_slice = conditioning.slice(slice_start, slice_end)
         if teacher_conditioning is None:
@@ -1059,6 +1070,7 @@ def _do_model_forward(
                 model=model,
                 args=args,
                 teacher_model=teacher_model,
+                teacher_latents=teacher_latents_slice,
                 teacher_mask=teacher_mask_slice,
                 teacher_conditioning=teacher_conditioning_slice,
                 lcf_mask=lcf_mask_slice,

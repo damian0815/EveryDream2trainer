@@ -131,14 +131,19 @@ class EveryDreamBatch(Dataset):
         train_item: dict = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
         example["pathname"] = train_item["pathname"]
 
-        std_dev = 0.5
-        mean = 0.5
+        use_imagenet_norm_std = False # done in VAE encode
+        if use_imagenet_norm_std:
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+        else:
+            mean = [0.5]
+            std = [0.5]
 
         if self.normalize_image:
             image_transforms = transforms.Compose(
                 [
                     transforms.ToTensor(),
-                    transforms.Normalize([mean], [std_dev]),
+                    transforms.Normalize(mean, std),
                 ]
             )
         else:

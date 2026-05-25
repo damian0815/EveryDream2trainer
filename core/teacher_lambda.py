@@ -53,20 +53,21 @@ import torch
 # ---------------------------------------------------------------------------
 
 #: SNR at or below which teacher lambda falls to zero (pure-noise outer edge).
-#: Corresponds approximately to FM t≈948 (shift=1) or DDPM t≈860.
-TEACHER_LAMBDA_SNR_ZERO_LO: float = 0.003
+#: Below this, v ≈ ε for any architecture; teacher signal is redundant with GT.
+TEACHER_LAMBDA_SNR_ZERO_LO: float = 1e-9
 
 #: SNR at or above which teacher lambda is at full weight (high-noise inner edge).
-#: Corresponds approximately to FM t≈797 (shift=1) or DDPM t≈680.
-TEACHER_LAMBDA_SNR_FULL_LO: float = 0.065
+#: Mode-selection regime begins; teacher's structural prior is high-value here.
+TEACHER_LAMBDA_SNR_FULL_LO: float = 1e-8
 
 #: SNR at or below which teacher lambda is at full weight (low-noise inner edge).
-#: Corresponds approximately to FM t≈400 (shift=1) or DDPM t≈230.
-TEACHER_LAMBDA_SNR_FULL_HI: float = 2.25
+#: Above this, x_1_hat is near-clean and HF-smoothing in the VAE roundtrip dominates the target.
+TEACHER_LAMBDA_SNR_FULL_HI: float = 1.0
 
 #: SNR at or above which teacher lambda falls to zero (fine-detail outer edge).
-#: Corresponds approximately to FM t≈200 (shift=1) or DDPM t≈30.
-TEACHER_LAMBDA_SNR_ZERO_HI: float = 16.0
+#: At SNR > 2, the target is essentially a smoothed clean latent and the student
+#: should learn HF from GT, not from teacher.
+TEACHER_LAMBDA_SNR_ZERO_HI: float = 2.0
 
 
 # ---------------------------------------------------------------------------

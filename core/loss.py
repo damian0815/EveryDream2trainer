@@ -15,9 +15,11 @@ import torch.nn.functional as F
 from scipy.stats import beta as sp_beta
 
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
+from torchvision import transforms
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
-from core.latent_interposer import infer_latent_space_type, TaesdLatentConverter, get_shared_interposer
+from core.latent_interposer import infer_latent_space_type, TaesdLatentConverter, get_shared_interposer, \
+    convert_latents_slow_vae_roundtrip
 from core.prediction_bridge import (
     get_prediction_bridge,
     VPredToFMBridge,
@@ -44,18 +46,20 @@ alpha<1: Quick advance (spread hugs final_value)
 """
 
 
-def get_latents(image, model: TrainingModel, device, args):
+def encode_with_vae_to_scaled_latents(image, model: TrainingModel, device, args):
     with torch.no_grad():
         with autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16):
             pixel_values = image.to(memory_format=torch.contiguous_format).to(
                 device, dtype=model.vae.dtype
             )
+            imagenet_normalize = False #model.is_sdxl
+            if imagenet_normalize:
+                pixel_values = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(pixel_values)
             latents = model.vae.encode(pixel_values, return_dict=False)
         del pixel_values
         scaling_factor = 0.13025 if model.is_sdxl else 0.18215
         latents = latents[0].sample() * scaling_factor
         return latents
-
 
 def get_loss(
     model_pred,
@@ -519,6 +523,7 @@ def get_model_prediction_and_target(
     is_cond_dropout_noise: torch.Tensor = None,
     skip_contrastive: bool = False,
     teacher_model: TrainingModel | None = None,
+    teacher_latents: torch.Tensor | None = None,
     teacher_mask: torch.Tensor | None = None,
     teacher_conditioning: Conditioning | None = None,
     debug_fake: bool = False,
@@ -580,6 +585,7 @@ def get_model_prediction_and_target(
         conditioning_masked = conditioning.get_masked(mask)
         noise_masked = noise[mask]
         teacher_mask_masked = teacher_mask[mask] if teacher_mask is not None else None
+        teacher_latents_masked = teacher_latents[mask] if teacher_mask is not None else None
         teacher_conditioning_masked = (
             teacher_conditioning.get_masked(mask)
             if teacher_conditioning is not None
@@ -597,6 +603,7 @@ def get_model_prediction_and_target(
             args=args,
             skip_contrastive=skip_contrastive,
             teacher_model=teacher_model,
+            teacher_latents=teacher_latents_masked,
             teacher_mask=teacher_mask_masked,
             teacher_conditioning=teacher_conditioning_masked,
             debug_fake=debug_fake,
@@ -692,6 +699,7 @@ def get_model_prediction_and_target(
                 student_model=model,
                 student_timesteps=timesteps,
                 clean_image_latents=latents,
+                teacher_clean_image_latents=teacher_latents,
                 noise=noise,
                 _debug_capture=_teacher_debug_capture if debug_teacher else None,
             )
@@ -728,9 +736,7 @@ def get_model_prediction_and_target(
             target=target,
             clean_latents=latents,
             student_timesteps=timesteps,
-            teacher_noisy=_teacher_debug_capture.get("teacher_noisy"),
-            teacher_output=_teacher_debug_capture.get("teacher_output"),
-            teacher_timesteps=_teacher_debug_capture.get("teacher_timesteps"),
+            teacher_debug_capture=_teacher_debug_capture,
             teacher_target=teacher_target,
             student_latent_type=_student_latent_type,
             teacher_latent_type=_teacher_latent_type,
@@ -1164,6 +1170,7 @@ def get_teacher_target(
     student_model: TrainingModel,
     student_timesteps: torch.Tensor,    # [B], student-domain
     clean_image_latents: torch.Tensor,  # [B, C, H, W]
+    teacher_clean_image_latents: torch.Tensor, # [B, C, H, W]
     noise: torch.Tensor,                # [B, C, H, W]
     _debug_capture: Optional[Dict[str, Any]] = None,  # filled when debug_teacher is active
 ) -> torch.Tensor:
@@ -1184,10 +1191,13 @@ def get_teacher_target(
             student_model=student_model,
             student_timesteps=student_timesteps,
             clean_image_latents=clean_image_latents,
+            teacher_clean_image_latents=teacher_clean_image_latents,
             student_noise=noise,
             latent_interposer=get_shared_interposer(),
             _debug_capture=_debug_capture,
         )
+
+    raise NotImplementedError("teacher with non-flow-prediction student is not implemented")
 
     # ── Unified bridge-based distillation ──────────────────────────────────────
     teacher_pred_type = _get_prediction_type(teacher_model)
@@ -1215,7 +1225,7 @@ def get_teacher_target(
     ).to(teacher_model.device)
 
     # Step 2: build teacher noisy latents
-    teacher_noisy = bridge.build_noisy_latents(
+    teacher_noisy_latents = bridge.build_noisy_latents(
         clean_image_latents, noise, teacher_timesteps,
         teacher_sched=teacher_model.noise_scheduler,
     )
@@ -1223,7 +1233,7 @@ def get_teacher_target(
     # Step 3: run teacher UNet (single call site, no per-crossing branching)
     with torch.no_grad():
         teacher_output = teacher_model.unet(
-            teacher_noisy.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+            teacher_noisy_latents.to(teacher_model.device, dtype=teacher_model.unet.dtype),
             teacher_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
             teacher_conditioning.prompt_embeds.to(
                 teacher_model.device, dtype=teacher_model.unet.dtype
@@ -1236,7 +1246,7 @@ def get_teacher_target(
 
     student_target = bridge.convert_output(
         teacher_output=teacher_output,
-        teacher_noisy_latents=teacher_noisy,
+        teacher_noisy_latents=teacher_noisy_latents,
         teacher_timesteps=teacher_timesteps,
         student_timesteps=student_timesteps,
         noise=noise,
@@ -1245,7 +1255,8 @@ def get_teacher_target(
     )
 
     if _debug_capture is not None:
-        _debug_capture["teacher_noisy"] = teacher_noisy.detach()
+        #_debug_capture["teacher_noise"] = teacher_noise.detach()
+        _debug_capture["teacher_noisy_latents"] = teacher_noisy_latents.detach()
         _debug_capture["teacher_output"] = teacher_output.detach()
         _debug_capture["teacher_timesteps"] = teacher_timesteps.detach()
 
@@ -1317,7 +1328,8 @@ def _teacher_fm_target_via_interposer(
     teacher_conditioning: Conditioning,
     student_model: TrainingModel,
     student_timesteps: torch.Tensor,       # shifted float timesteps, shape [B]
-    clean_image_latents: torch.Tensor,  # x_1_vS — scaled SDXL latents, shape [B,4,H,W]
+    clean_image_latents: torch.Tensor,  # x_1_vS, shape [B,4,H,W]
+    teacher_clean_image_latents: torch.Tensor, # x_1_vT,  [B,4,H,W]
     student_noise: torch.Tensor,   # x_0_vS, shape [B,4,H,W]
     latent_interposer,
     _debug_capture: Optional[Dict[str, Any]] = None,
@@ -1364,11 +1376,7 @@ def _teacher_fm_target_via_interposer(
             f"  noise handling    : student_noise passed through interposer ({student_vae_space}→{teacher_vae_space}) for coherent velocity target\n"
         )
 
-    # ---- 1. Convert student noisy latent -> teacher VAE space
-    x_t_vS = _get_noisy_latents(clean_image_latents, student_noise, student_model.noise_scheduler, student_timesteps, 0)
-    x_t_vT = latent_interposer.convert(x_t_vS, student_vae_space, teacher_vae_space)
-
-    # ---- 2. Find timesteps by SNR matching
+    # ---- 1. Find timesteps by SNR matching
     if is_vpred_teacher or is_epsilon_teacher:
         fm_sigmas = student_model.noise_scheduler.get_sigmas_for_timesteps(
             student_timesteps.to(student_model.noise_scheduler.timesteps.device)
@@ -1376,6 +1384,28 @@ def _teacher_fm_target_via_interposer(
         teacher_timesteps = _ddpm_timesteps_matching_fm_sigma(fm_sigmas, teacher_model.noise_scheduler)
     else:
         teacher_timesteps = student_timesteps
+
+    # ---- 2. Convert student noisy latent -> teacher VAE space
+    student_to_teacher_method = 'fresh_eps' # empirically evaluated, fresh_eps and same_raw_eps both are best
+    if student_to_teacher_method == 'convert_xt':
+        teacher_noise = student_noise
+        x_t_vS = _get_noisy_latents(clean_image_latents, student_noise, student_model.noise_scheduler, student_timesteps, 0)
+        x_t_vT = latent_interposer.convert(x_t_vS, student_vae_space, teacher_vae_space)
+    elif student_to_teacher_method == 'convert_eps':
+        teacher_noise = latent_interposer.convert(student_noise, student_vae_space, teacher_vae_space)
+        #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+        x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+    elif student_to_teacher_method == 'fresh_eps':
+        teacher_noise = torch.randn_like(student_noise)
+        #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+        x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+    elif student_to_teacher_method == 'same_raw_eps':
+        teacher_noise = student_noise
+        #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+        x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+    else:
+        raise ValueError(f"Unknown method {student_to_teacher_method}")
+
 
     # ---- 3. Run teacher UNet ----
     v_hat_vT = teacher_model.unet(
@@ -1403,20 +1433,36 @@ def _teacher_fm_target_via_interposer(
             x_t_vT.float(), v_hat_vT, ac[teacher_timesteps].float()
         )
     else:
-        sigmas = teacher_model.noise_scheduler.get_sigmas_for_timesteps(teacher_timesteps)
+        sigmas = teacher_model.noise_scheduler.get_sigmas_for_timesteps(teacher_timesteps).to(x_t_vT.device)
         x_1_hat_vT = _recover_x0_from_fm_velocity(x_t_vT, v_hat_vT, sigmas)
 
     # ---- 5. Map predicted clean endpoint back to student VAE space
-    x_1_hat_vS = latent_interposer.convert(x_1_hat_vT, teacher_vae_space, student_vae_space)
-    x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
+    teacher_to_student_method = 'convert_slow'
+    if teacher_to_student_method == 'convert_fast':
+        x_1_hat_vS = latent_interposer.convert(x_1_hat_vT, teacher_vae_space,
+        student_vae_space)
+        x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
+    elif teacher_to_student_method == 'convert_slow':
+        normalization = 'none'# 'imagenet' if student_model.is_sdxl else 'none'
+        x_1_hat_vS = convert_latents_slow_vae_roundtrip(x_1_hat_vT, teacher_model.vae, student_model.vae, normalization=normalization)
+    else:
+        raise ValueError(f"Unrecognized teacher_to_student_method '{teacher_to_student_method}'")
 
     # ---- 7. Build student-space distillation velocity target ----
     # Code convention: target = x_0_vS − x_1_hat_vS  (noise − clean)
-    v_target_vS = student_noise.float() - x_1_hat_vS
+    #extra_perturbation_alpha = 0.1
+    extra_perturbation_alpha = 0
+    extra_perturbation_noise = torch.randn_like(student_noise)
+    v_target_vS = student_noise.float() - (
+        x_1_hat_vS * (1 - extra_perturbation_alpha)
+        + extra_perturbation_noise * extra_perturbation_alpha
+    )
 
     if _debug_capture is not None:
-        _debug_capture["teacher_noisy"] = x_t_vT.detach()
-        _debug_capture["teacher_output"] = v_hat_vT.detach()
+        v_target_vT = teacher_noise.float() - x_1_hat_vT
+        _debug_capture["teacher_noise"] = teacher_noise.detach()
+        _debug_capture["teacher_noisy_latents"] = x_t_vT.detach()
+        _debug_capture["teacher_output"] = v_target_vT.detach()
         _debug_capture["teacher_timesteps"] = teacher_timesteps.detach()
 
     return v_target_vS.to(dtype=student_model.unet.dtype)

@@ -72,7 +72,7 @@ from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_ar
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
-    get_latents,
+    encode_with_vae_to_scaled_latents,
     compute_timestep_intervals,
 )
 from core.self_flow import SelfFlowMLPProjectionHead, get_self_flow_channels, SELF_FLOW_MODES
@@ -630,7 +630,8 @@ def main(args):
                 model.clip_model = clip_model
                 model.clip_processor = clip_processor
 
-        teacher_model = load_teacher_model(args, device, model)
+        teacher_model = load_teacher_model(args, device, model,
+                                           flow_match_shift_dynamic=args.flow_match_shift_dynamic, flow_match_shift=args.flow_match_shift)
 
         model.setup_cond_dropout_tokens()
         if teacher_model is not None:
@@ -665,8 +666,15 @@ def main(args):
         else:
             logging.info("* Using SDP attention *")
 
-        train_dtype = torch.float16 if device=='mps' else (torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float32)
-        vae_dtype = torch.float16 if args.amp else train_dtype
+        if model.is_sdxl:
+            train_dtype = torch.bfloat16
+            vae_dtype = torch.float32
+        elif device == 'mps':
+            train_dtype = torch.float16
+            vae_dtype = train_dtype
+        else:
+            train_dtype = torch.bfloat16 if args.force_bfloat16 else torch.float32
+            vae_dtype = torch.bfloat16 if args.amp else train_dtype
 
         model.vae = model.vae.to(device, dtype=vae_dtype)
         model.unet = model.unet.to(device, dtype=train_dtype)
@@ -1170,7 +1178,7 @@ def main(args):
         if type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
             timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
         model.load_vae_to_device(device)
-        latents = get_latents(image, model, device=model.unet.device, args=args)
+        latents = encode_with_vae_to_scaled_latents(image, model, device=model.unet.device, args=args)
         if args.offload_vae:
             model.load_vae_to_device('cpu')
         noise = get_noise(latents.shape, model.unet.device, image.dtype,
@@ -1380,7 +1388,7 @@ def main(args):
                                 everything_contrastive_learning_p = args.everything_contrastive_learning_p
                             full_batch["do_contrastive_learning"] = everything_contrastive_learning_p > random.random()
 
-                        if args.flow_match_shift_dynamic and type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
+                        if args.flow_match_shift_dynamic and isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
                             # gentle shift, randomly falling back to no shift
                             assert model.noise_scheduler.config.time_shift_type == 'linear'
                             shift = 1.0 + 0.5 * (image_pixel_count / 1024**2)
@@ -1388,8 +1396,8 @@ def main(args):
                                 shift = 1.0
                             #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
                             model.set_noise_scheduler_shift(shift)
-                            # Teacher uses its own fixed shift; do NOT override it with the
-                            # student's dynamic per-resolution shift.
+                            if teacher_model is not None and isinstance(teacher_model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+                                teacher_model.set_noise_scheduler_shift(shift)
 
                         train_step(
                             full_batch=full_batch,

@@ -480,12 +480,10 @@ def log_teacher_debug(
     clean_latents: torch.Tensor,          # [B, C, H, W]  clean image latents x₀
     student_timesteps: torch.Tensor,      # [B]
     # Teacher-side tensors (all optional — None when no teacher is active)
-    teacher_noisy: Optional[torch.Tensor] = None,       # [B, C, H, W]
-    teacher_output: Optional[torch.Tensor] = None,      # [B, C, H, W]  raw teacher UNet output
-    teacher_timesteps: Optional[torch.Tensor] = None,   # [B]
-    teacher_target: Optional[torch.Tensor] = None,      # [B, C, H, W]  teacher→student target
+    teacher_debug_capture: Optional[dict[str, torch.Tensor]] = None,
     # Latent-space type codes ("v1", "xl", "v3", "fx") for TAESD decoding
     # and per-column colour-projection selection.
+    teacher_target: Optional[torch.Tensor] = None,
     student_latent_type: Optional[str] = None,
     teacher_latent_type: Optional[str] = None,
 ) -> None:
@@ -535,16 +533,21 @@ def log_teacher_debug(
         s_vel = _recover_fm_velocity(model_pred, noisy_latents, student_timesteps,
                                      student_scheduler, student_pred_type, noise)
 
+        teacher_noise = teacher_debug_capture.get("teacher_noise")
+        teacher_noisy_latents = teacher_debug_capture.get("teacher_noisy_latents")
+        teacher_output = teacher_debug_capture.get("teacher_output")
+        teacher_timesteps = teacher_debug_capture.get("teacher_timesteps")
+
         # ── Derive teacher predicted-clean and predicted-velocity ──────────
         have_teacher = (
             teacher_output is not None
             and teacher_scheduler is not None
-            and teacher_noisy is not None
+            and teacher_noisy_latents is not None
             and teacher_timesteps is not None
             and teacher_pred_type is not None
         )
         if have_teacher:
-            t_x0 = _recover_x0(teacher_output, teacher_noisy, teacher_timesteps,
+            t_x0 = _recover_x0(teacher_output, teacher_noisy_latents, teacher_timesteps,
                                 teacher_scheduler, teacher_pred_type)
             # t_vel requires noise and x0 in the same latent space.
             # In cross-VAE mode the student noise is in student space while
@@ -552,7 +555,7 @@ def log_teacher_debug(
             if cross_vae:
                 t_vel = None   # suppressed; would mix incompatible spaces
             else:
-                t_vel = _recover_fm_velocity(teacher_output, teacher_noisy, teacher_timesteps,
+                t_vel = _recover_fm_velocity(teacher_output, teacher_noisy_latents, teacher_timesteps,
                                              teacher_scheduler, teacher_pred_type, noise)
         else:
             t_x0 = None
@@ -584,11 +587,11 @@ def log_teacher_debug(
             f"  clean_latents (actual x₀): {_stats(clean_latents)}",
             "",
             "─── TEACHER ───────────────────────────────────────────────────",
-            f"  teacher_noise (shared ε) : {_stats(noise) if have_teacher else 'N/A'}",
-            f"  teacher_noisy_latents    : {_stats(teacher_noisy) if teacher_noisy is not None else 'N/A'}",
-            f"  teacher_output (raw)     : {_stats(teacher_output) if teacher_output is not None else 'N/A'}",
-            f"  teacher_pred_clean (x₀)  : {_stats(t_x0) if t_x0 is not None else 'N/A'}",
-            f"  teacher_pred_velocity    : {_stats(t_vel) if t_vel is not None else ('N/A (cross-VAE)' if cross_vae else 'N/A')}",
+            f"  noise (ε)                : {_stats(teacher_noise) if have_teacher else 'N/A'}",
+            f"  noisy_latents (x_t)      : {_stats(teacher_noisy_latents) if teacher_noisy_latents is not None else 'N/A'}",
+            f"  model_pred (raw output)  : {_stats(teacher_output) if teacher_output is not None else 'N/A'}",
+            f"  pred_clean_latents (x₀)  : {_stats(t_x0) if t_x0 is not None else 'N/A'}",
+            f"  pred_velocity            : {_stats(t_vel) if t_vel is not None else ('N/A (cross-VAE)' if cross_vae else 'N/A')}",
             f"  teacher_target (→student): {_stats(teacher_target) if teacher_target is not None else 'N/A'}",
             "╚══════════════════════════════════════════════════════════════╝",
         ]
@@ -619,7 +622,7 @@ def log_teacher_debug(
             ("student\ntarget",      target,                             slt,  False),
             ("actual\nclean-lat",    clean_latents,                      slt,  True),
             ("teacher\nnoise",       noise if have_teacher else None,    slt,  False),
-            ("teacher\nnoisy-lat",   teacher_noisy,                      tlt,  True),
+            ("teacher\nnoisy-lat",   teacher_noisy_latents,                      tlt,  True),
             ("teacher\npred-raw",    teacher_output,                     tlt,  False),
             ("teacher\npred-x0",     t_x0,                               tlt,  True),
             ("teacher\npred-vel",    t_vel,                              tlt,  False),
@@ -935,7 +938,7 @@ def get_teacher_debug_grid_image(
         ``"clean_image_latents"``  – clean student-space latents  ``[B,C,H,W]``
         ``"noise"``                – shared noise ε               ``[B,C,H,W]``
         ``"student_timesteps"``    – student timesteps            ``[B]``
-        ``"teacher_noisy"``        – teacher noisy input          ``[B,C,H,W]``
+        ``"teacher_noisy_latents"``        – teacher noisy input          ``[B,C,H,W]``
         ``"teacher_output"``       – raw teacher UNet output      ``[B,C,H,W]``
         ``"teacher_timesteps"``    – teacher timesteps            ``[B]``
         ``"teacher_target"``       – distillation target (student space) ``[B,C,H,W]``
@@ -999,7 +1002,7 @@ def get_teacher_debug_grid_image(
     # ── Derive teacher predicted clean-latent (t_x0) ─────────────────────────
     t_x0: Optional[torch.Tensor] = None
     t_out = dc.get("teacher_output")
-    t_nsy = dc.get("teacher_noisy")
+    t_nsy = dc.get("teacher_noisy_latents")
     t_ts  = dc.get("teacher_timesteps")
     if t_out is not None and t_nsy is not None and t_ts is not None and teacher_model is not None:
         try:
@@ -1081,7 +1084,7 @@ def get_teacher_debug_grid_image(
         raise ValueError(
             "debug_capture contains no tensors to visualise.  "
             "Add at least one of: clean_image_latents, noise, "
-            "teacher_noisy, teacher_output."
+            "teacher_noisy_latents, teacher_output."
         )
     batch_size = _ref.shape[0]
     lH, lW = _ref.shape[-2], _ref.shape[-1]

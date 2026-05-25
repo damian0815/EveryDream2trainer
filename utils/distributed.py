@@ -150,6 +150,7 @@ def sync_ddp_gradients(*modules) -> None:
     """
     if not dist.is_initialized():
         return
+    print(f"rank {get_rank()} syncing grads before optimizer step")
     for m in modules:
         if m is None or not isinstance(m, DistributedDataParallel):
             continue

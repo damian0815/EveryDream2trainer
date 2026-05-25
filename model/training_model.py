@@ -584,7 +584,7 @@ def convert_diffusers_lora_to_single_file(diffusers_format, civitai_path):
 @torch.no_grad()
 def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
                save_full_precision=False, save_optimizer_flag=False, save_ckpt=True,
-               plugin_runner: PluginRunner = None):
+               plugin_runner: PluginRunner=None, unet_only_with_hardlinks_source: str=None):
     """
     Save the model to disk
     """
@@ -657,6 +657,16 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     diffusers_model_path = save_path
     logging.info(f" * Saving diffusers model to {diffusers_model_path}")
     pipeline.save_pretrained(diffusers_model_path)
+    if unet_only_with_hardlinks_source is not None:
+        # replace vae, text encoder diffusion pytorch files with hardlinks
+        for subfolder in ['vae', 'text_encoder', 'text_encoder_2']:
+            for file in ['model.safetensors', 'diffusion_pytorch_model.safetensors']:
+                relpath = subfolder + '/' + file
+                saved_path = os.path.join(diffusers_model_path, relpath)
+                hardlink_source_path = os.path.join(unet_only_with_hardlinks_source, relpath)
+                if os.path.exists(saved_path) and os.path.exists(hardlink_source_path):
+                    os.unlink(saved_path)
+                    os.link(hardlink_source_path, saved_path)
 
     if save_ckpt:
         sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
