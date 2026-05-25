@@ -305,6 +305,15 @@ class TrainingModel:
     self_flow_teacher_unet = None   # UNet2DConditionModel|None – frozen EMA copy
     self_flow_proj_head = None      # SelfFlowProjectionHead|None – trainable 1×1 conv
 
+    # EMA weights (in-memory mode: cpu or cuda).  None when disk-offload is used or EMA is disabled.
+    unet_ema: Optional['UNet2DConditionModel'] = None
+    text_encoder_ema: Optional['CLIPTextModel'] = None
+    text_encoder_2_ema: Optional['CLIPTextModel'] = None
+
+    # When ema_device='disk': the directory that holds the live *_ema.safetensors working files.
+    # None for in-memory EMA modes.
+    ema_working_dir: Optional[str] = None
+
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
         return TrainingModel(
@@ -549,8 +558,9 @@ def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, 
 
 
 @dataclass
+@dataclass
 class EveryDreamTrainingState:
-    model: TrainingModel
+    model: 'TrainingModel'
     optimizer: EveryDreamOptimizer
     train_batch: 'EveryDreamBatch'
 
@@ -686,6 +696,29 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
         logging.info(f" * Saving Self-Flow teacher UNet to {teacher_path}")
         state_dict = {k: v.cpu().contiguous() for k, v in ed_state.model.self_flow_teacher_unet.state_dict().items()}
         safetensors.torch.save_file(state_dict, teacher_path)
+
+    # ── EMA sidecars ──────────────────────────────────────────────────────────
+    # In-memory EMA (cpu / cuda): serialise the live module state_dict.
+    _ema_components = [
+        ("unet_ema",          ed_state.model.unet_ema),
+        ("text_encoder_ema",  ed_state.model.text_encoder_ema),
+        ("text_encoder_2_ema", ed_state.model.text_encoder_2_ema),
+    ]
+    for _ema_name, _ema_module in _ema_components:
+        if _ema_module is not None:
+            _ema_path = os.path.join(save_path, f"{_ema_name}.safetensors")
+            logging.info(f" * Saving EMA sidecar: {_ema_path}")
+            _state = {k: v.cpu().contiguous() for k, v in _ema_module.state_dict().items()}
+            safetensors.torch.save_file(_state, _ema_path)
+
+    # Disk-offload EMA: copy the working safetensors files into the checkpoint dir.
+    if ed_state.model.ema_working_dir is not None:
+        for _ema_name in ("unet_ema", "text_encoder_ema", "text_encoder_2_ema"):
+            _src = os.path.join(ed_state.model.ema_working_dir, f"{_ema_name}.safetensors")
+            if os.path.isfile(_src):
+                _dst = os.path.join(save_path, f"{_ema_name}.safetensors")
+                shutil.copy2(_src, _dst)
+                logging.info(f" * Copied EMA sidecar (disk-offload): {_ema_name}.safetensors → {save_path}")
 
 
 @torch.no_grad()
