@@ -28,6 +28,7 @@ import gc
 import random
 import traceback
 
+from contextlib import contextmanager
 from typing import Optional
 
 import torch.distributed as dist
@@ -653,6 +654,70 @@ def _init_ema(model: "TrainingModel", args, device, log_folder: str) -> bool:
     )
     return True
 
+
+@contextmanager
+def _with_ema_weights(model: "TrainingModel"):
+    """
+    Context manager that temporarily loads EMA weights into model components for inference,
+    then restores the original training weights on exit.
+
+    Handles both in-memory EMA (model.unet_ema etc.) and disk-offload EMA (model.ema_working_dir).
+    For DDP-wrapped modules, operates on the underlying .module.
+    Does nothing (yields immediately) if no EMA state is available.
+    """
+    def _unwrap(m):
+        return m.module if hasattr(m, 'module') else m
+
+    components = [
+        ("unet",           getattr(model, "unet", None)),
+        ("text_encoder",   getattr(model, "text_encoder", None)),
+        ("text_encoder_2", getattr(model, "text_encoder_2", None)),
+    ]
+
+    saved_states: dict[str, dict] = {}
+
+    for name, module in components:
+        if module is None:
+            continue
+        target = _unwrap(module)
+
+        if model.ema_working_dir is not None:
+            # Disk-offload mode: load EMA state from working file
+            disk_path = os.path.join(model.ema_working_dir, f"{name}_ema.safetensors")
+            if not os.path.isfile(disk_path):
+                continue
+            try:
+                ema_sd_raw = safetensors.torch.load_file(disk_path, device="cpu")
+            except Exception as e:
+                logging.warning(f"_with_ema_weights: could not load {disk_path}: {e}")
+                continue
+        else:
+            # In-memory mode
+            ema_module = getattr(model, f"{name}_ema", None)
+            if ema_module is None:
+                continue
+            ema_sd_raw = ema_module.state_dict()
+
+        # Save original weights (on the target's own device/dtype)
+        saved_states[name] = {k: v.clone() for k, v in target.state_dict().items()}
+
+        # Cast EMA state to match existing tensor dtype/device before loading
+        current_sd = target.state_dict()
+        ema_sd_typed = {k: v.to(dtype=current_sd[k].dtype, device=current_sd[k].device)
+                        for k, v in ema_sd_raw.items()
+                        if k in current_sd}
+        target.load_state_dict(ema_sd_typed, strict=False)
+
+    try:
+        yield
+    finally:
+        # Restore original training weights
+        for name, state in saved_states.items():
+            module = getattr(model, name, None)
+            if module is not None:
+                _unwrap(module).load_state_dict(state, strict=False)
+
+
 def _get_default_forward_slice_size(tv: TrainingVariables):
     return tv.default_forward_slice_size[tv.batch_resolution]
 
@@ -1104,12 +1169,10 @@ def main(args):
     if get_use_ema_decay_training(args):
         if args.ema_strength_target is not None:
             total_number_of_steps: float = epoch_len * args.max_epochs
-            total_number_of_ema_updates: float = total_number_of_steps / args.ema_update_interval
-            args.ema_decay_rate = args.ema_strength_target ** (1.0 / total_number_of_ema_updates)
+            args.ema_decay_rate = args.ema_strength_target ** (1.0 / total_number_of_steps)
             logging.info(
                 f"ema_strength_target={args.ema_strength_target} → "
-                f"ema_decay_rate={args.ema_decay_rate:.8f} "
-                f"({total_number_of_ema_updates:.0f} EMA updates over {total_number_of_steps:.0f} steps)"
+                f"ema_decay_rate={args.ema_decay_rate:.8f} over {total_number_of_steps:.0f} steps)"
             )
 
     ed_optimizer = EveryDreamOptimizer(args,
@@ -1265,6 +1328,12 @@ def main(args):
             extra_info: str = ""
             torch.cuda.empty_cache()
 
+            # Determine which sampling passes to run
+            ema_active = (get_use_ema_decay_training(args) and
+                          (model.unet_ema is not None or model.ema_working_dir is not None))
+            run_nonema = args.ema_sample_nonema_model or not ema_active
+            run_ema    = args.ema_sample_ema_model and ema_active
+
             unet_was_training = model.unet.training
             text_encoder_was_training = model.text_encoder.training
             try:
@@ -1272,16 +1341,34 @@ def main(args):
                 model.text_encoder.eval()
                 if model.text_encoder_2:
                     model.text_encoder_2.eval()
-                inference_pipe = sample_generator.create_inference_pipe(
-                    model_being_trained=model,
-                    diffusers_scheduler_config=model.noise_scheduler.config,
-                    flow_match_shift=args.flow_match_shift,
-                    flow_match_shift_dynamic=args.flow_match_shift_dynamic
-                ).to(device)
-                sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
-                # Cleanup
-                del inference_pipe
+                # ── Non-EMA (raw model) samples → "samples/" ──────────────────
+                if run_nonema:
+                    inference_pipe = sample_generator.create_inference_pipe(
+                        model_being_trained=model,
+                        diffusers_scheduler_config=model.noise_scheduler.config,
+                        flow_match_shift=args.flow_match_shift,
+                        flow_match_shift_dynamic=args.flow_match_shift_dynamic
+                    ).to(device)
+                    sample_generator.generate_samples(inference_pipe, global_step,
+                                                      extra_info=extra_info,
+                                                      samples_subdir="samples")
+                    del inference_pipe
+
+                # ── EMA samples → "samples-ema/" ──────────────────────────────
+                if run_ema:
+                    with _with_ema_weights(model):
+                        inference_pipe = sample_generator.create_inference_pipe(
+                            model_being_trained=model,
+                            diffusers_scheduler_config=model.noise_scheduler.config,
+                            flow_match_shift=args.flow_match_shift,
+                            flow_match_shift_dynamic=args.flow_match_shift_dynamic
+                        ).to(device)
+                        sample_generator.generate_samples(inference_pipe, global_step,
+                                                          extra_info=extra_info,
+                                                          samples_subdir="samples-ema")
+                        del inference_pipe
+
             finally:
                 if unet_was_training:
                     model.unet.train()
@@ -1561,6 +1648,7 @@ def main(args):
                         if get_use_ema_decay_training(args):
                             if ((tv.global_step + 1) % args.ema_update_interval) == 0:
                                 if _is_main:  # EMA is rank-0 only
+                                    effective_ema_decay_rate = args.ema_decay_rate ** args.ema_update_interval
                                     def _unwrap(m):
                                         """Strip DDP wrapper if present."""
                                         return m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
@@ -1569,26 +1657,26 @@ def main(args):
                                         # ── Disk-offload EMA update ──────────────
                                         if not args.disable_unet_training:
                                             _f = os.path.join(model.ema_working_dir, "unet_ema.safetensors")
-                                            update_ema_disk(_unwrap(model.unet), _f, args.ema_decay_rate)
+                                            update_ema_disk(_unwrap(model.unet), _f, effective_ema_decay_rate)
                                         if not args.disable_textenc_training:
                                             _f = os.path.join(model.ema_working_dir, "text_encoder_ema.safetensors")
-                                            update_ema_disk(_unwrap(model.text_encoder), _f, args.ema_decay_rate)
+                                            update_ema_disk(_unwrap(model.text_encoder), _f, effective_ema_decay_rate)
                                             if model.is_sdxl and model.text_encoder_2 is not None:
                                                 _f = os.path.join(model.ema_working_dir, "text_encoder_2_ema.safetensors")
-                                                update_ema_disk(_unwrap(model.text_encoder_2), _f, args.ema_decay_rate)
+                                                update_ema_disk(_unwrap(model.text_encoder_2), _f, effective_ema_decay_rate)
                                     else:
                                         # ── In-memory EMA update (cpu / cuda) ────
                                         if model.unet_ema is not None:
                                             update_ema(_unwrap(model.unet), model.unet_ema,
-                                                       args.ema_decay_rate, default_device=device,
+                                                       effective_ema_decay_rate, default_device=device,
                                                        ema_device=args.ema_device)
                                         if model.text_encoder_ema is not None:
                                             update_ema(_unwrap(model.text_encoder), model.text_encoder_ema,
-                                                       args.ema_decay_rate, default_device=device,
+                                                       effective_ema_decay_rate, default_device=device,
                                                        ema_device=args.ema_device)
                                         if model.is_sdxl and model.text_encoder_2_ema is not None:
                                             update_ema(_unwrap(model.text_encoder_2), model.text_encoder_2_ema,
-                                                       args.ema_decay_rate, default_device=device,
+                                                       effective_ema_decay_rate, default_device=device,
                                                        ema_device=args.ema_device)
 
                         # Self-Flow EMA teacher update (independent interval from main EMA)
@@ -2047,7 +2135,7 @@ if __name__ == "__main__":
     argparser.add_argument("--debug_invert_min_snr_gamma", action='store_true', help="invert the timestep/scale equation for min snr gamma")
     argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
     argparser.add_argument("--ema_strength_target", type=float, default=None, help="EMA decay target value in range (0,1). emarate will be calculated from equation: 'ema_decay_rate=ema_strength_target^(total_steps/ema_update_interval)'. Using this parameter will enable the ema feature and overide ema_decay_rate.")
-    argparser.add_argument("--ema_update_interval", type=int, default=500, help="How many steps between optimizer steps that EMA decay updates. EMA model will be update on every step modulo grad_accum times ema_update_interval.")
+    argparser.add_argument("--ema_update_interval", type=int, default=500, help="How many steps between optimizer steps that EMA decay updates. EMA model will be update on every step modulo ema_update_interval.")
     argparser.add_argument("--ema_device", type=str, default='cpu',
                            help="EMA storage location. 'cpu': keep EMA in system RAM (~4 s/update, saves VRAM). "
                                 "'cuda': keep EMA on GPU (fast, ~3.2 GB VRAM). "

@@ -231,17 +231,24 @@ class SampleGenerator:
 
 
     @torch.no_grad()
-    def generate_samples(self, pipe: StableDiffusionPipeline, global_step: int, extra_info: str = ""):
+    def generate_samples(self, pipe: StableDiffusionPipeline, global_step: int, extra_info: str = "",
+                         samples_subdir: str = "samples"):
         """
-        generates samples at different cfg scales and saves them to disk
+        generates samples at different cfg scales and saves them to disk.
+        samples_subdir: subfolder under log_folder to save to, also used as the tensorboard tag prefix.
+                        Use "samples" for normal model output and "samples-ema" for EMA model output.
         """
+        # Ensure the target subdirectory exists
+        subdir_path = os.path.join(self.log_folder, samples_subdir)
+        os.makedirs(subdir_path, exist_ok=True)
+
         try:
             font = ImageFont.truetype(font="arial.ttf", size=20)
         except:
             font = ImageFont.load_default()
 
         if not self.show_progress_bars:
-            print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts")
+            print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts (subdir: {samples_subdir})")
 
         sample_index = 0
         with autocast('cuda'):
@@ -353,7 +360,8 @@ class SampleGenerator:
                                                    global_step=global_step,
                                                    prompt=prompt,
                                                    is_random_caption=batch[prompt_idx].wants_random_caption,
-                                                   extra_info=extra_info)
+                                                   extra_info=extra_info,
+                                                   samples_subdir=samples_subdir)
                             sample_index += 1
 
                             del result
@@ -368,7 +376,8 @@ class SampleGenerator:
                                                    global_step=global_step, extra_info=extra_info,
                                                    index_offset=len(self.sample_requests),
                                                    flow_match_shift=pipe.scheduler.config.get('shift', 1),
-                                                   flow_match_shift_dynamic=pipe.scheduler.config.get('use_dynamic_shifting', False))
+                                                   flow_match_shift_dynamic=pipe.scheduler.config.get('use_dynamic_shifting', False),
+                                                   samples_subdir=samples_subdir)
 
             except Exception as e:
                     print(traceback.format_exc())
@@ -381,20 +390,26 @@ class SampleGenerator:
                           prompt: str,
                           is_random_caption: bool,
                           extra_info: str,
-                          pngmetadata: dict=None):
+                          pngmetadata: dict=None,
+                          samples_subdir: str = "samples"):
         clean_prompt = clean_filename(prompt)
 
-        result.save(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg",
+        subdir_path = os.path.join(self.log_folder, samples_subdir)
+        os.makedirs(subdir_path, exist_ok=True)
+
+        result.save(f"{subdir_path}/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg",
                     format="JPEG", quality=95, optimize=True, progressive=False, pngmetadata=pngmetadata)
-        with open(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt",
+        with open(f"{subdir_path}/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt",
                   "w", encoding='utf-8') as f:
             f.write(prompt)
         tfimage = transforms.ToTensor()(result)
+        # Tensorboard tag uses the samples_subdir as prefix so EMA and non-EMA images appear in separate groups
+        tag_prefix = samples_subdir.replace("/", "_").replace("-", "_")
         if is_random_caption:
-            self.log_writer.add_image(tag=f"sample_{sample_index}{extra_info}", img_tensor=tfimage,
+            self.log_writer.add_image(tag=f"{tag_prefix}_{sample_index}{extra_info}", img_tensor=tfimage,
                                       global_step=global_step)
         else:
-            self.log_writer.add_image(tag=f"sample_{sample_index}_{extra_info}{clean_prompt[:100]}", img_tensor=tfimage,
+            self.log_writer.add_image(tag=f"{tag_prefix}_{sample_index}_{extra_info}{clean_prompt[:100]}", img_tensor=tfimage,
                                       global_step=global_step)
         del tfimage
 
@@ -458,13 +473,14 @@ class SampleGenerator:
         else:
             raise ValueError(f"unknown scheduler '{scheduler}'")
 
-    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0, flow_match_shift=1, flow_match_shift_dynamic=False):
+    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0, flow_match_shift=1, flow_match_shift_dynamic=False, samples_subdir: str = "samples"):
 
         params = [ImageGenerationParams.from_invokeai_metadata(d)
                   for d in sample_invokeai_info_dicts]
         def save_image(image, sample_index, prompt, pngmetadata):
             return self.save_sample_image(image, sample_index, global_step=global_step, prompt=prompt,
-                                          is_random_caption=False, extra_info=extra_info, pngmetadata=pngmetadata)
+                                          is_random_caption=False, extra_info=extra_info, pngmetadata=pngmetadata,
+                                          samples_subdir=samples_subdir)
 
         generate_images_diffusers(pipe=pipe,
                                   model_name=f'training-global_step{global_step}-{extra_info}',
