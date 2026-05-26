@@ -902,5 +902,5 @@ def load_clip_model(model_id: str, processor_model_id: str=None) -> tuple[CLIPMo
 
 
 def get_use_ema_decay_training(args):
-    use_ema_dacay_training = (args.ema_decay_rate != None) or (args.ema_strength_target != None)
+    use_ema_dacay_training = (args.ema_decay_rate is not None) or (args.ema_strength_target != None)
     return use_ema_dacay_training

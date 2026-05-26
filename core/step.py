@@ -187,7 +187,7 @@ def train_step(
             record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images/len(caption_variants))
 
             # Text conditioning generation
-            teacher_mask = _generate_teacher_mask_or_none(teacher_model=teacher_model, timesteps=timesteps, teacher_p=args.teacher_p, teacher_timestep_max=args.teacher_timestep_max)
+            teacher_mask = _generate_teacher_mask_or_none(training_model=model, args=args, teacher_model=teacher_model, timesteps=timesteps)
             t_conditioning_start = time.perf_counter()
             conditioning, teacher_conditioning, caption_str = _generate_conditioning(
                 batch,
@@ -839,11 +839,11 @@ def _encode_latents(
         del latents_slices
         return latents
 
-def _generate_teacher_mask_or_none(teacher_model: TrainingModel|None, timesteps: torch.Tensor, teacher_p, teacher_timestep_max) -> torch.Tensor|None:
+def _generate_teacher_mask_or_none(training_model: TrainingModel, args: argparse.Namespace, teacher_model: TrainingModel|None, timesteps: torch.Tensor) -> torch.Tensor|None:
     if teacher_model is None:
         return None
 
-    if teacher_timestep_max is not None:
+    if args.teacher_timestep_max is not None:
         # scale teacher_p based on timesteps
         # 1000...args.teacher_timestep_max: p = 0
         # args.teacher_timestep_max...0: ramp from 0 to args.teacher_p
@@ -851,10 +851,11 @@ def _generate_teacher_mask_or_none(teacher_model: TrainingModel|None, timesteps:
             teacher_timestep_max - timesteps.float(),
             torch.zeros([1])
         ) / teacher_timestep_max
-        teacher_p = teacher_p * scale
+        teacher_p = args.teacher_p * scale
 
+    teacher_lambda = get_teacher_lambda(timesteps, args, training_model.noise_scheduler)
     batch_size = timesteps.shape[0]
-    return (torch.rand(batch_size) < teacher_p).to(teacher_model.unet.device)
+    return ((torch.rand(batch_size) < args.teacher_p) & (teacher_lambda > 0)).to(teacher_model.unet.device)
 
 def _generate_conditioning(
     batch: dict,

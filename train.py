@@ -1101,12 +1101,7 @@ def main(args):
     # --------------------------------------------------------------------------
 
     # ── EMA update-interval accounting ────────────────────────────────────────
-    # Scale the user-facing interval (in optimizer-step units) to raw data-step
-    # units so the modulo check in the training loop works correctly when
-    # grad_accum > 1.  Also compute ema_decay_rate from ema_strength_target now
-    # that epoch_len is known.
     if get_use_ema_decay_training(args):
-        args.ema_update_interval = args.ema_update_interval * args.grad_accum
         if args.ema_strength_target is not None:
             total_number_of_steps: float = epoch_len * args.max_epochs
             total_number_of_ema_updates: float = total_number_of_steps / args.ema_update_interval
@@ -1563,7 +1558,7 @@ def main(args):
                             if user_wants_samples or sample_generator.should_generate_samples(tv.global_step, local_step=step):
                                 generate_samples(global_step=tv.global_step, batch=full_batch)
 
-                        if args.ema_decay_rate != None:
+                        if get_use_ema_decay_training(args):
                             if ((tv.global_step + 1) % args.ema_update_interval) == 0:
                                 if _is_main:  # EMA is rank-0 only
                                     def _unwrap(m):
@@ -2059,8 +2054,8 @@ if __name__ == "__main__":
                                 "'disk': keep EMA as safetensors files on disk; loaded only during update steps, "
                                 "then freed — minimal VRAM and RAM at the cost of disk I/O per update. "
                                 "(default: 'cpu')")
-    argparser.add_argument("--ema_sample_nonema_model", action="store_true", default=False, help="Will show samples from non-EMA trained model, just like regular training. Can be used with: --ema_sample_ema_model")
-    argparser.add_argument("--ema_sample_ema_model", action="store_true", default=False, help="Will show samples from EMA model. May be slower when using ema cpu offloading. Can be used with: --ema_sample_nonema_model")
+    argparser.add_argument("--ema_sample_nonema_model", action=argparse.BooleanOptionalAction, default=False, help="Generate samples from non-EMA trained model, just like regular training. Disabled by default. Can be combined with --ema_sample_ema_model")
+    argparser.add_argument("--ema_sample_ema_model", action=argparse.BooleanOptionalAction, default=True, help="Generate samples from EMA model. Enabled by default. Cn be combined with --ema_sample_nonema_model")
     argparser.add_argument("--ema_resume_model", type=str, default=None, help="The EMA decay checkpoint to resume from for EMA decay, either a local .ckpt file, a converted Diffusers format folder, or a Huggingface.co repo id such as stabilityai/stable-diffusion-2-1-ema-decay")
     argparser.add_argument("--pyramid_noise_discount", type=float, default=None, help="Enables pyramid noise and use specified discount factor for it")
     argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
