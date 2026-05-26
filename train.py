@@ -28,7 +28,6 @@ import gc
 import random
 import traceback
 
-from contextlib import contextmanager
 from typing import Optional
 
 import torch.distributed as dist
@@ -654,70 +653,6 @@ def _init_ema(model: "TrainingModel", args, device, log_folder: str) -> bool:
     )
     return True
 
-
-@contextmanager
-def _with_ema_weights(model: "TrainingModel"):
-    """
-    Context manager that temporarily loads EMA weights into model components for inference,
-    then restores the original training weights on exit.
-
-    Handles both in-memory EMA (model.unet_ema etc.) and disk-offload EMA (model.ema_working_dir).
-    For DDP-wrapped modules, operates on the underlying .module.
-    Does nothing (yields immediately) if no EMA state is available.
-    """
-    def _unwrap(m):
-        return m.module if hasattr(m, 'module') else m
-
-    components = [
-        ("unet",           getattr(model, "unet", None)),
-        ("text_encoder",   getattr(model, "text_encoder", None)),
-        ("text_encoder_2", getattr(model, "text_encoder_2", None)),
-    ]
-
-    saved_states: dict[str, dict] = {}
-
-    for name, module in components:
-        if module is None:
-            continue
-        target = _unwrap(module)
-
-        if model.ema_working_dir is not None:
-            # Disk-offload mode: load EMA state from working file
-            disk_path = os.path.join(model.ema_working_dir, f"{name}_ema.safetensors")
-            if not os.path.isfile(disk_path):
-                continue
-            try:
-                ema_sd_raw = safetensors.torch.load_file(disk_path, device="cpu")
-            except Exception as e:
-                logging.warning(f"_with_ema_weights: could not load {disk_path}: {e}")
-                continue
-        else:
-            # In-memory mode
-            ema_module = getattr(model, f"{name}_ema", None)
-            if ema_module is None:
-                continue
-            ema_sd_raw = ema_module.state_dict()
-
-        # Save original weights (on the target's own device/dtype)
-        saved_states[name] = {k: v.clone() for k, v in target.state_dict().items()}
-
-        # Cast EMA state to match existing tensor dtype/device before loading
-        current_sd = target.state_dict()
-        ema_sd_typed = {k: v.to(dtype=current_sd[k].dtype, device=current_sd[k].device)
-                        for k, v in ema_sd_raw.items()
-                        if k in current_sd}
-        target.load_state_dict(ema_sd_typed, strict=False)
-
-    try:
-        yield
-    finally:
-        # Restore original training weights
-        for name, state in saved_states.items():
-            module = getattr(model, name, None)
-            if module is not None:
-                _unwrap(module).load_state_dict(state, strict=False)
-
-
 def _get_default_forward_slice_size(tv: TrainingVariables):
     return tv.default_forward_slice_size[tv.batch_resolution]
 
@@ -1328,12 +1263,6 @@ def main(args):
             extra_info: str = ""
             torch.cuda.empty_cache()
 
-            # Determine which sampling passes to run
-            ema_active = (get_use_ema_decay_training(args) and
-                          (model.unet_ema is not None or model.ema_working_dir is not None))
-            run_nonema = args.ema_sample_nonema_model or not ema_active
-            run_ema    = args.ema_sample_ema_model and ema_active
-
             unet_was_training = model.unet.training
             text_encoder_was_training = model.text_encoder.training
             try:
@@ -1341,34 +1270,16 @@ def main(args):
                 model.text_encoder.eval()
                 if model.text_encoder_2:
                     model.text_encoder_2.eval()
+                inference_pipe = sample_generator.create_inference_pipe(
+                    model_being_trained=model,
+                    diffusers_scheduler_config=model.noise_scheduler.config,
+                    flow_match_shift=args.flow_match_shift,
+                    flow_match_shift_dynamic=args.flow_match_shift_dynamic
+                ).to(device)
+                sample_generator.generate_samples(inference_pipe, global_step, extra_info=extra_info)
 
-                # ── Non-EMA (raw model) samples → "samples/" ──────────────────
-                if run_nonema:
-                    inference_pipe = sample_generator.create_inference_pipe(
-                        model_being_trained=model,
-                        diffusers_scheduler_config=model.noise_scheduler.config,
-                        flow_match_shift=args.flow_match_shift,
-                        flow_match_shift_dynamic=args.flow_match_shift_dynamic
-                    ).to(device)
-                    sample_generator.generate_samples(inference_pipe, global_step,
-                                                      extra_info=extra_info,
-                                                      samples_subdir="samples")
-                    del inference_pipe
-
-                # ── EMA samples → "samples-ema/" ──────────────────────────────
-                if run_ema:
-                    with _with_ema_weights(model):
-                        inference_pipe = sample_generator.create_inference_pipe(
-                            model_being_trained=model,
-                            diffusers_scheduler_config=model.noise_scheduler.config,
-                            flow_match_shift=args.flow_match_shift,
-                            flow_match_shift_dynamic=args.flow_match_shift_dynamic
-                        ).to(device)
-                        sample_generator.generate_samples(inference_pipe, global_step,
-                                                          extra_info=extra_info,
-                                                          samples_subdir="samples-ema")
-                        del inference_pipe
-
+                # Cleanup
+                del inference_pipe
             finally:
                 if unet_was_training:
                     model.unet.train()
@@ -1648,7 +1559,15 @@ def main(args):
                         if get_use_ema_decay_training(args):
                             if ((tv.global_step + 1) % args.ema_update_interval) == 0:
                                 if _is_main:  # EMA is rank-0 only
-                                    effective_ema_decay_rate = args.ema_decay_rate ** args.ema_update_interval
+                                    # Couple EMA decay to LR warmup: linearly ramp per-step decay
+                                    # 0 → ema_decay_rate over lr_warmup_steps so early unstable
+                                    # weights don't pollute the EMA.
+                                    _ema_warmup_steps = getattr(args, 'lr_warmup_steps', 0) or 0
+                                    if _ema_warmup_steps > 0 and tv.global_step < _ema_warmup_steps:
+                                        _ema_warmup_factor = tv.global_step / _ema_warmup_steps
+                                    else:
+                                        _ema_warmup_factor = 1.0
+                                    effective_ema_decay_rate = (args.ema_decay_rate * _ema_warmup_factor) ** args.ema_update_interval
                                     def _unwrap(m):
                                         """Strip DDP wrapper if present."""
                                         return m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
