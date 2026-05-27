@@ -4,8 +4,6 @@ Teacher model loading for EveryDream2trainer cross-space FM distillation.
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
 import torch
 from diffusers import AutoPipelineForText2Image, FlowMatchEulerDiscreteScheduler, StableDiffusionXLPipeline
 
@@ -17,23 +15,23 @@ def load_teacher_model(
     args,
     device,
     student_model: TrainingModel,
+    teacher_path: str,
     flow_match_shift_dynamic: bool = False,
     flow_match_shift: int = 1,
-) -> Optional[TrainingModel]:
+) -> TrainingModel:
     """
     Load a teacher pipeline and wrap it as a :class:`TrainingModel`.
+    ``teacher_path`` is the model path to load; the caller is responsible for
+    skipping this function when no teachers are requested.
     """
-    if getattr(args, 'teacher', None) is None or getattr(args, 'teacher_p', 0) <= 0:
-        return None
-
     logging.info(
-        f"* Loading teacher model @ p={args.teacher_p} from {args.teacher}"
+        f"* Loading teacher model @ p={args.teacher_p} from {teacher_path}"
     )
 
     # ── Load pipeline (auto-detects SD1/SD2/SDXL) ───────────────────────────
     try:
         teacher_pipeline = AutoPipelineForText2Image.from_pretrained(
-            args.teacher, torch_dtype=torch.float16
+            teacher_path, torch_dtype=torch.float16
         ).to(device)
     except Exception as e:
         logging.warning(
@@ -126,6 +124,7 @@ def load_teacher_model(
         compel=None,
         yaml=None,
     )
+    teacher_model.set_is_sdxl_override(teacher_is_sdxl)
     del teacher_pipeline
     if isinstance(teacher_scheduler, TrainFlowMatchEulerDiscreteScheduler):
         teacher_model.set_noise_scheduler_shift(flow_match_shift)

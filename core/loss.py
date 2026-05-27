@@ -522,10 +522,10 @@ def get_model_prediction_and_target(
     args=None,
     is_cond_dropout_noise: torch.Tensor = None,
     skip_contrastive: bool = False,
-    teacher_model: TrainingModel | None = None,
-    teacher_latents: torch.Tensor | None = None,
+    teacher_models: list = None,
+    teacher_latents_list: list = None,
     teacher_mask: torch.Tensor | None = None,
-    teacher_conditioning: Conditioning | None = None,
+    teacher_conditionings: list = None,
     debug_fake: bool = False,
     log_writer=None,
     global_step: int = 0,
@@ -538,6 +538,14 @@ def get_model_prediction_and_target(
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
     Returns model_pred, target, teacher_target (None if teacher_mask is None), noisy_latents
     """
+    # Normalise list-typed teacher arguments (callers may pass None for backward compat)
+    if teacher_models is None:
+        teacher_models = []
+    if teacher_latents_list is None:
+        teacher_latents_list = []
+    if teacher_conditionings is None:
+        teacher_conditionings = []
+
     midblock_out_shape = get_midblock_out_shape(latents.shape, model)
 
     if mask is not None:
@@ -548,8 +556,8 @@ def get_model_prediction_and_target(
         target = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
-        # When teacher_mask is None no separate teacher_target tensor is needed.
-        teacher_target = None if teacher_mask is None else torch.zeros_like(
+        # When teacher_models is empty or teacher_mask is None, no teacher_target needed.
+        teacher_target = None if (not teacher_models or teacher_mask is None) else torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         noisy_latents = torch.zeros_like(
@@ -585,12 +593,11 @@ def get_model_prediction_and_target(
         conditioning_masked = conditioning.get_masked(mask)
         noise_masked = noise[mask]
         teacher_mask_masked = teacher_mask[mask] if teacher_mask is not None else None
-        teacher_latents_masked = teacher_latents[mask] if teacher_mask is not None else None
-        teacher_conditioning_masked = (
-            teacher_conditioning.get_masked(mask)
-            if teacher_conditioning is not None
-            else None
-        )
+        teacher_latents_list_masked = [tl[mask] if tl is not None else None for tl in teacher_latents_list]
+        teacher_conditionings_masked = [
+            tc.get_masked(mask) if tc is not None else None
+            for tc in teacher_conditionings
+        ]
         lcf_mask_masked = lcf_mask[mask] if lcf_mask is not None else None
         timesteps_masked = timesteps[mask]
         self_flow_s_timesteps_masked = self_flow_s_timesteps[mask] if self_flow_s_timesteps is not None else None
@@ -602,10 +609,10 @@ def get_model_prediction_and_target(
             model=model,
             args=args,
             skip_contrastive=skip_contrastive,
-            teacher_model=teacher_model,
-            teacher_latents=teacher_latents_masked,
+            teacher_models=teacher_models,
+            teacher_latents_list=teacher_latents_list_masked,
             teacher_mask=teacher_mask_masked,
-            teacher_conditioning=teacher_conditioning_masked,
+            teacher_conditionings=teacher_conditionings_masked,
             debug_fake=debug_fake,
             log_writer=log_writer,
             global_step=global_step,
@@ -681,8 +688,8 @@ def get_model_prediction_and_target(
 
     teacher_target = None
     _teacher_debug_capture: Dict[str, Any] = {}
-    if teacher_mask is None:
-        # No supplementary teacher_target needed: no teacher guidance this step.
+    if not teacher_models or teacher_mask is None:
+        # No teacher guidance this step.
         pass
     elif teacher_mask.sum() == 0:
         teacher_target = torch.zeros_like(
@@ -690,19 +697,24 @@ def get_model_prediction_and_target(
         )
     else:
         with torch.no_grad():
-            if teacher_conditioning is None:
-                teacher_conditioning = conditioning
-
-            teacher_target = get_teacher_target(
-                teacher_model=teacher_model,
-                teacher_conditioning=teacher_conditioning,
-                student_model=model,
-                student_timesteps=timesteps,
-                clean_image_latents=latents,
-                teacher_clean_image_latents=teacher_latents,
-                noise=noise,
-                _debug_capture=_teacher_debug_capture if debug_teacher else None,
-            )
+            # Pad lists to teacher_models length with None so zip always works.
+            _conditionings = list(teacher_conditionings) + [None] * max(0, len(teacher_models) - len(teacher_conditionings))
+            _latents_list = list(teacher_latents_list) + [None] * max(0, len(teacher_models) - len(teacher_latents_list))
+            teacher_target = None
+            for teacher_model_i, teacher_conditioning_i, teacher_latents_i in zip(
+                    teacher_models, _conditionings, _latents_list):
+                effective_conditioning = teacher_conditioning_i if teacher_conditioning_i is not None else conditioning
+                t = get_teacher_target(
+                    teacher_model=teacher_model_i,
+                    teacher_conditioning=effective_conditioning,
+                    student_model=model,
+                    student_timesteps=timesteps,
+                    clean_image_latents=latents,
+                    teacher_clean_image_latents=teacher_latents_i,
+                    noise=noise,
+                    _debug_capture=_teacher_debug_capture if debug_teacher else None,
+                )
+                teacher_target = t if teacher_target is None else teacher_target + t
 
     # ── Teacher debug logging (first 20 steps) ────────────────────────────
     if debug_teacher and global_step < 20:
@@ -710,15 +722,17 @@ def get_model_prediction_and_target(
         _teacher_pred_type: Optional[str] = None
         _teacher_sched = None
         _teacher_latent_type: Optional[str] = None
-        if teacher_model is not None:
-            _teacher_pred_type = _get_prediction_type(teacher_model)
-            _teacher_sched = teacher_model.noise_scheduler
+        # Use the first teacher for backward-compatible single-teacher debug output.
+        _debug_teacher_model = teacher_models[0] if teacher_models else None
+        if _debug_teacher_model is not None:
+            _teacher_pred_type = _get_prediction_type(_debug_teacher_model)
+            _teacher_sched = _debug_teacher_model.noise_scheduler
         # Infer latent space types for correct per-column rendering in the debug grid.
         try:
             from core.latent_interposer import infer_latent_space_type
             _student_latent_type = infer_latent_space_type(model)
-            if teacher_model is not None:
-                _teacher_latent_type = infer_latent_space_type(teacher_model)
+            if _debug_teacher_model is not None:
+                _teacher_latent_type = infer_latent_space_type(_debug_teacher_model)
         except Exception:
             _student_latent_type = "xl" if model.is_sdxl else "v1"
         log_teacher_debug(
@@ -1386,25 +1400,29 @@ def _teacher_fm_target_via_interposer(
         teacher_timesteps = student_timesteps
 
     # ---- 2. Convert student noisy latent -> teacher VAE space
-    student_to_teacher_method = 'fresh_eps' # empirically evaluated, fresh_eps and same_raw_eps both are best
-    if student_to_teacher_method == 'convert_xt':
+    if student_vae_space == teacher_vae_space:
         teacher_noise = student_noise
-        x_t_vS = _get_noisy_latents(clean_image_latents, student_noise, student_model.noise_scheduler, student_timesteps, 0)
-        x_t_vT = latent_interposer.convert(x_t_vS, student_vae_space, teacher_vae_space)
-    elif student_to_teacher_method == 'convert_eps':
-        teacher_noise = latent_interposer.convert(student_noise, student_vae_space, teacher_vae_space)
-        #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
-        x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
-    elif student_to_teacher_method == 'fresh_eps':
-        teacher_noise = torch.randn_like(student_noise)
-        #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
-        x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
-    elif student_to_teacher_method == 'same_raw_eps':
-        teacher_noise = student_noise
-        #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
-        x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        x_t_vT = _get_noisy_latents(clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
     else:
-        raise ValueError(f"Unknown method {student_to_teacher_method}")
+        student_to_teacher_method = 'fresh_eps' # empirically evaluated, fresh_eps and same_raw_eps both are best
+        if student_to_teacher_method == 'convert_xt':
+            teacher_noise = student_noise
+            x_t_vS = _get_noisy_latents(clean_image_latents, student_noise, student_model.noise_scheduler, student_timesteps, 0)
+            x_t_vT = latent_interposer.convert(x_t_vS, student_vae_space, teacher_vae_space)
+        elif student_to_teacher_method == 'convert_eps':
+            teacher_noise = latent_interposer.convert(student_noise, student_vae_space, teacher_vae_space)
+            #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+            x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        elif student_to_teacher_method == 'fresh_eps':
+            teacher_noise = torch.randn_like(student_noise)
+            #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+            x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        elif student_to_teacher_method == 'same_raw_eps':
+            teacher_noise = student_noise
+            #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+            x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        else:
+            raise ValueError(f"Unknown method {student_to_teacher_method}")
 
 
     # ---- 3. Run teacher UNet ----
@@ -1437,26 +1455,22 @@ def _teacher_fm_target_via_interposer(
         x_1_hat_vT = _recover_x0_from_fm_velocity(x_t_vT, v_hat_vT, sigmas)
 
     # ---- 5. Map predicted clean endpoint back to student VAE space
-    teacher_to_student_method = 'convert_slow'
-    if teacher_to_student_method == 'convert_fast':
-        x_1_hat_vS = latent_interposer.convert(x_1_hat_vT, teacher_vae_space,
-        student_vae_space)
-        x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
-    elif teacher_to_student_method == 'convert_slow':
-        normalization = 'none'# 'imagenet' if student_model.is_sdxl else 'none'
-        x_1_hat_vS = convert_latents_slow_vae_roundtrip(x_1_hat_vT, teacher_model.vae, student_model.vae, normalization=normalization)
+    if student_vae_space == teacher_vae_space:
+        x_1_hat_vS = x_1_hat_vT
     else:
-        raise ValueError(f"Unrecognized teacher_to_student_method '{teacher_to_student_method}'")
+        teacher_to_student_method = 'convert_slow'
+        if teacher_to_student_method == 'convert_fast':
+            x_1_hat_vS = latent_interposer.convert(x_1_hat_vT, teacher_vae_space,
+            student_vae_space)
+            x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
+        elif teacher_to_student_method == 'convert_slow':
+            normalization = 'none'# 'imagenet' if student_model.is_sdxl else 'none'
+            x_1_hat_vS = convert_latents_slow_vae_roundtrip(x_1_hat_vT, teacher_model.vae, student_model.vae, normalization=normalization)
+        else:
+            raise ValueError(f"Unrecognized teacher_to_student_method '{teacher_to_student_method}'")
 
     # ---- 7. Build student-space distillation velocity target ----
-    # Code convention: target = x_0_vS − x_1_hat_vS  (noise − clean)
-    #extra_perturbation_alpha = 0.1
-    extra_perturbation_alpha = 0
-    extra_perturbation_noise = torch.randn_like(student_noise)
-    v_target_vS = student_noise.float() - (
-        x_1_hat_vS * (1 - extra_perturbation_alpha)
-        + extra_perturbation_noise * extra_perturbation_alpha
-    )
+    v_target_vS = student_noise.float() - x_1_hat_vS
 
     if _debug_capture is not None:
         v_target_vT = teacher_noise.float() - x_1_hat_vT

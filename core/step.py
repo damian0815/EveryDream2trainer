@@ -55,7 +55,7 @@ def record_performance_timing(label: str, duration_seconds: float, num_images: i
 def train_step(
     full_batch: dict,
     model: TrainingModel,
-    teacher_model: TrainingModel|None,
+    teacher_models: list,
     tv: TrainingVariables,
     train_progress_01: float,
     ed_optimizer: EveryDreamOptimizer,
@@ -135,10 +135,10 @@ def train_step(
                 model_for_vae.load_vae_to_device('cpu')
             return these_latents
         latents = _do_encode_latents(model)
-        if teacher_model is not None and teacher_model.is_sdxl != model.is_sdxl:
-            teacher_latents = _do_encode_latents(teacher_model)
-        else:
-            teacher_latents = None
+        teacher_latents_list = [
+            _do_encode_latents(tm) if tm.is_sdxl != model.is_sdxl else None
+            for tm in teacher_models
+        ]
         record_performance_timing("4_vae_encoding", time.perf_counter() - t_vae_start, batch_size)
 
         for caption_variant in caption_variants:
@@ -187,14 +187,14 @@ def train_step(
             record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images/len(caption_variants))
 
             # Text conditioning generation
-            teacher_mask = _generate_teacher_mask_or_none(training_model=model, args=args, teacher_model=teacher_model, timesteps=timesteps)
+            teacher_mask = _generate_teacher_mask_or_none(training_model=model, args=args, teacher_models=teacher_models, timesteps=timesteps)
             t_conditioning_start = time.perf_counter()
-            conditioning, teacher_conditioning, caption_str = _generate_conditioning(
+            conditioning, teacher_conditionings, caption_str = _generate_conditioning(
                 batch,
                 caption_variant=caption_variant,
                 cond_dropout_mask=cond_dropout_mask,
                 model=model,
-                teacher_model=teacher_model,
+                teacher_models=teacher_models,
                 teacher_mask=teacher_mask,
                 args=args
             )
@@ -219,10 +219,10 @@ def train_step(
                         timesteps=timesteps,
                         caption_variant=caption_variant,
 
-                        teacher_model=teacher_model,
-                        teacher_latents=teacher_latents,
+                        teacher_models=teacher_models,
+                        teacher_latents_list=teacher_latents_list,
                         teacher_mask=teacher_mask,
-                        teacher_conditioning=teacher_conditioning,
+                        teacher_conditionings=teacher_conditionings,
 
                         forward_slice_size=slice_size,
                         tv=tv,
@@ -839,9 +839,10 @@ def _encode_latents(
         del latents_slices
         return latents
 
-def _generate_teacher_mask_or_none(training_model: TrainingModel, args: argparse.Namespace, teacher_model: TrainingModel|None, timesteps: torch.Tensor) -> torch.Tensor|None:
-    if teacher_model is None:
+def _generate_teacher_mask_or_none(training_model: TrainingModel, args: argparse.Namespace, teacher_models: list, timesteps: torch.Tensor) -> torch.Tensor|None:
+    if not teacher_models:
         return None
+    teacher_model = teacher_models[0]
 
     if args.teacher_timestep_max is not None:
         # scale teacher_p based on timesteps
@@ -862,9 +863,9 @@ def _generate_conditioning(
     caption_variant: str|tuple[str, str],
     cond_dropout_mask: torch.Tensor,
     model: TrainingModel,
-    teacher_model: TrainingModel,
+    teacher_models: list,
     teacher_mask,
-args) -> tuple[Conditioning, Conditioning|None, list[str]]:
+args) -> tuple[Conditioning, list, list[str]]:
 
     if type(caption_variant) is str:
         caption_variant = (caption_variant, )
@@ -891,16 +892,19 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
             this_add_time_ids = None
             this_teacher_tokens = None
             this_teacher_tokens_2 = None
+            # Use the first teacher's cond-dropout tokens for teacher-specific tokenisation
+            # (v1 limitation: only the first teacher may have a heterogeneous tokenizer).
+            first_teacher = teacher_models[0] if teacher_models else None
             if key is None:
                 # empty variant half
                 this_caption_str = [model.cond_dropout_caption] * batch_size
                 this_tokens = model.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
                 if model.is_sdxl:
                     this_tokens_2 = model.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
-                if teacher_model is not None:
-                    this_teacher_tokens = teacher_model.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
-                    if teacher_model.is_sdxl:
-                        this_teacher_tokens_2 = teacher_model.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
+                if first_teacher is not None:
+                    this_teacher_tokens = first_teacher.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
+                    if first_teacher.is_sdxl:
+                        this_teacher_tokens_2 = first_teacher.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
             else:
                 this_caption_str = [batch["captions"][key][i] for i in range(batch_size)]
                 assert all(c is not None for c in caption_str)
@@ -929,10 +933,10 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                     this_tokens[i] = model.cond_dropout_tokens
                     if model.is_sdxl:
                         this_tokens_2[i] = model.cond_dropout_tokens_2
-                    if teacher_model is not None:
-                        this_teacher_tokens[i] = teacher_model.cond_dropout_tokens
-                        if teacher_model.is_sdxl:
-                            this_teacher_tokens_2[i] = teacher_model.cond_dropout_tokens_2
+                    if first_teacher is not None:
+                        this_teacher_tokens[i] = first_teacher.cond_dropout_tokens
+                        if first_teacher.is_sdxl:
+                            this_teacher_tokens_2[i] = first_teacher.cond_dropout_tokens_2
 
             caption_str.append(this_caption_str)
             tokens.append(this_tokens)
@@ -942,7 +946,10 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
             add_time_ids.append(this_add_time_ids)
 
         conditioning_list = []
-        teacher_conditioning_list = []
+        # per_teacher_conditioning_lists[j] accumulates Conditioning objects across caption variants
+        # for teacher_models[j]. If a teacher has no dedicated text encoder (text_encoder is None),
+        # its list remains empty and we store None in teacher_conditionings.
+        per_teacher_conditioning_lists: list[list] = [[] for _ in teacher_models]
 
         for i, key in enumerate(caption_variant):
             encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
@@ -952,34 +959,38 @@ args) -> tuple[Conditioning, Conditioning|None, list[str]]:
                                         encoder_2_hidden_states, encoder_2_pooled_embeds,
                                         add_time_ids[i]))
 
-            if teacher_mask is None or torch.sum(teacher_mask) == 0 or teacher_model.text_encoder is None:
-                pass
-            else:
-                with torch.no_grad():
-                    # Use teacher-specific tokens when available (separate tokenization for teacher encoder)
-                    t_tokens = teacher_tokens[i] if teacher_tokens[i] is not None else tokens[i]
-                    t_tokens_2 = teacher_tokens_2[i] if teacher_tokens_2[i] is not None else tokens_2[i]
-                    teacher_encoder_hidden_states, teacher_encoder_pooled_embeds, teacher_encoder_2_hidden_states, teacher_encoder_2_pooled_embeds = get_text_conditioning(
-                        t_tokens, t_tokens_2, caption_str[i], teacher_model, args
-                    )
-
-                    teacher_conditioning_list.append(Conditioning(teacher_encoder_hidden_states,
-                                                teacher_encoder_pooled_embeds,
-                                                teacher_encoder_2_hidden_states,
-                                                teacher_encoder_2_pooled_embeds,
-                                                add_time_ids[i] if teacher_model.is_sdxl else None))
+            if teacher_mask is not None and torch.sum(teacher_mask) > 0:
+                for j, tm in enumerate(teacher_models):
+                    if tm.text_encoder is None:
+                        continue  # shares student text encoder; no separate conditioning needed
+                    with torch.no_grad():
+                        # teacher[0] may have pre-tokenised teacher tokens from the dataloader;
+                        # teacher[j>0] falls back to student tokens (v1 limitation).
+                        if j == 0:
+                            t_tokens = teacher_tokens[i] if teacher_tokens[i] is not None else tokens[i]
+                            t_tokens_2 = teacher_tokens_2[i] if teacher_tokens_2[i] is not None else tokens_2[i]
+                        else:
+                            t_tokens = tokens[i]
+                            t_tokens_2 = tokens_2[i]
+                        te_hs, te_pe, te_hs2, te_pe2 = get_text_conditioning(
+                            t_tokens, t_tokens_2, caption_str[i], tm, args
+                        )
+                        per_teacher_conditioning_lists[j].append(Conditioning(
+                            te_hs, te_pe, te_hs2, te_pe2,
+                            add_time_ids[i] if tm.is_sdxl else None
+                        ))
 
         # concatenate
         conditioning = Conditioning.cat(conditioning_list)
-        if teacher_conditioning_list:
-            teacher_conditioning = Conditioning.cat(teacher_conditioning_list)
-        else:
-            teacher_conditioning = None
+        teacher_conditionings: list = [
+            Conditioning.cat(tc_list) if tc_list else None
+            for tc_list in per_teacher_conditioning_lists
+        ]
 
         if args.offload_text_encoder:
             model.load_textenc_to_device('cpu')
 
-    return conditioning, teacher_conditioning, caption_str
+    return conditioning, teacher_conditionings, caption_str
 
 
 @dataclass
@@ -999,7 +1010,7 @@ def _do_model_forward(
     model: TrainingModel,
     batch: dict, latents: torch.Tensor, noise: torch.Tensor, conditioning: Conditioning, is_cond_dropout_noise: torch.Tensor,
     timesteps: torch.Tensor, caption_variant: str|tuple[str, str],
-    teacher_model: TrainingModel|None, teacher_latents: torch.Tensor|None, teacher_mask: torch.Tensor|None, teacher_conditioning: Conditioning|None,
+    teacher_models: list, teacher_latents_list: list, teacher_mask: torch.Tensor|None, teacher_conditionings: list,
     forward_slice_size: int,
     tv: TrainingVariables, args: Namespace,
     debug_teacher: bool = False,
@@ -1029,17 +1040,17 @@ def _do_model_forward(
         def _safe_slice(x):
             return None if x is None else x[slice_start:slice_end]
         latents_slice = latents[slice_start:slice_end]
-        teacher_latents_slice = _safe_slice(teacher_latents)
+        teacher_latents_list_slice = [_safe_slice(tl) for tl in teacher_latents_list]
         noise_slice = noise[slice_start:slice_end]
         timesteps_slice = timesteps[slice_start:slice_end]
         is_cond_dropout_noise_slice = is_cond_dropout_noise[slice_start:slice_end]
         teacher_mask_slice = _safe_slice(teacher_mask)
 
         conditioning_slice = conditioning.slice(slice_start, slice_end)
-        if teacher_conditioning is None:
-            teacher_conditioning_slice = None
-        else:
-            teacher_conditioning_slice = teacher_conditioning.slice(slice_start, slice_end)
+        teacher_conditionings_slice = [
+            c.slice(slice_start, slice_end) if c is not None else None
+            for c in teacher_conditionings
+        ]
 
         try:
             if do_local_contrastive_flow_loss:
@@ -1070,10 +1081,10 @@ def _do_model_forward(
                 is_cond_dropout_noise=is_cond_dropout_noise_slice,
                 model=model,
                 args=args,
-                teacher_model=teacher_model,
-                teacher_latents=teacher_latents_slice,
+                teacher_models=teacher_models,
+                teacher_latents_list=teacher_latents_list_slice,
                 teacher_mask=teacher_mask_slice,
-                teacher_conditioning=teacher_conditioning_slice,
+                teacher_conditionings=teacher_conditionings_slice,
                 lcf_mask=lcf_mask_slice,
                 self_flow_s_timesteps=self_flow_s_timesteps_slice,
                 global_step=tv.global_step,
@@ -1121,9 +1132,10 @@ def _do_model_forward(
                     is_cond_dropout_noise=is_cond_dropout_noise_slice,
                     model=model,
                     args=args,
-                    teacher_model=None,
+                    teacher_models=[],
+                    teacher_latents_list=[],
                     teacher_mask=None,
-                    teacher_conditioning=None,
+                    teacher_conditionings=[],
                     mask=lcf_mask_slice,
                     lcf_mask=lcf_mask_slice,
                 )

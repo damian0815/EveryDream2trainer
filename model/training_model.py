@@ -260,6 +260,8 @@ class TrainingModel:
 
     @property
     def is_sdxl(self) -> bool:
+        if self._is_sdxl_override is not None: # in case we're running without a text encoder
+            return self._is_sdxl_override
         return self.text_encoder_2 is not None
 
     @property
@@ -313,6 +315,11 @@ class TrainingModel:
     # When ema_device='disk': the directory that holds the live *_ema.safetensors working files.
     # None for in-memory EMA modes.
     ema_working_dir: Optional[str] = None
+
+    _is_sdxl_override: Optional[bool] = None
+    def set_is_sdxl_override(self, is_sdxl_override: bool):
+        """ allow overriding the default "do we have a text enc 2" is_sdxl test """
+        self._is_sdxl_override = is_sdxl_override
 
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
@@ -557,7 +564,6 @@ def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, 
     return encoder_hidden_states
 
 
-@dataclass
 @dataclass
 class EveryDreamTrainingState:
     model: 'TrainingModel'

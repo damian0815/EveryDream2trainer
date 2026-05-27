@@ -763,7 +763,7 @@ def main(args):
             compel=None,
             yaml=None,
         )
-        teacher_model = None
+        teacher_models = []
     else:
         try:
             model: TrainingModel = load_model(args)
@@ -784,12 +784,16 @@ def main(args):
                 model.clip_model = clip_model
                 model.clip_processor = clip_processor
 
-        teacher_model = load_teacher_model(args, device, model,
-                                           flow_match_shift_dynamic=args.flow_match_shift_dynamic, flow_match_shift=args.flow_match_shift)
+        teacher_models = [
+            load_teacher_model(args, device, model, teacher_path=p,
+                               flow_match_shift_dynamic=args.flow_match_shift_dynamic,
+                               flow_match_shift=args.flow_match_shift)
+            for p in (args.teacher or [])
+        ]
 
         model.setup_cond_dropout_tokens()
-        if teacher_model is not None:
-            teacher_model.setup_cond_dropout_tokens()
+        for tm in teacher_models:
+            tm.setup_cond_dropout_tokens()
 
         compel = None
         if args.use_compel:
@@ -1014,8 +1018,8 @@ def main(args):
         conditional_dropout=args.cond_dropout,
         tokenizer=model.tokenizer,
         tokenizer_2=model.tokenizer_2,
-        teacher_tokenizer=teacher_model.tokenizer if teacher_model is not None else None,
-        teacher_tokenizer_2=teacher_model.tokenizer_2 if teacher_model is not None else None,
+        teacher_tokenizer=teacher_models[0].tokenizer if teacher_models else None,
+        teacher_tokenizer_2=teacher_models[0].tokenizer_2 if teacher_models else None,
         seed = seed,
         shuffle_tags=args.shuffle_tags,
         keep_tags=args.keep_tags,
@@ -1530,13 +1534,14 @@ def main(args):
                                 shift = 1.0
                             #print(f'at resolution {round(image_pixel_count ** 0.5)}, shift is {shift} ({model.noise_scheduler.config.time_shift_type})')
                             model.set_noise_scheduler_shift(shift)
-                            if teacher_model is not None and isinstance(teacher_model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
-                                teacher_model.set_noise_scheduler_shift(shift)
+                            for tm in teacher_models:
+                                if isinstance(tm.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+                                    tm.set_noise_scheduler_shift(shift)
 
                         train_step(
                             full_batch=full_batch,
                             model=model,
-                            teacher_model=teacher_model,
+                            teacher_models=teacher_models,
                             tv=tv,
                             train_progress_01=train_progress_01,
                             ed_optimizer=ed_optimizer,
@@ -2052,8 +2057,8 @@ if __name__ == "__main__":
     argparser.add_argument("--min_snr_gamma", type=float, default=None, help="min-SNR-gamma parameter is the loss function into individual tasks. Recommended values: 5, 1, 20. Disabled by default and enabled when used. More info: https://arxiv.org/abs/2303.09556")
     argparser.add_argument("--min_snr_alpha", type=float, default=1, help="Blending factor for min-SNR-gamma weighting. 1=use pure min SNR gamma weighting, 0.5=use a 50/50 blend of min SNR gamma and regular loss weighting (default: 1)")
     argparser.add_argument("--debug_invert_min_snr_gamma", action='store_true', help="invert the timestep/scale equation for min snr gamma")
-    argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
-    argparser.add_argument("--ema_strength_target", type=float, default=None, help="EMA decay target value in range (0,1). emarate will be calculated from equation: 'ema_decay_rate=ema_strength_target^(total_steps/ema_update_interval)'. Using this parameter will enable the ema feature and overide ema_decay_rate.")
+    argparser.add_argument("--ema_decay_rate", type=float, default=None, help="EMA decay rate. EMA model will be updated with (1 - ema_rate) from training, and the ema_rate from previous EMA, every interval. Rate is computed per step. Values less than 1 and not so far from 1. Using this parameter will enable the feature.")
+    argparser.add_argument("--ema_strength_target", type=float, default=None, help="EMA decay target value in range (0,1). emarate will be calculated from equation: 'ema_decay_rate=ema_strength_target^total_steps'. Using this parameter will enable the ema feature and overide ema_decay_rate.")
     argparser.add_argument("--ema_update_interval", type=int, default=500, help="How many steps between optimizer steps that EMA decay updates. EMA model will be update on every step modulo ema_update_interval.")
     argparser.add_argument("--ema_device", type=str, default='cpu',
                            help="EMA storage location. 'cpu': keep EMA in system RAM (~4 s/update, saves VRAM). "
@@ -2067,7 +2072,7 @@ if __name__ == "__main__":
     argparser.add_argument("--pyramid_noise_discount", type=float, default=None, help="Enables pyramid noise and use specified discount factor for it")
     argparser.add_argument("--batch_share_noise", action="store_true", help="All samples in a batch have the same noise")
     argparser.add_argument("--batch_share_timesteps", action="store_true", help="All samples in a batch have the same timesteps")
-    argparser.add_argument("--teacher", type=str, default=None, help="Teacher model")
+    argparser.add_argument("--teacher", type=str, nargs='*', default=[], help="Teacher model path(s). Pass one or more paths to enable distillation from multiple teachers.")
     argparser.add_argument("--teacher_p", type=float, default=1.0, help="Probability of teacher model being used as target")
     argparser.add_argument("--teacher_lambda", type=float, default=1.0, help="When teacher is used, the scale factor for teacher loss when added to regular loss")
     argparser.add_argument("--teacher_lambda_falloff", action=argparse.BooleanOptionalAction, default=False, help="When enabled, teacher_lambda falls off linearly to 0 below teacher_lambda_falloff_tmax down to teacher_lambda_falloff_tmin")
