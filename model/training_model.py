@@ -255,6 +255,34 @@ class TrainingVariables:
             oom_history[batch_resolution].pop(0)
 
 
+def _module_cpu_copy_with_optional_ema_state(
+    live_module: torch.nn.Module,
+    ema_path: Optional[str],
+) -> torch.nn.Module:
+    """
+    Returns a detached CPU copy of *live_module* whose parameters are replaced
+    by the EMA state loaded from *ema_path* when that file exists.  Falls back
+    to the live parameters (copied to CPU) when the file is absent.
+
+    The returned module has ``requires_grad_(False)`` applied so it is safe to
+    move straight into an inference pipeline.
+    """
+    cpu_copy = copy.deepcopy(live_module).cpu()
+    if ema_path and os.path.isfile(ema_path):
+        state = safetensors.torch.load_file(ema_path, device="cpu")
+        missing, _ = cpu_copy.load_state_dict(state, strict=False)
+        if missing:
+            logging.warning(
+                f"EMA state from {ema_path}: {len(missing)} missing keys "
+                f"(first 5: {missing[:5]}), using live weights for those"
+            )
+    else:
+        if ema_path:
+            logging.warning(f"EMA state file not found at {ema_path}, using live weights")
+    cpu_copy.requires_grad_(False)
+    return cpu_copy
+
+
 @dataclass
 class TrainingModel:
 
@@ -362,30 +390,124 @@ class TrainingModel:
         if self.text_encoder_2:
             self.text_encoder_2.to(device)
 
-    def build_inference_pipeline(self, scheduler: SchedulerMixin|None = None) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
+    def _build_inference_pipeline(
+        self,
+        unet,
+        text_encoder,
+        text_encoder_2,
+        scheduler: SchedulerMixin | None = None,
+    ) -> StableDiffusionPipeline | StableDiffusionXLPipeline:
+        """
+        Core pipeline-construction logic shared by build_inference_pipeline() and
+        build_ema_inference_pipeline().  The caller supplies whichever unet /
+        text-encoder variants (live or EMA) should be used.
+        The pipeline type (SDXL vs SD1/2) is inferred from text_encoder_2.
+        """
         if scheduler is None:
             scheduler = self.noise_scheduler
-        if self.is_sdxl:
+        if text_encoder_2 is not None:
             return StableDiffusionXLPipeline(
                 vae=self.vae,
-                text_encoder=self.text_encoder,
-                text_encoder_2=self.text_encoder_2,
+                text_encoder=text_encoder,
+                text_encoder_2=text_encoder_2,
                 tokenizer=self.tokenizer,
                 tokenizer_2=self.tokenizer_2,
-                unet=self.unet,
+                unet=unet,
                 scheduler=scheduler,
             )
         else:
             return StableDiffusionPipeline(
                 vae=self.vae,
-                text_encoder=self.text_encoder,
+                text_encoder=text_encoder,
                 tokenizer=self.tokenizer,
-                unet=self.unet,
+                unet=unet,
                 scheduler=scheduler,
-                safety_checker=None, # save vram
-                requires_safety_checker=None, # avoid nag
-                feature_extractor=None, # must be None if no safety checker
+                safety_checker=None,           # save vram
+                requires_safety_checker=None,  # avoid nag
+                feature_extractor=None,        # must be None if no safety checker
             )
+
+    def build_inference_pipeline(self, scheduler: SchedulerMixin | None = None) -> StableDiffusionPipeline | StableDiffusionXLPipeline:
+        return self._build_inference_pipeline(
+            unet=self.unet,
+            text_encoder=self.text_encoder,
+            text_encoder_2=self.text_encoder_2,
+            scheduler=scheduler,
+        )
+
+    def build_ema_inference_pipeline(self, scheduler: SchedulerMixin | None = None) -> StableDiffusionPipeline | StableDiffusionXLPipeline | None:
+        """
+        Builds an inference pipeline using EMA weights wherever they are
+        available, falling back to the live weights for any component that has
+        no EMA counterpart.
+
+        Two EMA storage modes are handled transparently:
+
+        * **In-memory** (``unet_ema`` / ``text_encoder_ema`` attributes set):
+          the EMA modules are deepcopied to CPU so that calling ``.to(device)``
+          on the returned pipeline never mutates the persistent EMA state.
+
+        * **Disk-offload** (``ema_working_dir`` set): EMA state dicts are
+          loaded from the ``*_ema.safetensors`` working files into fresh CPU
+          copies of each live module.
+
+        In both cases the returned pipeline has all components on CPU.  The
+        caller is responsible for calling ``pipe.to(device)`` before inference
+        and ``del pipe`` (+ ``torch.cuda.empty_cache()``) afterwards.
+
+        Returns ``None`` when no EMA weights exist at all.
+        """
+        has_inmemory_ema = (
+            self.unet_ema is not None
+            or self.text_encoder_ema is not None
+            or self.text_encoder_2_ema is not None
+        )
+        has_disk_ema = (
+            self.ema_working_dir is not None
+            and os.path.isfile(os.path.join(self.ema_working_dir, "unet_ema.safetensors"))
+        )
+
+        if not has_inmemory_ema and not has_disk_ema:
+            return None
+
+        if self.ema_working_dir is not None:
+            # ── Disk-offload mode: load from the working safetensors files ──
+            unet_for_pipe = _module_cpu_copy_with_optional_ema_state(
+                self.unet,
+                os.path.join(self.ema_working_dir, "unet_ema.safetensors"),
+            )
+            te_for_pipe = _module_cpu_copy_with_optional_ema_state(
+                self.text_encoder,
+                os.path.join(self.ema_working_dir, "text_encoder_ema.safetensors"),
+            )
+            te2_for_pipe = None
+            if self.is_sdxl and self.text_encoder_2 is not None:
+                te2_for_pipe = _module_cpu_copy_with_optional_ema_state(
+                    self.text_encoder_2,
+                    os.path.join(self.ema_working_dir, "text_encoder_2_ema.safetensors"),
+                )
+        else:
+            # ── In-memory mode: deepcopy EMA modules to CPU ──────────────
+            # Deepcopy is used so that pipe.to(device) never moves the
+            # persistent self.*_ema modules away from their ema_device.
+            def _cpu_copy(ema_module, live_module):
+                src = ema_module if ema_module is not None else live_module
+                c = copy.deepcopy(src).cpu()
+                c.requires_grad_(False)
+                return c
+
+            unet_for_pipe = _cpu_copy(self.unet_ema, self.unet)
+            te_for_pipe   = _cpu_copy(self.text_encoder_ema, self.text_encoder)
+            te2_for_pipe  = None
+            if self.is_sdxl:
+                te2_for_pipe = _cpu_copy(self.text_encoder_2_ema, self.text_encoder_2)
+
+        return self._build_inference_pipeline(
+            unet=unet_for_pipe,
+            text_encoder=te_for_pipe,
+            text_encoder_2=te2_for_pipe,
+            scheduler=scheduler,
+        )
 
 
 

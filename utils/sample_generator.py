@@ -427,6 +427,31 @@ class SampleGenerator:
             pipe.enable_xformers_memory_efficient_attention()
         return pipe
 
+    @torch.no_grad()
+    def create_ema_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config,
+                                  flow_match_shift=1, flow_match_shift_dynamic=False
+                                  ) -> StableDiffusionPipeline | StableDiffusionXLPipeline | None:
+        """
+        Creates an inference pipeline using EMA weights where available,
+        falling back to live weights for any component without an EMA counterpart.
+
+        All pipeline components are placed on CPU.  The caller must call
+        ``pipe.to(device)`` before inference and ``del pipe`` (+ empty_cache)
+        afterwards to avoid leaving stale tensors on the GPU.
+
+        Returns None when no EMA weights exist yet.
+        """
+        if model_being_trained.is_flow_matching and self.scheduler != 'flow-matching':
+            print(f"Warning: model is flow-matching but scheduler is '{self.scheduler}'. Overriding.")
+            self.scheduler = 'flow-matching'
+        scheduler = self._create_scheduler(diffusers_scheduler_config, flow_match_shift, flow_match_shift_dynamic)
+        pipe = model_being_trained.build_ema_inference_pipeline(scheduler=scheduler)
+        if pipe is None:
+            return None
+        if self.use_xformers:
+            pipe.enable_xformers_memory_efficient_attention()
+        return pipe
+
 
     @torch.no_grad()
     def _create_scheduler(self, scheduler_config: dict, flow_match_shift: int, flow_match_shift_dynamic: bool):
