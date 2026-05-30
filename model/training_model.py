@@ -2,6 +2,7 @@ import argparse
 import copy
 import logging
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import diffusers
@@ -508,6 +509,114 @@ class TrainingModel:
             text_encoder_2=te2_for_pipe,
             scheduler=scheduler,
         )
+
+    @contextmanager
+    def ema_inplace_swap(self):
+        """
+        Context manager for disk-offload EMA inference.
+
+        For each model component that has a corresponding EMA file in
+        ``ema_working_dir``:
+
+        1. The current (live) weights are saved to a temporary backup file on
+           disk (in training precision, e.g. fp16/bf16).
+        2. The EMA weights are loaded from disk and copied **in-place** into
+           the live module on its current device and dtype — the model never
+           leaves the GPU and no second module copy is held in CPU RAM.
+        3. On exit (normal or exceptional) the live weights are restored from
+           the backup file and the backup is deleted.
+
+        This lets ``build_inference_pipeline()`` be used directly for EMA
+        sampling — no separate EMA pipeline object or CPU offload needed.
+
+        Peak extra CPU RAM is bounded by the float32 EMA state dict of the
+        largest component (typically the UNet, ~2× its training-precision
+        size), which is freed immediately after each in-place copy.
+        """
+        if self.ema_working_dir is None:
+            raise RuntimeError(
+                "ema_inplace_swap requires disk-offload EMA (ema_device='disk')"
+            )
+
+        def _unwrap(m):
+            return m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
+
+        components = [
+            (_unwrap(self.unet),         "unet"),
+            (_unwrap(self.text_encoder), "text_encoder"),
+        ]
+        if self.is_sdxl and self.text_encoder_2 is not None:
+            components.append((_unwrap(self.text_encoder_2), "text_encoder_2"))
+
+        # Registered in order of successful backup so the finally block only
+        # attempts to restore what was actually swapped.
+        to_restore: list[tuple[torch.nn.Module, str, str]] = []  # (module, name, backup_path)
+
+        try:
+            for module, name in components:
+                ema_path = os.path.join(self.ema_working_dir, f"{name}_ema.safetensors")
+                if not os.path.isfile(ema_path):
+                    logging.debug(f"ema_inplace_swap: no EMA file for {name}, skipping")
+                    continue
+
+                backup_path = os.path.join(
+                    self.ema_working_dir, f"{name}_live_backup.safetensors"
+                )
+
+                # ── Step 1: persist live weights to a temp backup ────────
+                logging.info(f"ema_inplace_swap: backing up live {name} → {backup_path}")
+                live_sd = {
+                    k: v.detach().cpu().contiguous()
+                    for k, v in module.state_dict().items()
+                }
+                safetensors.torch.save_file(live_sd, backup_path)
+                del live_sd
+
+                # Register now so the finally block restores even if the
+                # EMA load below fails.
+                to_restore.append((module, name, backup_path))
+
+                # ── Step 2: load EMA weights and copy in-place ───────────
+                target_dtype  = next(module.parameters()).dtype
+                target_device = next(module.parameters()).device
+                logging.info(
+                    f"ema_inplace_swap: applying EMA {name} "
+                    f"({target_dtype} on {target_device})"
+                )
+                ema_sd = safetensors.torch.load_file(ema_path, device="cpu")
+                named_params = dict(module.named_parameters())
+                with torch.no_grad():
+                    for k, ema_v in ema_sd.items():
+                        if k in named_params:
+                            named_params[k].data.copy_(
+                                ema_v.to(dtype=target_dtype, device=target_device)
+                            )
+                del ema_sd, named_params
+
+            yield  # ← inference runs here
+
+        finally:
+            # ── Restore live weights from backup, then clean up ──────────
+            for module, name, backup_path in to_restore:
+                if not os.path.isfile(backup_path):
+                    logging.error(
+                        f"ema_inplace_swap: backup file missing at {backup_path} — "
+                        f"live weights for this component could not be restored!"
+                    )
+                    continue
+                target_dtype  = next(module.parameters()).dtype
+                target_device = next(module.parameters()).device
+                logging.info(f"ema_inplace_swap: restoring live {name} from {backup_path}")
+                live_sd = safetensors.torch.load_file(backup_path, device="cpu")
+                named_params = dict(module.named_parameters())
+                with torch.no_grad():
+                    for k, p in named_params.items():
+                        if k in live_sd:
+                            p.data.copy_(
+                                live_sd[k].to(dtype=target_dtype, device=target_device)
+                            )
+                del live_sd, named_params
+                os.unlink(backup_path)
 
 
 

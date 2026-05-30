@@ -1,5 +1,6 @@
 from diffusers import UNet2DConditionModel
 from safetensors.torch import load_file
+import os
 
 def apply_unet_ema(
     unet: UNet2DConditionModel,

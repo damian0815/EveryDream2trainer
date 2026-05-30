@@ -727,6 +727,7 @@ def main(args):
     set_seed(seed)
     if torch.cuda.is_available():
         if _is_dist:
+            # Phase 1: per-rank device overrides --gpuid
             device = torch.device(f"cuda:{_local_rank}")
         else:
             device = torch.device(f"cuda:{args.gpuid}")
@@ -1299,36 +1300,55 @@ def main(args):
                 # ── EMA pass ───────────────────────────────────────────────
                 if run_ema:
                     logging.info(f" * Generating samples [EMA model] at gs:{global_step}")
-                    # Move the live model to CPU to free VRAM for the EMA pipeline.
-                    _unwrap(model.unet).to("cpu")
-                    _unwrap(model.text_encoder).to("cpu")
-                    if model.text_encoder_2 is not None:
-                        _unwrap(model.text_encoder_2).to("cpu")
-                    torch.cuda.empty_cache()
-                    try:
-                        ema_pipe = sample_generator.create_ema_inference_pipe(
-                            model_being_trained=model,
-                            diffusers_scheduler_config=model.noise_scheduler.config,
-                            flow_match_shift=args.flow_match_shift,
-                            flow_match_shift_dynamic=args.flow_match_shift_dynamic,
-                        )
-                        if ema_pipe is None:
-                            logging.warning(
-                                " * EMA sampling requested but no EMA weights found yet, "
-                                "skipping EMA sample pass"
-                            )
-                        else:
-                            ema_pipe = ema_pipe.to(device)
+
+                    if model.ema_working_dir is not None:
+                        # ── Disk EMA: in-place weight swap on the live CUDA model ──
+                        # The live model stays on the GPU throughout; EMA weights are
+                        # loaded from disk and applied in-place, inference runs, then
+                        # the original weights are restored.  No CPU offload needed.
+                        with model.ema_inplace_swap():
+                            ema_pipe = sample_generator.create_inference_pipe(
+                                model_being_trained=model,
+                                diffusers_scheduler_config=model.noise_scheduler.config,
+                                flow_match_shift=args.flow_match_shift,
+                                flow_match_shift_dynamic=args.flow_match_shift_dynamic,
+                            ).to(device)
                             sample_generator.generate_samples(ema_pipe, global_step,
                                                               extra_info="", samples_subdir="samples-ema")
                             del ema_pipe
-                    finally:
-                        # Always restore the live model to the training device.
                         torch.cuda.empty_cache()
-                        _unwrap(model.unet).to(device)
-                        _unwrap(model.text_encoder).to(device)
+
+                    else:
+                        # ── In-memory EMA: move live model to CPU, use EMA modules ──
+                        _unwrap(model.unet).to("cpu")
+                        _unwrap(model.text_encoder).to("cpu")
                         if model.text_encoder_2 is not None:
-                            _unwrap(model.text_encoder_2).to(device)
+                            _unwrap(model.text_encoder_2).to("cpu")
+                        torch.cuda.empty_cache()
+                        try:
+                            ema_pipe = sample_generator.create_ema_inference_pipe(
+                                model_being_trained=model,
+                                diffusers_scheduler_config=model.noise_scheduler.config,
+                                flow_match_shift=args.flow_match_shift,
+                                flow_match_shift_dynamic=args.flow_match_shift_dynamic,
+                            )
+                            if ema_pipe is None:
+                                logging.warning(
+                                    " * EMA sampling requested but no EMA weights found yet, "
+                                    "skipping EMA sample pass"
+                                )
+                            else:
+                                ema_pipe = ema_pipe.to(device)
+                                sample_generator.generate_samples(ema_pipe, global_step,
+                                                                  extra_info="", samples_subdir="samples-ema")
+                                del ema_pipe
+                        finally:
+                            # Always restore the live model to the training device.
+                            torch.cuda.empty_cache()
+                            _unwrap(model.unet).to(device)
+                            _unwrap(model.text_encoder).to(device)
+                            if model.text_encoder_2 is not None:
+                                _unwrap(model.text_encoder_2).to(device)
 
             finally:
                 if unet_was_training:
