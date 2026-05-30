@@ -7,7 +7,7 @@ import random
 import time
 from argparse import Namespace
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import math
 import torch
@@ -31,6 +31,14 @@ from utils.distributed import get_rank, is_distributed as _is_distributed, get_d
     sync_ddp_gradients
 import torch.distributed as dist
 
+# Type alias: any callable that takes a nibble dict and returns a scalar loss tensor with grad.
+# nibble_loss_fn is responsible for ALL model-specific work (forward pass, loss computation, logging).
+# It must return a scalar Tensor with grad attached.
+NibbleLossFn = Callable[
+    [dict],         # nibble batch dict (same structure as full_batch but smaller)
+    torch.Tensor,   # scalar loss tensor WITH grad attached (mean over nibble images)
+]
+
 # Global performance profiling storage
 # Structure: {<label>: [duration_per_image, duration_per_image, ...]}
 PERFORMANCE_PROFILE = {}
@@ -51,6 +59,134 @@ def record_performance_timing(label: str, duration_seconds: float, num_images: i
     logging.info(f"[PERF] {label}: {duration_seconds:.4f}s total, {duration_per_image:.6f}s per image ({num_images} images)")
 
 
+def run_accumulation_loop(
+    full_batch: dict,
+    tv: TrainingVariables,
+    ed_optimizer: EveryDreamOptimizer,
+    nibble_loss_fn: NibbleLossFn,
+    plugin_runner: Optional[PluginRunner],
+    log_writer: SummaryWriter,
+    steps_pbar,
+    did_step_optimizer_cb: Optional[Callable],
+    args: argparse.Namespace,
+    train_progress_01: float = 0.0,
+    model_for_autocast=None,
+) -> None:
+    """
+    Model-agnostic nibble/accumulation/backward/optimizer-step loop.
+
+    Iterates over nibble-sized slices of full_batch. For each nibble:
+      - calls nibble_loss_fn(nibble) to get a scalar loss (with grad)
+      - accumulates that loss into tv
+      - fires a pre-emptive backward if accumulated >= max_backward_slice_size
+      - fires backward + optimizer.step() when ready
+
+    nibble_loss_fn is responsible for ALL model-specific work.
+    It must return a scalar Tensor with grad attached.
+    """
+    if did_step_optimizer_cb is None:
+        did_step_optimizer_cb = lambda: True
+
+    if plugin_runner is None:
+        plugin_runner = PluginRunner()
+
+    remaining_batch = full_batch
+
+    while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
+        batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size(training_variables=tv))
+        assert batch["runt_size"] == 0
+        num_images = batch["image"].shape[0]
+
+        use_bfloat16 = (
+            model_for_autocast is not None
+            and (getattr(model_for_autocast, 'is_sdxl', False) or getattr(args, 'force_bfloat16', False))
+        )
+
+        # Pre-emptive backward: fire if adding this nibble would exceed max_backward_slice_size
+        if (tv.accumulated_loss_images_count > 0
+                and tv.accumulated_loss_images_count + num_images > tv.max_backward_slice_size):
+            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if use_bfloat16 else torch.float16):
+                optimizer_backward(ed_optimizer, tv, plugin_runner,
+                                   f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
+
+        # Call the model-specific nibble loss function
+        loss_mean = nibble_loss_fn(batch)
+
+        # Accumulate loss into tv
+        try:
+            tv.accumulate_loss(
+                loss_mean,
+                pathnames=batch.get("pathnames", [])[:num_images],
+                captions=(batch.get("captions") or {}).get("default", [])[:num_images],
+                timesteps=[],
+            )
+        except InfOrNanException:
+            logging.error("Inf or NaN detected in loss, dropping this loss batch.")
+
+        # Update progress bar
+        steps_pbar.set_postfix({
+            "_l": tv.accumulated_loss_images_count,
+            "b": tv.backwarded_images_count,
+            "os": str(tv.optimizer_step),
+            "N": str(tv.total_trained_samples_count),
+            "gs": str(tv.global_step),
+        })
+
+        # Regular backward + optimizer step (if threshold reached)
+        should_step_optimizer = (
+            (tv.backwarded_images_count + tv.accumulated_loss_images_count)
+            >= tv.desired_effective_batch_size
+        ) or tv.interleaved_bs1_count is not None
+
+        if ((should_step_optimizer and tv.accumulated_loss_images_count > 0)
+                or tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
+            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if use_bfloat16 else torch.float16):
+                optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
+
+        if should_step_optimizer and tv.backwarded_images_count > 0:
+            # Block until everyone wants to step (no-op in single-GPU mode)
+            while True:
+                global_state_signal = get_distributed_state_signal(StateSignal.WANTS_STEP, full_batch['image'].device)
+                if global_state_signal == StateSignal.DONE:
+                    return
+                elif global_state_signal == StateSignal.WANTS_STEP:
+                    break
+                else:
+                    raise RuntimeError(f"unknown state signal {global_state_signal}")
+
+            sync_ddp_gradients(
+                *[m for m in [
+                    getattr(model_for_autocast, 'unet', None),
+                    getattr(model_for_autocast, 'text_encoder', None),
+                    getattr(model_for_autocast, 'text_encoder_2', None),
+                ] if m is not None]
+            )
+
+            ed_optimizer.step_optimizer(tv.global_step, tv, log_data=None)
+
+            tv.last_effective_batch_size = tv.backwarded_images_count
+            tv.total_trained_samples_count += tv.backwarded_images_count
+            tv.optimizer_step += 1
+            tv.current_timestep_interval = None
+            tv.backwarded_images_count = 0
+
+            if tv.interleaved_bs1_count is not None:
+                tv.interleaved_bs1_count += 1
+
+            if (tv.interleaved_bs1_count is None
+                    or tv.interleaved_bs1_count >= max(
+                        1, tv.desired_effective_batch_size ** getattr(args, 'interleave_batch_size_1_alpha', 1)
+                    )):
+                tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
+                if getattr(args, 'interleave_batch_size_1', False):
+                    if tv.interleaved_bs1_count is None:
+                        tv.interleaved_bs1_count = 0
+                    else:
+                        tv.interleaved_bs1_count = None
+
+            did_step_optimizer_cb()
+
+
 @line_profiler.profile
 def train_step(
     full_batch: dict,
@@ -69,39 +205,33 @@ def train_step(
     did_step_optimizer_cb: Callable|None,
     args: argparse.Namespace,
 ):
-    if did_step_optimizer_cb is None:
-        did_step_optimizer_cb = lambda: True
-    remaining_batch = full_batch
-
     t_step_start = time.perf_counter()
 
-    while remaining_batch is not None and remaining_batch['image'].shape[0] > 0:
-        t_nibble_start = time.perf_counter()
-        batch, remaining_batch = nibble_batch(remaining_batch, get_nibble_size(training_variables=tv))
-        assert batch["runt_size"] == 0
+    def nibble_loss_fn(batch: dict) -> torch.Tensor:
+        """
+        SD/SDXL-specific per-nibble forward pass. Handles caption selection,
+        noise generation, VAE encoding, text conditioning, model forward, and
+        loss computation for all caption variants. Returns a combined scalar loss.
+        """
         image_shape = batch["image"].shape
-        num_images = image_shape[0]
-        record_performance_timing("1_batch_nibbling", time.perf_counter() - t_nibble_start, num_images)
+        batch_size = image_shape[0]
+        num_images = batch_size
 
-        # Caption selection logic
+        # Caption selection
         t_caption_start = time.perf_counter()
-        #if args.contrastive_learning_curriculum_alpha == 0:
-        #    contrastive_loss_scale = args.contrastive_loss_scale
-        #else:
-        #    contrastive_loss_scale = get_exponential_scaled_value(train_progress_01,
-        #                                                          initial_value=args.contrastive_learning_negative_loss_scale,
-        #                                                          final_value=0,
-        #                                                          alpha=args.contrastive_learning_curriculum_alpha)
-        #    # print('contrastive learning negative loss scale:', contrastive_loss_scale)
-
         loss_scale = args.loss_scale * batch["loss_scale"]
         assert loss_scale.shape[0] == batch["image"].shape[0]
-        # loss_scale = loss_scale.float() * (reference_image_size / image_size)
 
         assert type(batch["captions"]) is dict
 
         try:
-            caption_variants = select_caption_variants(batch["captions"], requested_variants=args.caption_variants, all_caption_variants=args.all_caption_variants, caption_cross_concatenation_p=args.caption_cross_concatenation_p, caption_cross_concatenation_empty_half_p=args.caption_cross_concatenation_empty_half_p)
+            caption_variants = select_caption_variants(
+                batch["captions"],
+                requested_variants=args.caption_variants,
+                all_caption_variants=args.all_caption_variants,
+                caption_cross_concatenation_p=args.caption_cross_concatenation_p,
+                caption_cross_concatenation_empty_half_p=args.caption_cross_concatenation_empty_half_p,
+            )
         except RuntimeError as e:
             logging.error(f"Caught error {repr(e)} while calling select_caption_variants -> surprise cond dropout")
             logging.info(
@@ -112,28 +242,31 @@ def train_step(
 
         record_performance_timing("2_caption_selection", time.perf_counter() - t_caption_start, num_images)
 
-        batch_size = image_shape[0]
-
         # Noise generation
         t_noise_start = time.perf_counter()
         with torch.no_grad():
             noise_shape = (batch_size, 4, image_shape[2] // 8, image_shape[3] // 8)
-            noise = get_noise(noise_shape, device=model.device, dtype=model.dtype,
-                              pyramid_noise_discount=args.pyramid_noise_discount,
-                              zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
-                              batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise)
-                              )
+            noise = get_noise(
+                noise_shape,
+                device=model.device,
+                dtype=model.dtype,
+                pyramid_noise_discount=args.pyramid_noise_discount,
+                zero_frequency_noise_ratio=args.zero_frequency_noise_ratio,
+                batch_share_noise=(full_batch["do_contrastive_learning"] or args.batch_share_noise),
+            )
         record_performance_timing("3_noise_generation", time.perf_counter() - t_noise_start, batch_size)
 
         # VAE encoding
         t_vae_start = time.perf_counter()
-        assert batch["runt_size"] == 0 # _encode_latents assumption
+        assert batch["runt_size"] == 0  # _encode_latents assumption
+
         def _do_encode_latents(model_for_vae: TrainingModel):
             model_for_vae.vae.to(vae_dtype)
             these_latents = _encode_latents(model=model_for_vae, image=batch["image"], amp=args.amp, tv=tv)
             if args.offload_vae:
                 model_for_vae.load_vae_to_device('cpu')
             return these_latents
+
         latents = _do_encode_latents(model)
         teacher_latents_list = [
             _do_encode_latents(tm) if tm.is_sdxl != model.is_sdxl else None
@@ -141,18 +274,10 @@ def train_step(
         ]
         record_performance_timing("4_vae_encoding", time.perf_counter() - t_vae_start, batch_size)
 
+        # Per-caption-variant forward + loss computation
+        total_loss_mean = None
         for caption_variant in caption_variants:
-
-            t_variant_start = time.perf_counter()
-
-            # pre-emptive backward on images accumulated so far if we are going to exceed max backward slice size in this iteration
-            if tv.accumulated_loss_images_count > 0 and tv.accumulated_loss_images_count + latents.shape[0] > tv.max_backward_slice_size:
-                with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-                    optimizer_backward(ed_optimizer, tv, plugin_runner,
-                                       f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
-                    record_performance_timing("4.5_preemptive_backward", time.perf_counter() - t_variant_start, num_images/len(caption_variants))
-
-            # Timesteps generation
+            # Timestep generation
             t_timesteps_start = time.perf_counter()
             timesteps = _get_step_timesteps(
                 count=batch["image"].shape[0],
@@ -161,12 +286,13 @@ def train_step(
                 model=model,
                 tv=tv,
                 share_timesteps=batch["do_contrastive_learning"] or args.batch_share_timesteps,
-                args=args
+                args=args,
             )
-            # apply shift
+            # Apply shift for flow-matching schedulers
             if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
-                timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
-                # bf16 stability: clamp timestep indices if requested
+                timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(
+                    timesteps, model.noise_scheduler.timesteps
+                )
                 t_clamp_min = getattr(args, 'flow_match_t_clamp_min', None)
                 t_clamp_max = getattr(args, 'flow_match_t_clamp_max', None)
                 if t_clamp_min is not None or t_clamp_max is not None:
@@ -177,17 +303,22 @@ def train_step(
                         max=t_clamp_max if t_clamp_max is not None else num_ts - 1,
                     )
                     timesteps = model.noise_scheduler.timesteps.flip(0)[idx]
-            record_performance_timing("5_timesteps_generation", time.perf_counter() - t_timesteps_start, num_images/len(caption_variants))
+            record_performance_timing("5_timesteps_generation", time.perf_counter() - t_timesteps_start, num_images / len(caption_variants))
 
             # Conditional dropout
             t_cond_dropout_start = time.perf_counter()
-            cond_dropout_mask = build_cond_dropout_mask(batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args)
-            is_cond_dropout_noise = cond_dropout_mask & (torch.rand(batch_size, device=model.unet.device) < args.cond_dropout_noise_p) # replace latents with noise where True
-
-            record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images/len(caption_variants))
+            cond_dropout_mask = build_cond_dropout_mask(
+                batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args
+            )
+            is_cond_dropout_noise = cond_dropout_mask & (
+                torch.rand(batch_size, device=model.unet.device) < args.cond_dropout_noise_p
+            )
+            record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images / len(caption_variants))
 
             # Text conditioning generation
-            teacher_mask = _generate_teacher_mask_or_none(training_model=model, args=args, teacher_models=teacher_models, timesteps=timesteps)
+            teacher_mask = _generate_teacher_mask_or_none(
+                training_model=model, args=args, teacher_models=teacher_models, timesteps=timesteps
+            )
             t_conditioning_start = time.perf_counter()
             conditioning, teacher_conditionings, caption_str = _generate_conditioning(
                 batch,
@@ -196,9 +327,9 @@ def train_step(
                 model=model,
                 teacher_models=teacher_models,
                 teacher_mask=teacher_mask,
-                args=args
+                args=args,
             )
-            record_performance_timing("7_conditioning_generation", time.perf_counter() - t_conditioning_start, num_images/len(caption_variants))
+            record_performance_timing("7_conditioning_generation", time.perf_counter() - t_conditioning_start, num_images / len(caption_variants))
 
             tv.cond_dropout_count += torch.sum(cond_dropout_mask)
             tv.non_cond_dropout_count += torch.sum(~cond_dropout_mask)
@@ -207,33 +338,35 @@ def train_step(
 
             # Model forward pass
             t_forward_start = time.perf_counter()
-            model_forward_result = repeat_with_oom_handling(initial_slice_size=tv.forward_slice_size, callback=lambda slice_size: _do_model_forward(
-                        model=model,
+            model_forward_result = repeat_with_oom_handling(
+                initial_slice_size=tv.forward_slice_size,
+                callback=lambda slice_size: _do_model_forward(
+                    model=model,
+                    batch=batch,
+                    latents=latents,
+                    noise=noise,
+                    conditioning=conditioning,
+                    is_cond_dropout_noise=is_cond_dropout_noise,
+                    timesteps=timesteps,
+                    caption_variant=caption_variant,
+                    teacher_models=teacher_models,
+                    teacher_latents_list=teacher_latents_list,
+                    teacher_mask=teacher_mask,
+                    teacher_conditionings=teacher_conditionings,
+                    forward_slice_size=slice_size,
+                    tv=tv,
+                    args=args,
+                    debug_teacher=getattr(args, "debug_teacher", False),
+                    log_writer=log_writer,
+                ),
+                oom_log_info=(
+                    f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} "
+                    f"for full batch size {batch_size}. loss images accumulated: {tv.accumulated_loss_images_count}"
+                ),
+            )
+            record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images / len(caption_variants))
 
-                        batch=batch,
-                        latents=latents,
-                        noise=noise,
-                        conditioning=conditioning,
-                        is_cond_dropout_noise=is_cond_dropout_noise,
-
-                        timesteps=timesteps,
-                        caption_variant=caption_variant,
-
-                        teacher_models=teacher_models,
-                        teacher_latents_list=teacher_latents_list,
-                        teacher_mask=teacher_mask,
-                        teacher_conditionings=teacher_conditionings,
-
-                        forward_slice_size=slice_size,
-                        tv=tv,
-                        args=args,
-                        debug_teacher=getattr(args, "debug_teacher", False),
-                        log_writer=log_writer,
-                    ), oom_log_info=f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} for full batch size {batch_size}. "
-                f"loss images accumulated: {tv.accumulated_loss_images_count}")
-            record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images/len(caption_variants))
-
-            loss_scale = loss_scale[:model_forward_result.model_pred.shape[0]]
+            loss_scale_variant = loss_scale[:model_forward_result.model_pred.shape[0]]
 
             # Loss computation
             t_loss_start = time.perf_counter()
@@ -245,16 +378,14 @@ def train_step(
                 timesteps=timesteps,
                 conditioning=conditioning,
                 teacher_mask=teacher_mask,
-
                 tv=tv,
                 log_data=log_data,
                 log_writer=log_writer,
-
-                negative_loss_mask=loss_scale < 0,
+                negative_loss_mask=loss_scale_variant < 0,
                 args=args,
-                verbose=(tv.global_step % 200 == 0)
+                verbose=(tv.global_step % 200 == 0),
             )
-            record_performance_timing("9_loss_computation", time.perf_counter() - t_loss_start, num_images/len(caption_variants))
+            record_performance_timing("9_loss_computation", time.perf_counter() - t_loss_start, num_images / len(caption_variants))
 
             if model.clip_model is not None:
                 clip_loss_1d = get_clip_loss(
@@ -267,140 +398,79 @@ def train_step(
 
             del model_forward_result
 
-
-            # Loss logging and accumulation
+            # Per-timestep and per-image loss logging
             t_loss_accum_start = time.perf_counter()
             for i, used_timestep in enumerate(timesteps):
                 used_timestep_detached = int(used_timestep.detach().item())
                 current, count = log_data.loss_per_timestep[tv.batch_resolution].get(used_timestep_detached, (0, 0))
                 log_data.loss_per_timestep[tv.batch_resolution][used_timestep_detached] = (
-                    current + loss_1d[i].mean().detach().item(), count + 1)
-
+                    current + loss_1d[i].mean().detach().item(), count + 1
+                )
                 pathname = os.path.realpath(batch["pathnames"][i])
                 if pathname not in log_data.loss_per_image_and_timestep[tv.batch_resolution]:
                     log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname] = []
                 log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname].append(
-                    (used_timestep_detached, loss_1d[i].mean().detach().item()))
+                    (used_timestep_detached, loss_1d[i].mean().detach().item())
+                )
 
-            # apply any hinge negative loss modification
-            loss_1d = apply_negative_loss_hinge(loss_1d, (loss_scale < 0).to(loss_1d.device), margin=args.negative_loss_margin)
-            loss_1d = loss_1d * loss_scale.abs().to(loss_1d.device)
+            # Apply hinge and loss scale
+            loss_1d = apply_negative_loss_hinge(
+                loss_1d, (loss_scale_variant < 0).to(loss_1d.device), margin=args.negative_loss_margin
+            )
+            loss_1d = loss_1d * loss_scale_variant.abs().to(loss_1d.device)
 
-            # take mean of all dimensions except batch, then divide through by a fixed batch size
+            # Compute loss_mean for this variant
             if args.loss_mean_over_full_effective_batch:
-                # strictly more correct, but LR scaling becomes necessary
                 loss_mean_divisor = max(1, tv.desired_effective_batch_size)
             else:
                 loss_mean_divisor = 1
             loss_mean = loss_1d.sum() / loss_mean_divisor
 
-            # logging.info(
-            #    f"model_pred has NaN: {torch.isnan(model_pred).any()} inf: {torch.isinf(model_pred).any()} range: [{model_pred.min():.4f}, {model_pred.max():.4f}]"
-            # )
-            # logging.info(
-            #    f"target has NaN: {torch.isnan(target).any()} inf: {torch.isinf(target).any()} range: [{target.min():.4f}, {target.max():.4f}]"
-            # )
-            # logging.info(
-            #    f"loss has NaN: {torch.isnan(loss).any()} inf: {torch.isinf(loss).any()} range: [{loss.min():.4f}, {loss.max():.4f}]"
-            # )
-
             log_data.loss_log_step_cd.append(loss_1d[cond_dropout_mask].mean().detach().item())
             log_data.loss_log_step_non_cd.append(loss_1d[~cond_dropout_mask].mean().detach().item())
-
             log_data.forward_size_coverage[loss_1d.shape[0]] += 1
 
-
             loss_step = loss_mean.detach().item()
-            try:
-                tv.accumulate_loss(loss_mean,
-                                   pathnames=batch["pathnames"][:timesteps.shape[0]],
-                                   captions=caption_str[:timesteps.shape[0]],
-                                   timesteps=timesteps.detach().cpu().tolist())
-            except InfOrNanException:
-                logging.error("Inf or NaN detected in loss, dropping this loss batch. ")
 
             for t in timesteps:
                 log_data.timestep_coverage[int(t.item())] += 1
                 log_data.cumulative_timestep_coverage[int(t.item())] += 1
-            #timesteps_shifted = model.noise_scheduler.get_shifted_timesteps(timesteps, model.noise_scheduler.timesteps)
-            #for t in timesteps_shifted:
-            #    log_data.cumulative_timestep_shifted_coverage[int(t.item())] += 1
-            #del timesteps_shifted
 
-            steps_pbar.set_postfix(
-                {
-                    "rank": get_rank(),
-                    "loss/step": loss_step,
-                    "_f": tv.forward_slice_size,
-                    "_l": loss_1d.shape[0],
-                    "l": tv.accumulated_loss_images_count,
-                    "b": tv.backwarded_images_count,
-                    "os": str(tv.optimizer_step),
-                    "N": str(tv.total_trained_samples_count),
-                    "gs": str(tv.global_step),  # string conversion sidesteps scientific notation
-                }
-            )
+            steps_pbar.set_postfix({
+                "rank": get_rank(),
+                "loss/step": loss_step,
+                "_f": tv.forward_slice_size,
+                "_l": loss_1d.shape[0],
+                "l": tv.accumulated_loss_images_count,
+                "b": tv.backwarded_images_count,
+                "os": str(tv.optimizer_step),
+                "N": str(tv.total_trained_samples_count),
+                "gs": str(tv.global_step),
+            })
 
-            del loss_1d, loss_mean
+            del loss_1d
             log_data.loss_log_step.append(loss_step)
             log_data.loss_epoch.append(loss_step)
-            record_performance_timing("10_loss_accumulation", time.perf_counter() - t_loss_accum_start, num_images/len(caption_variants))
+            record_performance_timing("10_loss_accumulation", time.perf_counter() - t_loss_accum_start, num_images / len(caption_variants))
 
-            # Backward pass (if needed)
-            should_step_optimizer = (
-                                        (tv.backwarded_images_count + tv.accumulated_loss_images_count)
-                                        >= tv.desired_effective_batch_size
-                                    ) or tv.interleaved_bs1_count is not None
-            if ((should_step_optimizer and tv.accumulated_loss_images_count > 0) or
-                tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
-                t_backward_start = time.perf_counter()
-                with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if (model.is_sdxl or args.force_bfloat16) else torch.float16):
-                    optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
-                record_performance_timing("11_backward_pass", time.perf_counter() - t_backward_start, num_images/len(caption_variants))
+            # Accumulate loss across caption variants
+            total_loss_mean = loss_mean if total_loss_mean is None else total_loss_mean + loss_mean
 
-            # Record local intent; the collective vote fires ONCE after the while loop.
-            if should_step_optimizer and tv.backwarded_images_count > 0:
-                # block until everyone wants to step
-                while True:
-                    global_state_signal = get_distributed_state_signal(StateSignal.WANTS_STEP, model.device)
-                    if global_state_signal == StateSignal.DONE:
-                        print("another rank is done -> discarding our gradients")
-                        return
-                    elif global_state_signal == StateSignal.WANTS_STEP:
-                        break
-                    else:
-                        raise RuntimeError(f"unknown state signal {global_state_signal}")
+        return total_loss_mean
 
-                # gather grads (no-op on non-multi)
-                sync_ddp_gradients(model.unet, model.text_encoder, model.text_encoder_2)
-
-                t_optimizer_step_start = time.perf_counter()
-                # step_optimizer calls sync_ddp_gradients (collective) then
-                # optimizer.step() — guarded by backwarded_images_count > 0 inside.
-                ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
-                record_performance_timing("12_optimizer_step", time.perf_counter() - t_optimizer_step_start, full_batch['image'].shape[0])
-
-                tv.last_effective_batch_size = tv.backwarded_images_count
-                tv.total_trained_samples_count += tv.backwarded_images_count
-                tv.optimizer_step += 1
-                tv.current_timestep_interval = None   # draw a new SNR interval next step
-                tv.backwarded_images_count = 0
-
-                # if we are interleaving BS1, increment counter
-                if tv.interleaved_bs1_count is not None:
-                    tv.interleaved_bs1_count += 1
-
-                # if not interleaving BS1, or we've reached the end of the BS1 run
-                if tv.interleaved_bs1_count is None or tv.interleaved_bs1_count >= max(1,
-                                                                                       tv.desired_effective_batch_size ** args.interleave_batch_size_1_alpha):
-                    tv.desired_effective_batch_size = choose_effective_batch_size(args, train_progress_01)
-                    if args.interleave_batch_size_1:
-                        if tv.interleaved_bs1_count is None:
-                            tv.interleaved_bs1_count = 0
-                        else:
-                            tv.interleaved_bs1_count = None
-
-                did_step_optimizer_cb()
+    run_accumulation_loop(
+        full_batch=full_batch,
+        tv=tv,
+        ed_optimizer=ed_optimizer,
+        nibble_loss_fn=nibble_loss_fn,
+        plugin_runner=plugin_runner,
+        log_writer=log_writer,
+        steps_pbar=steps_pbar,
+        did_step_optimizer_cb=did_step_optimizer_cb,
+        args=args,
+        train_progress_01=train_progress_01,
+        model_for_autocast=model,
+    )
 
     t_step_end = time.perf_counter()
     record_performance_timing("0_total_step_time", t_step_end - t_step_start, full_batch['image'].shape[0])
@@ -506,18 +576,18 @@ def _subdivide_batch_part(part, start, end):
 
 
 def choose_effective_batch_size(args, train_progress_01):
+    batch_size = getattr(args, 'batch_size', 1)
+    initial_bs = getattr(args, 'initial_batch_size', None)
+    final_bs = getattr(args, 'final_batch_size', None)
+    alpha = getattr(args, 'batch_size_curriculum_alpha', 1.0)
     return max(
         1,
         round(
             get_exponential_scaled_value(
                 train_progress_01,
-                initial_value=args.batch_size
-                if args.initial_batch_size is None
-                else args.initial_batch_size,
-                final_value=args.batch_size
-                if args.final_batch_size is None
-                else args.final_batch_size,
-                alpha=args.batch_size_curriculum_alpha,
+                initial_value=batch_size if initial_bs is None else initial_bs,
+                final_value=batch_size if final_bs is None else final_bs,
+                alpha=alpha,
             )
         ),
     )

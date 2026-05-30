@@ -1275,14 +1275,10 @@ def main(args):
             run_nonema = args.ema_sample_nonema_model or not ema_active
             run_ema    = args.ema_sample_ema_model and ema_active
 
-            unet_was_training = model.unet.training
-            text_encoder_was_training = model.text_encoder.training
-            try:
-                model.unet.eval()
-                model.text_encoder.eval()
-                if model.text_encoder_2:
-                    model.text_encoder_2.eval()
-
+            guard_modules = [model.unet, model.text_encoder]
+            if model.text_encoder_2:
+                guard_modules.append(model.text_encoder_2)
+            with inference_guard(*guard_modules):
                 # ── Non-EMA (live model) pass ──────────────────────────────
                 if run_nonema:
                     logging.info(f" * Generating samples [non-EMA model] at gs:{global_step}")
@@ -1350,13 +1346,6 @@ def main(args):
                             if model.text_encoder_2 is not None:
                                 _unwrap(model.text_encoder_2).to(device)
 
-            finally:
-                if unet_was_training:
-                    model.unet.train()
-                if text_encoder_was_training:
-                    model.text_encoder.train()
-                    if model.text_encoder_2:
-                        model.text_encoder_2.train()
 
             gc.collect()
             torch.cuda.empty_cache()

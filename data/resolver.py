@@ -75,21 +75,27 @@ def strategy(data_root: str) -> typing.Type[DataResolver]:
         
     raise ValueError(f"data_root '{data_root}' is not a valid directory or JSON file.")
                     
-def resolve_root(path: str, args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
+def resolve_root(path: str, args: argparse.Namespace, resolution=None, aspects=None) -> list[ImageTrainItem]:
     """
     Resolve the training data from the root path.
     :param path: The root path to resolve.
     :param args: EveryDream configuration, an `argparse.Namespace` object.
+    :param aspects: Aspect ratio buckets. Falls back to args.aspects when not supplied.
     """
+    if aspects is None:
+        aspects = getattr(args, 'aspects', None)
     resolver = strategy(path)
     return resolver(args, aspects).image_train_items(path)
 
-def resolve(value: typing.Union[dict, str], args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
+def resolve(value: typing.Union[dict, str], args: argparse.Namespace, resolution=None, aspects=None) -> list[ImageTrainItem]:
     """
     Resolve the training data from the value.
     :param value: The value to resolve, either a dict, an array, or a string.
     :param args: EveryDream configuration, an `argparse.Namespace` object.
+    :param aspects: Aspect ratio buckets. Falls back to args.aspects when not supplied.
     """
+    if aspects is None:
+        aspects = getattr(args, 'aspects', None)
     if isinstance(value, str):
         return resolve_root(value, args, resolution, aspects)
     
