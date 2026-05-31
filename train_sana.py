@@ -220,12 +220,10 @@ def build_sana_data_loader(args: Namespace, seed: int):
         batch_size=args.batch_size,
     )
 
-    # Default image_output_range is [-1, 1], matching diffusers AutoencoderDC convention
     dataset = EveryDreamBatch(
         data_loader=data_loader_multi_aspect,
         tokenizer=None,
         seed=seed,
-        #image_output_range='[0,255]'
     )
 
     data_loader = build_torch_dataloader(

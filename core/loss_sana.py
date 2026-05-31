@@ -81,6 +81,7 @@ def compute_sana_loss(
 
     # Flow-matching velocity target: v = ε − z₀
     target = noise - z
+    # [x.item() for x in [target.isnan().sum(), model_pred.isnan().sum(), target.isinf().sum(), model_pred.isinf().sum()]]
 
     # return 1D loss
     mean_dims = list(range(1, len(target.shape)))

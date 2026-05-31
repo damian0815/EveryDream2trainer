@@ -61,10 +61,8 @@ class EveryDreamBatch(Dataset):
                  invert_masks=False,
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0,
-                 image_output_range: Literal['[-1,1]', '[0,255]'] = '[-1,1]',
                  ):
 
-        self.image_output_range = image_output_range
         if plugin_runner is None:
             print("EveryDreamBatch using empty PluginRunner")
             plugin_runner = PluginRunner()
@@ -167,8 +165,6 @@ class EveryDreamBatch(Dataset):
         else:
             example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
             example["image"] = image_transforms(example["image"]) # range [-1, 1]
-            if self.image_output_range == "[0,255]":
-                example["image"] = (example["image"] * 0.5 + 0.5) * 255.0  # [-1, 1] → [0, 255]
         if train_item["mask"] is not None:
             mask_transforms = transforms.Compose(
                 [
