@@ -22,6 +22,7 @@ def encode_prompts(
     max_sequence_length: int = 300,
     complex_human_instruction: Optional[list[str]] = None,
     dtype: torch.dtype = torch.bfloat16,
+    slice_size: int=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Encodes a list of captions using the Gemma text encoder.
@@ -35,6 +36,7 @@ def encode_prompts(
         complex_human_instruction : Optional list of system-prompt lines prepended to
                                     every caption (mirrors SANA's chi_prompt feature).
         dtype               : Float dtype for the output embeddings.
+        slice_size          : Max size of internal processing batch slices (saves VRAM)
 
     Returns:
         prompt_embeds         (B, N, C) — text embeddings ready for
@@ -42,6 +44,26 @@ def encode_prompts(
         prompt_attention_mask (B, N)    — boolean-style mask (1=keep, 0=pad) ready for
                               SanaTransformer2DModel.forward(encoder_attention_mask=...)
     """
+
+    if slice_size is not None:
+        results = []
+        for slice_start in range(0, len(captions), slice_size):
+            slice_end = slice_start + slice_size
+            captions_slice = captions[slice_start:slice_end]
+            complex_human_instruction_slice = None if complex_human_instruction is None else complex_human_instruction[slice_start:slice_end]
+            results.append(encode_prompts(
+                tokenizer,
+                text_encoder,
+                captions_slice,
+                device,
+                max_sequence_length=max_sequence_length,
+                complex_human_instruction=complex_human_instruction_slice,
+                dtype=dtype,
+                slice_size=None
+            ))
+        all_prompt_embeds, all_attn_mask = list(zip(*results))
+        return torch.cat(all_prompt_embeds, dim=0), torch.cat(all_attn_mask, dim=0)
+
     tokenizer.padding_side = "right"
 
     if complex_human_instruction:

@@ -95,13 +95,22 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
     TrainFlowMatchEulerDiscreteScheduler so the training loop can use the same
     noising/timestep utilities as SD2/SDXL flow-matching training.
     Optionally loads fine-tuned transformer weights from args.resume_from.
+
+    The transformer is kept in float32 for numerical stability (SANA's linear
+    attention is prone to NaN gradients in bf16).  The frozen text encoder and
+    VAE are cast to bfloat16 to save VRAM.
     """
     from diffusers import SanaPipeline
     from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 
-    torch_dtype = _parse_dtype(getattr(args, "mixed_precision", "bf16"))
+    # Load everything in float32; we'll downcast the frozen components below.
+    pipe = SanaPipeline.from_pretrained(args.model_id, torch_dtype=torch.float32)
 
-    pipe = SanaPipeline.from_pretrained(args.model_id, torch_dtype=torch_dtype)
+    cast_vae_and_text_encoder_to_bfloat16 = True
+    if cast_vae_and_text_encoder_to_bfloat16:
+        # Frozen components: cast to bfloat16 to save VRAM.
+        pipe.text_encoder.to(dtype=torch.bfloat16)
+        pipe.vae.to(dtype=torch.bfloat16)
 
     for p in pipe.text_encoder.parameters():
         p.requires_grad_(False)
@@ -151,13 +160,6 @@ def save_sana_model(path: str, model: SanaTrainingModel, global_step: int) -> No
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _parse_dtype(mixed_precision: str) -> torch.dtype:
-    return {
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-        "no": torch.float32,
-    }.get(mixed_precision, torch.bfloat16)
 
 
 def _load_transformer_checkpoint(transformer: nn.Module, checkpoint_path: str) -> None:

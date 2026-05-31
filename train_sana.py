@@ -23,12 +23,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 import data.aspects as aspects_module
 import data.resolver as resolver_module
+from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE, SAVE_FULL_AND_STOP_SEMAPHORE_FILE
 from core.step import run_accumulation_loop, repeat_with_oom_handling
 from core.step import get_best_match_resolution, choose_effective_batch_size
 from core.loss import get_multirank_stratified_random_timesteps
 from core.loss_sana import compute_sana_loss
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import setup_local_logger, log_args, do_log_step, LogData
+from data.dataset import select_caption_variants
 from model.sana_training_model import SanaTrainingModel, load_sana_model, save_sana_model
 from model.sana_text_encoder import encode_prompts
 from model.training_model import TrainingVariables
@@ -243,14 +245,24 @@ def _encode_latents(
     model: SanaTrainingModel,
     images: torch.Tensor,
     device: torch.device,
+    slice_size: int=None
 ) -> torch.Tensor:
     """
     Encodes a batch of images (float, range [-1, 1]) via DC-AE.
     Returns scaled latents: encode(x).latent * vae.config.scaling_factor.
     AutoencoderDC is deterministic (no .latent_dist); use .latent directly.
+    Casts images to the VAE's dtype (bfloat16), not the transformer's (float32).
     """
+    if slice_size is not None:
+        results = []
+        for slice_start in range(0, images.shape[0], slice_size):
+            results.append(_encode_latents(model, images[slice_start:slice_start + slice_size], device))
+        return torch.cat(results, dim=0)
+
+    vae_dtype = next(model.vae.parameters()).dtype
     with torch.no_grad():
-        latents = model.vae.encode(images.to(device, dtype=model.dtype)).latent
+        latents = model.vae.encode(images.to(device, dtype=vae_dtype)).latent
+    # Return latents in transformer dtype (float32) so gradients flow cleanly.
     return latents.to(model.dtype) * model.vae.config.scaling_factor
 
 
@@ -336,17 +348,28 @@ def train_sana_step(
     then delegates nibbling/accumulation/backward/step to run_accumulation_loop().
     """
     # 1. Text-encode the full batch once (encoder is frozen), with OOM retry
+    caption_variants = select_caption_variants(
+        full_batch["captions"],
+        requested_variants=args.caption_variants,
+        caption_cross_concatenation_p=args.caption_cross_concatenation_p,
+        caption_cross_concatenation_empty_half_p=args.caption_cross_concatenation_empty_half_p,
+    )
+    assert len(caption_variants) == 1
+    caption_variant = caption_variants[0]
+    del caption_variants
+
     with torch.no_grad():
         y, y_mask = repeat_with_oom_handling(
-            initial_slice_size=len(full_batch["captions"]["default"]),
+            initial_slice_size=len(full_batch["captions"][caption_variant]),
             callback=lambda sz: encode_prompts(
                 model.tokenizer,
                 model.text_encoder,
-                full_batch["captions"]["default"][:sz],
+                full_batch["captions"][caption_variant],
                 device,
                 max_sequence_length=model.max_sequence_length,
                 complex_human_instruction=model.complex_human_instruction or None,
                 dtype=model.dtype,
+                slice_size=sz
             ),
             oom_log_info=f"OOM gs:{tv.global_step} SANA text encoder encode",
         )
@@ -354,7 +377,7 @@ def train_sana_step(
     # 2. VAE-encode the full batch once, with OOM retry
     z = repeat_with_oom_handling(
         initial_slice_size=tv.forward_slice_size,
-        callback=lambda sz: _encode_latents(model, full_batch["image"][:sz], device),
+        callback=lambda sz: _encode_latents(model, full_batch["image"], device, slice_size=sz),
         oom_log_info=f"OOM gs:{tv.global_step} SANA VAE encode",
     )
 
@@ -384,6 +407,7 @@ def train_sana_step(
         full_batch=full_batch,
         tv=tv,
         ed_optimizer=ed_optimizer,
+        model=model,
         nibble_loss_fn=nibble_loss_fn,
         plugin_runner=None,
         log_data=log_data,
@@ -391,6 +415,25 @@ def train_sana_step(
         did_step_optimizer_cb=None,
         args=args,
     )
+
+
+def generate_samples(model: SanaTrainingModel, sample_generator: SampleGenerator, global_step: int, batch: dict) -> None:
+    logging.info(f"Generating samples at gs:{global_step}")
+    with inference_guard(model.transformer):
+        pipe = sample_generator.create_inference_pipe(
+            model_being_trained=model,
+            diffusers_scheduler_config=model.noise_scheduler.config,
+        )
+        sample_generator.reload_config()
+        if batch is not None:
+            flattened_captions_dict = [v
+                                       for _, l in batch["captions"].items()
+                                       for v in l]
+            sample_generator.update_random_captions(flattened_captions_dict)
+        sample_generator.generate_samples(pipe, global_step)
+        del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -427,13 +470,17 @@ def train_sana_loop(
     )
 
     log_data = LogData()
+    should_stop = False
 
     for epoch in range(args.max_epochs):
         # Reset stratified timestep buffer at each epoch boundary (matches train.py)
         tv.remaining_stratified_timesteps = None
 
         dataset.shuffle(epoch_n=epoch, max_epochs=args.max_epochs)
+        sample_generator.on_epoch_start(epoch, global_step, epoch_length = len(data_loader))
         steps_pbar = tqdm.tqdm(data_loader, desc=f"Epoch {epoch}")
+
+        local_step = 0
 
         for full_batch in steps_pbar:
             if global_step >= args.max_steps:
@@ -466,21 +513,30 @@ def train_sana_loop(
                 logging.info(f"Saving SANA model to {save_path}")
                 save_sana_model(save_path, model, global_step)
 
-            if sample_generator.should_generate_samples(global_step, local_step=0):
-                logging.info(f"Generating samples at gs:{global_step}")
-                with inference_guard(model.transformer):
-                    pipe = sample_generator.create_inference_pipe(
-                        model_being_trained=model,
-                        diffusers_scheduler_config=model.noise_scheduler.config,
-                    ).to(device)
-                    sample_generator.generate_samples(pipe, global_step)
-                    del pipe
-                gc.collect()
-                torch.cuda.empty_cache()
+            user_wants_samples = check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE)
+            if user_wants_samples or sample_generator.should_generate_samples(tv.global_step, local_step=local_step):
+                generate_samples(model, sample_generator, global_step=global_step, batch=full_batch)
 
             global_step += 1
+            local_step += 1
 
-    save_sana_model(os.path.join(logdir, "final"), model, global_step)
+            should_save = False
+            if check_semaphore_file_and_unlink(SAVE_FULL_SEMAPHORE_FILE):
+                should_save = True
+            if check_semaphore_file_and_unlink(SAVE_FULL_AND_STOP_SEMAPHORE_FILE):
+                should_save = True
+                should_stop = True
+            if should_save:
+                logging.info("Save requested -> saving")
+                save_sana_model(os.path.join(logdir, 'ckpts'), model, global_step)
+            if should_stop:
+                logging.info("Stop requested -> stopping")
+                break
+
+        if should_stop:
+            break
+
+    save_sana_model(os.path.join(logdir, 'ckpts'), model, global_step)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +551,9 @@ def main_sana() -> None:
     """
     import pprint
     args = parse_sana_args()
+
+    if args.debug_log_on_nan:
+        torch.autograd.set_detect_anomaly(True)
 
     # ── Logging ──────────────────────────────────────────────────────────────
     # Mirrors train.py: timestamped run folder, file + console logging,
@@ -563,6 +622,11 @@ def main_sana() -> None:
         f"resolutions={args.resolution}, "
         f"batch_size={args.batch_size}"
     )
+
+    _is_main = True # multiprocess placeholder
+    if _is_main and sample_generator.generate_pretrain_samples:
+        _, batch = next(enumerate(data_loader))
+        generate_samples(model, sample_generator, global_step=0, batch=batch)
 
     train_sana_loop(
         model=model,

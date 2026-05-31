@@ -9,7 +9,7 @@ from diffusers import (
     DDIMScheduler, DDPMScheduler, DPMSolverMultistepScheduler, DPMSolverSDEScheduler,
     EulerAncestralDiscreteScheduler, PNDMScheduler, LMSDiscreteScheduler,
     KDPM2AncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverSinglestepScheduler, StableDiffusionXLPipeline,
-    FlowMatchEulerDiscreteScheduler
+    FlowMatchEulerDiscreteScheduler, SanaPipeline
 )
 from diffusers import StableDiffusionPipeline
 from compel import CompelForSD
@@ -343,18 +343,22 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                             # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                             #print("updated scheduler with shift", shift)
 
+                        non_sana_kwargs = {} if isinstance(pipe, SanaPipeline) else dict(
+                            pooled_prompt_embeds=pooled_embeds,
+                            negative_pooled_prompt_embeds=negative_pooled_embeds,
+                            guidance_rescale=p0.cfg_rescale_multiplier
+                        )
+
                         images = pipe(prompt=prompt,
                                       prompt_embeds=embeds,
-                                      pooled_prompt_embeds=pooled_embeds,
                                       negative_prompt=negative_prompt,
                                       negative_prompt_embeds=negative_embeds,
-                                      negative_pooled_prompt_embeds=negative_pooled_embeds,
                                       generator=generator,
                                       width=p0.width,
                                       height=p0.height,
                                       guidance_scale=cfg,
-                                      guidance_rescale=p0.cfg_rescale_multiplier,
-                                      num_inference_steps=p0.steps
+                                      num_inference_steps=p0.steps,
+                                      **non_sana_kwargs
                                       ).images
 
                         for image in images:

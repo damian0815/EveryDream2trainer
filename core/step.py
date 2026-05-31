@@ -11,7 +11,6 @@ from typing import Callable, Optional
 
 import math
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
 from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 import line_profiler
@@ -24,6 +23,7 @@ from core.loss import get_noise, get_multirank_stratified_random_timesteps, get_
     compute_saturation_penalty_loss
 from core.self_flow import compute_self_flow_loss
 from data.dataset import select_caption_variants
+from model.sana_training_model import SanaTrainingModel
 from model.training_model import TrainingVariables, TrainingModel, get_text_conditioning, Conditioning
 from optimizer.optimizers import InfOrNanException, EveryDreamOptimizer
 from plugins.plugins import PluginRunner
@@ -63,6 +63,7 @@ def run_accumulation_loop(
     full_batch: dict,
     tv: TrainingVariables,
     ed_optimizer: EveryDreamOptimizer,
+    model: TrainingModel|SanaTrainingModel,
     nibble_loss_fn: NibbleLossFn,
     plugin_runner: Optional[PluginRunner],
     log_data: LogData,
@@ -70,7 +71,6 @@ def run_accumulation_loop(
     did_step_optimizer_cb: Optional[Callable],
     args: argparse.Namespace,
     train_progress_01: float = 0.0,
-    model_for_autocast=None,
 ) -> None:
     """
     Model-agnostic nibble/accumulation/backward/optimizer-step loop.
@@ -97,15 +97,10 @@ def run_accumulation_loop(
         assert batch["runt_size"] == 0
         num_images = batch["image"].shape[0]
 
-        use_bfloat16 = (
-            model_for_autocast is not None
-            and (getattr(model_for_autocast, 'is_sdxl', False) or getattr(args, 'force_bfloat16', False))
-        )
-
         # Pre-emptive backward: fire if adding this nibble would exceed max_backward_slice_size
         if (tv.accumulated_loss_images_count > 0
                 and tv.accumulated_loss_images_count + num_images > tv.max_backward_slice_size):
-            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if use_bfloat16 else torch.float16):
+            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16):
                 optimizer_backward(ed_optimizer, tv, plugin_runner,
                                    f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
 
@@ -160,6 +155,11 @@ def run_accumulation_loop(
             "gs": str(tv.global_step),
         })
 
+        should_do_backward = tv.accumulated_loss_images_count >= tv.max_backward_slice_size
+        if should_do_backward:
+            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16):
+                optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
+
         # Regular backward + optimizer step (if threshold reached)
         should_step_optimizer = (
             (tv.backwarded_images_count + tv.accumulated_loss_images_count)
@@ -168,7 +168,7 @@ def run_accumulation_loop(
 
         if ((should_step_optimizer and tv.accumulated_loss_images_count > 0)
                 or tv.accumulated_loss_images_count >= tv.max_backward_slice_size):
-            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16 if use_bfloat16 else torch.float16):
+            with torch.amp.autocast('cuda', enabled=args.amp, dtype=torch.bfloat16):
                 optimizer_backward(ed_optimizer, tv, plugin_runner, 'regular backward: ')
 
         if should_step_optimizer and tv.backwarded_images_count > 0:
@@ -184,13 +184,13 @@ def run_accumulation_loop(
 
             sync_ddp_gradients(
                 *[m for m in [
-                    getattr(model_for_autocast, 'unet', None),
-                    getattr(model_for_autocast, 'text_encoder', None),
-                    getattr(model_for_autocast, 'text_encoder_2', None),
+                    getattr(model, 'unet', None),
+                    getattr(model, 'text_encoder', None),
+                    getattr(model, 'text_encoder_2', None),
                 ] if m is not None]
             )
 
-            ed_optimizer.step_optimizer(tv.global_step, tv, log_data=None)
+            ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
 
             tv.last_effective_batch_size = tv.backwarded_images_count
             tv.total_trained_samples_count += tv.backwarded_images_count
@@ -269,7 +269,6 @@ def train_step(
         assert len(caption_variants) == 1
         caption_variant = caption_variants[0]
         del caption_variants
-        print(f"selected caption variant: {caption_variant}")
 
         record_performance_timing("2_caption_selection", time.perf_counter() - t_caption_start, num_images)
 
@@ -468,7 +467,7 @@ def train_step(
         did_step_optimizer_cb=did_step_optimizer_cb,
         args=args,
         train_progress_01=train_progress_01,
-        model_for_autocast=model,
+        model=model,
     )
 
     t_step_end = time.perf_counter()

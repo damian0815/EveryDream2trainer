@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from colorama import Fore, Style
 from diffusers import (
     StableDiffusionPipeline,
+    SanaPipeline,
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     DDPMScheduler,
@@ -22,8 +23,7 @@ from diffusers import (
     KDPM2AncestralDiscreteScheduler,
     DPMSolverSDEScheduler,
     DPMSolverSinglestepScheduler,
-    FlowMatchEulerDiscreteScheduler,
-    StableDiffusionXLPipeline, FlowMatchHeunDiscreteScheduler,
+    StableDiffusionXLPipeline,
 )
 
 from torch.amp import autocast
@@ -251,7 +251,7 @@ class SampleGenerator:
             print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts (subdir: {samples_subdir})")
 
         sample_index = 0
-        with autocast('cuda'):
+        with autocast('cuda', enabled=type(pipe) is not SanaPipeline):
             try:
                 do_regular_samples = self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts
                 if do_regular_samples:
@@ -264,7 +264,6 @@ class SampleGenerator:
                                       desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
-                    from diffusers import SanaPipeline
                     if type(pipe) in (StableDiffusionXLPipeline, SanaPipeline):
                         print(f"{type(pipe).__name__} -> no Compel")
                         compel = None
@@ -306,20 +305,24 @@ class SampleGenerator:
                                 #pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                                 #print("updated scheduler with shift", shift)
 
+                            non_sana_kwargs = {} if isinstance(pipe, SanaPipeline) else dict(
+                                pooled_prompt_embeds=pooled_prompt_embeds,
+                                negative_pooled_prompt_embeds=negative_pooled_embeds,
+                                guidance_rescale=self.guidance_rescale
+                            )
+
                             images = pipe(
                                 prompt=prompt,
                                 prompt_embeds=embeds,
-                                pooled_prompt_embeds=pooled_prompt_embeds,
                                 negative_prompt=negative_prompt,
                                 negative_prompt_embeds=negative_embeds,
-                                negative_pooled_prompt_embeds=negative_pooled_embeds,
                                 num_inference_steps=self.num_inference_steps,
                                 num_images_per_prompt=1,
                                 guidance_scale=cfg,
                                 generator=generators,
                                 width=size[0],
                                 height=size[1],
-                                **({} if isinstance(pipe, SanaPipeline) else {"guidance_rescale": self.guidance_rescale}),
+                                **non_sana_kwargs,
                             ).images
 
                             for image in images:
@@ -426,7 +429,7 @@ class SampleGenerator:
         pipe = model_being_trained.build_inference_pipeline(scheduler=scheduler)
         if self.use_xformers:
             pipe.enable_xformers_memory_efficient_attention()
-        return pipe
+        return pipe.to(model_being_trained.device)
 
     @torch.no_grad()
     def create_ema_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config,
