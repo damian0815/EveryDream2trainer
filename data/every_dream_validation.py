@@ -559,14 +559,9 @@ class EveryDreamValidator:
                     for key in keys:
 
                         caption_str = batch["captions"][key]
-                        tokens = torch.stack(batch["tokens"][key])
-                        if model.is_sdxl:
-                            tokens_2 = torch.stack(batch["tokens_2"][key])
-                        else:
-                            tokens_2 = None
 
                         encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
-                            tokens, tokens_2, caption_str, model, args=None
+                            caption_str, model, args=None
                         )
                         if model.is_sdxl:
                             add_time_ids = batch["add_time_ids"].to(encoder_hidden_states.device)

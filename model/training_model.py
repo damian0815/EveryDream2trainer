@@ -722,10 +722,21 @@ def _make_conditioning_slice(
         )
 
 
-def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
-    # todo: move to Conditioning
+def _tokenize_captions(captions: list[str], tokenizer) -> torch.Tensor:
+    return torch.tensor(
+        tokenizer(
+            captions,
+            truncation=True,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+        ).input_ids
+    )
+
+
+def get_text_conditioning(caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
     if model.compel:
         print("Compel is setup but not being used (not implemented)")
+    tokens = _tokenize_captions(caption_str, model.tokenizer)
     encoder_hidden_states, encoder_pooled_embeds = _encode_caption_tokens(
         tokens,
         model.text_encoder,
@@ -739,6 +750,7 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
     if model.is_sdxl:
         # note: to support a "style" prompt we'd need to collect/encode a "tokens_3" (style prompt tokens)
         # so we don't support that for now
+        tokens_2 = _tokenize_captions(caption_str, model.tokenizer_2)
         encoder_2_hidden_states, encoder_2_pooled_embeds = _encode_caption_tokens(
             tokens_2,
             model.text_encoder_2,
@@ -752,8 +764,6 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
     else:
         encoder_2_hidden_states = None
         encoder_2_pooled_embeds = None
-    # todo: -----
-    # todo: move to conditioning (end)
     return encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds
 
 

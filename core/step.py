@@ -238,7 +238,6 @@ def train_step(
             logging.info(
                 f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']} - treating as cond dropout for this batch **")
             batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
-            batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
             caption_variants = ['default']
 
         record_performance_timing("2_caption_selection", time.perf_counter() - t_caption_start, num_images)
@@ -915,19 +914,20 @@ def _generate_teacher_mask_or_none(training_model: TrainingModel, args: argparse
         return None
     teacher_model = teacher_models[0]
 
+    teacher_p = args.teacher_p
     if args.teacher_timestep_max is not None:
         # scale teacher_p based on timesteps
         # 1000...args.teacher_timestep_max: p = 0
         # args.teacher_timestep_max...0: ramp from 0 to args.teacher_p
         scale = torch.maximum(
-            teacher_timestep_max - timesteps.float(),
+            args.teacher_timestep_max - timesteps.float(),
             torch.zeros([1])
-        ) / teacher_timestep_max
+        ) / args.teacher_timestep_max
         teacher_p = args.teacher_p * scale
 
     teacher_lambda = get_teacher_lambda(timesteps, args, training_model.noise_scheduler)
     batch_size = timesteps.shape[0]
-    return ((torch.rand(batch_size) < args.teacher_p) & (teacher_lambda > 0)).to(teacher_model.unet.device)
+    return ((torch.rand(batch_size) < teacher_p) & (teacher_lambda > 0)).to(teacher_model.unet.device)
 
 def _generate_conditioning(
     batch: dict,
@@ -946,74 +946,31 @@ args) -> tuple[Conditioning, list, list[str]]:
         if args.disable_textenc_training
         else contextlib.nullcontext()
     ):
-        # todo move this logic to the dataloader
         batch_size = batch["image"].shape[0]
 
         model.load_textenc_to_device(model.device)
 
+        first_teacher = teacher_models[0] if teacher_models else None
+
         caption_str = []
-        tokens = []
-        tokens_2 = []
-        teacher_tokens = []
-        teacher_tokens_2 = []
         add_time_ids = []
 
         for key in caption_variant:
-            this_tokens_2 = None
-            this_add_time_ids = None
-            this_teacher_tokens = None
-            this_teacher_tokens_2 = None
-            # Use the first teacher's cond-dropout tokens for teacher-specific tokenisation
-            # (v1 limitation: only the first teacher may have a heterogeneous tokenizer).
-            first_teacher = teacher_models[0] if teacher_models else None
             if key is None:
-                # empty variant half
+                # empty variant half — use cond-dropout string for all items
                 this_caption_str = [model.cond_dropout_caption] * batch_size
-                this_tokens = model.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
-                if model.is_sdxl:
-                    this_tokens_2 = model.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
-                if first_teacher is not None:
-                    this_teacher_tokens = first_teacher.cond_dropout_tokens.unsqueeze(0).repeat((batch_size, 1))
-                    if first_teacher.is_sdxl:
-                        this_teacher_tokens_2 = first_teacher.cond_dropout_tokens_2.unsqueeze(0).repeat((batch_size, 1))
             else:
                 this_caption_str = [batch["captions"][key][i] for i in range(batch_size)]
-                assert all(c is not None for c in caption_str)
-                this_tokens = torch.stack([batch["tokens"][key][i] for i in range(batch_size)])
-                if model.is_sdxl:
-                    this_tokens_2 = torch.stack([batch["tokens_2"][key][i] for i in range(batch_size)])
-                if "tokens_teacher" in batch:
-                    for i in range(batch_size):
-                        if batch["tokens_teacher"][key][i] is None:
-                            print("** None in tokens_teacher?")
-                            batch["tokens_teacher"][key][i] = batch["tokens"][key][i]
-                    this_teacher_tokens = torch.stack([batch["tokens_teacher"][key][i] for i in range(batch_size)])
-                if "tokens_teacher_2" in batch:
-                    for i in range(batch_size):
-                        if batch["tokens_teacher_2"][key][i] is None:
-                            print("** None in tokens_teacher_2?")
-                            batch["tokens_teacher_2"][key][i] = batch["tokens"][key][i]
-                    this_teacher_tokens_2 = torch.stack([batch["tokens_teacher_2"][key][i] for i in range(batch_size)])
+                assert all(c is not None for c in this_caption_str)
 
-            if model.is_sdxl:
-                this_add_time_ids = batch["add_time_ids"].to(model.unet.device)
-
+            # Apply per-sample cond dropout by replacing caption strings
             for i in range(cond_dropout_mask.shape[0]):
                 if cond_dropout_mask[i]:
                     this_caption_str[i] = model.cond_dropout_caption
-                    this_tokens[i] = model.cond_dropout_tokens
-                    if model.is_sdxl:
-                        this_tokens_2[i] = model.cond_dropout_tokens_2
-                    if first_teacher is not None:
-                        this_teacher_tokens[i] = first_teacher.cond_dropout_tokens
-                        if first_teacher.is_sdxl:
-                            this_teacher_tokens_2[i] = first_teacher.cond_dropout_tokens_2
+
+            this_add_time_ids = batch["add_time_ids"].to(model.unet.device) if model.is_sdxl else None
 
             caption_str.append(this_caption_str)
-            tokens.append(this_tokens)
-            tokens_2.append(this_tokens_2)
-            teacher_tokens.append(this_teacher_tokens)
-            teacher_tokens_2.append(this_teacher_tokens_2)
             add_time_ids.append(this_add_time_ids)
 
         conditioning_list = []
@@ -1024,7 +981,7 @@ args) -> tuple[Conditioning, list, list[str]]:
 
         for i, key in enumerate(caption_variant):
             encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds = get_text_conditioning(
-                tokens[i], tokens_2[i], caption_str[i], model, args
+                caption_str[i], model, args
             )
             conditioning_list.append(Conditioning(encoder_hidden_states, encoder_pooled_embeds,
                                         encoder_2_hidden_states, encoder_2_pooled_embeds,
@@ -1035,16 +992,8 @@ args) -> tuple[Conditioning, list, list[str]]:
                     if tm.text_encoder is None:
                         continue  # shares student text encoder; no separate conditioning needed
                     with torch.no_grad():
-                        # teacher[0] may have pre-tokenised teacher tokens from the dataloader;
-                        # teacher[j>0] falls back to student tokens (v1 limitation).
-                        if j == 0:
-                            t_tokens = teacher_tokens[i] if teacher_tokens[i] is not None else tokens[i]
-                            t_tokens_2 = teacher_tokens_2[i] if teacher_tokens_2[i] is not None else tokens_2[i]
-                        else:
-                            t_tokens = tokens[i]
-                            t_tokens_2 = tokens_2[i]
                         te_hs, te_pe, te_hs2, te_pe2 = get_text_conditioning(
-                            t_tokens, t_tokens_2, caption_str[i], tm, args
+                            caption_str[i], tm, args
                         )
                         per_teacher_conditioning_lists[j].append(Conditioning(
                             te_hs, te_pe, te_hs2, te_pe2,

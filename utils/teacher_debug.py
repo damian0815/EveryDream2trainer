@@ -787,27 +787,13 @@ def prepare_teacher_target_inputs(
     idx = max(0, min(timestep_index, len(sched.timesteps) - 1))
     student_timesteps = sched.timesteps[idx: idx + 1].to(device)   # [1]
 
-    # ── 6. Tokenise caption and build teacher conditioning ────────────────────
+    # ── 6. Build teacher conditioning ─
     t_device = teacher_model.unet.device
     teacher_model.load_textenc_to_device(t_device)
 
-    def _tok(tokenizer, text: str) -> torch.Tensor:
-        ids = tokenizer(
-            text, truncation=True, padding="max_length",
-            max_length=tokenizer.model_max_length,
-        ).input_ids
-        return torch.tensor(ids).unsqueeze(0).to(teacher_model.text_encoder.device)
-
-    tokens   = _tok(teacher_model.tokenizer, caption)
-    tokens_2 = (
-        _tok(teacher_model.tokenizer_2, caption)
-        if teacher_model.is_sdxl and getattr(teacher_model, "tokenizer_2", None) is not None
-        else None
-    )
-
     with torch.no_grad():
         enc_hs, enc_pe, enc_2_hs, enc_2_pe = get_text_conditioning(
-            tokens, tokens_2, [caption], teacher_model, args=None
+            [caption], teacher_model, args=None
         )
 
     if teacher_model.is_sdxl:
@@ -876,23 +862,9 @@ def prepare_conditioning(
     device = model.unet.device
     model.load_textenc_to_device(device)
 
-    def _tok(tokenizer, text: str) -> torch.Tensor:
-        ids = tokenizer(
-            text, truncation=True, padding="max_length",
-            max_length=tokenizer.model_max_length,
-        ).input_ids
-        return torch.tensor(ids).unsqueeze(0).to(model.text_encoder.device)
-
-    tokens   = _tok(model.tokenizer, caption)
-    tokens_2 = (
-        _tok(model.tokenizer_2, caption)
-        if model.is_sdxl and getattr(model, "tokenizer_2", None) is not None
-        else None
-    )
-
     with torch.no_grad():
         enc_hs, enc_pe, enc_2_hs, enc_2_pe = get_text_conditioning(
-            tokens, tokens_2, [caption], model, args=None
+            [caption], model, args=None
         )
 
     if model.is_sdxl:
