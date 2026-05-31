@@ -1,67 +1,97 @@
 """
-SANA loss utilities: timestep sampling and forward-pass loss computation.
+SANA flow-matching training loss using 🤗 diffusers.
+
+No SANA repo clone required — all scheduler maths is self-contained here.
+
+Theory
+------
+Flow matching uses the forward (noising) process:
+
+    z_t = (1 - σ) · z₀  +  σ · ε       ε ~ N(0, I),  σ ∈ [0, 1]
+
+The transformer is trained to predict the velocity  v = ε − z₀:
+
+    loss = MSE(transformer(z_t, timestep=σ·T), ε − z₀)
+
+where T = num_train_timesteps (default 1000).
 """
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
-def sample_sana_timesteps(
+def sample_flow_sigmas(
     batch_size: int,
-    train_sampling_steps: int,
     weighting_scheme: str,
     logit_mean: float,
     logit_std: float,
     device: torch.device,
-) -> torch.Tensor:
+    num_train_timesteps: int = 1000,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Draws `batch_size` timestep indices.
+    Samples a σ ∈ (0, 1) for each image and converts it to a continuous timestep.
 
-    If weighting_scheme is "logit_normal": uses logit-normal distribution
-    (via compute_density_for_timestep_sampling).
-    Otherwise: uniform random integers in [0, train_sampling_steps).
+    Args:
+        batch_size          : Number of samples.
+        weighting_scheme    : "uniform" or "logit_normal".
+        logit_mean          : Mean for logit-normal sampling (ignored for uniform).
+        logit_std           : Std  for logit-normal sampling (ignored for uniform).
+        device              : Target device.
+        num_train_timesteps : T — scales σ to the transformer's timestep range.
 
-    Returns a 1D LongTensor of shape (batch_size,).
+    Returns:
+        sigma      (B,) float — noise fraction ∈ (0, 1)
+        timestep_t (B,) float — σ · T, the value passed to transformer.forward
     """
     if weighting_scheme == "logit_normal":
-        from diffusion.model.respace import compute_density_for_timestep_sampling
-        u = compute_density_for_timestep_sampling(
-            weighting_scheme=weighting_scheme,
-            batch_size=batch_size,
-            logit_mean=logit_mean,
-            logit_std=logit_std,
-            mode_scale=None,
+        u = torch.sigmoid(
+            torch.randn(batch_size, device=device) * logit_std + logit_mean
         )
-        return (u * train_sampling_steps).long().clamp(0, train_sampling_steps - 1).to(device)
     else:
-        return torch.randint(0, train_sampling_steps, (batch_size,), device=device)
+        u = torch.rand(batch_size, device=device)
+
+    timestep_t = u * num_train_timesteps
+    return u, timestep_t
 
 
 def compute_sana_loss(
-    model,
+    transformer: torch.nn.Module,
     z: torch.Tensor,
     y: torch.Tensor,
     y_mask: torch.Tensor,
-    timesteps: torch.Tensor,
-    data_info: dict,
+    sigma: torch.Tensor,
+    timestep_t: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Runs one forward pass through the SANA transformer and returns the mean loss.
+    One flow-matching forward pass through the SANA transformer.
 
-    model    : SanaTrainingModel
-    z        : VAE-encoded latents, shape (B, C, H, W)
-    y        : text embeddings from encode_sana_text, shape (B, 1, N, C)
-    y_mask   : attention mask from encode_sana_text, shape (B, 1, 1, N)
-    timesteps: integer timestep indices, shape (B,)
-    data_info: dict with keys "img_hw" and "aspect_ratio" (required by SanaMS forward)
+    Args:
+        transformer : SanaTransformer2DModel (the trained component).
+        z           : Clean VAE latents,  shape (B, C, H, W).
+        y           : Text embeddings,    shape (B, N, C_text).
+        y_mask      : Attention mask,     shape (B, N).
+        sigma       : Noise fraction,     shape (B,)   — sampled by sample_flow_sigmas.
+        timestep_t  : Continuous timestep shape (B,)   — sampled by sample_flow_sigmas.
 
-    Returns a scalar Tensor with grad attached.
+    Returns:
+        Scalar loss Tensor with grad attached.
     """
-    loss_dict = model.train_diffusion.training_losses(
-        model.transformer,
-        z,
-        timesteps,
-        model_kwargs=dict(y=y, mask=y_mask, data_info=data_info),
-    )
-    return loss_dict["loss"].mean()
+    noise = torch.randn_like(z)
 
+    # Forward process: z_t = (1 - σ) · z₀ + σ · ε
+    sigma_view = sigma.view(-1, 1, 1, 1).to(z.dtype)
+    noisy_z = (1.0 - sigma_view) * z + sigma_view * noise
+
+    # Velocity prediction
+    model_pred = transformer(
+        hidden_states=noisy_z,
+        encoder_hidden_states=y,
+        timestep=timestep_t,
+        encoder_attention_mask=y_mask,
+    ).sample
+
+    # Flow-matching velocity target: v = ε − z₀
+    target = noise - z
+
+    return F.mse_loss(model_pred.float(), target.float())

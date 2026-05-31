@@ -1,11 +1,13 @@
 """
 SanaTrainingModel: dataclass holding all SANA model components plus factory and save functions.
+Uses 🤗 diffusers (SanaPipeline, SanaTransformer2DModel, AutoencoderDC,
+FlowMatchEulerDiscreteScheduler) — no SANA repo clone required.
 """
 from __future__ import annotations
 
 import os
 from argparse import Namespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -16,13 +18,16 @@ import torch.nn as nn
 class SanaTrainingModel:
     """Holds all SANA model components for training."""
 
-    transformer: nn.Module          # SanaMS — the sole trained component
-    text_encoder: nn.Module         # T5/Gemma/Qwen — frozen, not trained
-    tokenizer: Any                  # matching tokenizer
-    vae: nn.Module                  # DC-AE — frozen, not trained
-    vae_config: Any                 # SanaVaeConfig (vae_type, vae_downsample_rate, etc.)
-    train_diffusion: Any            # SANA Scheduler with .training_losses()
-    sana_config: Any                # full SanaConfig pyrallis object
+    transformer: nn.Module                   # SanaTransformer2DModel — sole trained component
+    text_encoder: nn.Module                  # Gemma2 — frozen, not trained
+    tokenizer: Any                           # GemmaTokenizerFast — frozen
+    vae: nn.Module                           # AutoencoderDC — frozen, not trained
+    scheduler: Any                           # FlowMatchEulerDiscreteScheduler
+    model_id: str                            # HF hub ID, recorded for save/resume
+
+    max_sequence_length: int = 300           # Gemma token budget
+    complex_human_instruction: list = field(default_factory=list)  # optional system-prompt prefix
+    guidance_scale: float = 4.5             # default cfg scale for sample generation
 
     transformer_ema: Optional[nn.Module] = None  # reserved for future EMA support
 
@@ -35,45 +40,37 @@ class SanaTrainingModel:
         return next(self.transformer.parameters()).dtype
 
 
-def load_sana_model(args: Namespace, sana_config) -> SanaTrainingModel:
+def load_sana_model(args: Namespace) -> SanaTrainingModel:
     """
-    Instantiates and returns a SanaTrainingModel from sana_config.
-    Loads a checkpoint if sana_config.model.resume_from or .load_from is set.
-    Freezes text_encoder and vae parameters (requires_grad = False).
+    Loads all SANA components via SanaPipeline.from_pretrained and wraps them in
+    a SanaTrainingModel.  Freezes the text encoder and VAE (requires_grad = False).
+    Optionally loads fine-tuned transformer weights from args.resume_from.
     """
-    from diffusion.model.builder import build_model, get_tokenizer_and_text_encoder, get_vae
-    from diffusion import Scheduler
-    from diffusion.utils.checkpoint import load_checkpoint
+    from diffusers import SanaPipeline
 
-    transformer = build_model(sana_config)
+    torch_dtype = _parse_dtype(getattr(args, "mixed_precision", "bf16"))
 
-    tokenizer, text_encoder = get_tokenizer_and_text_encoder(sana_config)
-    for p in text_encoder.parameters():
+    pipe = SanaPipeline.from_pretrained(args.model_id, torch_dtype=torch_dtype)
+
+    for p in pipe.text_encoder.parameters():
         p.requires_grad_(False)
-
-    vae = get_vae(sana_config)
-    for p in vae.parameters():
+    for p in pipe.vae.parameters():
         p.requires_grad_(False)
-
-    train_diffusion = Scheduler(
-        sana_config.scheduler.train_sampling_steps,
-        noise_schedule=sana_config.scheduler.noise_schedule,
-        predict_v=getattr(sana_config.scheduler, 'predict_v', False),
-        snr_shift_scale=getattr(sana_config.scheduler, 'snr_shift_scale', 1.0),
-    )
 
     model = SanaTrainingModel(
-        transformer=transformer,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        vae=vae,
-        vae_config=sana_config.vae,
-        train_diffusion=train_diffusion,
-        sana_config=sana_config,
+        transformer=pipe.transformer,
+        text_encoder=pipe.text_encoder,
+        tokenizer=pipe.tokenizer,
+        vae=pipe.vae,
+        scheduler=pipe.scheduler,
+        model_id=args.model_id,
+        max_sequence_length=getattr(args, "max_sequence_length", 300),
+        complex_human_instruction=getattr(args, "complex_human_instruction", []) or [],
+        guidance_scale=getattr(args, "guidance_scale", 4.5),
     )
 
-    if getattr(sana_config.model, 'resume_from', None) or getattr(sana_config.model, 'load_from', None):
-        load_checkpoint(model.transformer, sana_config)
+    if getattr(args, "resume_from", None):
+        _load_transformer_checkpoint(model.transformer, args.resume_from)
 
     return model
 
@@ -81,17 +78,36 @@ def load_sana_model(args: Namespace, sana_config) -> SanaTrainingModel:
 def save_sana_model(path: str, model: SanaTrainingModel, global_step: int) -> None:
     """
     Saves only the transformer (the trained component) as a safetensors file.
-    Saves the config as config.yaml.
-    Text encoder and VAE are NOT saved (they are frozen/unchanged).
+    Also writes model_id.txt so the full pipeline can be reconstructed later:
+
+        pipe = SanaPipeline.from_pretrained(model_id)
+        load_model(pipe.transformer, "transformer_gsNNNN.safetensors")
     """
-    import pyrallis
     from safetensors.torch import save_file
 
     os.makedirs(path, exist_ok=True)
+
     weights_path = os.path.join(path, f"transformer_gs{global_step}.safetensors")
     save_file(model.transformer.state_dict(), weights_path)
 
-    config_path = os.path.join(path, "config.yaml")
-    with open(config_path, "w") as f:
-        pyrallis.dump(model.sana_config, f)
+    model_id_path = os.path.join(path, "model_id.txt")
+    with open(model_id_path, "w") as f:
+        f.write(model.model_id)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_dtype(mixed_precision: str) -> torch.dtype:
+    return {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "no": torch.float32,
+    }.get(mixed_precision, torch.bfloat16)
+
+
+def _load_transformer_checkpoint(transformer: nn.Module, checkpoint_path: str) -> None:
+    """Loads a safetensors checkpoint into the transformer in-place."""
+    from safetensors.torch import load_model
+    load_model(transformer, checkpoint_path)
