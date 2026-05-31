@@ -9,15 +9,13 @@ Reuses:
   - EveryDreamBatch / DataLoaderMultiAspect    (data loading, aspect-ratio bucketing)
   - EveryDreamOptimizer                        (AdamW, CAME, Prodigy, ...)
   - utils/inference_context.py                 (eval/train guard during sample generation)
+  - SampleGenerator                            (sample generation, TensorBoard logging)
 """
 import argparse
-import copy
 import gc
 import logging
 import os
 from argparse import Namespace
-from typing import Optional
-
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
@@ -25,12 +23,15 @@ import data.aspects as aspects_module
 import data.resolver as resolver_module
 from core.step import run_accumulation_loop, repeat_with_oom_handling
 from core.step import get_best_match_resolution, choose_effective_batch_size
-from core.loss_sana import sample_flow_sigmas, compute_sana_loss
+from core.loss import get_multirank_stratified_random_timesteps
+from core.loss_sana import compute_sana_loss
+from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from model.sana_training_model import SanaTrainingModel, load_sana_model, save_sana_model
-from model.sana_text_encoder import encode_prompts, encode_null_prompt
+from model.sana_text_encoder import encode_prompts
 from model.training_model import TrainingVariables
 from optimizer.optimizers import EveryDreamOptimizer
 from utils.inference_context import inference_guard
+from utils.sample_generator import SampleGenerator
 
 
 # ---------------------------------------------------------------------------
@@ -116,26 +117,36 @@ def parse_args() -> Namespace:
     parser.add_argument("--save_every", type=int, default=1000,
                         help="Save transformer weights every N optimizer steps")
 
+    # Optimizer config
+    parser.add_argument("--optimizer_config", type=str, default="optimizer.json",
+                        help="Path to a JSON optimizer config file (default: optimizer.json)")
+
     # Sample generation
     parser.add_argument("--sample_every", type=int, default=500,
-                        help="Generate validation samples every N optimizer steps")
-    parser.add_argument("--guidance_scale", type=float, default=4.5,
-                        help="Classifier-free guidance scale for sample generation")
-    parser.add_argument("--sample_height", type=int, default=None,
-                        help="Height for generated samples (defaults to first --resolution)")
-    parser.add_argument("--sample_width", type=int, default=None,
-                        help="Width for generated samples (defaults to first --resolution)")
+                        help="Generate validation samples every N optimizer steps (or load from sample_prompts.json)")
+    parser.add_argument("--sample_prompts", type=str, default="sample_prompts.json",
+                        help="Path to a sample-prompts .json or .txt file for SampleGenerator")
 
     # Text encoding
     parser.add_argument("--max_sequence_length", type=int, default=300,
                         help="Gemma token budget")
 
-    # Flow-matching scheduler
-    parser.add_argument("--num_train_timesteps", type=int, default=1000)
-    parser.add_argument("--weighting_scheme", type=str, default="logit_normal",
-                        choices=["uniform", "logit_normal"])
-    parser.add_argument("--logit_mean", type=float, default=0.0)
-    parser.add_argument("--logit_std", type=float, default=1.0)
+    # Timestep sampling — mirrors train.py exactly
+    parser.add_argument("--timesteps_multirank_stratified",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Use multirank stratified timestep sampling")
+    parser.add_argument("--timesteps_multirank_stratified_distribution",
+                        type=str,
+                        choices=["uniform", "beta", "mode", "boundary-oversampling", "lognormal"],
+                        default="lognormal",
+                        help="Timestep distribution. For 'lognormal', --alpha controls the std "
+                             "of the underlying normal (width of the distribution).")
+    parser.add_argument("--timesteps_multirank_stratified_stratify",
+                        action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--timesteps_multirank_stratified_alpha", type=float, default=1.0,
+                        help="Alpha/std parameter. For lognormal: std of the normal before sigmoid.")
+    parser.add_argument("--timesteps_multirank_stratified_beta", type=float, default=1.6)
+    parser.add_argument("--timesteps_multirank_stratified_mode_scale", type=float, default=0.5)
 
     cli = parser.parse_args()
 
@@ -188,14 +199,37 @@ def parse_args() -> Namespace:
         max_epochs=cli.max_epochs,
         save_every=cli.save_every,
         sample_every=cli.sample_every,
-        guidance_scale=cli.guidance_scale,
-        sample_height=cli.sample_height or resolutions[0],
-        sample_width=cli.sample_width or resolutions[0],
+        sample_prompts=cli.sample_prompts,
         max_sequence_length=cli.max_sequence_length,
-        num_train_timesteps=cli.num_train_timesteps,
-        weighting_scheme=cli.weighting_scheme,
-        logit_mean=cli.logit_mean,
-        logit_std=cli.logit_std,
+        # ---- EveryDreamOptimizer required args ----
+        optimizer_config=cli.optimizer_config,
+        grad_accum=dl_grad_accum,
+        clip_grad_norm=None,
+        disable_unet_training=False,
+        disable_textenc_training=True,    # SANA text encoder is always frozen
+        lora=False,
+        amp_without_grad_scaler=True,
+        debug_unet_freeze_regex=False,
+        unet_freeze_regex=None,
+        optimizer_param_grouping=["single"],
+        lr_decay_steps=0,
+        lr_scheduler="cosine",
+        lr_warmup_steps=None,
+        lr_advance_steps=None,
+        lr_end=None,
+        lr_num_restarts=1,
+        auto_decay_steps_multiplier=1.1,
+        resume_ckpt=cli.resume_from or "",
+        optimizer_progressive_unlock=False,
+        optimizer_progressive_unlock_by_qk_proximity=False,
+        init_grad_scale=None,
+        # -------------------------------------------
+        timesteps_multirank_stratified=cli.timesteps_multirank_stratified,
+        timesteps_multirank_stratified_distribution=cli.timesteps_multirank_stratified_distribution,
+        timesteps_multirank_stratified_stratify=cli.timesteps_multirank_stratified_stratify,
+        timesteps_multirank_stratified_alpha=cli.timesteps_multirank_stratified_alpha,
+        timesteps_multirank_stratified_beta=cli.timesteps_multirank_stratified_beta,
+        timesteps_multirank_stratified_mode_scale=cli.timesteps_multirank_stratified_mode_scale,
     )
 
 
@@ -329,6 +363,53 @@ def _update_tv_for_batch(tv: TrainingVariables, full_batch: dict, args: Namespac
 # Per-step training
 # ---------------------------------------------------------------------------
 
+def _draw_stratified_timesteps(
+    batch_size: int,
+    tv: TrainingVariables,
+    model: SanaTrainingModel,
+    args: Namespace,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Returns a (batch_size,) float tensor of flow-matching timestep values.
+
+    Uses multirank stratified sampling when args.timesteps_multirank_stratified is
+    True (mirrors the path in core/step.py).  Falls back to uniform random integer
+    indices otherwise.
+
+    The integer indices are converted to float timestep values via
+    TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(), which incorporates
+    any configured frequency shift.
+    """
+    if args.timesteps_multirank_stratified:
+        while (
+            tv.remaining_stratified_timesteps is None
+            or tv.remaining_stratified_timesteps.shape[0] < max(batch_size, tv.desired_effective_batch_size)
+        ):
+            chunk = get_multirank_stratified_random_timesteps(
+                batch_size=tv.desired_effective_batch_size,
+                device=device,
+                distribution=args.timesteps_multirank_stratified_distribution,
+                alpha=args.timesteps_multirank_stratified_alpha,
+                beta=args.timesteps_multirank_stratified_beta,
+                mode_scale=args.timesteps_multirank_stratified_mode_scale,
+                stratify=args.timesteps_multirank_stratified_stratify,
+            )
+            tv.remaining_stratified_timesteps = (
+                chunk if tv.remaining_stratified_timesteps is None
+                else torch.cat([tv.remaining_stratified_timesteps, chunk])
+            )
+        timestep_indices = tv.remaining_stratified_timesteps[:batch_size]
+        tv.remaining_stratified_timesteps = tv.remaining_stratified_timesteps[batch_size:]
+    else:
+        num_train_timesteps = model.noise_scheduler.config.num_train_timesteps
+        timestep_indices = torch.randint(0, num_train_timesteps, (batch_size,))
+
+    return TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(
+        timestep_indices, model.noise_scheduler.timesteps
+    ).to(device)
+
+
 def train_sana_step(
     full_batch: dict,
     model: SanaTrainingModel,
@@ -340,7 +421,7 @@ def train_sana_step(
     args: Namespace,
 ) -> None:
     """
-    Handles per-batch SANA training: text encoding, VAE encoding, sigma sampling,
+    Handles per-batch SANA training: text encoding, VAE encoding, timestep sampling,
     then delegates nibbling/accumulation/backward/step to run_accumulation_loop().
     """
     # 1. Text-encode the full batch once (encoder is frozen)
@@ -362,26 +443,20 @@ def train_sana_step(
         oom_log_info=f"OOM gs:{tv.global_step} SANA VAE encode",
     )
 
-    # 3. Sample flow-matching sigmas and timesteps for the full batch
-    sigma, timestep_t = sample_flow_sigmas(
-        batch_size=full_batch["image"].shape[0],
-        weighting_scheme=args.weighting_scheme,
-        logit_mean=args.logit_mean,
-        logit_std=args.logit_std,
-        device=device,
-        num_train_timesteps=args.num_train_timesteps,
-    )
+    # 3. Sample stratified flow-matching timesteps for the full batch
+    full_batch_size = full_batch["image"].shape[0]
+    timesteps = _draw_stratified_timesteps(full_batch_size, tv, model, args, device)
 
-    # 4. Build the nibble loss closure (closed over pre-encoded z, y, y_mask, sigma, timestep_t)
+    # 4. Build the nibble loss closure (closed over pre-encoded z, y, y_mask, timesteps)
     def nibble_loss_fn(nibble: dict) -> torch.Tensor:
         n = nibble["image"].shape[0]
         return compute_sana_loss(
             model.transformer,
+            model.noise_scheduler,
             z[:n],
             y[:n],
             y_mask[:n],
-            sigma[:n],
-            timestep_t[:n],
+            timesteps[:n],
         )
 
     # 5. Generic accumulation loop (handles nibbling, OOM, backward, optimizer.step)
@@ -399,72 +474,6 @@ def train_sana_step(
 
 
 # ---------------------------------------------------------------------------
-# Sample generation
-# ---------------------------------------------------------------------------
-
-def generate_sana_samples(
-    model: SanaTrainingModel,
-    global_step: int,
-    log_writer: SummaryWriter,
-    sample_prompts: list[str],
-    output_dir: str,
-    device: torch.device,
-    args: Namespace,
-) -> None:
-    """
-    Runs inference for each prompt via a temporary SanaPipeline constructed from
-    the live model components, then saves images to TensorBoard and disk.
-    """
-    import numpy as np
-    from diffusers import SanaPipeline
-    from PIL import Image as PILImage
-
-    samples_dir = os.path.join(output_dir, "samples-sana", f"gs{global_step}")
-    os.makedirs(samples_dir, exist_ok=True)
-
-    with inference_guard(model.transformer):
-        # Build a pipeline from the live components.
-        # Deepcopy the scheduler so the training scheduler's state is not mutated.
-        pipe = SanaPipeline(
-            transformer=model.transformer,
-            text_encoder=model.text_encoder,
-            tokenizer=model.tokenizer,
-            vae=model.vae,
-            scheduler=copy.deepcopy(model.scheduler),
-        )
-        pipe.to(device)
-
-        for i, prompt in enumerate(sample_prompts):
-            try:
-                with torch.no_grad():
-                    result = pipe(
-                        prompt=prompt,
-                        height=args.sample_height,
-                        width=args.sample_width,
-                        guidance_scale=args.guidance_scale,
-                        num_inference_steps=20,
-                    )
-                image: PILImage.Image = result.images[0]
-
-                img_tensor = torch.from_numpy(
-                    np.array(image).astype("float32") / 255.0
-                ).permute(2, 0, 1)
-                log_writer.add_image(
-                    f"samples-sana/{prompt[:40]}",
-                    img_tensor,
-                    global_step=global_step,
-                )
-
-                out_path = os.path.join(
-                    samples_dir, f"{i:03d}_{prompt[:40].replace('/', '_')}.webp"
-                )
-                image.save(out_path, format="webp", quality=90)
-
-            except Exception as e:
-                logging.warning(f"generate_sana_samples: failed for '{prompt[:40]}': {e}")
-
-
-# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -477,7 +486,7 @@ def train_sana_loop(
     log_writer: SummaryWriter,
     device: torch.device,
     args: Namespace,
-    sample_prompts: list[str],
+    sample_generator: SampleGenerator,
     logdir: str,
 ) -> None:
     """
@@ -498,6 +507,9 @@ def train_sana_loop(
     )
 
     for epoch in range(args.max_epochs):
+        # Reset stratified timestep buffer at each epoch boundary (matches train.py)
+        tv.remaining_stratified_timesteps = None
+
         dataset.shuffle(epoch_n=epoch, max_epochs=args.max_epochs)
         steps_pbar = tqdm.tqdm(data_loader, desc=f"Epoch {epoch}")
 
@@ -526,11 +538,15 @@ def train_sana_loop(
                 logging.info(f"Saving SANA model to {save_path}")
                 save_sana_model(save_path, model, global_step)
 
-            if global_step % args.sample_every == 0 and sample_prompts:
+            if sample_generator.should_generate_samples(global_step, local_step=0):
                 logging.info(f"Generating samples at gs:{global_step}")
-                generate_sana_samples(
-                    model, global_step, log_writer, sample_prompts, logdir, device, args
-                )
+                with inference_guard(model.transformer):
+                    pipe = sample_generator.create_inference_pipe(
+                        model_being_trained=model,
+                        diffusers_scheduler_config=model.noise_scheduler.config,
+                    ).to(device)
+                    sample_generator.generate_samples(pipe, global_step)
+                    del pipe
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -566,24 +582,51 @@ def main_sana() -> None:
     model.vae.to(device)
 
     # Only the transformer is trained
+    import json
+    from plugins.plugins import PluginRunner
+    optimizer_config_path = (
+        args.optimizer_config
+        if os.path.isabs(args.optimizer_config)
+        else os.path.join(os.path.dirname(os.path.abspath(__file__)), args.optimizer_config)
+    )
+    if not os.path.exists(optimizer_config_path):
+        raise FileNotFoundError(
+            f"Optimizer config not found: {optimizer_config_path}. "
+            "Pass --optimizer_config pointing to a valid JSON file (e.g. optimizer.json)."
+        )
+    with open(optimizer_config_path) as f:
+        optimizer_config = json.load(f)
+
+    logging.info(f"Building data loader for resolutions: {args.resolution}")
+    dataset, data_loader = build_sana_data_loader(args, seed=args.seed)
+    epoch_len = len(data_loader)
+
     ed_optimizer = EveryDreamOptimizer(
         args=args,
-        optimizer_config=None,
-        text_encoder=None,
-        unet=model.transformer,
-        global_step=0,
+        optimizer_config=optimizer_config,
+        model=model,
+        epoch_len=epoch_len,
+        plugin_runner=PluginRunner(),
+        log_writer=log_writer,
     )
 
     tv = setup_sana_training_variables(args)
 
-    logging.info(f"Building data loader for resolutions: {args.resolution}")
-    dataset, data_loader = build_sana_data_loader(args, seed=args.seed)
 
-    sample_prompts = []
-    prompts_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_prompts.txt")
-    if os.path.exists(prompts_path):
-        with open(prompts_path) as f:
-            sample_prompts = [line.strip() for line in f if line.strip()]
+    sample_prompts_path = (
+        args.sample_prompts
+        if os.path.isabs(args.sample_prompts)
+        else os.path.join(os.path.dirname(os.path.abspath(__file__)), args.sample_prompts)
+    )
+    sample_generator = SampleGenerator(
+        log_folder=logdir,
+        log_writer=log_writer,
+        default_resolution=args.resolution[0],
+        config_file_path=sample_prompts_path if os.path.exists(sample_prompts_path) else None,
+        batch_size=1,
+        default_seed=args.seed,
+        default_sample_steps=args.sample_every,
+    )
 
     logging.info(
         f"Starting SANA training — logdir={logdir}, "
@@ -601,7 +644,7 @@ def main_sana() -> None:
         log_writer=log_writer,
         device=device,
         args=args,
-        sample_prompts=sample_prompts,
+        sample_generator=sample_generator,
         logdir=logdir,
     )
 

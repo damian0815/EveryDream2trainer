@@ -264,9 +264,10 @@ class SampleGenerator:
                                       desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
-                    if type(pipe) is StableDiffusionXLPipeline:
-                        print("SDXL -> no Compel")
-                        compel = None #CompelForSDXL(pipe)
+                    from diffusers import SanaPipeline
+                    if type(pipe) in (StableDiffusionXLPipeline, SanaPipeline):
+                        print(f"{type(pipe).__name__} -> no Compel")
+                        compel = None
                     else:
                         compel = CompelForSD(pipe)
                     for batch in batches:
@@ -318,7 +319,7 @@ class SampleGenerator:
                                 generator=generators,
                                 width=size[0],
                                 height=size[1],
-                                guidance_rescale=self.guidance_rescale
+                                **({} if isinstance(pipe, SanaPipeline) else {"guidance_rescale": self.guidance_rescale}),
                             ).images
 
                             for image in images:
@@ -414,7 +415,7 @@ class SampleGenerator:
         del tfimage
 
     @torch.no_grad()
-    def create_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config, flow_match_shift=1, flow_match_shift_dynamic=False) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
+    def create_inference_pipe(self, model_being_trained, diffusers_scheduler_config, flow_match_shift=1, flow_match_shift_dynamic=False):
         """
         creates a pipeline for SD inference
         """

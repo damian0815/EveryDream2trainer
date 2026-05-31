@@ -31,7 +31,7 @@ def load_teacher_model(
     # ── Load pipeline (auto-detects SD1/SD2/SDXL) ───────────────────────────
     try:
         teacher_pipeline = AutoPipelineForText2Image.from_pretrained(
-            teacher_path, torch_dtype=torch.float16
+            teacher_path, dtype=torch.float16
         ).to(device)
     except Exception as e:
         logging.warning(
@@ -40,7 +40,7 @@ def load_teacher_model(
         )
         from diffusers import StableDiffusionPipeline
         teacher_pipeline = StableDiffusionPipeline.from_pretrained(
-            args.teacher, torch_dtype=torch.float16
+            args.teacher, dtype=torch.float16
         ).to(device)
 
     teacher_is_sdxl = isinstance(teacher_pipeline, StableDiffusionXLPipeline)
