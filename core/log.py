@@ -1,8 +1,10 @@
 import dataclasses
+import datetime
 import json
 import logging
 import math
 import os
+import sys
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -16,6 +18,47 @@ from data.image_train_item import ImageTrainItem
 from model.training_model import TrainingModel, TrainingVariables
 
 from optimizer.attention_activation_control import ActivationLogger
+
+def setup_local_logger(args) -> tuple[str, str]:
+    """
+    Creates the run-specific log folder, configures file + console logging,
+    and returns ``(datetimestamp, log_folder)``.
+
+    Log folder layout::
+
+        <args.logdir>/<args.project_name>-<YYYYMMDD-HHMMSS>/
+            <args.project_name>-<YYYYMMDD-HHMMSS>.log
+    """
+    os.makedirs(args.logdir, exist_ok=True)
+
+    datetimestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_folder = os.path.join(args.logdir, f"{args.project_name}-{datetimestamp}")
+    os.makedirs(log_folder, exist_ok=True)
+
+    logfilename = os.path.join(log_folder, f"{args.project_name}-{datetimestamp}.log")
+    print(f" logging to {logfilename}")
+
+    logging.basicConfig(
+        filename=logfilename,
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        datefmt="%m/%d/%Y %I:%M:%S %p",
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.addFilter(
+        lambda record: "Palette images with Transparency expressed in bytes"
+        not in record.getMessage()
+    )
+    logging.getLogger().addHandler(console_handler)
+
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message="UserWarning: Palette images with Transparency expressed in bytes should be converted to RGBA images",
+    )
+
+    return datetimestamp, log_folder
+
 
 @dataclasses.dataclass
 class LogData:

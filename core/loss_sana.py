@@ -31,6 +31,7 @@ def compute_sana_loss(
     y: torch.Tensor,
     y_mask: torch.Tensor,
     timesteps: torch.Tensor,
+    slice_size: int=None
 ) -> torch.Tensor:
     """
     One flow-matching forward pass through the SANA transformer.
@@ -47,6 +48,22 @@ def compute_sana_loss(
     Returns:
         Scalar loss Tensor with grad attached.
     """
+
+    if slice_size is not None and slice_size < z.shape[0]:
+        slice_results = []
+        for slice_start in range(0, z.shape[0], slice_size):
+            slice_end = slice_start + slice_size
+            slice_results.append(compute_sana_loss(
+                transformer=transformer,
+                noise_scheduler=noise_scheduler,
+                z=z[slice_start:slice_end],
+                y=y[slice_start:slice_end],
+                y_mask=y_mask[slice_start:slice_end],
+                timesteps=timesteps[slice_start:slice_end],
+                slice_size=None
+            ))
+        return torch.cat(slice_results, dim=0)
+
     noise = torch.randn_like(z)
 
     # Noise via the shared training scheduler path:
@@ -65,4 +82,6 @@ def compute_sana_loss(
     # Flow-matching velocity target: v = ε − z₀
     target = noise - z
 
-    return F.mse_loss(model_pred.float(), target.float())
+    # return 1D loss
+    mean_dims = range(1, target.shape[1])
+    return F.mse_loss(model_pred.float(), target.float(), reduction='none').mean(dim=mean_dims)

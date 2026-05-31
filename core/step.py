@@ -65,7 +65,7 @@ def run_accumulation_loop(
     ed_optimizer: EveryDreamOptimizer,
     nibble_loss_fn: NibbleLossFn,
     plugin_runner: Optional[PluginRunner],
-    log_writer: SummaryWriter,
+    log_data: LogData,
     steps_pbar,
     did_step_optimizer_cb: Optional[Callable],
     args: argparse.Namespace,
@@ -110,7 +110,34 @@ def run_accumulation_loop(
                                    f'pre-emptive backward @{tv.accumulated_loss_images_count}/{tv.max_backward_slice_size}: ')
 
         # Call the model-specific nibble loss function
-        loss_mean = nibble_loss_fn(batch)
+        loss_1d = nibble_loss_fn(batch)
+
+        # Compute loss_mean for this variant
+        if args.loss_mean_over_full_effective_batch:
+            loss_mean_divisor = max(1, tv.desired_effective_batch_size)
+        else:
+            loss_mean_divisor = 1
+        loss_mean = loss_1d.sum() / loss_mean_divisor
+
+        log_data.forward_size_coverage[loss_1d.shape[0]] += 1
+
+        loss_step = loss_mean.detach().item()
+
+        steps_pbar.set_postfix({
+            "rank": get_rank(),
+            "loss/step": loss_step,
+            "_f": tv.forward_slice_size,
+            "_l": loss_1d.shape[0],
+            "l": tv.accumulated_loss_images_count,
+            "b": tv.backwarded_images_count,
+            "os": str(tv.optimizer_step),
+            "N": str(tv.total_trained_samples_count),
+            "gs": str(tv.global_step),
+        })
+
+        del loss_1d
+        log_data.loss_log_step.append(loss_step)
+        log_data.loss_epoch.append(loss_step)
 
         # Accumulate loss into tv; pass num_images dummy timesteps so the count
         # is correctly tracked (accumulated_loss_images_count += len(timesteps)).
@@ -229,7 +256,6 @@ def train_step(
             caption_variants = select_caption_variants(
                 batch["captions"],
                 requested_variants=args.caption_variants,
-                all_caption_variants=args.all_caption_variants,
                 caption_cross_concatenation_p=args.caption_cross_concatenation_p,
                 caption_cross_concatenation_empty_half_p=args.caption_cross_concatenation_empty_half_p,
             )
@@ -239,6 +265,11 @@ def train_step(
                 f"surprise cond dropout: ** Apparently no captions: {batch.get('pathnames', '(no paths)')}: {batch['captions']} - treating as cond dropout for this batch **")
             batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
             caption_variants = ['default']
+
+        assert len(caption_variants) == 1
+        caption_variant = caption_variants[0]
+        del caption_variants
+        print(f"selected caption variant: {caption_variant}")
 
         record_performance_timing("2_caption_selection", time.perf_counter() - t_caption_start, num_images)
 
@@ -274,189 +305,157 @@ def train_step(
         ]
         record_performance_timing("4_vae_encoding", time.perf_counter() - t_vae_start, batch_size)
 
-        # Per-caption-variant forward + loss computation
-        total_loss_mean = None
-        for caption_variant in caption_variants:
-            # Timestep generation
-            t_timesteps_start = time.perf_counter()
-            timesteps = _get_step_timesteps(
-                count=batch["image"].shape[0],
-                timesteps_range=batch["timesteps_range"],
-                train_progress_01=train_progress_01,
-                model=model,
-                tv=tv,
-                share_timesteps=batch["do_contrastive_learning"] or args.batch_share_timesteps,
-                args=args,
+        # Timestep generation
+        t_timesteps_start = time.perf_counter()
+        timesteps = _get_step_timesteps(
+            count=batch["image"].shape[0],
+            timesteps_range=batch["timesteps_range"],
+            train_progress_01=train_progress_01,
+            model=model,
+            tv=tv,
+            share_timesteps=batch["do_contrastive_learning"] or args.batch_share_timesteps,
+            args=args,
+        )
+        # Apply shift for flow-matching schedulers
+        if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
+            timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(
+                timesteps, model.noise_scheduler.timesteps
             )
-            # Apply shift for flow-matching schedulers
-            if isinstance(model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler):
-                timesteps = TrainFlowMatchEulerDiscreteScheduler.get_shifted_timesteps(
-                    timesteps, model.noise_scheduler.timesteps
+            t_clamp_min = getattr(args, 'flow_match_t_clamp_min', None)
+            t_clamp_max = getattr(args, 'flow_match_t_clamp_max', None)
+            if t_clamp_min is not None or t_clamp_max is not None:
+                num_ts = model.noise_scheduler.timesteps.shape[0]
+                idx = torch.bucketize(timesteps, model.noise_scheduler.timesteps.flip(0))
+                idx = idx.clamp(
+                    min=t_clamp_min if t_clamp_min is not None else 0,
+                    max=t_clamp_max if t_clamp_max is not None else num_ts - 1,
                 )
-                t_clamp_min = getattr(args, 'flow_match_t_clamp_min', None)
-                t_clamp_max = getattr(args, 'flow_match_t_clamp_max', None)
-                if t_clamp_min is not None or t_clamp_max is not None:
-                    num_ts = model.noise_scheduler.timesteps.shape[0]
-                    idx = torch.bucketize(timesteps, model.noise_scheduler.timesteps.flip(0))
-                    idx = idx.clamp(
-                        min=t_clamp_min if t_clamp_min is not None else 0,
-                        max=t_clamp_max if t_clamp_max is not None else num_ts - 1,
-                    )
-                    timesteps = model.noise_scheduler.timesteps.flip(0)[idx]
-            record_performance_timing("5_timesteps_generation", time.perf_counter() - t_timesteps_start, num_images / len(caption_variants))
+                timesteps = model.noise_scheduler.timesteps.flip(0)[idx]
+        record_performance_timing("5_timesteps_generation", time.perf_counter() - t_timesteps_start, num_images)
 
-            # Conditional dropout
-            t_cond_dropout_start = time.perf_counter()
-            cond_dropout_mask = build_cond_dropout_mask(
-                batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args
-            )
-            is_cond_dropout_noise = cond_dropout_mask & (
-                torch.rand(batch_size, device=model.unet.device) < args.cond_dropout_noise_p
-            )
-            record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images / len(caption_variants))
+        # Conditional dropout
+        t_cond_dropout_start = time.perf_counter()
+        cond_dropout_mask = build_cond_dropout_mask(
+            batch=batch, timesteps=timesteps, model=model, tv=tv, train_progress_01=train_progress_01, args=args
+        )
+        is_cond_dropout_noise = cond_dropout_mask & (
+            torch.rand(batch_size, device=model.unet.device) < args.cond_dropout_noise_p
+        )
+        record_performance_timing("6_cond_dropout", time.perf_counter() - t_cond_dropout_start, num_images)
 
-            # Text conditioning generation
-            teacher_mask = _generate_teacher_mask_or_none(
-                training_model=model, args=args, teacher_models=teacher_models, timesteps=timesteps
-            )
-            t_conditioning_start = time.perf_counter()
-            conditioning, teacher_conditionings, caption_str = _generate_conditioning(
-                batch,
-                caption_variant=caption_variant,
-                cond_dropout_mask=cond_dropout_mask,
-                model=model,
-                teacher_models=teacher_models,
-                teacher_mask=teacher_mask,
-                args=args,
-            )
-            record_performance_timing("7_conditioning_generation", time.perf_counter() - t_conditioning_start, num_images / len(caption_variants))
+        # Text conditioning generation
+        teacher_mask = _generate_teacher_mask_or_none(
+            training_model=model, args=args, teacher_models=teacher_models, timesteps=timesteps
+        )
+        t_conditioning_start = time.perf_counter()
+        conditioning, teacher_conditionings, caption_str = _generate_conditioning(
+            batch,
+            caption_variant=caption_variant,
+            cond_dropout_mask=cond_dropout_mask,
+            model=model,
+            teacher_models=teacher_models,
+            teacher_mask=teacher_mask,
+            args=args,
+        )
+        record_performance_timing("7_conditioning_generation", time.perf_counter() - t_conditioning_start, num_images)
 
-            tv.cond_dropout_count += torch.sum(cond_dropout_mask)
-            tv.non_cond_dropout_count += torch.sum(~cond_dropout_mask)
+        tv.cond_dropout_count += torch.sum(cond_dropout_mask)
+        tv.non_cond_dropout_count += torch.sum(~cond_dropout_mask)
 
-            model_forward_slice_size = tv.forward_slice_size
+        model_forward_slice_size = tv.forward_slice_size
 
-            # Model forward pass
-            t_forward_start = time.perf_counter()
-            model_forward_result = repeat_with_oom_handling(
-                initial_slice_size=tv.forward_slice_size,
-                callback=lambda slice_size: _do_model_forward(
-                    model=model,
-                    batch=batch,
-                    latents=latents,
-                    noise=noise,
-                    conditioning=conditioning,
-                    is_cond_dropout_noise=is_cond_dropout_noise,
-                    timesteps=timesteps,
-                    caption_variant=caption_variant,
-                    teacher_models=teacher_models,
-                    teacher_latents_list=teacher_latents_list,
-                    teacher_mask=teacher_mask,
-                    teacher_conditionings=teacher_conditionings,
-                    forward_slice_size=slice_size,
-                    tv=tv,
-                    args=args,
-                    debug_teacher=getattr(args, "debug_teacher", False),
-                    log_writer=log_writer,
-                ),
-                oom_log_info=(
-                    f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} "
-                    f"for full batch size {batch_size}. loss images accumulated: {tv.accumulated_loss_images_count}"
-                ),
-            )
-            record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images / len(caption_variants))
-
-            loss_scale_variant = loss_scale[:model_forward_result.model_pred.shape[0]]
-
-            # Loss computation
-            t_loss_start = time.perf_counter()
-            loss_1d = _do_loss(
-                model_forward_result,
+        # Model forward pass
+        t_forward_start = time.perf_counter()
+        model_forward_result = repeat_with_oom_handling(
+            initial_slice_size=tv.forward_slice_size,
+            callback=lambda slice_size: _do_model_forward(
                 model=model,
                 batch=batch,
-                is_cond_dropout=cond_dropout_mask,
-                timesteps=timesteps,
+                latents=latents,
+                noise=noise,
                 conditioning=conditioning,
+                is_cond_dropout_noise=is_cond_dropout_noise,
+                timesteps=timesteps,
+                caption_variant=caption_variant,
+                teacher_models=teacher_models,
+                teacher_latents_list=teacher_latents_list,
                 teacher_mask=teacher_mask,
+                teacher_conditionings=teacher_conditionings,
+                forward_slice_size=slice_size,
                 tv=tv,
-                log_data=log_data,
-                log_writer=log_writer,
-                negative_loss_mask=loss_scale_variant < 0,
                 args=args,
-                verbose=(tv.global_step % 200 == 0),
+                debug_teacher=getattr(args, "debug_teacher", False),
+                log_writer=log_writer,
+            ),
+            oom_log_info=(
+                f"OOM step {tv.global_step} in unet forward with slice size {model_forward_slice_size} "
+                f"for full batch size {batch_size}. loss images accumulated: {tv.accumulated_loss_images_count}"
+            ),
+        )
+        record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images)
+
+        loss_scale_variant = loss_scale[:model_forward_result.model_pred.shape[0]]
+
+        # Loss computation
+        t_loss_start = time.perf_counter()
+        loss_1d = _do_loss(
+            model_forward_result,
+            model=model,
+            batch=batch,
+            is_cond_dropout=cond_dropout_mask,
+            timesteps=timesteps,
+            conditioning=conditioning,
+            teacher_mask=teacher_mask,
+            tv=tv,
+            log_data=log_data,
+            log_writer=log_writer,
+            negative_loss_mask=loss_scale_variant < 0,
+            args=args,
+            verbose=(tv.global_step % 200 == 0),
+        )
+        record_performance_timing("9_loss_computation", time.perf_counter() - t_loss_start, num_images)
+
+        if model.clip_model is not None:
+            clip_loss_1d = get_clip_loss(
+                image_embeds=model_forward_result.clip_image_features,
+                text_embeds=model_forward_result.clip_pooled_text_features,
+                model=model,
+                mask=~cond_dropout_mask,
             )
-            record_performance_timing("9_loss_computation", time.perf_counter() - t_loss_start, num_images / len(caption_variants))
+            loss_1d += clip_loss_1d * args.clip_vision_contrastive_loss_lambda
 
-            if model.clip_model is not None:
-                clip_loss_1d = get_clip_loss(
-                    image_embeds=model_forward_result.clip_image_features,
-                    text_embeds=model_forward_result.clip_pooled_text_features,
-                    model=model,
-                    mask=~cond_dropout_mask,
-                )
-                loss_1d += clip_loss_1d * args.clip_vision_contrastive_loss_lambda
+        del model_forward_result
 
-            del model_forward_result
-
-            # Per-timestep and per-image loss logging
-            t_loss_accum_start = time.perf_counter()
-            for i, used_timestep in enumerate(timesteps):
-                used_timestep_detached = int(used_timestep.detach().item())
-                current, count = log_data.loss_per_timestep[tv.batch_resolution].get(used_timestep_detached, (0, 0))
-                log_data.loss_per_timestep[tv.batch_resolution][used_timestep_detached] = (
-                    current + loss_1d[i].mean().detach().item(), count + 1
-                )
-                pathname = os.path.realpath(batch["pathnames"][i])
-                if pathname not in log_data.loss_per_image_and_timestep[tv.batch_resolution]:
-                    log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname] = []
-                log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname].append(
-                    (used_timestep_detached, loss_1d[i].mean().detach().item())
-                )
-
-            # Apply hinge and loss scale
-            loss_1d = apply_negative_loss_hinge(
-                loss_1d, (loss_scale_variant < 0).to(loss_1d.device), margin=args.negative_loss_margin
+        # Per-timestep and per-image loss logging
+        t_loss_accum_start = time.perf_counter()
+        for i, used_timestep in enumerate(timesteps):
+            used_timestep_detached = int(used_timestep.detach().item())
+            current, count = log_data.loss_per_timestep[tv.batch_resolution].get(used_timestep_detached, (0, 0))
+            log_data.loss_per_timestep[tv.batch_resolution][used_timestep_detached] = (
+                current + loss_1d[i].mean().detach().item(), count + 1
             )
-            loss_1d = loss_1d * loss_scale_variant.abs().to(loss_1d.device)
+            pathname = os.path.realpath(batch["pathnames"][i])
+            if pathname not in log_data.loss_per_image_and_timestep[tv.batch_resolution]:
+                log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname] = []
+            log_data.loss_per_image_and_timestep[tv.batch_resolution][pathname].append(
+                (used_timestep_detached, loss_1d[i].mean().detach().item())
+            )
 
-            # Compute loss_mean for this variant
-            if args.loss_mean_over_full_effective_batch:
-                loss_mean_divisor = max(1, tv.desired_effective_batch_size)
-            else:
-                loss_mean_divisor = 1
-            loss_mean = loss_1d.sum() / loss_mean_divisor
+        # Apply hinge and loss scale
+        loss_1d = apply_negative_loss_hinge(
+            loss_1d, (loss_scale_variant < 0).to(loss_1d.device), margin=args.negative_loss_margin
+        )
+        loss_1d = loss_1d * loss_scale_variant.abs().to(loss_1d.device)
 
-            log_data.loss_log_step_cd.append(loss_1d[cond_dropout_mask].mean().detach().item())
-            log_data.loss_log_step_non_cd.append(loss_1d[~cond_dropout_mask].mean().detach().item())
-            log_data.forward_size_coverage[loss_1d.shape[0]] += 1
+        log_data.loss_log_step_cd.append(loss_1d[cond_dropout_mask].mean().detach().item())
+        log_data.loss_log_step_non_cd.append(loss_1d[~cond_dropout_mask].mean().detach().item())
+        log_data.forward_size_coverage[loss_1d.shape[0]] += 1
 
-            loss_step = loss_mean.detach().item()
+        for t in timesteps:
+            log_data.timestep_coverage[int(t.item())] += 1
+            log_data.cumulative_timestep_coverage[int(t.item())] += 1
 
-            for t in timesteps:
-                log_data.timestep_coverage[int(t.item())] += 1
-                log_data.cumulative_timestep_coverage[int(t.item())] += 1
-
-            steps_pbar.set_postfix({
-                "rank": get_rank(),
-                "loss/step": loss_step,
-                "_f": tv.forward_slice_size,
-                "_l": loss_1d.shape[0],
-                "l": tv.accumulated_loss_images_count,
-                "b": tv.backwarded_images_count,
-                "os": str(tv.optimizer_step),
-                "N": str(tv.total_trained_samples_count),
-                "gs": str(tv.global_step),
-            })
-
-            del loss_1d
-            log_data.loss_log_step.append(loss_step)
-            log_data.loss_epoch.append(loss_step)
-            record_performance_timing("10_loss_accumulation", time.perf_counter() - t_loss_accum_start, num_images / len(caption_variants))
-
-            # Accumulate loss across caption variants
-            total_loss_mean = loss_mean if total_loss_mean is None else total_loss_mean + loss_mean
-
-        return total_loss_mean
+        return loss_1d
 
     run_accumulation_loop(
         full_batch=full_batch,
@@ -464,7 +463,7 @@ def train_step(
         ed_optimizer=ed_optimizer,
         nibble_loss_fn=nibble_loss_fn,
         plugin_runner=plugin_runner,
-        log_writer=log_writer,
+        log_data=log_data,
         steps_pbar=steps_pbar,
         did_step_optimizer_cb=did_step_optimizer_cb,
         args=args,

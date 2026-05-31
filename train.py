@@ -69,7 +69,7 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader, collate_fn
 from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeBScheduler
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
-from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData
+from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData, setup_local_logger
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
@@ -187,34 +187,7 @@ def _epoch_step_source(
             if slab_step >= slab_size:
                 break
 
-def setup_local_logger(args):
-    """
-    configures logger with file and console logging, logs args, and returns the datestamp
-    """
-    log_path = args.logdir
-    os.makedirs(log_path, exist_ok=True)
 
-    datetimestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-
-    log_folder = os.path.join(log_path, f"{args.project_name}-{datetimestamp}")
-    os.makedirs(log_folder, exist_ok=True)
-
-    logfilename = os.path.join(log_folder, f"{args.project_name}-{datetimestamp}.log")
-
-    print(f" logging to {logfilename}")
-    logging.basicConfig(filename=logfilename,
-                        level=logging.INFO,
-                        format="%(asctime)s %(message)s",
-                        datefmt="%m/%d/%Y %I:%M:%S %p",
-                       )
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.addFilter(lambda msg: "Palette images with Transparency expressed in bytes" not in msg.getMessage())
-    logging.getLogger().addHandler(console_handler)
-    import warnings
-    warnings.filterwarnings("ignore", message="UserWarning: Palette images with Transparency expressed in bytes should be converted to RGBA images")
-    #from PIL import Image
-
-    return datetimestamp, log_folder
 
 # def save_optimizer(optimizer: torch.optim.Optimizer, path: str):
 #     """

@@ -101,7 +101,7 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
 
     torch_dtype = _parse_dtype(getattr(args, "mixed_precision", "bf16"))
 
-    pipe = SanaPipeline.from_pretrained(args.model_id, dtype=torch_dtype)
+    pipe = SanaPipeline.from_pretrained(args.model_id, torch_dtype=torch_dtype)
 
     for p in pipe.text_encoder.parameters():
         p.requires_grad_(False)

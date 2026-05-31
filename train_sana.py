@@ -27,6 +27,7 @@ from core.step import get_best_match_resolution, choose_effective_batch_size
 from core.loss import get_multirank_stratified_random_timesteps
 from core.loss_sana import compute_sana_loss
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
+from core.log import setup_local_logger, log_args, LogData
 from model.sana_training_model import SanaTrainingModel, load_sana_model, save_sana_model
 from model.sana_text_encoder import encode_prompts
 from model.training_model import TrainingVariables
@@ -250,8 +251,8 @@ def _encode_latents(
     AutoencoderDC is deterministic (no .latent_dist); use .latent directly.
     """
     with torch.no_grad():
-        latents = model.vae.encode(images.to(device)).latent
-    return latents * model.vae.config.scaling_factor
+        latents = model.vae.encode(images.to(device, dtype=model.dtype)).latent
+    return latents.to(model.dtype) * model.vae.config.scaling_factor
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +327,7 @@ def train_sana_step(
     model: SanaTrainingModel,
     tv: TrainingVariables,
     ed_optimizer: EveryDreamOptimizer,
-    log_writer: SummaryWriter,
+    log_data: LogData,
     steps_pbar,
     device: torch.device,
     args: Namespace,
@@ -335,16 +336,20 @@ def train_sana_step(
     Handles per-batch SANA training: text encoding, VAE encoding, timestep sampling,
     then delegates nibbling/accumulation/backward/step to run_accumulation_loop().
     """
-    # 1. Text-encode the full batch once (encoder is frozen)
+    # 1. Text-encode the full batch once (encoder is frozen), with OOM retry
     with torch.no_grad():
-        y, y_mask = encode_prompts(
-            model.tokenizer,
-            model.text_encoder,
-            full_batch["captions"]["default"],
-            device,
-            max_sequence_length=model.max_sequence_length,
-            complex_human_instruction=model.complex_human_instruction or None,
-            dtype=model.dtype,
+        y, y_mask = repeat_with_oom_handling(
+            initial_slice_size=len(full_batch["captions"]["default"]),
+            callback=lambda sz: encode_prompts(
+                model.tokenizer,
+                model.text_encoder,
+                full_batch["captions"]["default"][:sz],
+                device,
+                max_sequence_length=model.max_sequence_length,
+                complex_human_instruction=model.complex_human_instruction or None,
+                dtype=model.dtype,
+            ),
+            oom_log_info=f"OOM gs:{tv.global_step} SANA text encoder encode",
         )
 
     # 2. VAE-encode the full batch once, with OOM retry
@@ -361,13 +366,18 @@ def train_sana_step(
     # 4. Build the nibble loss closure (closed over pre-encoded z, y, y_mask, timesteps)
     def nibble_loss_fn(nibble: dict) -> torch.Tensor:
         n = nibble["image"].shape[0]
-        return compute_sana_loss(
-            model.transformer,
-            model.noise_scheduler,
-            z[:n],
-            y[:n],
-            y_mask[:n],
-            timesteps[:n],
+        return repeat_with_oom_handling(
+            initial_slice_size=n,
+            callback=lambda slice_size: compute_sana_loss(
+                model.transformer,
+                model.noise_scheduler,
+                z,
+                y,
+                y_mask,
+                timesteps,
+                slice_size=slice_size
+            ),
+            oom_log_info=f"OOM gs:{tv.global_step} SANA transformer forward",
         )
 
     # 5. Generic accumulation loop (handles nibbling, OOM, backward, optimizer.step)
@@ -377,7 +387,7 @@ def train_sana_step(
         ed_optimizer=ed_optimizer,
         nibble_loss_fn=nibble_loss_fn,
         plugin_runner=None,
-        log_writer=log_writer,
+        log_data=log_data,
         steps_pbar=steps_pbar,
         did_step_optimizer_cb=None,
         args=args,
@@ -417,6 +427,8 @@ def train_sana_loop(
         f"grad_accum_window={args.dl_grad_accum})"
     )
 
+    log_data = LogData()
+
     for epoch in range(args.max_epochs):
         # Reset stratified timestep buffer at each epoch boundary (matches train.py)
         tv.remaining_stratified_timesteps = None
@@ -438,7 +450,7 @@ def train_sana_loop(
                 model=model,
                 tv=tv,
                 ed_optimizer=ed_optimizer,
-                log_writer=log_writer,
+                log_data=log_data,
                 steps_pbar=steps_pbar,
                 device=device,
                 args=args,
@@ -476,15 +488,22 @@ def main_sana() -> None:
     loading, data pipeline, optimiser, training variables, logging, and the
     training loop.
     """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
+    import pprint
     args = parse_sana_args()
 
-    logdir = os.path.join(args.logdir, args.project_name)
-    os.makedirs(logdir, exist_ok=True)
-    log_writer = SummaryWriter(log_dir=logdir)
+    # ── Logging ──────────────────────────────────────────────────────────────
+    # Mirrors train.py: timestamped run folder, file + console logging,
+    # and JSON config dumps.
+    log_time, log_folder = setup_local_logger(args)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(" Args:")
+    pprint.pprint(vars(args))
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
 
     logging.info(f"Loading SANA model from {args.model_id}...")
     model = load_sana_model(args)
@@ -495,22 +514,22 @@ def main_sana() -> None:
     # Only the transformer is trained
     import json
     from plugins.plugins import PluginRunner
-    optimizer_config_path = (
-        args.optimizer_config
-        if os.path.isabs(args.optimizer_config)
-        else os.path.join(os.path.dirname(os.path.abspath(__file__)), args.optimizer_config)
-    )
-    if not os.path.exists(optimizer_config_path):
+    if not os.path.exists(args.optimizer_config):
         raise FileNotFoundError(
-            f"Optimizer config not found: {optimizer_config_path}. "
+            f"Optimizer config not found: {args.optimizer_config}. "
             "Pass --optimizer_config pointing to a valid JSON file (e.g. optimizer.json)."
         )
-    with open(optimizer_config_path) as f:
+    with open(args.optimizer_config) as f:
         optimizer_config = json.load(f)
 
     logging.info(f"Building data loader for resolutions: {args.resolution}")
     dataset, data_loader = build_sana_data_loader(args, seed=args.seed)
     epoch_len = len(data_loader)
+
+    log_writer = SummaryWriter(log_dir=log_folder, flush_secs=20)
+
+    # Dump args + optimizer config next to the TensorBoard event file
+    log_args(log_writer, args, optimizer_config, log_folder, log_time)
 
     ed_optimizer = EveryDreamOptimizer(
         args=args,
@@ -523,9 +542,8 @@ def main_sana() -> None:
 
     tv = setup_sana_training_variables(args)
 
-
     sample_generator = SampleGenerator(
-        log_folder=logdir,
+        log_folder=log_folder,
         log_writer=log_writer,
         default_resolution=args.resolution[0],
         config_file_path=args.sample_prompts,
@@ -535,7 +553,7 @@ def main_sana() -> None:
     )
 
     logging.info(
-        f"Starting SANA training — logdir={logdir}, "
+        f"Starting SANA training — log_folder={log_folder}, "
         f"model={args.model_id}, "
         f"resolutions={args.resolution}, "
         f"batch_size={args.batch_size}"
@@ -551,7 +569,7 @@ def main_sana() -> None:
         device=device,
         args=args,
         sample_generator=sample_generator,
-        logdir=logdir,
+        logdir=log_folder,
     )
 
     log_writer.close()
