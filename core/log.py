@@ -113,11 +113,13 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
             global_step=global_step,
         )
         tv.cond_dropouts = []
-    log_writer.add_scalar(
-        tag="hyperparameter/cond dropout actual",
-        scalar_value=tv.cond_dropout_count / (tv.cond_dropout_count + tv.non_cond_dropout_count),
-        global_step=global_step
-    )
+    _cond_total = tv.cond_dropout_count + tv.non_cond_dropout_count
+    if _cond_total > 0:
+        log_writer.add_scalar(
+            tag="hyperparameter/cond dropout actual",
+            scalar_value=tv.cond_dropout_count / _cond_total,
+            global_step=global_step
+        )
 
     images_per_sec_avg = sum(log_data.images_per_sec_log_step) / (len(log_data.images_per_sec_log_step) if log_data.images_per_sec_log_step else 1)
     log_writer.add_scalar(tag="performance/images per second", scalar_value=images_per_sec_avg, global_step=global_step)

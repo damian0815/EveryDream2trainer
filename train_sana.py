@@ -15,6 +15,7 @@ Reuses:
 import gc
 import logging
 import os
+import time
 from argparse import Namespace
 
 import torch
@@ -27,7 +28,7 @@ from core.step import get_best_match_resolution, choose_effective_batch_size
 from core.loss import get_multirank_stratified_random_timesteps
 from core.loss_sana import compute_sana_loss
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
-from core.log import setup_local_logger, log_args, LogData
+from core.log import setup_local_logger, log_args, do_log_step, LogData
 from model.sana_training_model import SanaTrainingModel, load_sana_model, save_sana_model
 from model.sana_text_encoder import encode_prompts
 from model.training_model import TrainingVariables
@@ -224,7 +225,7 @@ def build_sana_data_loader(args: Namespace, seed: int):
         data_loader=data_loader_multi_aspect,
         tokenizer=None,
         seed=seed,
-        image_output_range='[0,255]'
+        #image_output_range='[0,255]'
     )
 
     data_loader = build_torch_dataloader(
@@ -445,6 +446,7 @@ def train_sana_loop(
 
             _update_tv_for_batch(tv, full_batch, args)
 
+            step_start_time = time.time()
             train_sana_step(
                 full_batch=full_batch,
                 model=model,
@@ -455,6 +457,11 @@ def train_sana_loop(
                 device=device,
                 args=args,
             )
+            images_per_sec = full_batch["image"].shape[0] / (time.time() - step_start_time)
+            log_data.images_per_sec_log_step.append(images_per_sec)
+
+            if (tv.global_step + 1) % args.log_step == 0:
+                do_log_step(args, ed_optimizer, log_data, logdir, log_writer, model, tv)
 
             if global_step > 0 and global_step % args.save_every == 0:
                 save_path = os.path.join(logdir, f"gs{global_step}")

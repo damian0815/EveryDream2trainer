@@ -83,5 +83,5 @@ def compute_sana_loss(
     target = noise - z
 
     # return 1D loss
-    mean_dims = range(1, target.shape[1])
+    mean_dims = list(range(1, len(target.shape)))
     return F.mse_loss(model_pred.float(), target.float(), reduction='none').mean(dim=mean_dims)
