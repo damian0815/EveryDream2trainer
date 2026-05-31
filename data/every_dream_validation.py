@@ -936,11 +936,7 @@ class EveryDreamValidator:
     def _build_ed_batch(self, items: list[ImageTrainItem], model: TrainingModel, name='val'):
         batch_size = self.batch_size
         seed = self.seed
-        data_loader = DataLoaderMultiAspect(
-            items,
-            batch_size=batch_size,
-            seed=seed,
-        )
+        data_loader = DataLoaderMultiAspect(items, seed=seed, batch_size=batch_size)
         empty_plugin_runner = PluginRunner()
 
         ed_batch = EveryDreamBatch(

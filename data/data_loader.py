@@ -34,8 +34,7 @@ import PIL.Image
 
 from utils.first_fit_decreasing import first_fit_decreasing
 
-PIL.Image.MAX_IMAGE_PIXELS = 715827880*4 # increase decompression bomb error limit to 4x default
-
+PIL.Image.MAX_IMAGE_PIXELS = 715827880*4 # prevent decompression bomb errors for very large images (e.g. 64k x 64k, which is 4x the default limit of 32k x 32k)
 
 
 class DataLoaderMultiAspect():
@@ -46,16 +45,11 @@ class DataLoaderMultiAspect():
     seed: random seed
     batch_size: number of images per batch
     """
-    def __init__(self, image_train_items: list[ImageTrainItem], seed=555,
-                 batch_size=1, grad_accum=1,
-                 chunk_shuffle_batch_size=None, batch_id_dropout_p=0,
-                 keep_same_sample_at_different_resolutions_together=False,
-                 caption_variants: list[str]=None,
-                 expand_caption_variants: bool=False
-                 ):
+    def __init__(self, image_train_items: list[ImageTrainItem], seed=555, batch_size=1, chunk_shuffle_batch_size=None,
+                 batch_id_dropout_p=0, keep_same_sample_at_different_resolutions_together=False,
+                 caption_variants: list[str] = None, expand_caption_variants: bool = False):
         self.seed = seed
         self.batch_size = batch_size
-        self.grad_accum = grad_accum
         self.chunk_shuffle_batch_size = chunk_shuffle_batch_size or batch_size
         self.prepared_train_data = image_train_items
         self.caption_variants = caption_variants
@@ -141,7 +135,6 @@ class DataLoaderMultiAspect():
 
         buckets = defaultdict(list)
         batch_size = self.batch_size
-        grad_accum = self.grad_accum
 
         def _make_bucket_key(image, batch_id_override: str=None):
             return (image.batch_id if batch_id_override is None else batch_id_override,
@@ -226,7 +219,7 @@ class DataLoaderMultiAspect():
         # at this point items have a partially deterministic order
         # (in particular: rarer aspect ratios are more likely to cluster at the end due to stochastic sampling)
         # so we shuffle them to mitigate this, using chunked_shuffle to keep batches with the same aspect ratio together
-        items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size*grad_accum, randomizer=randomizer)
+        items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size, randomizer=randomizer)
                              for k,v in items_by_batch_id.items()}
         if not items_by_batch_id:
             raise RuntimeError("No images available after applying dropout and multipliers. Check your dataset and multiplier settings.")
@@ -240,8 +233,7 @@ class DataLoaderMultiAspect():
         # handle batch_id
         # unlabelled data (no batch_id) is in batches labelled DEFAULT_BATCH_ID.
         items = flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id,
-                                                                   batch_size=batch_size,
-                                                                   grad_accum=grad_accum)
+                                                                   batch_size=batch_size)
 
         items = chunked_shuffle(items, chunk_size=self.chunk_shuffle_batch_size, randomizer=randomizer)
 
@@ -317,8 +309,7 @@ def collapse_buckets_by_batch_id(buckets: dict[tuple, list[ImageTrainItem]]) -> 
     return items_by_batch_id
 
 def flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id: Dict[str, List[ImageTrainItem]],
-                                                       batch_size: int,
-                                                       grad_accum: int) -> List[ImageTrainItem]:
+                                                       batch_size: int) -> List[ImageTrainItem]:
     # precondition: items_by_batch_id has no incomplete batches
     assert(all((len(v) % batch_size)==0 for v in items_by_batch_id.values()))
     # ensure we don't mix up aspect ratios by treating each chunk of batch_size images as
@@ -326,7 +317,7 @@ def flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id: Dict[str
     filler_items = chunk_list(items_by_batch_id.get(DEFAULT_BATCH_ID, []), batch_size)
     custom_batched_items = [chunk_list(v, batch_size) for k, v in items_by_batch_id.items() if k != DEFAULT_BATCH_ID]
     neighbourly_chunked_items = first_fit_decreasing(custom_batched_items,
-                                                     batch_size=grad_accum,
+                                                     batch_size=1,
                                                      filler_items=filler_items)
 
     items: List[ImageTrainItem] = unchunk_list(neighbourly_chunked_items)

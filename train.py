@@ -999,17 +999,12 @@ def main(args):
     plugin_runner = PluginRunner(plugins=plugins)
     plugin_runner.run_on_model_load(unet=model.unet, text_encoder=model.text_encoder, tokenizer=model.tokenizer, optimizer_config=optimizer_config)
 
-    data_loader = DataLoaderMultiAspect(
-        image_train_items=image_train_items,
-        seed=seed,
-        batch_size=args.batch_size,
-        grad_accum=args.grad_accum,
-        chunk_shuffle_batch_size=args.batch_size,
-        batch_id_dropout_p=args.batch_id_dropout_p,
-        keep_same_sample_at_different_resolutions_together=args.keep_same_sample_at_different_resolutions_together,
-        caption_variants=args.caption_variants,
-        expand_caption_variants=args.expand_caption_variants
-    )
+    data_loader = DataLoaderMultiAspect(image_train_items=image_train_items, seed=seed, batch_size=args.batch_size,
+                                        chunk_shuffle_batch_size=args.batch_size,
+                                        batch_id_dropout_p=args.batch_id_dropout_p,
+                                        keep_same_sample_at_different_resolutions_together=args.keep_same_sample_at_different_resolutions_together,
+                                        caption_variants=args.caption_variants,
+                                        expand_caption_variants=args.expand_caption_variants)
 
     mask_p = 0 if args.mask_p is None else args.mask_p
     train_batch = EveryDreamBatch(

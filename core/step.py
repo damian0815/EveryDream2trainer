@@ -112,13 +112,14 @@ def run_accumulation_loop(
         # Call the model-specific nibble loss function
         loss_mean = nibble_loss_fn(batch)
 
-        # Accumulate loss into tv
+        # Accumulate loss into tv; pass num_images dummy timesteps so the count
+        # is correctly tracked (accumulated_loss_images_count += len(timesteps)).
         try:
             tv.accumulate_loss(
                 loss_mean,
                 pathnames=batch.get("pathnames", [])[:num_images],
                 captions=(batch.get("captions") or {}).get("default", [])[:num_images],
-                timesteps=[],
+                timesteps=[0] * num_images,
             )
         except InfOrNanException:
             logging.error("Inf or NaN detected in loss, dropping this loss batch.")
