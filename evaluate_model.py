@@ -25,7 +25,7 @@ def do_gens(model_path, gens_json_path, output_root, is_flow_matching=False, dev
         with open(os.path.splitext(output_path)[0] + '.txt', 'w') as f:
             f.write(prompt)
 
-    pipe = DiffusionPipeline.from_pretrained(model_path).to(device, dtype=torch.float16)
+    pipe = DiffusionPipeline.from_pretrained(model_path).to(device, torchdtype=torch.float16)
     generate_images_diffusers(pipe, model_name=os.path.basename(model_path), model_type='sd-2', all_params=gens, batch_size=batch_size, flow_match_shift_dynamic=True, image_save_cb=save_image, start_offset=start_offset)
 
 

@@ -29,7 +29,7 @@ def __generate_sample(pipe: StableDiffusionPipeline, prompt: str, cfg: float, he
     """
     generates a single sample at a given cfg scale and saves it to disk
     """
-    with autocast():
+    with autocast('cuda'):
         images = pipe(prompt,
                       num_inference_steps=steps,
                       num_images_per_prompt=batch_size,

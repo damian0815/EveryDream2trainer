@@ -6,7 +6,6 @@ import math
 import os
 import shutil
 from plugins.plugins import BasePlugin
-from model.training_model import save_model
 
 EVERY_N_MINUTES = 20
 
@@ -28,23 +27,29 @@ class InterruptiblePlugin(BasePlugin):
             save_path = os.path.join(log_folder, "ckpts", ckpt_name)
             print(f"InterruptiblePlugin: saving model to {save_path}")
             try:
-                save_optimizer = False
-                if not save_optimizer:
-                    print("NOT saving optimizer")
-                save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None,
-                           yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=save_optimizer)
+                self._do_save(save_path, global_step, num_samples, kwargs)
                 self._remove_previous()
             except OSError as e:
-                save_optimizer = False
                 if e.errno == errno.ENOSPC:
                     print("out of disk space for safe save, trying unsafe")
                     shutil.rmtree(save_path, ignore_errors=True)
                     self._remove_previous()
-                    save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'], save_ckpt_dir=None,
-                       yaml_name=None, save_ckpt=False, save_full_precision=True, save_optimizer_flag=save_optimizer)
+                    self._do_save(save_path, global_step, num_samples, kwargs)
                 else:
                     raise
             self.previous_save_path = save_path
+
+    def _do_save(self, save_path: str, global_step: int, num_samples: int, kwargs: dict) -> None:
+        """Saves the model, dispatching to SANA or SD save functions."""
+        save_fn = kwargs.get('save_fn')
+        if save_fn is not None:
+            save_fn(save_path, global_step, num_samples=num_samples)
+        else:
+            from model.training_model import save_model
+            print("NOT saving optimizer")
+            save_model(save_path, global_step=global_step, ed_state=kwargs['ed_state'],
+                       save_ckpt_dir=None, yaml_name=None, save_ckpt=False,
+                       save_full_precision=True, save_optimizer_flag=False)
 
     def on_training_end(self, **kwargs):
         print(f"InterruptiblePlugin: cleaning up")

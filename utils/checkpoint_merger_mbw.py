@@ -333,10 +333,8 @@ class CheckpointMergerPipeline(DiffusionPipeline):
 
                     if isinstance(module, bool):  # ignore requires_safety_checker boolean
                         continue
-                    theta_0 = getattr(module, "state_dict")
-                    theta_0 = theta_0()
+                    theta_0 = module.state_dict()
 
-                    update_theta_0 = getattr(module, "load_state_dict")
                     theta_1 = (
                         safetensors.torch.load_file(checkpoint_path_1)
                         if (checkpoint_path_1.endswith(".safetensors"))
@@ -400,7 +398,7 @@ class CheckpointMergerPipeline(DiffusionPipeline):
 
                 del theta_1
                 del theta_2
-                update_theta_0(theta_0)
+                module.load_state_dict(theta_0)
 
                 del theta_0
         return final_pipe
@@ -511,7 +509,8 @@ def do_multi_merge(models, model_weights=None, per_module_alphas: dict = None, b
             else:
                 path = os.path.join(intermediates_folder, f"intermediate_{i//chunk_size}.ckpt")
                 print(f"saving intermediate to {path}")
-                save_merge(intermediate, path, half=False)
+                is_sdxl = getattr(intermediate, 'text_encoder_2') is not None
+                save_merge(intermediate, path, half=not is_sdxl)
                 merged_intermediates.append(path)
                 merged_intermediates_weights.append(sum(chunk_weights))
                 print("done merging chunk")

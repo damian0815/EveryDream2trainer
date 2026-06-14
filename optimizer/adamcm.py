@@ -28,7 +28,7 @@ class AdamCM(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             for group in self.param_groups:
                 for p in group['params']:
                     if p.grad is None:

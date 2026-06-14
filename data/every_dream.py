@@ -18,19 +18,17 @@ import logging
 import os
 import statistics
 import traceback
-from collections import defaultdict, Counter
+from collections import Counter
 
 import math
 import torch
 from torch.utils.data import Dataset
+from typing_extensions import Literal
+
 from data.data_loader import DataLoaderMultiAspect
-from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID, check_caption_json
+from data.image_train_item import ImageTrainItem, check_caption_json
 import random
 from torchvision import transforms
-from transformers import CLIPTokenizer
-import torch.nn.functional as F
-
-from data.perlin import rand_perlin_2d_octaves
 from plugins.plugins import PluginRunner
 
 class EveryDreamBatch(Dataset):
@@ -49,6 +47,8 @@ class EveryDreamBatch(Dataset):
                  crop_jitter=0.02,
                  seed=555,
                  tokenizer_2=None,
+                 teacher_tokenizer=None,
+                 teacher_tokenizer_2=None,
                  shuffle_tags=False,
                  keep_tags=0,
                  normalize_image=True,
@@ -76,6 +76,10 @@ class EveryDreamBatch(Dataset):
         self.unloaded_to_idx = 0
         self.tokenizer = tokenizer
         self.tokenizer_2 = tokenizer_2
+        # Teacher tokenizers: only stored when distinct from student tokenizers.
+        # Identical tokenizer → same token IDs, no need to re-tokenize.
+        self.teacher_tokenizer = teacher_tokenizer if (teacher_tokenizer is not None and teacher_tokenizer is not tokenizer) else None
+        self.teacher_tokenizer_2 = teacher_tokenizer_2 if (teacher_tokenizer_2 is not None and teacher_tokenizer_2 is not tokenizer_2) else None
         self.max_token_length = None
         self.shuffle_tags = shuffle_tags
         self.keep_tags = keep_tags
@@ -125,14 +129,19 @@ class EveryDreamBatch(Dataset):
         train_item: dict = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
         example["pathname"] = train_item["pathname"]
 
-        std_dev = 0.5
-        mean = 0.5
+        use_imagenet_norm_std = False # done in VAE encode
+        if use_imagenet_norm_std:
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+        else:
+            mean = [0.5]
+            std = [0.5]
 
         if self.normalize_image:
             image_transforms = transforms.Compose(
                 [
                     transforms.ToTensor(),
-                    transforms.Normalize([mean], [std_dev]),
+                    transforms.Normalize(mean, std),
                 ]
             )
         else:
@@ -155,7 +164,7 @@ class EveryDreamBatch(Dataset):
             example["image"] = None
         else:
             example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
-            example["image"] = image_transforms(example["image"])
+            example["image"] = image_transforms(example["image"]) # range [-1, 1]
         if train_item["mask"] is not None:
             mask_transforms = transforms.Compose(
                 [
@@ -177,19 +186,6 @@ class EveryDreamBatch(Dataset):
             caption_keys = list(caption_dict.keys())
             example["caption"] = {k: caption_dict.get(k, None) or caption_dict[self.random_instance.choice(caption_keys)]
                                   for k in caption_keys}
-            example["tokens"] = {k: torch.tensor(self.tokenizer(example["caption"][k],
-                                                truncation=True,
-                                                padding="max_length",
-                                                max_length=self.tokenizer.model_max_length,
-                                              ).input_ids)
-                                 for k in caption_keys}
-            if self.is_sdxl:
-                example["tokens_2"] = {k: torch.tensor(self.tokenizer_2(example["caption"][k],
-                                                    truncation=True,
-                                                    padding="max_length",
-                                                    max_length=self.tokenizer_2.model_max_length,
-                                                  ).input_ids)
-                                     for k in caption_keys}
         except (ValueError, TypeError) as e:
             traceback.print_exc()
             print('caption_dict:', caption_dict)
@@ -274,23 +270,16 @@ class DataLoaderWithFixedBuffer(torch.utils.data.DataLoader):
             images = self.buffer_tensor.view(self.batch_size, 3, w, h)
 
         captions = [example["caption"] for example in batch]
-        tokens = [example["tokens"] for example in batch]
-        tokens_2 = ([example["tokens_2"] for example in batch]
-                     if "tokens_2" in batch[0]
-                     else None)
         runt_size = batch[0]["runt_size"]
 
         images = torch.stack(images)
         images = images.to(memory_format=torch.contiguous_format).float()
 
         ret = {
-            "tokens": torch.stack(tuple(tokens)),
             "image": images,
             "captions": captions,
             "runt_size": runt_size,
         }
-        if tokens_2 is not None:
-            ret["tokens_2"] = torch.stack(tuple(tokens_2))
 
         del batch
         return ret
@@ -324,11 +313,7 @@ def _replace_default_with_most_common(batch):
                                if k != "default" and k not in b["caption"]), None)
             if replacement is not None:
                 b["caption"][replacement] = b["caption"]["default"]
-                b["tokens"][replacement] = b["tokens"]["default"]
-                del b["caption"]["default"], b["tokens"]["default"]
-                if "tokens_2" in b:
-                    b["tokens_2"][replacement] = b["tokens_2"]["default"]
-                    del b["tokens_2"]["default"]
+                del b["caption"]["default"]
 
 def collapse_captions(batch):
     _replace_default_with_most_common(batch)
@@ -397,24 +382,15 @@ def collapse_captions(batch):
                 source_map[i] = chosen
 
     captions = {}
-    tokens = {}
-    tokens_2 = {} if "tokens_2" in batch[0] else None
     # map from caption variant to source caption per example
     for k, source_map in caption_source_map.items():
-        #print("k:", k, "source_map:", source_map)
         sourced_captions = [example["caption"].get(source_map.get(i, None), None)
                        for i, example in enumerate(batch)]
-        #print(sourced_captions)
         if all(c is None for c in sourced_captions):
             continue
         captions[k] = sourced_captions
-        tokens[k] = [example["tokens"].get(source_map.get(i, None), None)
-                     for i, example in enumerate(batch)]
-        if tokens_2 is not None:
-            tokens_2[k] = [example["tokens_2"].get(source_map.get(i, None), None)
-                            for i, example in enumerate(batch)]
 
-    return captions, tokens, tokens_2
+    return captions
 
 
 def collate_fn(batch):
@@ -438,7 +414,7 @@ def collate_fn(batch):
 
     # captions = [example["untransformed_caption" if do_contrastive_learning else "caption"] for example in batch]
     # replace all 'default' with the most common
-    captions, tokens, tokens_2 = collapse_captions(batch)
+    captions = collapse_captions(batch)
 
     add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
 
@@ -466,7 +442,6 @@ def collate_fn(batch):
     cond_dropout = [example.get("cond_dropout") for example in batch]
 
     ret = {
-        "tokens": tokens,
         "image": images,
         "mask": masks,
         "captions": captions,
@@ -475,12 +450,10 @@ def collate_fn(batch):
         "do_contrastive_learning": do_contrastive_learning,
         "timesteps_range": timesteps_range,
         "pathnames": pathnames,
-        "cond_dropout": cond_dropout
+        "cond_dropout": cond_dropout,
+        "add_time_ids": add_time_ids,
     }
 
-    if tokens_2:
-        ret["tokens_2"] = tokens_2
-        ret["add_time_ids"] = add_time_ids
     del batch
     return ret
 

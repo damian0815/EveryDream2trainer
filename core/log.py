@@ -1,8 +1,10 @@
 import dataclasses
+import datetime
 import json
 import logging
 import math
 import os
+import sys
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -16,6 +18,47 @@ from data.image_train_item import ImageTrainItem
 from model.training_model import TrainingModel, TrainingVariables
 
 from optimizer.attention_activation_control import ActivationLogger
+
+def setup_local_logger(args) -> tuple[str, str]:
+    """
+    Creates the run-specific log folder, configures file + console logging,
+    and returns ``(datetimestamp, log_folder)``.
+
+    Log folder layout::
+
+        <args.logdir>/<args.project_name>-<YYYYMMDD-HHMMSS>/
+            <args.project_name>-<YYYYMMDD-HHMMSS>.log
+    """
+    os.makedirs(args.logdir, exist_ok=True)
+
+    datetimestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_folder = os.path.join(args.logdir, f"{args.project_name}-{datetimestamp}")
+    os.makedirs(log_folder, exist_ok=True)
+
+    logfilename = os.path.join(log_folder, f"{args.project_name}-{datetimestamp}.log")
+    print(f" logging to {logfilename}")
+
+    logging.basicConfig(
+        filename=logfilename,
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        datefmt="%m/%d/%Y %I:%M:%S %p",
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.addFilter(
+        lambda record: "Palette images with Transparency expressed in bytes"
+        not in record.getMessage()
+    )
+    logging.getLogger().addHandler(console_handler)
+
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message="UserWarning: Palette images with Transparency expressed in bytes should be converted to RGBA images",
+    )
+
+    return datetimestamp, log_folder
+
 
 @dataclasses.dataclass
 class LogData:
@@ -70,14 +113,17 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
             global_step=global_step,
         )
         tv.cond_dropouts = []
-    log_writer.add_scalar(
-        tag="hyperparameter/cond dropout actual",
-        scalar_value=tv.cond_dropout_count / (tv.cond_dropout_count + tv.non_cond_dropout_count),
-        global_step=global_step
-    )
+    _cond_total = tv.cond_dropout_count + tv.non_cond_dropout_count
+    if _cond_total > 0:
+        log_writer.add_scalar(
+            tag="hyperparameter/cond dropout actual",
+            scalar_value=tv.cond_dropout_count / _cond_total,
+            global_step=global_step
+        )
 
     images_per_sec_avg = sum(log_data.images_per_sec_log_step) / (len(log_data.images_per_sec_log_step) if log_data.images_per_sec_log_step else 1)
     log_writer.add_scalar(tag="performance/images per second", scalar_value=images_per_sec_avg, global_step=global_step)
+    log_data.images_per_sec_log_step = []
 
     # For progress bar, use first unet LR or 0 if none
     lr_unet_for_display = list(lr_unet.values())[0] if lr_unet else 0

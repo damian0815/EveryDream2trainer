@@ -1,11 +1,18 @@
+import logging
 import random
 import traceback
+import uuid
 
 import yaml
 import json
 
 from attrs import define, field
-from data.image_train_item import ImageCaption, ImageTrainItem, check_caption_json
+from data.image_train_item import (
+    ImageCaption, ImageTrainItem, ImageSourceItem, ResolutionOption,
+    check_caption_json, _needs_transpose, DEFAULT_BATCH_ID,
+)
+import PIL.Image
+from torchvision import transforms
 from utils.fs_helpers import *
 from typing import Iterable, Counter
 
@@ -54,6 +61,7 @@ class ImageConfig:
     
     # Options
     multiply: float = None
+    per_resolution_multiply: dict[int, float] = None
     cond_dropout: float = None
     flip_p: float = None
     shuffle_tags: bool = False
@@ -66,12 +74,15 @@ class ImageConfig:
 
         other_multiply = 1.0 if other.multiply is None else other.multiply
         self_multiply = 1.0 if self.multiply is None else self.multiply
+        self_per_resolution_multiply = self.per_resolution_multiply or dict()
+        other_per_resolution_multiply = other.per_resolution_multiply or dict()
         return ImageConfig(
             main_prompts=other.main_prompts | self.main_prompts,
             rating=overlay(other.rating, self.rating),
             max_caption_length=overlay(other.max_caption_length, self.max_caption_length),
             tags= other.tags | self.tags,
             multiply=other_multiply * self_multiply,
+            per_resolution_multiply={**self_per_resolution_multiply, **other_per_resolution_multiply},
             cond_dropout=overlay(other.cond_dropout, self.cond_dropout),
             flip_p=overlay(other.flip_p, self.flip_p),
             shuffle_tags=overlay(other.shuffle_tags, self.shuffle_tags),
@@ -91,6 +102,7 @@ class ImageConfig:
             max_caption_length=data.get("max_caption_length"), 
             tags=safe_set(map(Tag.parse, data.get("tags", []))),
             multiply=data.get("multiply"),
+            per_resolution_multiply=data.get("per_resolution_multiply"),
             cond_dropout=data.get("cond_dropout"),
             flip_p=data.get("flip_p"),
             shuffle_tags=data.get("shuffle_tags"),
@@ -142,9 +154,17 @@ class ImageConfig:
                 case '.jpg' | '.jpeg' | '.png' | '.bmp' | '.webp' | '.jfif':
                     return ImageConfig(image=file)
                 case ".json":
-                    return ImageConfig.from_dict(json.load(read_text(file)))
+                    json_dict = json.load(read_text(file))
+                    if json_dict is None:
+                        logging.warning(f" *** JSON file {file} is empty, treating as no config")
+                        return None
+                    return ImageConfig.from_dict(json_dict)
                 case ".yaml" | ".yml":
-                    return ImageConfig.from_dict(yaml.safe_load(read_text(file)))
+                    yaml_dict = yaml.safe_load(read_text(file))
+                    if yaml_dict is None:
+                        logging.warning(f" *** YAML file {file} is empty, treating as no config")
+                        return None
+                    return ImageConfig.from_dict(yaml_dict)
                 case ".txt" | ".caption":
                     return ImageConfig.from_caption_text(read_text(file))
                 case _:
@@ -258,9 +278,9 @@ class Dataset:
                 image_configs[img] = cfg
         return Dataset(image_configs)    
     
-    def image_train_items(self, aspects):
+    def image_train_items(self, aspects, resolution):
         items = []
-        for image in tqdm(self.image_configs, desc="preloading", dynamic_ncols=True):
+        for image in tqdm(self.image_configs, desc=f"preloading [{resolution}]", dynamic_ncols=True):
             config = self.image_configs[image]
             #print(f" ********* shuffle: {config.shuffle_tags}")
 
@@ -287,13 +307,17 @@ class Dataset:
                     max_target_length=config.max_caption_length or DEFAULT_MAX_CAPTION_LENGTH,
                     use_weights=use_weights)
 
+                multiply = config.multiply or 1.0
+                if config.per_resolution_multiply is not None and resolution in config.per_resolution_multiply:
+                    multiply *= config.per_resolution_multiply[resolution]
+
                 item = ImageTrainItem(
                     image=None,
                     caption=caption,
                     aspects=aspects,
                     pathname=os.path.abspath(image),
                     flip_p=config.flip_p or 0.0,
-                    multiplier=config.multiply or 1.0,
+                    multiplier=multiply,
                     cond_dropout=config.cond_dropout,
                     shuffle_tags=config.shuffle_tags,
                     batch_id=config.batch_id,
@@ -306,13 +330,152 @@ class Dataset:
                 raise e
         return items
 
+    def image_source_items(self, aspects_per_resolution: dict) -> list:
+        """
+        Create one ImageSourceItem per image, computing resolution options for all
+        resolutions in a single pass (one file-open per image).
+
+        :param aspects_per_resolution: maps each resolution integer to its list of
+            (w, h) aspect-ratio bucket pairs.
+        :return: list[ImageSourceItem], one per image (including items with errors so
+            callers can log the error and skip them).
+        """
+        items = []
+        for image_path in tqdm(
+            self.image_configs,
+            desc="preloading (multi-resolution)",
+            dynamic_ncols=True,
+        ):
+            config = self.image_configs[image_path]
+
+            if len(config.main_prompts) > 1:
+                logging.warning(
+                    f" *** Multiple main_prompts for {image_path}; only the first is used."
+                )
+            if len(config.main_prompts) < 1:
+                logging.warning(f" *** No main_prompts for {image_path} — skipping.")
+                continue
+
+            caption = _build_caption(config)
+            abs_path = os.path.abspath(image_path)
+            image_size, error, resolution_options = _compute_resolution_options(
+                abs_path,
+                aspects_per_resolution,
+                config.per_resolution_multiply or {},
+            )
+
+            # Build the base ImageTrainItem via __new__ to avoid re-opening the image
+            # file in __compute_target_width_height.  Resolution-dependent fields
+            # (target_wh, is_undersized, uid, source_resolution) are intentionally left
+            # unset here; they are assigned later by ImageSourceItem.make_resolved_item().
+            base_item = ImageTrainItem.__new__(ImageTrainItem)
+            base_item.caption         = caption
+            base_item.aspects         = []          # not used in multi-resolution path
+            base_item.pathname        = abs_path
+            flip_p                    = config.flip_p or 0.0
+            base_item.flip            = transforms.RandomHorizontalFlip(p=flip_p)
+            base_item.cropped_img     = None
+            base_item.runt_size       = 0
+            mult                      = config.multiply or 1.0
+            base_item.multiplier      = mult
+            base_item.base_multiplier = mult
+            base_item.cond_dropout    = config.cond_dropout
+            base_item.shuffle_tags    = config.shuffle_tags or False
+            base_item.batch_id        = config.batch_id or DEFAULT_BATCH_ID
+            base_item.loss_scale      = config.loss_scale or 1.0
+            base_item.timesteps_range = config.timesteps_range
+            base_item.target_wh       = None        # assigned by make_resolved_item()
+            base_item.is_runt         = False
+            base_item.uid             = uuid.uuid4().hex
+            base_item.source_resolution = None
+            base_item.image_size      = image_size
+            base_item.mask            = None
+            base_item.image           = []
+            base_item.is_undersized   = False       # assigned by make_resolved_item()
+            base_item.error           = error
+
+            source_item = ImageSourceItem(
+                item=base_item,
+                resolution_options=resolution_options,
+                uid=uuid.uuid4().hex,
+            )
+            items.append(source_item)
+        return items
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (used by Dataset.image_source_items)
+# ---------------------------------------------------------------------------
+
+def _build_caption(config: 'ImageConfig') -> ImageCaption:
+    """Build an ImageCaption from a resolved ImageConfig."""
+    tags = []
+    tag_weights = []
+    for tag in sorted(config.tags, key=lambda x: x.weight or 1.0, reverse=True):
+        tags.append(tag.value)
+        tag_weights.append(tag.weight)
+    use_weights = len(set(tag_weights)) > 1
+    return ImageCaption(
+        main_prompt=next(iter(config.main_prompts)),
+        rating=config.rating or 1.0,
+        tags=tags,
+        tag_weights=tag_weights,
+        max_target_length=config.max_caption_length or DEFAULT_MAX_CAPTION_LENGTH,
+        use_weights=use_weights,
+    )
+
+
+def _compute_resolution_options(
+    pathname: str,
+    aspects_per_resolution: dict,
+    per_resolution_multiply: dict,
+) -> tuple:
+    """
+    Open the image once and compute a ResolutionOption for every resolution.
+
+    :param pathname: absolute path to the image file.
+    :param aspects_per_resolution: {resolution_int: list of [w, h] buckets}.
+    :param per_resolution_multiply: {resolution_int: float} from per_resolution_multiply
+        config field; may be empty.
+    :return: (image_size, error, resolution_options)
+        image_size  — (width, height) tuple, or None if the file could not be opened.
+        error       — Exception instance, or None.
+        resolution_options — dict[int, ResolutionOption].
+    """
+    image_size = None
+    error = None
+    resolution_options: dict[int, ResolutionOption] = {}
+    try:
+        with PIL.Image.open(pathname) as img:
+            if _needs_transpose(img):
+                height, width = img.size
+            else:
+                width, height = img.size
+            image_size = (width, height)
+            image_aspect = width / height
+            for resolution, aspects in aspects_per_resolution.items():
+                target_wh = min(aspects, key=lambda wh: abs(wh[0] / wh[1] - image_aspect))
+                is_feasible = not (
+                    (width != target_wh[0] and height != target_wh[1])
+                    and (width * height) < (target_wh[0] * 1.02 * target_wh[1] * 1.02)
+                )
+                weight = per_resolution_multiply.get(resolution, 1.0)
+                resolution_options[resolution] = ResolutionOption(
+                    resolution=resolution,
+                    target_wh=target_wh,
+                    unnormalised_weight=weight,
+                    is_feasible=is_feasible,
+                )
+    except Exception as e:
+        error = e
+    return image_size, error, resolution_options
+
 
 def select_caption_variants(
     captions_dict: dict[str, list[str]],
     requested_variants: list[str],
-    all_caption_variants: bool,
-    caption_cross_concatenation_p: float,
-    caption_cross_concatenation_empty_half_p: float
+    caption_cross_concatenation_p: float = 0,
+    caption_cross_concatenation_empty_half_p: float = 0
 ) -> list[str|tuple[str, str]]:
     available_non_default_variants = set(k for k in captions_dict if k != "default")
     if requested_variants:
@@ -328,29 +491,11 @@ def select_caption_variants(
     else:
         caption_candidates = list(available_non_default_variants)
 
-    if all_caption_variants:
-        caption_counter = Counter()
-        # add requested captions
-        for k in captions_dict.keys():
-            if k in caption_candidates or (
-                # only add 'default' if it's the only caption
-                k == 'default'
-                and len(captions_dict.keys()) == 1
-            ):
-                for image_index in range(len(captions_dict[k])):
-                    if captions_dict[k][image_index] is not None:
-                        caption_counter[k] += 1
-        # logging.info(
-        #    f"{len(caption_counter)} caption variants for this batch of {image_shape[0]} images: {caption_counter}")
-        selected_primary_variants = list(caption_counter.keys())
-    else:
-        if len(caption_candidates) == 0:
-            caption_candidates.append("default")
-            if "default" not in captions_dict:
-                raise RuntimeError("No captions found for batch, even default. This should not happen. Check your dataset and caption files.")
-                #batch["captions"]["default"] = [model.cond_dropout_caption] * image_shape[0]
-                #batch["tokens"]["default"] = [model.cond_dropout_tokens] * image_shape[0]
-        selected_primary_variants = [random.choice(caption_candidates)]
+    if len(caption_candidates) == 0:
+        caption_candidates.append("default")
+        if "default" not in captions_dict:
+            raise RuntimeError("No captions found for batch, even default. This should not happen. Check your dataset and caption files.")
+    selected_primary_variants = [random.choice(caption_candidates)]
 
     remaining_unused = set(available_non_default_variants) - set(selected_primary_variants) - set(requested_variants)
 
@@ -361,93 +506,24 @@ def select_caption_variants(
             final_variants.append(left)
             continue
 
-        # repopulate remaining unused if empty, but exclude selected primary variants and requested variants
         right_candidates = others.intersection(remaining_unused)
         if not right_candidates:
             remaining_unused = set(available_non_default_variants) - set(selected_primary_variants)
             if not remaining_unused:
                 remaining_unused = set(available_non_default_variants)
         if not right_candidates:
-            # ran out of candidates to concatenate with, just use the left variant
             final_variants.append(left)
             continue
 
         right = random.choice(list(right_candidates))
         remaining_unused.remove(right)
 
-        # perhaps swap
         if random.random() < 0.5:
             left, right = right, left
         concat_pair = [left, right]
-        # perhaps replace one with empty
         if random.random() < caption_cross_concatenation_empty_half_p:
             concat_pair[random.randint(0, 1)] = None
 
         final_variants.append(tuple(concat_pair))
 
     return final_variants
-
-
-
-def select_caption_variants_new(
-    captions_dict: dict[str, str],
-    requested_variants: list[str],
-    all_caption_variants: bool,
-    caption_cross_concatenation_p: float,
-    caption_cross_concatenation_empty_half_p: float
-) -> list[str|tuple[str, str]]:
-    available_non_default_variants = set(k for k in captions_dict if k != "default")
-    if requested_variants:
-        available_requested = available_non_default_variants.intersection(set(requested_variants))
-        # add wildcards for each missing - this takes care of '*' as variant too
-        missing = max(0, len(requested_variants) - len(available_requested))
-        for _ in range(missing):
-            remaining = available_non_default_variants - available_requested
-            if not remaining:
-                break
-            available_requested.add(random.choice(list(remaining)))
-        caption_candidates = list(available_requested)
-    else:
-        caption_candidates = list(available_non_default_variants)
-
-    batch_size = len(next(iter(captions_dict.values())))
-    selected_primary_variants = []
-    for i in range(batch_size):
-        selected_primary_variants.append(random.choice(caption_candidates))
-
-    remaining_unused = set(available_non_default_variants) - set(selected_primary_variants) - set(requested_variants)
-
-    variants = []
-    for i in range(batch_size):
-        left = selected_primary_variants[i]
-        others = set(c for c in available_non_default_variants if c != left)
-        if random.random() > caption_cross_concatenation_p or len(others) == 0:
-            variants.append(left)
-            continue
-
-        # repopulate remaining unused if empty, but exclude selected primary variants and requested variants
-        right_candidates = others.intersection(remaining_unused)
-        if not right_candidates:
-            remaining_unused = set(available_non_default_variants) - set(selected_primary_variants)
-            if not remaining_unused:
-                remaining_unused = set(available_non_default_variants)
-        if not right_candidates:
-            # ran out of candidates to concatenate with, just use the left variant
-            variants.append(left)
-            continue
-
-        right = random.choice(list(right_candidates))
-        remaining_unused.remove(right)
-
-        # perhaps swap
-        if random.random() < 0.5:
-            left, right = right, left
-        concat_pair = [left, right]
-        # perhaps replace one with empty
-        if random.random() < caption_cross_concatenation_empty_half_p:
-            concat_pair[random.randint(0, 1)] = None
-
-        variants.append(tuple(concat_pair))
-
-    return variants
-

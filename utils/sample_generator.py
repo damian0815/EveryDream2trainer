@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from colorama import Fore, Style
 from diffusers import (
     StableDiffusionPipeline,
+    SanaPipeline,
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     DDPMScheduler,
@@ -22,11 +23,10 @@ from diffusers import (
     KDPM2AncestralDiscreteScheduler,
     DPMSolverSDEScheduler,
     DPMSolverSinglestepScheduler,
-    FlowMatchEulerDiscreteScheduler,
-    StableDiffusionXLPipeline, FlowMatchHeunDiscreteScheduler,
+    StableDiffusionXLPipeline,
 )
 
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -87,6 +87,22 @@ def get_best_size_for_aspect_ratio(aspect_ratio, default_resolution) -> tuple[in
                 sizes.append((w, h))
     best_size = min(sizes, key=lambda s: abs(1 - (aspect_ratio / (s[0] / s[1]))))
     return best_size
+
+
+def _pipeline_has_quantized_components(pipe) -> bool:
+    """
+    Returns True if any pipeline component has been loaded with a quantizer
+    (e.g. bitsandbytes 8-bit / 4-bit via transformers).  Such components have
+    accelerate dispatch hooks and must NOT be moved via .to().
+    """
+    for component in pipe.components.values():
+        if component is None:
+            continue
+        if getattr(component, 'is_quantized', False):
+            return True
+        if getattr(component, 'hf_quantizer', None) is not None:
+            return True
+    return False
 
 
 class SampleGenerator:
@@ -231,20 +247,27 @@ class SampleGenerator:
 
 
     @torch.no_grad()
-    def generate_samples(self, pipe: StableDiffusionPipeline, global_step: int, extra_info: str = ""):
+    def generate_samples(self, pipe: StableDiffusionPipeline, global_step: int, extra_info: str = "",
+                         samples_subdir: str = "samples"):
         """
-        generates samples at different cfg scales and saves them to disk
+        generates samples at different cfg scales and saves them to disk.
+        samples_subdir: subfolder under log_folder to save to, also used as the tensorboard tag prefix.
+                        Use "samples" for normal model output and "samples-ema" for EMA model output.
         """
+        # Ensure the target subdirectory exists
+        subdir_path = os.path.join(self.log_folder, samples_subdir)
+        os.makedirs(subdir_path, exist_ok=True)
+
         try:
             font = ImageFont.truetype(font="arial.ttf", size=20)
         except:
             font = ImageFont.load_default()
 
         if not self.show_progress_bars:
-            print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts")
+            print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts (subdir: {samples_subdir})")
 
         sample_index = 0
-        with autocast():
+        with autocast('cuda', enabled=type(pipe) is not SanaPipeline):
             try:
                 do_regular_samples = self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts
                 if do_regular_samples:
@@ -257,9 +280,9 @@ class SampleGenerator:
                                       desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
-                    if type(pipe) is StableDiffusionXLPipeline:
-                        print("SDXL -> no Compel")
-                        compel = None #CompelForSDXL(pipe)
+                    if type(pipe) in (StableDiffusionXLPipeline, SanaPipeline):
+                        print(f"{type(pipe).__name__} -> no Compel")
+                        compel = None
                     else:
                         compel = CompelForSD(pipe)
                     for batch in batches:
@@ -298,20 +321,24 @@ class SampleGenerator:
                                 #pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                                 #print("updated scheduler with shift", shift)
 
+                            non_sana_kwargs = {} if isinstance(pipe, SanaPipeline) else dict(
+                                pooled_prompt_embeds=pooled_prompt_embeds,
+                                negative_pooled_prompt_embeds=negative_pooled_embeds,
+                                guidance_rescale=self.guidance_rescale
+                            )
+
                             images = pipe(
                                 prompt=prompt,
                                 prompt_embeds=embeds,
-                                pooled_prompt_embeds=pooled_prompt_embeds,
                                 negative_prompt=negative_prompt,
                                 negative_prompt_embeds=negative_embeds,
-                                negative_pooled_prompt_embeds=negative_pooled_embeds,
                                 num_inference_steps=self.num_inference_steps,
                                 num_images_per_prompt=1,
                                 guidance_scale=cfg,
                                 generator=generators,
                                 width=size[0],
                                 height=size[1],
-                                guidance_rescale=self.guidance_rescale
+                                **non_sana_kwargs,
                             ).images
 
                             for image in images:
@@ -353,7 +380,8 @@ class SampleGenerator:
                                                    global_step=global_step,
                                                    prompt=prompt,
                                                    is_random_caption=batch[prompt_idx].wants_random_caption,
-                                                   extra_info=extra_info)
+                                                   extra_info=extra_info,
+                                                   samples_subdir=samples_subdir)
                             sample_index += 1
 
                             del result
@@ -368,7 +396,8 @@ class SampleGenerator:
                                                    global_step=global_step, extra_info=extra_info,
                                                    index_offset=len(self.sample_requests),
                                                    flow_match_shift=pipe.scheduler.config.get('shift', 1),
-                                                   flow_match_shift_dynamic=pipe.scheduler.config.get('use_dynamic_shifting', False))
+                                                   flow_match_shift_dynamic=pipe.scheduler.config.get('use_dynamic_shifting', False),
+                                                   samples_subdir=samples_subdir)
 
             except Exception as e:
                     print(traceback.format_exc())
@@ -381,25 +410,31 @@ class SampleGenerator:
                           prompt: str,
                           is_random_caption: bool,
                           extra_info: str,
-                          pngmetadata: dict=None):
+                          pngmetadata: dict=None,
+                          samples_subdir: str = "samples"):
         clean_prompt = clean_filename(prompt)
 
-        result.save(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg",
+        subdir_path = os.path.join(self.log_folder, samples_subdir)
+        os.makedirs(subdir_path, exist_ok=True)
+
+        result.save(f"{subdir_path}/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.jpg",
                     format="JPEG", quality=95, optimize=True, progressive=False, pngmetadata=pngmetadata)
-        with open(f"{self.log_folder}/samples/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt",
+        with open(f"{subdir_path}/gs{global_step:05}-{sample_index}-{extra_info}{clean_prompt[:100]}.txt",
                   "w", encoding='utf-8') as f:
             f.write(prompt)
         tfimage = transforms.ToTensor()(result)
+        # Tensorboard tag uses the samples_subdir as prefix so EMA and non-EMA images appear in separate groups
+        tag_prefix = samples_subdir.replace("/", "_").replace("-", "_")
         if is_random_caption:
-            self.log_writer.add_image(tag=f"sample_{sample_index}{extra_info}", img_tensor=tfimage,
+            self.log_writer.add_image(tag=f"{tag_prefix}_{sample_index}{extra_info}", img_tensor=tfimage,
                                       global_step=global_step)
         else:
-            self.log_writer.add_image(tag=f"sample_{sample_index}_{extra_info}{clean_prompt[:100]}", img_tensor=tfimage,
+            self.log_writer.add_image(tag=f"{tag_prefix}_{sample_index}_{extra_info}{clean_prompt[:100]}", img_tensor=tfimage,
                                       global_step=global_step)
         del tfimage
 
     @torch.no_grad()
-    def create_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config, flow_match_shift=1, flow_match_shift_dynamic=False) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
+    def create_inference_pipe(self, model_being_trained, diffusers_scheduler_config, flow_match_shift=1, flow_match_shift_dynamic=False):
         """
         creates a pipeline for SD inference
         """
@@ -408,6 +443,35 @@ class SampleGenerator:
             self.scheduler = 'flow-matching'
         scheduler = self._create_scheduler(diffusers_scheduler_config, flow_match_shift, flow_match_shift_dynamic)
         pipe = model_being_trained.build_inference_pipeline(scheduler=scheduler)
+        if self.use_xformers:
+            pipe.enable_xformers_memory_efficient_attention()
+        # Quantized components (e.g. bitsandbytes 8-bit) have accelerate dispatch hooks
+        # attached and cannot be moved via .to() — they are already on the right device.
+        if not _pipeline_has_quantized_components(pipe):
+            pipe = pipe.to(model_being_trained.device)
+        return pipe
+
+    @torch.no_grad()
+    def create_ema_inference_pipe(self, model_being_trained: TrainingModel, diffusers_scheduler_config,
+                                  flow_match_shift=1, flow_match_shift_dynamic=False
+                                  ) -> StableDiffusionPipeline | StableDiffusionXLPipeline | None:
+        """
+        Creates an inference pipeline using EMA weights where available,
+        falling back to live weights for any component without an EMA counterpart.
+
+        All pipeline components are placed on CPU.  The caller must call
+        ``pipe.to(device)`` before inference and ``del pipe`` (+ empty_cache)
+        afterwards to avoid leaving stale tensors on the GPU.
+
+        Returns None when no EMA weights exist yet.
+        """
+        if model_being_trained.is_flow_matching and self.scheduler != 'flow-matching':
+            print(f"Warning: model is flow-matching but scheduler is '{self.scheduler}'. Overriding.")
+            self.scheduler = 'flow-matching'
+        scheduler = self._create_scheduler(diffusers_scheduler_config, flow_match_shift, flow_match_shift_dynamic)
+        pipe = model_being_trained.build_ema_inference_pipeline(scheduler=scheduler)
+        if pipe is None:
+            return None
         if self.use_xformers:
             pipe.enable_xformers_memory_efficient_attention()
         return pipe
@@ -458,13 +522,14 @@ class SampleGenerator:
         else:
             raise ValueError(f"unknown scheduler '{scheduler}'")
 
-    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0, flow_match_shift=1, flow_match_shift_dynamic=False):
+    def generate_invokeai_samples(self, sample_invokeai_info_dicts: list[dict], pipe, global_step, extra_info, index_offset=0, flow_match_shift=1, flow_match_shift_dynamic=False, samples_subdir: str = "samples"):
 
         params = [ImageGenerationParams.from_invokeai_metadata(d)
                   for d in sample_invokeai_info_dicts]
         def save_image(image, sample_index, prompt, pngmetadata):
             return self.save_sample_image(image, sample_index, global_step=global_step, prompt=prompt,
-                                          is_random_caption=False, extra_info=extra_info, pngmetadata=pngmetadata)
+                                          is_random_caption=False, extra_info=extra_info, pngmetadata=pngmetadata,
+                                          samples_subdir=samples_subdir)
 
         generate_images_diffusers(pipe=pipe,
                                   model_name=f'training-global_step{global_step}-{extra_info}',
@@ -475,7 +540,8 @@ class SampleGenerator:
                                   extra_cfgs=self.cfgs[1:],
                                   index_offset=index_offset,
                                   flow_match_shift=flow_match_shift,
-                                  flow_match_shift_dynamic=flow_match_shift_dynamic)
+                                  flow_match_shift_dynamic=flow_match_shift_dynamic,
+                                  show_individual_image_progress_bars=self.show_progress_bars)
 
 
     def on_epoch_start(self, epoch: int, global_step: int, epoch_length: int):

@@ -1,4 +1,5 @@
 import json
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 import re
@@ -9,10 +10,10 @@ from diffusers import (
     DDIMScheduler, DDPMScheduler, DPMSolverMultistepScheduler, DPMSolverSDEScheduler,
     EulerAncestralDiscreteScheduler, PNDMScheduler, LMSDiscreteScheduler,
     KDPM2AncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverSinglestepScheduler, StableDiffusionXLPipeline,
-    FlowMatchEulerDiscreteScheduler
+    FlowMatchEulerDiscreteScheduler, SanaPipeline
 )
 from diffusers import StableDiffusionPipeline
-from compel import CompelForSD
+from compel import CompelForSD, CompelForSDXL
 from PIL import Image, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import math
@@ -261,12 +262,15 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                               flow_match_shift=1,
                               flow_match_shift_dynamic=False,
                               start_offset=0,
+                              show_individual_image_progress_bars=False
                               ):
     extra_cfgs = extra_cfgs or []
     all_params = sorted(all_params, key=lambda x: get_critical_params(x))
 
     if type(pipe) is StableDiffusionXLPipeline:
-        compel = None #CompelForSDXL(pipe)
+        compel = CompelForSDXL(pipe)
+    elif type(pipe) is SanaPipeline:
+        compel = None
     else:
         compel = CompelForSD(pipe)
 
@@ -315,7 +319,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                 try:
                     prompts = [p.prompt for p in batch]
                     negative_prompts = [p.negative_prompt for p in batch]
-                    pipe.set_progress_bar_config(leave=False, desc=f"{len(prompts)} gens")
+                    pipe.set_progress_bar_config(disable=not show_individual_image_progress_bars, position=2, leave=False, desc=f"{len(prompts)} gens")
 
                     conditioning = compel(prompts, negative_prompt=negative_prompts) if compel is not None else None
 
@@ -343,18 +347,22 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                             # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                             #print("updated scheduler with shift", shift)
 
+                        non_sana_kwargs = {} if isinstance(pipe, SanaPipeline) else dict(
+                            pooled_prompt_embeds=pooled_embeds,
+                            negative_pooled_prompt_embeds=negative_pooled_embeds,
+                            guidance_rescale=p0.cfg_rescale_multiplier
+                        )
+
                         images = pipe(prompt=prompt,
                                       prompt_embeds=embeds,
-                                      pooled_prompt_embeds=pooled_embeds,
                                       negative_prompt=negative_prompt,
                                       negative_prompt_embeds=negative_embeds,
-                                      negative_pooled_prompt_embeds=negative_pooled_embeds,
                                       generator=generator,
                                       width=p0.width,
                                       height=p0.height,
                                       guidance_scale=cfg,
-                                      guidance_rescale=p0.cfg_rescale_multiplier,
-                                      num_inference_steps=p0.steps
+                                      num_inference_steps=p0.steps,
+                                      **non_sana_kwargs
                                       ).images
 
                         for image in images:
@@ -400,6 +408,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                         del result
                     del batch_images
                 except Exception as e:
+                    traceback.print_exc()
                     print("Error generating batch, skipping. Error:", repr(e))
                     continue
 

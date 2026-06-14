@@ -1,5 +1,10 @@
+import argparse
 import copy
+import glob
 import logging
+from collections import defaultdict
+from contextlib import contextmanager
+from typing import Any, Optional
 
 import diffusers
 import math
@@ -103,8 +108,14 @@ class TrainingVariables:
     global_step: int = None
     batch_resolution: int = None
 
+
     max_backward_slice_size: int = None
+    default_max_backward_slice_size: dict[int, int] = field(default_factory=dict)
+    backward_oom_history: dict[int, list[bool]] = field(default_factory=lambda: defaultdict(list))
+
     forward_slice_size: int = None
+    default_forward_slice_size: dict[int, int] = field(default_factory=dict)
+    forward_oom_history: dict[int, list[bool]] = field(default_factory=lambda: defaultdict(list))
 
     last_effective_batch_size: int = 0
     effective_backward_size: int = 0
@@ -132,11 +143,25 @@ class TrainingVariables:
     current_timestep_interval: tuple[int, int] | None = None          # per-optimizer-step latch for interval sampling
     timestep_intervals: list[tuple[int, int]] | None = None           # pre-computed SNR-based clusters
 
+    _backward_size_hint_logged: set = field(default_factory=set)      # resolutions for which the "could do backward=N" hint has already been printed
+
     timesteps_ranges: tuple[tuple[int, int], tuple[int, int]] = None
 
     prev_accumulated_pathnames: list[str] = field(default_factory=list)
     prev_accumulated_captions: list[str] = field(default_factory=list)
     prev_accumulated_timesteps: list[int] = field(default_factory=list)
+
+    def setup_default_slice_sizes(self, args: argparse.Namespace):
+        for index, resolution in enumerate(args.resolution):
+            if args.max_backward_slice_size:
+                self.default_max_backward_slice_size[resolution] = args.max_backward_slice_size[index]
+            else:
+                self.default_max_backward_slice_size[resolution] = args.batch_size
+            if args.forward_slice_size:
+                self.default_forward_slice_size[resolution] = min(args.batch_size, args.forward_slice_size[index])
+            else:
+                self.default_forward_slice_size[resolution] = args.batch_size
+
 
     def accumulate_loss(self, loss: torch.Tensor, pathnames: list[str], captions: list[str], timesteps: list[int]):
 
@@ -192,12 +217,81 @@ class TrainingVariables:
         filtered.cond_dropouts = []
         return filtered
 
+    def register_backward_oom_or_not(self, oomed: bool):
+        backward_oom_history_size = 10
+        self._register_oom_or_not(oomed, self.backward_oom_history, max_history_size=backward_oom_history_size)
+        batch_resolution = self.batch_resolution
+        oom_pct = sum(self.backward_oom_history[batch_resolution]) / len(self.backward_oom_history[batch_resolution])
+        if oom_pct > 0.75:
+            logging.warning(
+                f"Backward OOM'd for resolution {batch_resolution} in {oom_pct * 100}% of the last {backward_oom_history_size} batches")
+            current_backward_size = self.default_max_backward_slice_size[batch_resolution]
+            new_backward_size = current_backward_size - 1
+            if new_backward_size > 0:
+                logging.warning(f" -> dropping max backward size for {batch_resolution} to {new_backward_size}")
+                self.default_max_backward_slice_size[batch_resolution] = new_backward_size
+            else:
+                logging.error(f" !! max backward size for {batch_resolution} is already 1, cannot drop any further")
+
+    def register_forward_oom_or_not(self, oomed: bool):
+        forward_oom_history_size = 20
+        self._register_oom_or_not(oomed, self.forward_oom_history, max_history_size=forward_oom_history_size)
+        batch_resolution = self.batch_resolution
+        oom_pct = sum(self.forward_oom_history[batch_resolution]) / len(self.forward_oom_history[batch_resolution])
+        if oom_pct > 0.75:
+            logging.warning(
+                f"Forward OOM'd for resolution {batch_resolution} in {oom_pct * 100}% of the last {forward_oom_history_size} batches")
+            current_forward_size = self.default_forward_slice_size[batch_resolution]
+            new_forward_size = current_forward_size - 1
+            if new_forward_size > 0:
+                logging.warning(f" -> dropping max backward size for {batch_resolution} to {new_forward_size}")
+                self.default_forward_slice_size[batch_resolution] = math.floor(new_forward_size)
+            else:
+                logging.error(f" !! max backward size for {batch_resolution} is already 1, cannot drop any further")
+
+
+    def _register_oom_or_not(self, oomed, oom_history, max_history_size):
+        batch_resolution = self.batch_resolution
+        oom_history[batch_resolution].append(oomed)
+        if len(oom_history[batch_resolution]) > max_history_size:
+            oom_history[batch_resolution].pop(0)
+
+
+def _module_cpu_copy_with_optional_ema_state(
+    live_module: torch.nn.Module,
+    ema_path: Optional[str],
+) -> torch.nn.Module:
+    """
+    Returns a detached CPU copy of *live_module* whose parameters are replaced
+    by the EMA state loaded from *ema_path* when that file exists.  Falls back
+    to the live parameters (copied to CPU) when the file is absent.
+
+    The returned module has ``requires_grad_(False)`` applied so it is safe to
+    move straight into an inference pipeline.
+    """
+    cpu_copy = copy.deepcopy(live_module).cpu()
+    if ema_path and os.path.isfile(ema_path):
+        state = safetensors.torch.load_file(ema_path, device="cpu")
+        missing, _ = cpu_copy.load_state_dict(state, strict=False)
+        if missing:
+            logging.warning(
+                f"EMA state from {ema_path}: {len(missing)} missing keys "
+                f"(first 5: {missing[:5]}), using live weights for those"
+            )
+    else:
+        if ema_path:
+            logging.warning(f"EMA state file not found at {ema_path}, using live weights")
+    cpu_copy.requires_grad_(False)
+    return cpu_copy
+
 
 @dataclass
 class TrainingModel:
 
     @property
     def is_sdxl(self) -> bool:
+        if self._is_sdxl_override is not None: # in case we're running without a text encoder
+            return self._is_sdxl_override
         return self.text_encoder_2 is not None
 
     @property
@@ -239,6 +333,24 @@ class TrainingModel:
     clip_model = None  # 'CLIP'|None = None
     clip_processor = None  # 'Compose'|None = None
 
+    # Self-Flow representation learning (set after construction in train.py)
+    self_flow_teacher_unet = None   # UNet2DConditionModel|None – frozen EMA copy
+    self_flow_proj_head = None      # SelfFlowProjectionHead|None – trainable 1×1 conv
+
+    # EMA weights (in-memory mode: cpu or cuda).  None when disk-offload is used or EMA is disabled.
+    unet_ema: Optional['UNet2DConditionModel'] = None
+    text_encoder_ema: Optional['CLIPTextModel'] = None
+    text_encoder_2_ema: Optional['CLIPTextModel'] = None
+
+    # When ema_device='disk': the directory that holds the live *_ema.safetensors working files.
+    # None for in-memory EMA modes.
+    ema_working_dir: Optional[str] = None
+
+    _is_sdxl_override: Optional[bool] = None
+    def set_is_sdxl_override(self, is_sdxl_override: bool):
+        """ allow overriding the default "do we have a text enc 2" is_sdxl test """
+        self._is_sdxl_override = is_sdxl_override
+
     @staticmethod
     def from_pipeline(pipe: StableDiffusionPipeline|StableDiffusionXLPipeline, compel=None, yaml=None) -> 'TrainingModel':
         return TrainingModel(
@@ -252,6 +364,19 @@ class TrainingModel:
             compel=compel,
             yaml=None,
         )
+
+    def setup_cond_dropout_tokens(self):
+        self.cond_dropout_tokens = torch.tensor(self.tokenizer(self.cond_dropout_caption,
+                                                               truncation=True,
+                                                               padding="max_length",
+                                                               max_length=self.tokenizer.model_max_length,
+                                                               ).input_ids)
+        if self.tokenizer_2 is not None:
+            self.cond_dropout_tokens_2 = torch.tensor(self.tokenizer_2(self.cond_dropout_caption,
+                                                                       truncation=True,
+                                                                       padding="max_length",
+                                                                       max_length=self.tokenizer_2.model_max_length,
+                                                                       ).input_ids)
 
     def set_noise_scheduler_shift(self, shift):
         assert isinstance(self.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler), "Noise scheduler is not TrainFlowMatchEulerDiscreteScheduler"
@@ -267,30 +392,232 @@ class TrainingModel:
         if self.text_encoder_2:
             self.text_encoder_2.to(device)
 
-    def build_inference_pipeline(self, scheduler: SchedulerMixin|None = None) -> StableDiffusionPipeline|StableDiffusionXLPipeline:
+    def _build_inference_pipeline(
+        self,
+        unet,
+        text_encoder,
+        text_encoder_2,
+        scheduler: SchedulerMixin | None = None,
+    ) -> StableDiffusionPipeline | StableDiffusionXLPipeline:
+        """
+        Core pipeline-construction logic shared by build_inference_pipeline() and
+        build_ema_inference_pipeline().  The caller supplies whichever unet /
+        text-encoder variants (live or EMA) should be used.
+        The pipeline type (SDXL vs SD1/2) is inferred from text_encoder_2.
+        """
         if scheduler is None:
             scheduler = self.noise_scheduler
-        if self.is_sdxl:
+        if text_encoder_2 is not None:
             return StableDiffusionXLPipeline(
                 vae=self.vae,
-                text_encoder=self.text_encoder,
-                text_encoder_2=self.text_encoder_2,
+                text_encoder=text_encoder,
+                text_encoder_2=text_encoder_2,
                 tokenizer=self.tokenizer,
                 tokenizer_2=self.tokenizer_2,
-                unet=self.unet,
+                unet=unet,
                 scheduler=scheduler,
             )
         else:
             return StableDiffusionPipeline(
                 vae=self.vae,
-                text_encoder=self.text_encoder,
+                text_encoder=text_encoder,
                 tokenizer=self.tokenizer,
-                unet=self.unet,
+                unet=unet,
                 scheduler=scheduler,
-                safety_checker=None, # save vram
-                requires_safety_checker=None, # avoid nag
-                feature_extractor=None, # must be None if no safety checker
+                safety_checker=None,           # save vram
+                requires_safety_checker=None,  # avoid nag
+                feature_extractor=None,        # must be None if no safety checker
             )
+
+    def build_inference_pipeline(self, scheduler: SchedulerMixin | None = None) -> StableDiffusionPipeline | StableDiffusionXLPipeline:
+        return self._build_inference_pipeline(
+            unet=self.unet,
+            text_encoder=self.text_encoder,
+            text_encoder_2=self.text_encoder_2,
+            scheduler=scheduler,
+        )
+
+    def build_ema_inference_pipeline(self, scheduler: SchedulerMixin | None = None) -> StableDiffusionPipeline | StableDiffusionXLPipeline | None:
+        """
+        Builds an inference pipeline using EMA weights wherever they are
+        available, falling back to the live weights for any component that has
+        no EMA counterpart.
+
+        Two EMA storage modes are handled transparently:
+
+        * **In-memory** (``unet_ema`` / ``text_encoder_ema`` attributes set):
+          the EMA modules are deepcopied to CPU so that calling ``.to(device)``
+          on the returned pipeline never mutates the persistent EMA state.
+
+        * **Disk-offload** (``ema_working_dir`` set): EMA state dicts are
+          loaded from the ``*_ema.safetensors`` working files into fresh CPU
+          copies of each live module.
+
+        In both cases the returned pipeline has all components on CPU.  The
+        caller is responsible for calling ``pipe.to(device)`` before inference
+        and ``del pipe`` (+ ``torch.cuda.empty_cache()``) afterwards.
+
+        Returns ``None`` when no EMA weights exist at all.
+        """
+        has_inmemory_ema = (
+            self.unet_ema is not None
+            or self.text_encoder_ema is not None
+            or self.text_encoder_2_ema is not None
+        )
+        has_disk_ema = (
+            self.ema_working_dir is not None
+            and os.path.isfile(os.path.join(self.ema_working_dir, "unet_ema.safetensors"))
+        )
+
+        if not has_inmemory_ema and not has_disk_ema:
+            return None
+
+        if self.ema_working_dir is not None:
+            # ── Disk-offload mode: load from the working safetensors files ──
+            unet_for_pipe = _module_cpu_copy_with_optional_ema_state(
+                self.unet,
+                os.path.join(self.ema_working_dir, "unet_ema.safetensors"),
+            )
+            te_for_pipe = _module_cpu_copy_with_optional_ema_state(
+                self.text_encoder,
+                os.path.join(self.ema_working_dir, "text_encoder_ema.safetensors"),
+            )
+            te2_for_pipe = None
+            if self.is_sdxl and self.text_encoder_2 is not None:
+                te2_for_pipe = _module_cpu_copy_with_optional_ema_state(
+                    self.text_encoder_2,
+                    os.path.join(self.ema_working_dir, "text_encoder_2_ema.safetensors"),
+                )
+        else:
+            # ── In-memory mode: deepcopy EMA modules to CPU ──────────────
+            # Deepcopy is used so that pipe.to(device) never moves the
+            # persistent self.*_ema modules away from their ema_device.
+            def _cpu_copy(ema_module, live_module):
+                src = ema_module if ema_module is not None else live_module
+                c = copy.deepcopy(src).cpu()
+                c.requires_grad_(False)
+                return c
+
+            unet_for_pipe = _cpu_copy(self.unet_ema, self.unet)
+            te_for_pipe   = _cpu_copy(self.text_encoder_ema, self.text_encoder)
+            te2_for_pipe  = None
+            if self.is_sdxl:
+                te2_for_pipe = _cpu_copy(self.text_encoder_2_ema, self.text_encoder_2)
+
+        return self._build_inference_pipeline(
+            unet=unet_for_pipe,
+            text_encoder=te_for_pipe,
+            text_encoder_2=te2_for_pipe,
+            scheduler=scheduler,
+        )
+
+    @contextmanager
+    def ema_inplace_swap(self):
+        """
+        Context manager for disk-offload EMA inference.
+
+        For each model component that has a corresponding EMA file in
+        ``ema_working_dir``:
+
+        1. The current (live) weights are saved to a temporary backup file on
+           disk (in training precision, e.g. fp16/bf16).
+        2. The EMA weights are loaded from disk and copied **in-place** into
+           the live module on its current device and dtype — the model never
+           leaves the GPU and no second module copy is held in CPU RAM.
+        3. On exit (normal or exceptional) the live weights are restored from
+           the backup file and the backup is deleted.
+
+        This lets ``build_inference_pipeline()`` be used directly for EMA
+        sampling — no separate EMA pipeline object or CPU offload needed.
+
+        Peak extra CPU RAM is bounded by the float32 EMA state dict of the
+        largest component (typically the UNet, ~2× its training-precision
+        size), which is freed immediately after each in-place copy.
+        """
+        if self.ema_working_dir is None:
+            raise RuntimeError(
+                "ema_inplace_swap requires disk-offload EMA (ema_device='disk')"
+            )
+
+        def _unwrap(m):
+            return m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
+
+        components = [
+            (_unwrap(self.unet),         "unet"),
+            (_unwrap(self.text_encoder), "text_encoder"),
+        ]
+        if self.is_sdxl and self.text_encoder_2 is not None:
+            components.append((_unwrap(self.text_encoder_2), "text_encoder_2"))
+
+        # Registered in order of successful backup so the finally block only
+        # attempts to restore what was actually swapped.
+        to_restore: list[tuple[torch.nn.Module, str, str]] = []  # (module, name, backup_path)
+
+        try:
+            for module, name in components:
+                ema_path = os.path.join(self.ema_working_dir, f"{name}_ema.safetensors")
+                if not os.path.isfile(ema_path):
+                    logging.debug(f"ema_inplace_swap: no EMA file for {name}, skipping")
+                    continue
+
+                backup_path = os.path.join(
+                    self.ema_working_dir, f"{name}_live_backup.safetensors"
+                )
+
+                # ── Step 1: persist live weights to a temp backup ────────
+                logging.info(f"ema_inplace_swap: backing up live {name} → {backup_path}")
+                live_sd = {
+                    k: v.detach().cpu().contiguous()
+                    for k, v in module.state_dict().items()
+                }
+                safetensors.torch.save_file(live_sd, backup_path)
+                del live_sd
+
+                # Register now so the finally block restores even if the
+                # EMA load below fails.
+                to_restore.append((module, name, backup_path))
+
+                # ── Step 2: load EMA weights and copy in-place ───────────
+                target_dtype  = next(module.parameters()).dtype
+                target_device = next(module.parameters()).device
+                logging.info(
+                    f"ema_inplace_swap: applying EMA {name} "
+                    f"({target_dtype} on {target_device})"
+                )
+                ema_sd = safetensors.torch.load_file(ema_path, device="cpu")
+                named_params = dict(module.named_parameters())
+                with torch.no_grad():
+                    for k, ema_v in ema_sd.items():
+                        if k in named_params:
+                            named_params[k].data.copy_(
+                                ema_v.to(dtype=target_dtype, device=target_device)
+                            )
+                del ema_sd, named_params
+
+            yield  # ← inference runs here
+
+        finally:
+            # ── Restore live weights from backup, then clean up ──────────
+            for module, name, backup_path in to_restore:
+                if not os.path.isfile(backup_path):
+                    logging.error(
+                        f"ema_inplace_swap: backup file missing at {backup_path} — "
+                        f"live weights for this component could not be restored!"
+                    )
+                    continue
+                target_dtype  = next(module.parameters()).dtype
+                target_device = next(module.parameters()).device
+                logging.info(f"ema_inplace_swap: restoring live {name} from {backup_path}")
+                live_sd = safetensors.torch.load_file(backup_path, device="cpu")
+                named_params = dict(module.named_parameters())
+                with torch.no_grad():
+                    for k, p in named_params.items():
+                        if k in live_sd:
+                            p.data.copy_(
+                                live_sd[k].to(dtype=target_dtype, device=target_device)
+                            )
+                del live_sd, named_params
+                os.unlink(backup_path)
 
 
 
@@ -396,10 +723,21 @@ def _make_conditioning_slice(
         )
 
 
-def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
-    # todo: move to Conditioning
+def _tokenize_captions(captions: list[str], tokenizer) -> torch.Tensor:
+    return torch.tensor(
+        tokenizer(
+            captions,
+            truncation=True,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+        ).input_ids
+    )
+
+
+def get_text_conditioning(caption_str: list[str], model: TrainingModel, args: Namespace|None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor|None, torch.Tensor|None]:
     if model.compel:
         print("Compel is setup but not being used (not implemented)")
+    tokens = _tokenize_captions(caption_str, model.tokenizer)
     encoder_hidden_states, encoder_pooled_embeds = _encode_caption_tokens(
         tokens,
         model.text_encoder,
@@ -413,6 +751,7 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
     if model.is_sdxl:
         # note: to support a "style" prompt we'd need to collect/encode a "tokens_3" (style prompt tokens)
         # so we don't support that for now
+        tokens_2 = _tokenize_captions(caption_str, model.tokenizer_2)
         encoder_2_hidden_states, encoder_2_pooled_embeds = _encode_caption_tokens(
             tokens_2,
             model.text_encoder_2,
@@ -426,8 +765,6 @@ def get_text_conditioning(tokens: torch.Tensor, tokens_2: torch.Tensor, caption_
     else:
         encoder_2_hidden_states = None
         encoder_2_pooled_embeds = None
-    # todo: -----
-    # todo: move to conditioning (end)
     return encoder_hidden_states, encoder_pooled_embeds, encoder_2_hidden_states, encoder_2_pooled_embeds
 
 
@@ -471,7 +808,7 @@ def _encode_caption_tokens(tokens, text_encoder: CLIPTextModel, clip_skip: int, 
 
 @dataclass
 class EveryDreamTrainingState:
-    model: TrainingModel
+    model: 'TrainingModel'
     optimizer: EveryDreamOptimizer
     train_batch: 'EveryDreamBatch'
 
@@ -505,7 +842,7 @@ def convert_diffusers_lora_to_single_file(diffusers_format, civitai_path):
 @torch.no_grad()
 def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, save_ckpt_dir, yaml_name,
                save_full_precision=False, save_optimizer_flag=False, save_ckpt=True,
-               plugin_runner: PluginRunner = None):
+               plugin_runner: PluginRunner=None, unet_only_with_hardlinks_source: str=None):
     """
     Save the model to disk
     """
@@ -541,14 +878,24 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
 
     noise_scheduler = diffusers.FlowMatchEulerDiscreteScheduler.from_config(ed_state.model.noise_scheduler.config) if isinstance(ed_state.model.noise_scheduler, TrainFlowMatchEulerDiscreteScheduler) else ed_state.model.noise_scheduler
 
+    def unwrap_ddp(module):
+        if isinstance(module, torch.nn.parallel.DistributedDataParallel):
+            return module.module
+        else:
+            return module
+
+    unet = unwrap_ddp(ed_state.model.unet)
+    text_encoder = unwrap_ddp(ed_state.model.text_encoder)
+    text_encoder_2 = unwrap_ddp(ed_state.model.text_encoder_2)
+
     if ed_state.model.is_sdxl:
         pipeline = StableDiffusionXLPipeline(
             vae=ed_state.model.vae,
-            text_encoder=ed_state.model.text_encoder,
-            text_encoder_2=ed_state.model.text_encoder_2,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
             tokenizer=ed_state.model.tokenizer,
             tokenizer_2=ed_state.model.tokenizer_2,
-            unet=ed_state.model.unet,
+            unet=unet,
             scheduler=noise_scheduler,
             feature_extractor=None,  # must be none of no safety checker
             add_watermarker=None
@@ -556,9 +903,9 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     else:
         pipeline = StableDiffusionPipeline(
             vae=ed_state.model.vae,
-            text_encoder=ed_state.model.text_encoder,
+            text_encoder=text_encoder,
             tokenizer=ed_state.model.tokenizer,
-            unet=ed_state.model.unet,
+            unet=unet,
             scheduler=noise_scheduler,
             safety_checker=None,  # save vram
             requires_safety_checker=None,  # avoid nag
@@ -568,6 +915,16 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     diffusers_model_path = save_path
     logging.info(f" * Saving diffusers model to {diffusers_model_path}")
     pipeline.save_pretrained(diffusers_model_path)
+    if unet_only_with_hardlinks_source is not None:
+        # replace vae, text encoder diffusion pytorch files with hardlinks
+        for subfolder in ['vae', 'text_encoder', 'text_encoder_2']:
+            for file in ['model.safetensors', 'diffusion_pytorch_model.safetensors']:
+                relpath = subfolder + '/' + file
+                saved_path = os.path.join(diffusers_model_path, relpath)
+                hardlink_source_path = os.path.join(unet_only_with_hardlinks_source, relpath)
+                if os.path.exists(saved_path) and os.path.exists(hardlink_source_path):
+                    os.unlink(saved_path)
+                    os.link(hardlink_source_path, saved_path)
 
     if save_ckpt:
         sd_ckpt_path = f"{os.path.basename(save_path)}.safetensors"
@@ -576,6 +933,40 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if save_optimizer_flag:
         logging.info(f" Saving optimizer state to {save_path}")
         ed_state.optimizer.save(save_path)
+
+    if ed_state.model.self_flow_proj_head is not None:
+        proj_head_path = os.path.join(save_path, "self_flow_proj_head.pt")
+        logging.info(f" * Saving Self-Flow projection head to {proj_head_path}")
+        torch.save(ed_state.model.self_flow_proj_head.state_dict(), proj_head_path)
+
+    if ed_state.model.self_flow_teacher_unet is not None:
+        teacher_path = os.path.join(save_path, "self_flow_teacher_unet.safetensors")
+        logging.info(f" * Saving Self-Flow teacher UNet to {teacher_path}")
+        state_dict = {k: v.cpu().contiguous() for k, v in ed_state.model.self_flow_teacher_unet.state_dict().items()}
+        safetensors.torch.save_file(state_dict, teacher_path)
+
+    # ── EMA sidecars ──────────────────────────────────────────────────────────
+    # In-memory EMA (cpu / cuda): serialise the live module state_dict.
+    _ema_components = [
+        ("unet_ema",          ed_state.model.unet_ema),
+        ("text_encoder_ema",  ed_state.model.text_encoder_ema),
+        ("text_encoder_2_ema", ed_state.model.text_encoder_2_ema),
+    ]
+    for _ema_name, _ema_module in _ema_components:
+        if _ema_module is not None:
+            _ema_path = os.path.join(save_path, f"{_ema_name}.safetensors")
+            logging.info(f" * Saving EMA sidecar: {_ema_path}")
+            _state = {k: v.cpu().contiguous() for k, v in _ema_module.state_dict().items()}
+            safetensors.torch.save_file(_state, _ema_path)
+
+    # Disk-offload EMA: copy the working safetensors files into the checkpoint dir.
+    if ed_state.model.ema_working_dir is not None:
+        for _ema_name in ("unet_ema", "text_encoder_ema", "text_encoder_2_ema"):
+            _src = os.path.join(ed_state.model.ema_working_dir, f"{_ema_name}.safetensors")
+            if os.path.isfile(_src):
+                _dst = os.path.join(save_path, f"{_ema_name}.safetensors")
+                shutil.copy2(_src, _dst)
+                logging.info(f" * Copied EMA sidecar (disk-offload): {_ema_name}.safetensors → {save_path}")
 
 
 @torch.no_grad()
@@ -606,7 +997,7 @@ def save_model_lora(model: TrainingModel, save_path: str):
     convert_diffusers_lora_to_single_file(save_path, civitai_path)
 
 
-def find_last_checkpoint(logdir, is_ema=False):
+def find_last_checkpoint(logdir, is_ema=False, resolve_to_transformer=False):
     """
     Finds the last checkpoint in the logdir, recursively
     """
@@ -615,7 +1006,7 @@ def find_last_checkpoint(logdir, is_ema=False):
 
     for root, dirs, files in os.walk(logdir):
         for file in files:
-            if os.path.basename(file) == "model_index.json":
+            if os.path.basename(file) == "model_index.json" or os.path.basename(file) == 'model_id.txt':
 
                 curr_date = os.path.getmtime(os.path.join(root,file))
 
@@ -623,12 +1014,24 @@ def find_last_checkpoint(logdir, is_ema=False):
                     last_date = curr_date
                     last_ckpt = root
 
-    assert last_ckpt, f"Could not find last checkpoint in logdir: {logdir}"
-    assert "errored" not in last_ckpt, f"Found last checkpoint: {last_ckpt}, but it was errored, cancelling"
+    if last_ckpt is None:
+        raise ValueError(f"Could not find last checkpoint in logdir: {logdir}")
+    if 'errored' in last_ckpt:
+        raise ValueError(f"Found last checkpoint: {last_ckpt}, but it was errored. Specify manually.")
 
     logging.info(f"    {Fore.LIGHTCYAN_EX}Found last checkpoint: {last_ckpt}, resuming{Style.RESET_ALL}")
 
-    return last_ckpt
+    if not resolve_to_transformer:
+        return last_ckpt
+
+    # look for a file "transformer*.safetensors
+    transformer_files = glob.glob(os.path.join(last_ckpt, "transformer_*"))
+    if len(transformer_files) == 0:
+        raise ValueError(f"Could not find transformer_* file in last checkpoint dir {last_ckpt}")
+    elif len(transformer_files) > 1:
+        raise ValueError(f"Found more than one transformer_* file in last checkpoint dir {last_ckpt}. Specify which one you want explicitly.")
+    else:
+        return transformer_files[0]
 
 
 def _check_pipe(pipe):
@@ -759,5 +1162,5 @@ def load_clip_model(model_id: str, processor_model_id: str=None) -> tuple[CLIPMo
 
 
 def get_use_ema_decay_training(args):
-    use_ema_dacay_training = (args.ema_decay_rate != None) or (args.ema_strength_target != None)
+    use_ema_dacay_training = (args.ema_decay_rate is not None) or (args.ema_strength_target != None)
     return use_ema_dacay_training

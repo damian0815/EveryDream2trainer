@@ -34,25 +34,27 @@ import PIL.Image
 
 from utils.first_fit_decreasing import first_fit_decreasing
 
-PIL.Image.MAX_IMAGE_PIXELS = 715827880*4 # increase decompression bomb error limit to 4x default
-
+PIL.Image.MAX_IMAGE_PIXELS = 715827880*4 # prevent decompression bomb errors for very large images (e.g. 64k x 64k, which is 4x the default limit of 32k x 32k)
 
 
 class DataLoaderMultiAspect():
     """
-    Data loader for multi-aspect-ratio training and bucketing
+    Data loader for multi-aspect-ratio training and bucketing.
 
-    image_train_items: list of `ImageTrainItem` objects
-    seed: random seed
-    batch_size: number of images per batch
+    Accepts either:
+      • list[ImageSourceItem] + global_resolution_weights  (new multi-resolution path)
+      • list[ImageTrainItem]  (legacy path — used by validation code)
+
+    When ImageSourceItem objects are supplied, resolution assignment is deferred to
+    each call of get_shuffled_image_buckets() via assign_resolutions().
+    When ImageTrainItem objects are supplied the old selection logic is used unchanged.
     """
-    def __init__(self, image_train_items: list[ImageTrainItem], seed=555,
-                 batch_size=1, grad_accum=1,
+    def __init__(self, image_train_items: list, seed=555, batch_size=1,
                  chunk_shuffle_batch_size=None, batch_id_dropout_p=0,
                  keep_same_sample_at_different_resolutions_together=False,
-                 caption_variants: list[str]=None,
-                 expand_caption_variants: bool=False
-                 ):
+                 caption_variants: list[str] = None, expand_caption_variants: bool = False,
+                 global_resolution_weights: dict = None,
+                 grad_accum: int = 1):
         self.seed = seed
         self.batch_size = batch_size
         self.grad_accum = grad_accum
@@ -60,6 +62,9 @@ class DataLoaderMultiAspect():
         self.prepared_train_data = image_train_items
         self.caption_variants = caption_variants
         self.expand_caption_variants = expand_caption_variants
+        # global_resolution_weights is set when the caller passes ImageSourceItem objects.
+        # None means the legacy ImageTrainItem path is active.
+        self.global_resolution_weights = global_resolution_weights
         random.Random(self.seed).shuffle(self.prepared_train_data)
         self.prepared_train_data = sorted(self.prepared_train_data, key=lambda img: img.caption.rating())
         self.expected_epoch_size = math.floor(sum([i.multiplier for i in self.prepared_train_data]))
@@ -106,38 +111,62 @@ class DataLoaderMultiAspect():
         
         return picked_images
 
+    def recompute_expected_epoch_size(self) -> None:
+        """Recompute expected_epoch_size after item multipliers have been mutated."""
+        self.expected_epoch_size = math.floor(sum(i.multiplier for i in self.prepared_train_data))
+
     def get_shuffled_image_buckets(self, dropout_fraction: float = 1.0) -> list[ImageTrainItem]:
         """
         Returns the current list of `ImageTrainItem` in randomized order,
         sorted into buckets with same sized images.
-        
-        If dropout_fraction < 1.0, only a subset of the images will be returned.
-        
-        If dropout_fraction >= 1.0, repicks fractional multipliers based on folder/multiply.txt values swept at prescan.
-        
+
+        When constructed with ImageSourceItem objects (new multi-resolution path),
+        resolution assignment happens here via assign_resolutions().
+
+        When constructed with ImageTrainItem objects (legacy validation path), the
+        existing selection logic is used unchanged.
+
         :param dropout_fraction: must be between 0.0 and 1.0.
         :return: Randomized list of `ImageTrainItem` objects
         """
+        from data.image_train_item import ImageSourceItem  # avoid circular at module level
 
         self.seed += 1
         randomizer = random.Random(self.seed)
 
         multipliers = {i.uid: i.multiplier for i in self.prepared_train_data}
-        #data_copy = copy.deepcopy(self.prepared_train_data)
         randomizer.shuffle(self.prepared_train_data)
 
         if dropout_fraction < 1.0:
-            picked_images = self.__pick_random_subset(dropout_fraction, randomizer)
+            picked_sources = self.__pick_random_subset(dropout_fraction, randomizer)
         else:
-            picked_images = self.__pick_multiplied_set_helper(self.prepared_train_data, multipliers, required_count=self.expected_epoch_size, randomizer=randomizer)
-            for i in picked_images:
+            picked_sources = self.__pick_multiplied_set_helper(
+                self.prepared_train_data, multipliers,
+                required_count=self.expected_epoch_size, randomizer=randomizer
+            )
+            for i in picked_sources:
                 assert multipliers[i.uid] < i.multiplier
+
+        # --- New multi-resolution path ---
+        if self.global_resolution_weights is not None:
+            from data.resolution_sampler import assign_resolutions
+            picked_images = assign_resolutions(
+                picked_sources, self.global_resolution_weights, randomizer
+            )
+            # Build reverse map wh → resolution int for runt top-up below
+            wh_to_resolution: dict[tuple, int] = {}
+            for source in self.prepared_train_data:
+                for r, opt in source.resolution_options.items():
+                    wh_to_resolution[tuple(opt.target_wh)] = r
+        else:
+            # Legacy path: picked_sources are already ImageTrainItem objects
+            picked_images = picked_sources
+            wh_to_resolution = None
 
         randomizer.shuffle(picked_images)
 
         buckets = defaultdict(list)
         batch_size = self.batch_size
-        grad_accum = self.grad_accum
 
         def _make_bucket_key(image, batch_id_override: str=None):
             return (image.batch_id if batch_id_override is None else batch_id_override,
@@ -158,12 +187,14 @@ class DataLoaderMultiAspect():
         pre_expanded_counts = {k: len(v) for k,v in buckets.items()}
         if self.expand_caption_variants:
             print(" * DataLoaderMultiAspect expanding caption dicts into multiple items with different subsets of captions, based on caption_variants: ", self.caption_variants)
+            pbar = tqdm(desc="expanding caption dicts", total=sum(len(v) for v in buckets.values()))
             for key, bucket_contents in list(buckets.items()):
                 pre_expanded_counts[key] = len(bucket_contents)
                 expanded_bucket_contents = []
                 for item in bucket_contents:
                     expanded_items = expand_caption_dict(item, caption_variants=self.caption_variants)
                     expanded_bucket_contents.extend(expanded_items)
+                    pbar.update()
                 buckets[key] = expanded_bucket_contents
                 #print(f" - expanded bucket {key} from {len(bucket_contents)} to {len(expanded_bucket_contents)} items")
 
@@ -192,13 +223,36 @@ class DataLoaderMultiAspect():
                 assert key[0] == DEFAULT_BATCH_ID, "there should be no more runts in named batches"
 
                 required_count = batch_size - len(bucket_contents) % batch_size
-                unpicked_images_preshuffled = [
-                    i
-                    for i in self.prepared_train_data
-                    if _make_bucket_key(i) == key and multipliers[i.uid] > 0
-                ]
-                topup = self.__pick_multiplied_set_helper(unpicked_images_preshuffled, multipliers, required_count=required_count, randomizer=randomizer)
-                bucket_contents.extend(topup)
+
+                if wh_to_resolution is not None:
+                    # New path: find unpicked ImageSourceItem objects eligible for this bucket
+                    resolution_int = wh_to_resolution.get(key[1:])
+                    unpicked_sources_preshuffled = [
+                        s for s in self.prepared_train_data
+                        if multipliers[s.uid] > 0
+                        and resolution_int is not None
+                        and resolution_int in s.resolution_options
+                        and s.resolution_options[resolution_int].is_feasible
+                        and tuple(s.resolution_options[resolution_int].target_wh) == key[1:]
+                    ]
+                    topup_sources = self.__pick_multiplied_set_helper(
+                        unpicked_sources_preshuffled, multipliers,
+                        required_count=required_count, randomizer=randomizer
+                    )
+                    import copy as _copy
+                    topup_images = [_copy.deepcopy(s).make_resolved_item(resolution_int) for s in topup_sources]
+                else:
+                    # Legacy path
+                    unpicked_images_preshuffled = [
+                        i for i in self.prepared_train_data
+                        if _make_bucket_key(i) == key and multipliers[i.uid] > 0
+                    ]
+                    topup_images = self.__pick_multiplied_set_helper(
+                        unpicked_images_preshuffled, multipliers,
+                        required_count=required_count, randomizer=randomizer
+                    )
+
+                bucket_contents.extend(topup_images)
 
                 # still runts?
                 final_truncate_count = len(bucket_contents) % batch_size
@@ -220,7 +274,7 @@ class DataLoaderMultiAspect():
         # at this point items have a partially deterministic order
         # (in particular: rarer aspect ratios are more likely to cluster at the end due to stochastic sampling)
         # so we shuffle them to mitigate this, using chunked_shuffle to keep batches with the same aspect ratio together
-        items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size*grad_accum, randomizer=randomizer)
+        items_by_batch_id = {k: chunked_shuffle(v, chunk_size=batch_size, randomizer=randomizer)
                              for k,v in items_by_batch_id.items()}
         if not items_by_batch_id:
             raise RuntimeError("No images available after applying dropout and multipliers. Check your dataset and multiplier settings.")
@@ -234,8 +288,7 @@ class DataLoaderMultiAspect():
         # handle batch_id
         # unlabelled data (no batch_id) is in batches labelled DEFAULT_BATCH_ID.
         items = flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id,
-                                                                   batch_size=batch_size,
-                                                                   grad_accum=grad_accum)
+                                                                   batch_size=batch_size)
 
         items = chunked_shuffle(items, chunk_size=self.chunk_shuffle_batch_size, randomizer=randomizer)
 
@@ -286,7 +339,7 @@ class DataLoaderMultiAspect():
             prepared_train_data.pop(pos)
 
         unpicked_images = [i for i in self.prepared_train_data if i not in picked_images]
-        return picked_images, unpicked_images
+        return picked_images  # unpicked_images intentionally not returned; runt logic uses multipliers dict
 
     def __update_rating_sums(self):        
         self.rating_overall_sum: float = 0.0
@@ -311,8 +364,7 @@ def collapse_buckets_by_batch_id(buckets: dict[tuple, list[ImageTrainItem]]) -> 
     return items_by_batch_id
 
 def flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id: Dict[str, List[ImageTrainItem]],
-                                                       batch_size: int,
-                                                       grad_accum: int) -> List[ImageTrainItem]:
+                                                       batch_size: int) -> List[ImageTrainItem]:
     # precondition: items_by_batch_id has no incomplete batches
     assert(all((len(v) % batch_size)==0 for v in items_by_batch_id.values()))
     # ensure we don't mix up aspect ratios by treating each chunk of batch_size images as
@@ -320,7 +372,7 @@ def flatten_buckets_preserving_named_batch_adjacency(items_by_batch_id: Dict[str
     filler_items = chunk_list(items_by_batch_id.get(DEFAULT_BATCH_ID, []), batch_size)
     custom_batched_items = [chunk_list(v, batch_size) for k, v in items_by_batch_id.items() if k != DEFAULT_BATCH_ID]
     neighbourly_chunked_items = first_fit_decreasing(custom_batched_items,
-                                                     batch_size=grad_accum,
+                                                     batch_size=1,
                                                      filler_items=filler_items)
 
     items: List[ImageTrainItem] = unchunk_list(neighbourly_chunked_items)

@@ -9,7 +9,6 @@ import torch
 
 from model.training_model import EveryDreamTrainingState
 from plugins.plugins import BasePlugin
-from utils.sample_generator import SampleGenerator, SampleRequest
 
 from utils.sample_generator_diffusers import ImageGenerationParams, generate_images_diffusers
 

@@ -12,12 +12,13 @@ from colorama import Fore, Style
 from data.image_train_item import ImageCaption, ImageTrainItem
 
 class DataResolver:
-    def __init__(self, args: argparse.Namespace, aspects):
+    def __init__(self, args: argparse.Namespace, aspects, resolution):
         """
         :param args: EveryDream configuration, an `argparse.Namespace` object.
         """
         self.aspects = aspects
         self.flip_p = args.flip_p
+        self.resolution = resolution
 
     def image_train_items(self, data_root: str) -> list[ImageTrainItem]:
         """
@@ -36,7 +37,7 @@ class JSONResolver(DataResolver):
 
         :param json_path: The path to the JSON file.
         """
-        return Dataset.from_json(json_path).image_train_items(self.aspects)
+        return Dataset.from_json(json_path).image_train_items(self.aspects, resolution=self.resolution)
     
 class DirectoryResolver(DataResolver):    
     def image_train_items(self, data_root: str) -> list[ImageTrainItem]:
@@ -48,7 +49,7 @@ class DirectoryResolver(DataResolver):
         :param data_root: The root directory to recurse through
         """
         DirectoryResolver.unzip_all(data_root)
-        return Dataset.from_path(data_root).image_train_items(self.aspects)
+        return Dataset.from_path(data_root).image_train_items(self.aspects, resolution=self.resolution)
         
     @staticmethod
     def unzip_all(path):
@@ -75,21 +76,27 @@ def strategy(data_root: str) -> typing.Type[DataResolver]:
         
     raise ValueError(f"data_root '{data_root}' is not a valid directory or JSON file.")
                     
-def resolve_root(path: str, args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
+def resolve_root(path: str, args: argparse.Namespace, resolution=None, aspects=None) -> list[ImageTrainItem]:
     """
     Resolve the training data from the root path.
     :param path: The root path to resolve.
     :param args: EveryDream configuration, an `argparse.Namespace` object.
+    :param aspects: Aspect ratio buckets. Falls back to args.aspects when not supplied.
     """
+    if aspects is None:
+        aspects = getattr(args, 'aspects', None)
     resolver = strategy(path)
-    return resolver(args, aspects).image_train_items(path)
+    return resolver(args, aspects, resolution).image_train_items(path)
 
-def resolve(value: typing.Union[dict, str], args: argparse.Namespace, resolution, aspects) -> list[ImageTrainItem]:
+def resolve(value: typing.Union[dict, str], args: argparse.Namespace, resolution=None, aspects=None) -> list[ImageTrainItem]:
     """
     Resolve the training data from the value.
     :param value: The value to resolve, either a dict, an array, or a string.
     :param args: EveryDream configuration, an `argparse.Namespace` object.
+    :param aspects: Aspect ratio buckets. Falls back to args.aspects when not supplied.
     """
+    if aspects is None:
+        aspects = getattr(args, 'aspects', None)
     if isinstance(value, str):
         return resolve_root(value, args, resolution, aspects)
     
@@ -109,3 +116,60 @@ def resolve(value: typing.Union[dict, str], args: argparse.Namespace, resolution
         for item in value:
             items += resolve(item, args, resolution, aspects)
         return items 
+
+def resolve_sources(
+    value,
+    args: argparse.Namespace,
+    aspects_per_resolution: dict,
+) -> list:
+    """
+    Like resolve(), but returns a list of ImageSourceItem covering all resolutions
+    at once.  Each image file is opened exactly once.
+
+    :param value: same as resolve() — a path string, dict, or list.
+    :param args: EveryDream configuration namespace.
+    :param aspects_per_resolution: {resolution_int: list of (w, h) buckets}.
+    :return: list[ImageSourceItem].
+    """
+    if isinstance(value, str):
+        return _resolve_sources_root(value, args, aspects_per_resolution)
+
+    if isinstance(value, dict):
+        resolver_name = value.get('resolver', None)
+        match resolver_name:
+            case 'directory' | 'json':
+                return _resolve_sources_root(
+                    value.get('path', None), args, aspects_per_resolution
+                )
+            case 'multi':
+                return resolve_sources(
+                    value.get('resolvers', []), args, aspects_per_resolution
+                )
+            case _:
+                raise ValueError(
+                    f"Cannot resolve training data for resolver '{resolver_name}'"
+                )
+
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            items += resolve_sources(item, args, aspects_per_resolution)
+        return items
+
+    raise ValueError(f"Unsupported value type for resolve_sources: {type(value)}")
+
+
+def _resolve_sources_root(
+    path: str,
+    args: argparse.Namespace,
+    aspects_per_resolution: dict,
+) -> list:
+    """Resolve a single data root (directory or JSON file) into ImageSourceItems."""
+    if os.path.isfile(path) and path.endswith('.json'):
+        dataset = Dataset.from_json(path)
+    elif os.path.isdir(path):
+        DirectoryResolver.unzip_all(path)
+        dataset = Dataset.from_path(path)
+    else:
+        raise ValueError(f"data_root '{path}' is not a valid directory or JSON file.")
+    return dataset.image_source_items(aspects_per_resolution)

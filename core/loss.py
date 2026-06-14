@@ -4,24 +4,37 @@ import line_profiler
 import math
 import random
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict, Any
 
 import torch
 import torchvision
 from diffusers.training_utils import compute_loss_weighting_for_sd3
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 import torch.nn.functional as F
 
 from scipy.stats import beta as sp_beta
 
 from diffusers import SchedulerMixin, ConfigMixin, FlowMatchEulerDiscreteScheduler
+from torchvision import transforms
 
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
+from core.latent_interposer import infer_latent_space_type, TaesdLatentConverter, get_shared_interposer, \
+    convert_latents_slow_vae_roundtrip
+from core.prediction_bridge import (
+    get_prediction_bridge,
+    VPredToFMBridge,
+    _ddpm_timesteps_matching_fm_sigma,
+    _recover_x0_from_epsilon,
+    _recover_x0_from_vpred,
+    _recover_x0_from_fm_velocity,
+)
 from core.loss_softrepa import (
     text_weighted_infonce_loss,
     text_weighted_infonce_loss_with_softrepa,
 )
+from core.self_flow import get_self_flow_modules, get_self_flow_channels, get_self_flow_spatial_divisors
 from model.training_model import TrainingModel, Conditioning
+from utils.teacher_debug import log_teacher_debug
 
 # from train import pyramid_noise_like, compute_snr
 
@@ -33,20 +46,20 @@ alpha<1: Quick advance (spread hugs final_value)
 """
 
 
-def get_latents(image, model: TrainingModel, device, args):
+def encode_with_vae_to_scaled_latents(image, model: TrainingModel, device, args):
     with torch.no_grad():
-        with autocast(
-            enabled=args.amp, dtype=torch.bfloat16 if model.is_sdxl else torch.float16
-        ):
+        with autocast('cuda', enabled=args.amp):
             pixel_values = image.to(memory_format=torch.contiguous_format).to(
                 device, dtype=model.vae.dtype
             )
+            imagenet_normalize = False #model.is_sdxl
+            if imagenet_normalize:
+                pixel_values = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(pixel_values)
             latents = model.vae.encode(pixel_values, return_dict=False)
         del pixel_values
         scaling_factor = 0.13025 if model.is_sdxl else 0.18215
         latents = latents[0].sample() * scaling_factor
         return latents
-
 
 def get_loss(
     model_pred,
@@ -448,6 +461,46 @@ def get_midblock_out_shape(latents_shape: torch.Size, model: TrainingModel) -> t
     return (latents_shape[0], model.unet.mid_block.out_channels, latents_shape[2]//8, latents_shape[3]//8)
 
 
+def get_self_flow_shapes(latents_shape: torch.Size, model: TrainingModel, mode: str = 'shallow'):
+    """Return (student_shape, teacher_shape) for self-flow feature tensors.
+
+    Shapes depend on the extraction-point mode:
+      'shallow' / 'deep' / 'semantic' → H/4 × W/4 spatial resolution
+      'detail'                         → H/2 × W/2 spatial resolution
+    """
+    B = latents_shape[0]
+    boc = model.unet.config.block_out_channels
+    student_ch, teacher_ch = get_self_flow_channels(mode, boc)
+    s_div, t_div = get_self_flow_spatial_divisors(mode)
+    Hs, Ws = latents_shape[2] // s_div, latents_shape[3] // s_div
+    Ht, Wt = latents_shape[2] // t_div, latents_shape[3] // t_div
+    return (B, student_ch, Hs, Ws), (B, teacher_ch, Ht, Wt)
+
+
+def build_self_flow_latents(
+    latents: torch.Tensor,
+    noise: torch.Tensor,
+    noise_scheduler,
+    t: torch.Tensor,
+    s: torch.Tensor,
+    mask_ratio: float,
+):
+    """Build heterogeneously noised student latents and uniformly cleaner teacher latents.
+    Student  x_τ    : mask_ratio of spatial locations use noise level s, rest use t.
+    Teacher  x_{τ_min}: uniformly noised at τ_min = min(t, s) per sample.
+    Returns (x_tau, x_tau_min, tau_min_timesteps).
+    """
+    B, C, H, W = latents.shape
+    device = latents.device
+    x_t = _get_noisy_latents(latents, noise, noise_scheduler, t, latents_perturbation=0)
+    x_s = _get_noisy_latents(latents, noise, noise_scheduler, s, latents_perturbation=0)
+    M = (torch.rand(B, 1, H, W, device=device) < mask_ratio).float()
+    x_tau = (1.0 - M) * x_t + M * x_s
+    tau_min = torch.minimum(t, s)
+    x_tau_min = _get_noisy_latents(latents, noise, noise_scheduler, tau_min, latents_perturbation=0)
+    return x_tau, x_tau_min, tau_min
+
+
 @dataclass
 class ModelPredictionAndTargetReturnType:
     model_pred: torch.Tensor
@@ -455,6 +508,8 @@ class ModelPredictionAndTargetReturnType:
     noisy_latents: torch.Tensor
     midblock_out: torch.Tensor|None = None
     teacher_target: torch.Tensor|None = None
+    self_flow_student_features: torch.Tensor|None = None  # [B, Cs, H/4, W/4]
+    self_flow_teacher_features: torch.Tensor|None = None  # [B, Ct, H/4, W/4]
 
 
 @line_profiler.profile
@@ -467,19 +522,30 @@ def get_model_prediction_and_target(
     args=None,
     is_cond_dropout_noise: torch.Tensor = None,
     skip_contrastive: bool = False,
-    teacher_model: TrainingModel | None = None,
+    teacher_models: list = None,
+    teacher_latents_list: list = None,
     teacher_mask: torch.Tensor | None = None,
-    teacher_conditioning: Conditioning | None = None,
+    teacher_conditionings: list = None,
     debug_fake: bool = False,
     log_writer=None,
     global_step: int = 0,
     mask=None,
     lcf_mask=None,
+    self_flow_s_timesteps: torch.Tensor | None = None,
+    debug_teacher: bool = False,
 ) -> ModelPredictionAndTargetReturnType:
     """
     If mask is provided, only compute for the masked entries and return full tensors with zeros elsewhere.
     Returns model_pred, target, teacher_target (None if teacher_mask is None), noisy_latents
     """
+    # Normalise list-typed teacher arguments (callers may pass None for backward compat)
+    if teacher_models is None:
+        teacher_models = []
+    if teacher_latents_list is None:
+        teacher_latents_list = []
+    if teacher_conditionings is None:
+        teacher_conditionings = []
+
     midblock_out_shape = get_midblock_out_shape(latents.shape, model)
 
     if mask is not None:
@@ -490,13 +556,27 @@ def get_model_prediction_and_target(
         target = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
-        teacher_target = None if teacher_mask is None else torch.zeros_like(
+        # When teacher_models is empty or teacher_mask is None, no teacher_target needed.
+        teacher_target = None if (not teacher_models or teacher_mask is None) else torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         noisy_latents = torch.zeros_like(
             latents, dtype=model.unet.dtype, device=model.unet.device
         )
         midblock_out = None if lcf_mask is None else torch.zeros(midblock_out_shape, dtype=model.unet.dtype, device=model.unet.device)
+
+        # self-flow feature placeholders
+        do_self_flow = (self_flow_s_timesteps is not None
+                  and model.self_flow_teacher_unet is not None)
+        if do_self_flow:
+            sf_mode = args.self_flow_mode
+            sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model, sf_mode)
+            self_flow_student_features = torch.zeros(sf_student_shape, dtype=model.unet.dtype, device=model.unet.device)
+            self_flow_teacher_features = torch.zeros(sf_teacher_shape, dtype=model.unet.dtype, device=model.unet.device)
+        else:
+            self_flow_student_features = None
+            self_flow_teacher_features = None
+
         if mask.sum() == 0:
             # early out for empty mask
             return ModelPredictionAndTargetReturnType(
@@ -505,19 +585,22 @@ def get_model_prediction_and_target(
                 teacher_target=teacher_target,
                 noisy_latents=noisy_latents,
                 midblock_out=midblock_out,
+                self_flow_student_features=self_flow_student_features,
+                self_flow_teacher_features=self_flow_teacher_features,
             )
 
         latents_masked = latents[mask]
         conditioning_masked = conditioning.get_masked(mask)
         noise_masked = noise[mask]
         teacher_mask_masked = teacher_mask[mask] if teacher_mask is not None else None
-        teacher_conditioning_masked = (
-            teacher_conditioning.get_masked(mask)
-            if teacher_conditioning is not None
-            else None
-        )
+        teacher_latents_list_masked = [tl[mask] if tl is not None else None for tl in teacher_latents_list]
+        teacher_conditionings_masked = [
+            tc.get_masked(mask) if tc is not None else None
+            for tc in teacher_conditionings
+        ]
         lcf_mask_masked = lcf_mask[mask] if lcf_mask is not None else None
         timesteps_masked = timesteps[mask]
+        self_flow_s_timesteps_masked = self_flow_s_timesteps[mask] if self_flow_s_timesteps is not None else None
         masked_result = get_model_prediction_and_target(
             latents=latents_masked,
             conditioning=conditioning_masked,
@@ -526,21 +609,27 @@ def get_model_prediction_and_target(
             model=model,
             args=args,
             skip_contrastive=skip_contrastive,
-            teacher_model=teacher_model,
+            teacher_models=teacher_models,
+            teacher_latents_list=teacher_latents_list_masked,
             teacher_mask=teacher_mask_masked,
-            teacher_conditioning=teacher_conditioning_masked,
+            teacher_conditionings=teacher_conditionings_masked,
             debug_fake=debug_fake,
             log_writer=log_writer,
             global_step=global_step,
             mask=None,
-            lcf_mask=lcf_mask_masked
+            lcf_mask=lcf_mask_masked,
+            self_flow_s_timesteps=self_flow_s_timesteps_masked,
+            debug_teacher=debug_teacher,
         )
         model_pred[mask] += masked_result.model_pred
         target[mask] += masked_result.target
-        if teacher_mask is not None:
+        if teacher_target is not None and masked_result.teacher_target is not None:
             teacher_target[mask] += masked_result.teacher_target
         if lcf_mask is not None:
             midblock_out[mask] += masked_result.midblock_out
+        if do_self_flow and masked_result.self_flow_student_features is not None:
+            self_flow_student_features[mask] += masked_result.self_flow_student_features
+            self_flow_teacher_features[mask] += masked_result.self_flow_teacher_features
         noisy_latents[mask] += masked_result.noisy_latents
         return ModelPredictionAndTargetReturnType(
             model_pred=model_pred,
@@ -548,6 +637,8 @@ def get_model_prediction_and_target(
             noisy_latents=noisy_latents,
             midblock_out=midblock_out,
             teacher_target=teacher_target,
+            self_flow_student_features=self_flow_student_features,
+            self_flow_teacher_features=self_flow_teacher_features,
         )
 
     if is_cond_dropout_noise is not None:
@@ -555,6 +646,7 @@ def get_model_prediction_and_target(
         for sample_index in range(latents.shape[0]):
             if is_cond_dropout_noise[sample_index]:
                 latents[sample_index] = torch.randn_like(latents[sample_index])
+
 
     # logging.info(f"get_model_prediction_and_target timesteps: {timesteps.detach().cpu().tolist()}")
     noisy_latents = _get_noisy_latents(
@@ -595,7 +687,9 @@ def get_model_prediction_and_target(
                 handle.remove()
 
     teacher_target = None
-    if teacher_mask is None:
+    _teacher_debug_capture: Dict[str, Any] = {}
+    if not teacher_models or teacher_mask is None:
+        # No teacher guidance this step.
         pass
     elif teacher_mask.sum() == 0:
         teacher_target = torch.zeros_like(
@@ -603,35 +697,138 @@ def get_model_prediction_and_target(
         )
     else:
         with torch.no_grad():
-            if teacher_conditioning is None:
-                teacher_conditioning = conditioning
-
-            teacher_target = get_teacher_target(
-                teacher_model=teacher_model,
-                teacher_conditioning=teacher_conditioning,
-                student_model=model,
-                timesteps=timesteps,
-                student_unet_timesteps=timesteps,
-                clean_image_latents=latents,
-                noise=noise,
-            )
-
-            if log_writer is not None:
-                loss_preview_image_rgb = torchvision.utils.make_grid(teacher_target)
-                log_writer.add_image(
-                    tag="loss/teacher target",
-                    img_tensor=loss_preview_image_rgb,
-                    global_step=global_step,
+            # Pad lists to teacher_models length with None so zip always works.
+            _conditionings = list(teacher_conditionings) + [None] * max(0, len(teacher_models) - len(teacher_conditionings))
+            _latents_list = list(teacher_latents_list) + [None] * max(0, len(teacher_models) - len(teacher_latents_list))
+            teacher_target = None
+            for teacher_model_i, teacher_conditioning_i, teacher_latents_i in zip(
+                    teacher_models, _conditionings, _latents_list):
+                effective_conditioning = teacher_conditioning_i if teacher_conditioning_i is not None else conditioning
+                t = get_teacher_target(
+                    teacher_model=teacher_model_i,
+                    teacher_conditioning=effective_conditioning,
+                    student_model=model,
+                    student_timesteps=timesteps,
+                    clean_image_latents=latents,
+                    teacher_clean_image_latents=teacher_latents_i,
+                    noise=noise,
+                    _debug_capture=_teacher_debug_capture if debug_teacher else None,
                 )
+                teacher_target = t if teacher_target is None else teacher_target + t
 
-            #target = teacher_target * teacher_mask.view(-1, 1, 1, 1).expand_as(
-            #    target
-            #).to(target.device) + target * ~teacher_mask.view(-1, 1, 1, 1).expand_as(
-            #    target
-            #).to(target.device)
+    # ── Teacher debug logging (first 20 steps) ────────────────────────────
+    if debug_teacher and global_step < 20:
+        _debug_output_dir = getattr(args, "logdir", None) or "."
+        _teacher_pred_type: Optional[str] = None
+        _teacher_sched = None
+        _teacher_latent_type: Optional[str] = None
+        # Use the first teacher for backward-compatible single-teacher debug output.
+        _debug_teacher_model = teacher_models[0] if teacher_models else None
+        if _debug_teacher_model is not None:
+            _teacher_pred_type = _get_prediction_type(_debug_teacher_model)
+            _teacher_sched = _debug_teacher_model.noise_scheduler
+        # Infer latent space types for correct per-column rendering in the debug grid.
+        try:
+            from core.latent_interposer import infer_latent_space_type
+            _student_latent_type = infer_latent_space_type(model)
+            if _debug_teacher_model is not None:
+                _teacher_latent_type = infer_latent_space_type(_debug_teacher_model)
+        except Exception:
+            _student_latent_type = "xl" if model.is_sdxl else "v1"
+        log_teacher_debug(
+            global_step=global_step,
+            output_dir=_debug_output_dir,
+            is_sdxl=model.is_sdxl,
+            log_writer=log_writer,
+            student_pred_type=_get_prediction_type(model),
+            student_scheduler=model.noise_scheduler,
+            teacher_pred_type=_teacher_pred_type,
+            teacher_scheduler=_teacher_sched,
+            noise=noise,
+            noisy_latents=noisy_latents,
+            model_pred=model_pred,
+            target=target,
+            clean_latents=latents,
+            student_timesteps=timesteps,
+            teacher_debug_capture=_teacher_debug_capture,
+            teacher_target=teacher_target,
+            student_latent_type=_student_latent_type,
+            teacher_latent_type=_teacher_latent_type,
+        )
+
+
+    # ---- Self-Flow representation learning ----
+    self_flow_student_features = None
+    self_flow_teacher_features = None
+    sf_teacher_unet = model.self_flow_teacher_unet
+    if self_flow_s_timesteps is not None and sf_teacher_unet is not None:
+        sf_mask_ratio = args.self_flow_mask_ratio
+        sf_mode = args.self_flow_mode
+
+        # Build heterogeneously noised latents for student and teacher
+        x_tau, x_tau_min, tau_min_ts = build_self_flow_latents(
+            latents=latents,
+            noise=noise,
+            noise_scheduler=model.noise_scheduler,
+            t=timesteps,
+            s=self_flow_s_timesteps,
+            mask_ratio=sf_mask_ratio,
+        )
+
+        # Resolve the modules to hook for this mode
+        sf_student_module, sf_teacher_module = get_self_flow_modules(model.unet, sf_teacher_unet, sf_mode)
+
+        # --- Student forward: x_τ input, scalar timestep t, capture student module ---
+        sf_student_storage = {}
+
+        def _sf_student_hook(module, inp, output):
+            out = output[0] if isinstance(output, tuple) else output
+            sf_student_storage['h'] = out
+
+        sf_student_handle = sf_student_module.register_forward_hook(_sf_student_hook)
+        try:
+            model.unet(
+                x_tau.to(dtype=model.unet.dtype),
+                timesteps.to(model.unet.device, dtype=model.unet.dtype),  # use original t
+                encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
+                added_cond_kwargs=(
+                    conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
+                    if model.is_sdxl else None
+                ),
+            )
+        finally:
+            sf_student_handle.remove()
+        self_flow_student_features = sf_student_storage.get('h')
+
+        # --- Teacher forward: x_{τ_min} input, scalar τ_min, capture teacher module ---
+        sf_teacher_storage = {}
+
+        def _sf_teacher_hook(module, inp, output):
+            out = output[0] if isinstance(output, tuple) else output
+            sf_teacher_storage['h'] = out
+
+        sf_teacher_handle = sf_teacher_module.register_forward_hook(_sf_teacher_hook)
+        try:
+            with torch.no_grad():
+                sf_teacher_unet(
+                    x_tau_min.to(dtype=sf_teacher_unet.dtype),
+                    tau_min_ts.to(sf_teacher_unet.device, dtype=sf_teacher_unet.dtype),
+                    encoder_hidden_states=conditioning.prompt_embeds.to(dtype=sf_teacher_unet.dtype),
+                    added_cond_kwargs=(
+                        conditioning.get_added_cond_kwargs(dtype=sf_teacher_unet.dtype)
+                        if model.is_sdxl else None
+                    ),
+                )
+        finally:
+            sf_teacher_handle.remove()
+        self_flow_teacher_features = sf_teacher_storage.get('h')
 
     return ModelPredictionAndTargetReturnType(
-        model_pred=model_pred, target=target, noisy_latents=noisy_latents, teacher_target=teacher_target, midblock_out=midblock_out)
+        model_pred=model_pred, target=target, noisy_latents=noisy_latents,
+        teacher_target=teacher_target, midblock_out=midblock_out,
+        self_flow_student_features=self_flow_student_features,
+        self_flow_teacher_features=self_flow_teacher_features,
+    )
 
 
 def _get_noisy_latents(
@@ -816,7 +1013,6 @@ def compute_timestep_intervals(noise_scheduler, k: int,
     Works for both flow-matching and DDPM/v-pred schedulers.
     Returns absolute timestep (left, right) inclusive pairs.
     """
-    import numpy as np
     from diffusers import FlowMatchEulerDiscreteScheduler
     from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 
@@ -911,7 +1107,7 @@ def get_multirank_stratified_random_timesteps(
             u = (indices + u) / batch_size
         sigmas = u
     elif distribution == "lognormal":
-        std = 1
+        std = alpha
         mean = 0
         u = torch.randn(batch_size) * std + mean
         sigmas = torch.sigmoid(u)
@@ -962,53 +1158,277 @@ def _get_boundary_oversampling_sigmas(k, lambda_=1.0):
     return t_samples.clamp(0, 1)
 
 
+def _get_prediction_type(model: TrainingModel) -> str:
+    """Return the normalised prediction-type string for a TrainingModel."""
+    if type(model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler:
+        return 'flow_prediction'
+    prediction_type = model.noise_scheduler.config.get('prediction_type', '<unknown>')
+    return prediction_type
+
+
+def _sched_shift(sched) -> str:
+    """Return the shift value of a scheduler as a string, or 'n/a'."""
+    shift = getattr(sched, 'config', {}).get('shift', None)
+    if shift is None:
+        shift = getattr(sched, 'shift', None)
+    return str(shift) if shift is not None else 'n/a'
+
+
+# Set of config tuples that have already been logged — prevents log spam on every step.
+_teacher_target_logged_configs: set = set()
+
 
 def get_teacher_target(
     teacher_model: TrainingModel,
     teacher_conditioning: Conditioning,
     student_model: TrainingModel,
-    timesteps: torch.Tensor,
-    student_unet_timesteps: torch.Tensor,
-    clean_image_latents: torch.Tensor,
-    noise: torch.Tensor,
-):
-    teacher_prediction_type = 'flow_prediction' if type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler else teacher_model.noise_scheduler.config.get('prediction_type', '<unknown teacher prediction type>')
-    student_prediction_type = 'flow_prediction' if type(student_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler else student_model.noise_scheduler.config.get('prediction_type', '<unknown student prediction type>')
-    if (
-        teacher_prediction_type in ["v_prediction", "v-prediction"]
-        and student_prediction_type == "flow_prediction"
-    ):
-        raise NotImplementedError("SNR-based timestep remapping implementation not correct for new flowmap timestep scheduling.")
-        #@todo use student_noisy_timesteps to compute teacher timesteps based on SNR matching
-        teacher_unet_timesteps, teacher_noisy_latents = _remap_noise_v_pred_to_flow_matching(
-            teacher_model, student_model, timesteps, clean_image_latents, noise
+    student_timesteps: torch.Tensor,    # [B], student-domain
+    clean_image_latents: torch.Tensor,  # [B, C, H, W]
+    teacher_clean_image_latents: torch.Tensor, # [B, C, H, W]
+    noise: torch.Tensor,                # [B, C, H, W]
+    _debug_capture: Optional[Dict[str, Any]] = None,  # filled when debug_teacher is active
+) -> torch.Tensor:
+    """
+    Unified teacher-target function.  Handles all 9 objective crossings via
+    PredictionBridge, plus the cross-VAE interposer path (unchanged).
+    """
+    student_pred_type = _get_prediction_type(student_model)
+
+    # ── Cross-VAE interposer (highest priority) ────────────────────────────────
+    # Detect cross-VAE on demand; no need for the interposer to be pre-attached
+    # to the model.  The shared singleton in latent_interposer is cheap to
+    # create and loads model weights lazily.
+    if student_pred_type == 'flow_prediction':
+        return _teacher_fm_target_via_interposer(
+            teacher_model=teacher_model,
+            teacher_conditioning=teacher_conditioning,
+            student_model=student_model,
+            student_timesteps=student_timesteps,
+            clean_image_latents=clean_image_latents,
+            teacher_clean_image_latents=teacher_clean_image_latents,
+            student_noise=noise,
+            latent_interposer=get_shared_interposer(),
+            _debug_capture=_debug_capture,
         )
+
+    raise NotImplementedError("teacher with non-flow-prediction student is not implemented")
+
+    # ── Unified bridge-based distillation ──────────────────────────────────────
+    teacher_pred_type = _get_prediction_type(teacher_model)
+    bridge = get_prediction_bridge(teacher_pred_type, student_pred_type)
+
+    _log_key = ('bridge', teacher_pred_type, student_pred_type, type(bridge).__name__)
+    if _log_key not in _teacher_target_logged_configs:
+        _teacher_target_logged_configs.add(_log_key)
+        t_shift = _sched_shift(teacher_model.noise_scheduler)
+        s_shift = _sched_shift(student_model.noise_scheduler)
+        logging.info(
+            f"\n*** Teacher distillation bridge (first call) ***\n"
+            f"  bridge class    : {type(bridge).__name__}\n"
+            f"  teacher pred    : {teacher_pred_type}  |  scheduler: {type(teacher_model.noise_scheduler).__name__}  |  shift: {t_shift}\n"
+            f"  student pred    : {student_pred_type}  |  scheduler: {type(student_model.noise_scheduler).__name__}  |  shift: {s_shift}\n"
+            f"  timestep remap  : {bridge.__class__.__name__}.remap_timesteps (SNR-matched if crossing FM↔DDPM, else identity)\n"
+            f"  VAE latent space: shared (same VAE, no interposer)\n"
+        )
+
+    # Step 1: map student timesteps → teacher timesteps (SNR-matched or identity)
+    teacher_timesteps = bridge.remap_timesteps(
+        student_timesteps,
+        student_sched=student_model.noise_scheduler,
+        teacher_sched=teacher_model.noise_scheduler,
+    ).to(teacher_model.device)
+
+    # Step 2: build teacher noisy latents
+    teacher_noisy_latents = bridge.build_noisy_latents(
+        clean_image_latents, noise, teacher_timesteps,
+        teacher_sched=teacher_model.noise_scheduler,
+    )
+
+    # Step 3: run teacher UNet (single call site, no per-crossing branching)
+    with torch.no_grad():
+        teacher_output = teacher_model.unet(
+            teacher_noisy_latents.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+            teacher_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+            teacher_conditioning.prompt_embeds.to(
+                teacher_model.device, dtype=teacher_model.unet.dtype
+            ),
+            added_cond_kwargs=(
+                teacher_conditioning.get_added_cond_kwargs(dtype=teacher_model.unet.dtype)
+                if teacher_model.is_sdxl else None
+            ),
+        ).sample.float()
+
+    student_target = bridge.convert_output(
+        teacher_output=teacher_output,
+        teacher_noisy_latents=teacher_noisy_latents,
+        teacher_timesteps=teacher_timesteps,
+        student_timesteps=student_timesteps,
+        noise=noise,
+        teacher_sched=teacher_model.noise_scheduler,
+        student_sched=student_model.noise_scheduler,
+    )
+
+    if _debug_capture is not None:
+        #_debug_capture["teacher_noise"] = teacher_noise.detach()
+        _debug_capture["teacher_noisy_latents"] = teacher_noisy_latents.detach()
+        _debug_capture["teacher_output"] = teacher_output.detach()
+        _debug_capture["teacher_timesteps"] = teacher_timesteps.detach()
+
+    return student_target.to(dtype=student_model.unet.dtype)
+
+
+
+def get_teacher_target_v2(
+    teacher_model: TrainingModel,
+    teacher_conditioning: Conditioning,
+    student_model: TrainingModel,
+    student_timesteps: torch.Tensor,    # [B], student-domain
+    student_noisy_latents: torch.Tensor,  # [B, C, H, W]
+    _debug_capture: Optional[Dict[str, Any]] = None,  # filled when debug_teacher is active
+) -> torch.Tensor:
+
+    teacher_pred_type = _get_prediction_type(teacher_model)
+    student_pred_type = _get_prediction_type(student_model)
+    bridge = get_prediction_bridge(teacher_pred_type, student_pred_type)
+
+    converter = TaesdLatentConverter()
+
+    # 1. Build teacher noisy latents `teacher_noisy_latents`
+    # If teacher and student have the same VAE, this is a no-op
+    student_latent_space = infer_latent_space_type(student_model)
+    teacher_latent_space = infer_latent_space_type(teacher_model)
+    if student_latent_space == teacher_latent_space:
+        teacher_noisy_latents = student_noisy_latents
     else:
-        if teacher_prediction_type != student_prediction_type:
-            supported_prediction_interconversion_types = {"epsilon", "v_prediction", "v-prediction"}
-            present_prediction_types = {
-                teacher_prediction_type,
-                student_prediction_type,
-            }
-            if supported_prediction_interconversion_types.isdisjoint(present_prediction_types):
-                raise ValueError(
-                    f"Unsupported prediction type conversion: {teacher_prediction_type} to {student_prediction_type}"
-                )
-
-        # _get_noise_latents uses non-shifted integer timesteps (indices)
-        teacher_noisy_latents = _get_noisy_latents(
-            clean_image_latents,
-            noise,
-            teacher_model.noise_scheduler,
-            timesteps,
-            latents_perturbation=0,
+        teacher_noisy_latents = converter.convert(
+            student_noisy_latents,
+            student_latent_space,
+            teacher_latent_space
         )
-        # student_unet_timesteps are already shifted
-        teacher_unet_timesteps = student_unet_timesteps
 
-    teacher_model_output = teacher_model.unet(
-        teacher_noisy_latents.to(teacher_model.device, dtype=teacher_model.unet.dtype),
-        teacher_unet_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+    # 2. Run teacher unet over noisy latents
+    # 2a. Get teacher timesteps
+    teacher_timesteps = bridge.remap_timesteps(
+        student_timesteps,
+        student_scheduler=student_model.noise_scheduler,
+        teacher_scheduler=teacher_model.noise_scheduler,
+    ).to(teacher_model.device)
+    # 2b. Run teacher unet
+    with torch.no_grad():
+        teacher_output = teacher_model.unet(
+            teacher_noisy_latents.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+            teacher_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+            teacher_conditioning.prompt_embeds.to(
+                teacher_model.device, dtype=teacher_model.unet.dtype
+            ),
+            added_cond_kwargs=(
+                teacher_conditioning.get_added_cond_kwargs(dtype=teacher_model.unet.dtype)
+                if teacher_model.is_sdxl else None
+            ),
+        ).sample.float()
+
+    # 3. Convert teacher output to student target
+    bridge.convert_output(teacher_output, teacher_noisy_latents,
+                          teacher_timesteps, student_timesteps,
+                          noise,
+                          teacher_model.noise_scheduler,
+                          student_model.noise_scheduler)
+
+
+
+
+def _teacher_fm_target_via_interposer(
+    teacher_model: TrainingModel,
+    teacher_conditioning: Conditioning,
+    student_model: TrainingModel,
+    student_timesteps: torch.Tensor,       # shifted float timesteps, shape [B]
+    clean_image_latents: torch.Tensor,  # x_1_vS, shape [B,4,H,W]
+    teacher_clean_image_latents: torch.Tensor, # x_1_vT,  [B,4,H,W]
+    student_noise: torch.Tensor,   # x_0_vS, shape [B,4,H,W]
+    latent_interposer,
+    _debug_capture: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+    """
+    Return a flow matching target from the teacher, regardless of teacher scheduler type or VAE space.
+    """
+
+    teacher_prediction_type = (
+        'flow_prediction'
+        if type(teacher_model.noise_scheduler) is TrainFlowMatchEulerDiscreteScheduler
+        else teacher_model.noise_scheduler.config.get('prediction_type', 'unknown')
+    )
+    is_vpred_teacher = teacher_prediction_type in ('v_prediction', 'v-prediction')
+    is_epsilon_teacher = teacher_prediction_type == 'epsilon'
+    student_vae_space = 'xl' if student_model.is_sdxl else 'v1'
+    teacher_vae_space = 'xl' if teacher_model.is_sdxl else 'v1'
+
+    # ---- One-time diagnostic log ----
+    _log_key = ('interposer', student_vae_space, teacher_vae_space, teacher_prediction_type)
+    if _log_key not in _teacher_target_logged_configs:
+        _teacher_target_logged_configs.add(_log_key)
+        t_shift = _sched_shift(teacher_model.noise_scheduler)
+        s_shift = _sched_shift(student_model.noise_scheduler)
+        if is_vpred_teacher or is_epsilon_teacher:
+            ts_method = (
+                f"SNR-matched: student FM sigma → nearest DDPM integer timestep\n"
+                f"             using _ddpm_timesteps_matching_fm_sigma() on teacher's DDPM scheduler"
+            )
+        else:
+            ts_method = (
+                f"Sigma-lookup: student sigma → nearest sigma in teacher's own shifted table\n"
+                f"              (teacher shift={t_shift}, student shift={s_shift})"
+            )
+        logging.info(
+            f"\n*** Teacher distillation via interposer (first call) ***\n"
+            f"  student VAE space : {student_vae_space} \n"
+            f"  teacher VAE space : {teacher_vae_space} \n"
+            f"  interposer        : {type(latent_interposer).__name__}  "
+            f"[{student_vae_space} → {teacher_vae_space} for x_1 and x_0, {teacher_vae_space} → {student_vae_space} for x̂_1]\n"
+            f"  teacher pred type : {teacher_prediction_type}  |  scheduler: {type(teacher_model.noise_scheduler).__name__}\n"
+            f"  student pred type : flow_prediction  |  scheduler: {type(student_model.noise_scheduler).__name__}\n"
+            f"  timestep mapping  : {ts_method}\n"
+            f"  noise handling    : student_noise passed through interposer ({student_vae_space}→{teacher_vae_space}) for coherent velocity target\n"
+        )
+
+    # ---- 1. Find timesteps by SNR matching
+    if is_vpred_teacher or is_epsilon_teacher:
+        fm_sigmas = student_model.noise_scheduler.get_sigmas_for_timesteps(
+            student_timesteps.to(student_model.noise_scheduler.timesteps.device)
+        )
+        teacher_timesteps = _ddpm_timesteps_matching_fm_sigma(fm_sigmas, teacher_model.noise_scheduler)
+    else:
+        teacher_timesteps = student_timesteps
+
+    # ---- 2. Convert student noisy latent -> teacher VAE space
+    if student_vae_space == teacher_vae_space:
+        teacher_noise = student_noise
+        x_t_vT = _get_noisy_latents(clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+    else:
+        student_to_teacher_method = 'fresh_eps' # empirically evaluated, fresh_eps and same_raw_eps both are best
+        if student_to_teacher_method == 'convert_xt':
+            teacher_noise = student_noise
+            x_t_vS = _get_noisy_latents(clean_image_latents, student_noise, student_model.noise_scheduler, student_timesteps, 0)
+            x_t_vT = latent_interposer.convert(x_t_vS, student_vae_space, teacher_vae_space)
+        elif student_to_teacher_method == 'convert_eps':
+            teacher_noise = latent_interposer.convert(student_noise, student_vae_space, teacher_vae_space)
+            #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+            x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        elif student_to_teacher_method == 'fresh_eps':
+            teacher_noise = torch.randn_like(student_noise)
+            #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+            x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        elif student_to_teacher_method == 'same_raw_eps':
+            teacher_noise = student_noise
+            #teacher_clean_image_latents = latent_interposer.convert(clean_image_latents, student_vae_space, teacher_vae_space)
+            x_t_vT = _get_noisy_latents(teacher_clean_image_latents, teacher_noise, teacher_model.noise_scheduler, teacher_timesteps, 0)
+        else:
+            raise ValueError(f"Unknown method {student_to_teacher_method}")
+
+
+    # ---- 3. Run teacher UNet ----
+    v_hat_vT = teacher_model.unet(
+        x_t_vT.to(teacher_model.device, dtype=teacher_model.unet.dtype),
+        teacher_timesteps.to(teacher_model.device, dtype=teacher_model.unet.dtype),
         teacher_conditioning.prompt_embeds.to(
             teacher_model.device, dtype=teacher_model.unet.dtype
         ),
@@ -1017,147 +1437,51 @@ def get_teacher_target(
             if teacher_model.is_sdxl
             else None
         ),
-    ).sample.float()
+    ).sample.to(x_t_vT.device).float()
 
-    if teacher_prediction_type == student_prediction_type:
-        return teacher_model_output
-
-    if student_prediction_type == 'flow_prediction' or teacher_prediction_type == 'flow_prediction':
-        raise NotImplementedError("conversion to/from flow_prediction is untested due to unet_timesteps handling")
-    return _convert_model_output(
-        noise=noise,
-        teacher_input=teacher_noisy_latents,
-        teacher_output=teacher_model_output,
-        teacher_scheduler=teacher_model.noise_scheduler,
-        teacher_unet_timesteps=teacher_unet_timesteps,
-        student_prediction_type=student_prediction_type,
-        student_unet_timesteps=student_unet_timesteps,
-    )
-
-
-def _convert_model_output(
-    noise: torch.Tensor,
-    teacher_input: torch.Tensor,
-    teacher_output: torch.Tensor,
-    teacher_scheduler: SchedulerMixin | ConfigMixin,
-    teacher_unet_timesteps,
-    student_prediction_type,
-    student_timesteps,
-):
-    source_prediction_type = teacher_scheduler.config.prediction_type
-    if source_prediction_type in ["v_prediction", "v-prediction"]:
-        alpha_t = (
-            teacher_scheduler.alphas_cumprod[teacher_unet_timesteps].view(-1, 1, 1, 1).sqrt()
+    # ---- 4. Recover predicted clean endpoint in teacher space ----
+    if is_vpred_teacher:
+        ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_t_vT.device)
+        x_1_hat_vT = _recover_x0_from_vpred(
+            x_t_vT.float(), v_hat_vT, ac[teacher_timesteps].float()
         )
-        sigma_t = (1 - alpha_t**2).sqrt().to(teacher_output.device)
-        # Solve for x_0 from v-prediction
-        x_0_pred = (alpha_t * teacher_input - sigma_t * teacher_output) / (
-            alpha_t**2 + sigma_t**2
-        ).sqrt()  # note that this denominator == 1 typically
-
-        if student_prediction_type == "epsilon":
-            assert student_timesteps == teacher_unet_timesteps
-            # Epsilon: ε = (x_t - α_t·x_0) / σ_t
-            return (teacher_input - alpha_t * x_0_pred) / sigma_t
-        elif student_prediction_type == "flow_prediction":
-            return noise - x_0_pred
-
-    elif source_prediction_type == "epsilon" and student_prediction_type in [
-        "v_prediction",
-        "v-prediction",
-    ]:
-        assert student_timesteps == teacher_unet_timesteps
-        # Convert epsilon to v-prediction
-        alpha_t = (
-            teacher_scheduler.alphas_cumprod[teacher_unet_timesteps].view(-1, 1, 1, 1).sqrt()
+    elif is_epsilon_teacher:
+        ac = teacher_model.noise_scheduler.alphas_cumprod.to(x_t_vT.device)
+        x_1_hat_vT = _recover_x0_from_epsilon(
+            x_t_vT.float(), v_hat_vT, ac[teacher_timesteps].float()
         )
-        sigma_t = (1 - alpha_t**2).sqrt().to(teacher_output.device)
-        # First get x_0 from epsilon: x_0 = (x_t - σ_t·ε) / α_t
-        x_0_pred = (teacher_input - sigma_t * teacher_output) / alpha_t
-        # Then compute v: v = α_t·ε - σ_t·x_0
-        return alpha_t * teacher_output - sigma_t * x_0_pred
     else:
-        raise ValueError(
-            f"Cannot convert between teacher model prediction type {source_prediction_type} and training model prediction type {student_prediction_type}"
-        )
+        sigmas = teacher_model.noise_scheduler.get_sigmas_for_timesteps(teacher_timesteps).to(x_t_vT.device)
+        x_1_hat_vT = _recover_x0_from_fm_velocity(x_t_vT, v_hat_vT, sigmas)
+
+    # ---- 5. Map predicted clean endpoint back to student VAE space
+    if student_vae_space == teacher_vae_space:
+        x_1_hat_vS = x_1_hat_vT
+    else:
+        teacher_to_student_method = 'convert_slow'
+        if teacher_to_student_method == 'convert_fast':
+            x_1_hat_vS = latent_interposer.convert(x_1_hat_vT, teacher_vae_space,
+            student_vae_space)
+            x_1_hat_vS = x_1_hat_vS.to(student_noise.device).float()
+        elif teacher_to_student_method == 'convert_slow':
+            normalization = 'none'# 'imagenet' if student_model.is_sdxl else 'none'
+            x_1_hat_vS = convert_latents_slow_vae_roundtrip(x_1_hat_vT, teacher_model.vae, student_model.vae, normalization=normalization)
+        else:
+            raise ValueError(f"Unrecognized teacher_to_student_method '{teacher_to_student_method}'")
+
+    # ---- 7. Build student-space distillation velocity target ----
+    v_target_vS = student_noise.float() - x_1_hat_vS
+
+    if _debug_capture is not None:
+        v_target_vT = teacher_noise.float() - x_1_hat_vT
+        _debug_capture["teacher_noise"] = teacher_noise.detach()
+        _debug_capture["teacher_noisy_latents"] = x_t_vT.detach()
+        _debug_capture["teacher_output"] = v_target_vT.detach()
+        _debug_capture["teacher_timesteps"] = teacher_timesteps.detach()
+
+    return v_target_vS.to(dtype=student_model.unet.dtype)
 
 
-def _remap_noise_v_pred_to_flow_matching(
-    teacher_model,  # v-pred
-    student_model,  # flow matching
-    student_timesteps: torch.Tensor,  # integer
-    latents: torch.Tensor,
-    noise: torch.Tensor,
-):
-    if teacher_model.noise_scheduler.config.prediction_type not in [
-        "v_prediction",
-        "v-prediction",
-    ]:
-        raise ValueError(
-            "Teacher model must use v-prediction for SNR-based timestep remapping."
-        )
-    if student_model.noise_scheduler.config.prediction_type != "flow_prediction":
-        raise ValueError(
-            "Student model must use flow-matching for SNR-based timestep remapping."
-        )
-
-    student_timesteps = student_timesteps.to(student_model.device)
-    teacher_timesteps = _get_ddpm_timesteps_for_flowmatch_timesteps(
-        flowmatch_timesteps=student_timesteps,
-        ddpm_scheduler=teacher_model.noise_scheduler,
-        flowmatch_scheduler=student_model.noise_scheduler,
-    )
-
-    teacher_noisy_latents = _get_noisy_latents(
-        latents,
-        noise,
-        teacher_model.noise_scheduler,
-        teacher_timesteps,
-        latents_perturbation=0.0,
-    )
-
-    teacher_timesteps = teacher_timesteps.to(teacher_model.device)
-    return teacher_timesteps, teacher_noisy_latents
-
-
-def _get_ddpm_timesteps_for_flowmatch_timesteps(
-    flowmatch_timesteps: torch.Tensor,
-    ddpm_scheduler: SchedulerMixin,
-    flowmatch_scheduler: TrainFlowMatchEulerDiscreteScheduler,
-) -> torch.Tensor:
-    assert flowmatch_timesteps.dtype not in [
-        torch.int64,
-        torch.int32,
-        torch.int16,
-        torch.long,
-    ], "expecting floating point (shifted) timesteps for flowmatch"
-    flowmatch_timestep_indices = flowmatch_scheduler.get_timestep_indices(
-        flowmatch_timesteps
-    ).cpu()
-    t_flow = flowmatch_scheduler.sigmas[flowmatch_timestep_indices]
-
-    snr_flow = t_flow**2 / (1 - t_flow) ** 2
-
-    # Find DDPM timestep where SNR matches
-    # SNR_ddpm = alpha_bar / (1 - alpha_bar)
-    # Solving: alpha_bar = SNR / (1 + SNR)
-    alpha_bar_target = snr_flow / (1 + snr_flow)
-
-    # Find the closest DDPM timestep
-    # scheduler.alphas_cumprod contains alpha_bar values for each timestep
-    alphas_cumprod = ddpm_scheduler.alphas_cumprod.cpu()
-
-    # Find timestep with closest alpha_bar
-    ddpm_timesteps = torch.argmin(
-        torch.abs(alphas_cumprod - alpha_bar_target.unsqueeze(-1)), dim=-1
-    )
-    # print(f"Flow t={t_flow} -> DDPM timestep={ddpm_timesteps}")
-
-    # For DDPM
-    # print(f"DDPM alpha_bar at t={ddpm_timesteps}: {ddpm_scheduler.alphas_cumprod[ddpm_timestep]}")
-    # print(f"DDPM sqrt(alpha_bar): {torch.sqrt(ddpm_scheduler.alphas_cumprod[ddpm_timestep])}")
-
-    return ddpm_timesteps
 
 
 def get_local_contrastive_flow_loss(

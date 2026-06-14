@@ -73,7 +73,7 @@ class LatentCacheManager():
         self.vae = None
 
     def vae_to_device(self, device):
-        self.vae.to(self.device)
+        self.vae.to(device)
         self.vae_on_device = True
     
     def vae_to_cpu(self):

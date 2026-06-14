@@ -55,5 +55,11 @@
   "loss_type": "sd3-cosmap",
   "timesteps_multirank_stratified_distribution": "uniform",
   "timesteps_multirank_stratified_stratify": true,
-  "no_save_on_error": true
+  "no_save_on_error": true,
+  "self_flow_p": 0.0,
+  "self_flow_gamma": 0.8,
+  "self_flow_mask_ratio": 0.25,
+  "self_flow_ema_decay": 0.9999,
+  "self_flow_ema_update_interval": 1,
+  "self_flow_mode": "shallow"
 }

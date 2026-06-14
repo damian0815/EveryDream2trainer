@@ -65,7 +65,6 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         indices_reversed = len(timestep_values) - 1 - timestep_indices.cpu()
         return timestep_values[indices_reversed]
 
-
     def get_sigmas_for_timesteps(self, timesteps: torch.Tensor):
         """ For the given timesteps, get the corresponding sigmas """
         indices = (timesteps[:, None] == self.timesteps[None, :]).nonzero(as_tuple=True)[1]
@@ -84,6 +83,8 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
     def add_noise(self, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         return self.scale_noise(latents, timesteps, noise)
+
+
 
 
 class SDPipelineInferenceFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):

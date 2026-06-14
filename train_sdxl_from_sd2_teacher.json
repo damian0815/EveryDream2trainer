@@ -1,0 +1,42 @@
+{
+  "_comment": "Example config for SDXL Flow-Matching student distilled from an SD2 Flow-Matching teacher.",
+  "_comment2": "Set --resume_ckpt to your base SDXL-FM checkpoint. Set --teacher to your SD2-FM model.",
+
+  "resume_ckpt": "stabilityai/stable-diffusion-xl-base-1.0",
+  "project_name": "sdxl_distill_sd2_teacher",
+
+  "max_epochs": 10,
+  "lr": 1e-5,
+  "batch_size": 4,
+
+  "resolution": [1024],
+  "log_step": 25,
+  "save_every_n_epochs": 1,
+  "ckpt_every_n_minutes": 30,
+
+  "flow_matching": true,
+  "flow_match_shift": 3.0,
+  "flow_match_shift_dynamic": false,
+
+  "_comment_clamp": "Clamp timestep indices away from extremes for bf16 stability (0-999 scale).",
+  "flow_match_t_clamp_min": 20,
+  "flow_match_t_clamp_max": 980,
+
+  "_comment_teacher": "Teacher distillation settings.",
+  "teacher": "/path/to/sd2-flow-match-model",
+  "teacher_p": 0.5,
+  "teacher_lambda": 1.0,
+  "teacher_prediction_type": "flow_prediction",
+  "_comment_teacher_shift": "Set this to the shift the teacher was trained with (1.0 for SD2-FM at 512px, 3.0 for SDXL-FM at 1024px). Do NOT set to student's shift if different.",
+  "teacher_flow_match_shift": 1.0,
+
+  "optimizer_config": "optimizer-1e-5-cosine.json",
+
+  "disable_textenc_training": true,
+  "grad_accum": 1,
+  "gradient_checkpointing": true,
+
+  "sample_prompts": "sample_prompts.json",
+  "sample_steps": 20
+}
+

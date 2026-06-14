@@ -8,14 +8,14 @@ import torch
 
 
 class ParamGroupBuilder:
-    def __init__(self, optimizer_param_grouping: Literal['zones', 'per-module', 'transformer10x', 'single'], betas, weight_decay, base_lr):
+    def __init__(self, optimizer_param_grouping: Literal['zones', 'transformer10x', 'single']|tuple[str, str], betas, weight_decay, base_lr):
         self.param_grouping = optimizer_param_grouping
         self.betas = betas
         self.weight_decay = weight_decay
         self.base_lr = base_lr
 
     def build_param_groups(self, parameters: tuple[str, torch.nn.Parameter]) -> list[dict]:
-        if self.param_grouping == 'zones':
+        if self.param_grouping[0] == 'zones':
             zone_members = defaultdict(list)
             for name, p in parameters:
                 zone = get_unet_module_zone(name)
@@ -27,8 +27,10 @@ class ParamGroupBuilder:
                 'weight_decay': self.weight_decay,
                 'lr': self.base_lr * get_lr_scale_for_zone(z)
             } for z in zone_members.keys()]
-        elif self.param_grouping == 'per-module':
-            scales = get_raw_unet_module_lr_scales()
+        elif self.param_grouping[0] == 'per-module':
+            if len(self.param_grouping) != 2:
+                raise ValueError("must specify path when using per-module param grouping, eg --optimizer_param_grouping per-module /path/to/grad_ratios.json of format {module_name: grad_ratio} where grad_ratio is the ratio between (mean) grad after backward() and weight magnitude for each module (parameter).")
+            scales = get_raw_unet_module_lr_scales(self.param_grouping[1])
             return [{
                 'name': n,
                 'params': [p],
@@ -36,7 +38,7 @@ class ParamGroupBuilder:
                 'weight_decay': self.weight_decay,
                 'lr': self.base_lr * scales[n]
             } for n, p in parameters]
-        elif  self.param_grouping == 'transformer10x':
+        elif self.param_grouping[0] == 'transformer10x':
             return [{
                 'name': 'transformer_blocks',
                 'params': [p for n, p in parameters if 'transformer_blocks' in n],
@@ -50,7 +52,7 @@ class ParamGroupBuilder:
                 'weight_decay': self.weight_decay,
                 'lr': self.base_lr
             }]
-        elif  self.param_grouping == 'single':
+        elif self.param_grouping[0] == 'single':
             return [{
                 'params': [p for n, p in parameters],
                 'betas': self.betas,
@@ -58,7 +60,7 @@ class ParamGroupBuilder:
                 'lr': self.base_lr
             }]
         else:
-            raise ValueError(f"Unknown param grouping {self.param_grouping}")
+            raise ValueError(f"Unknown param grouping {self.param_grouping[0]}")
 
 
 
@@ -106,8 +108,8 @@ def get_lr_scale_for_zone(zone: str) -> float:
     }
     return LR_SCALES[zone]
 
-def get_raw_unet_module_lr_scales() -> dict[str, float]:
-    with open(os.path.join(os.path.dirname(__file__), 'grad_ratios.json'), 'r') as f:
+def get_raw_unet_module_lr_scales(path) -> dict[str, float]:
+    with open(path, 'r') as f:
         d = json.load(f)
         return {n: 1/r for n, r in d.items()}  # invert to get lr scale multipliers
         #return {n: min(100, max(0.01, 1/r)) for n, r in d.items()}  # clamp to avoid extreme outliers

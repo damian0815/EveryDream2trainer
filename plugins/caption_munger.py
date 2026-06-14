@@ -2,7 +2,6 @@ import json
 import logging
 import random
 import re
-import time
 import os
 
 from tqdm.auto import tqdm
@@ -23,18 +22,18 @@ replace_dots_with_commas_p = 0.3
 
 
 
-shuffle_sentences_p = 0.02
-too_long_caption_shuffle_sentences_p = 0.5
-shuffle_phrases_within_sentences_p = 0.01
-keep_first_phrase_p = 1
-keep_first_sentence_p = 0.98
+SHUFFLE_SENTENCES_P = 0.02
+TOO_LONG_CAPTION_SHUFFLE_SENTENCES_P = 0.5
+SHUFFLE_PHRASES_WITHIN_SENTENCES_P = 0.01
+KEEP_FIRST_PHRASE_P = 1
+KEEP_FIRST_SENTENCE_P = 0.98
 
-rotate_sentences_p = 0.02
-too_long_caption_rotate_sentences_p = 0.75
+ROTATE_SENTENCES_P = 0.02
+TOO_LONG_CAPTION_ROTATE_SENTENCES_P = 0.75
 
-truncate_sentences_p = 0
-ending_dot_p = 0.5
-replace_dots_with_commas_p = 0.02
+TRUNCATE_SENTENCES_P = 0
+ENDING_DOT_P = 0.5
+REPLACE_DOTS_WITH_COMMAS_P = 0.02
 
 caption_variants = None
 
@@ -62,12 +61,12 @@ class CaptionMungerPlugin(BasePlugin):
             append_prepend_root = self.config['per_file_prepend_append_root_folder']
             logging.info(f" * CaptionMungerPlugin: loading per-file prepend/append from {append_prepend_root}")
             with tqdm(desc="Loading per-file prepend/append", unit=" paths") as pbar:
-                for dir, _, files in os.walk(append_prepend_root):
+                for directory, _, files in os.walk(append_prepend_root):
                     for file in files:
                         if file.endswith('.txt'):
                             continue
                         pbar.update(1)
-                        reference_file = os.path.join(dir, file)
+                        reference_file = os.path.join(directory, file)
                         try:
                             insert_file = os.path.splitext(reference_file)[0] + '.txt'
                             with open(insert_file, 'rt') as f:
@@ -88,9 +87,7 @@ class CaptionMungerPlugin(BasePlugin):
         self.tokenizer = kwargs['tokenizer']
 
     def transform_caption_parts(self, caption:str) -> str:
-
         parts = [s.strip() for s in caption.split("||")]
-
         shuffle_p = 0.3
         truncate_p = 0.3
         if shuffle_p > random.random():
@@ -156,7 +153,7 @@ class CaptionMungerPlugin(BasePlugin):
             parts = [p.strip() for p in caption.split("<<then>>")]
             prefix = handle_shufbreak(parts[0],
                                       keep_first_sentence_p=1,
-                                      shuffle_sentences_p=shuffle_sentences_p,
+                                      shuffle_sentences_p=SHUFFLE_SENTENCES_P,
                                       truncate_sentences_p=0)
             caption = "<<shufbreak>>".join(parts[1:])
 
@@ -166,32 +163,32 @@ class CaptionMungerPlugin(BasePlugin):
             parts = [p.strip() for p in caption.split("<<finally>>")]
             suffix = handle_shufbreak(parts[-1],
                                       keep_first_sentence_p=0,
-                                      shuffle_sentences_p=shuffle_sentences_p,
-                                      truncate_sentences_p=truncate_sentences_p)
+                                      shuffle_sentences_p=SHUFFLE_SENTENCES_P,
+                                      truncate_sentences_p=TRUNCATE_SENTENCES_P)
             caption = "<<shufbreak>>".join(parts[:-1])
 
-        tokens = _get_tokens_full(caption, prefix, suffix, self.tokenizer)
-        if len(tokens) <= 75:
-            actual_shuffle_sentences_p = shuffle_sentences_p
-            actual_rotate_sentences_p = rotate_sentences_p
+        approx_token_count = _estimate_token_count(caption, prefix, suffix, self.tokenizer)
+        if self.tokenizer is None or approx_token_count <= self.tokenizer.model_max_length - 10:
+            actual_shuffle_sentences_p = SHUFFLE_SENTENCES_P
+            actual_rotate_sentences_p = ROTATE_SENTENCES_P
         else:
             # long captions get slightly different handling
-            if too_long_caption_rotate_sentences_p > random.random():
-                actual_shuffle_sentences_p = shuffle_sentences_p
+            if TOO_LONG_CAPTION_ROTATE_SENTENCES_P > random.random():
+                actual_shuffle_sentences_p = SHUFFLE_SENTENCES_P
                 actual_rotate_sentences_p = 1
             else:
-                actual_shuffle_sentences_p = too_long_caption_shuffle_sentences_p
+                actual_shuffle_sentences_p = TOO_LONG_CAPTION_SHUFFLE_SENTENCES_P
                 actual_rotate_sentences_p = 0
 
         out_caption = handle_shufbreak(
             caption,
-            keep_first_sentence_p=0 if len(prefix.strip()) > 0 else keep_first_sentence_p,
+            keep_first_sentence_p=0 if len(prefix.strip()) > 0 else KEEP_FIRST_SENTENCE_P,
             shuffle_sentences_p=actual_shuffle_sentences_p,
-            truncate_sentences_p=truncate_sentences_p,
+            truncate_sentences_p=TRUNCATE_SENTENCES_P,
             rotate_sentences_p=actual_rotate_sentences_p,
         )
 
-        if replace_dots_with_commas_p > random.random():
+        if REPLACE_DOTS_WITH_COMMAS_P > random.random():
             out_caption = out_caption.replace(". ", ", ")
 
         if len(prefix.strip()) > 0:
@@ -203,7 +200,7 @@ class CaptionMungerPlugin(BasePlugin):
                 out_caption += '. '
             out_caption += suffix
 
-        if ending_dot_p > random.random():
+        if ENDING_DOT_P > random.random():
             out_caption += "."
 
         return out_caption
@@ -253,16 +250,19 @@ class CaptionMungerPlugin(BasePlugin):
             return caption[0:insert_pos] + " " + insert_str + "." + caption[insert_pos:]
 
 
-def _get_tokens_full(caption_with_shufbreaks, prefix, suffix, tokenizer: CLIPTokenizer) -> list[str]:
-    full_caption = ''
-
+def _estimate_token_count(caption_with_shufbreaks, prefix, suffix, tokenizer):
+    # throwaway, inaccurate result
+    caption_no_shufbreaks = ''
     if len(prefix.strip()) > 0:
-        full_caption += prefix
-    full_caption += caption_with_shufbreaks.replace('<<shufbreak>>', '. ')
+        caption_no_shufbreaks = prefix + '. ' + caption_with_shufbreaks
+    caption_no_shufbreaks += caption_with_shufbreaks.replace('<<shufbreak>>', '. ')
     if len(suffix.strip()) > 0:
-        full_caption += suffix
-
-    return tokenizer.tokenize(full_caption)
+        caption_no_shufbreaks += '. ' + suffix
+    caption_no_shufbreaks.replace(". .", ".")
+    if tokenizer is not None:
+        return len(tokenizer.tokenize(caption_no_shufbreaks))
+    # estimate: 4 tokens ~= 3 words
+    return round(len(caption_no_shufbreaks.split()) * 4 / 3)
 
 
 def partial_shuffle(l, factor=5):
@@ -277,7 +277,7 @@ def shuffle_on_doublebar(sentence: str) -> str:
     phrases = [s.strip() for s in sentence.split('||')]
     phrases = [p for p in phrases if len(p) > 0]
     # possibly preserve first phrase
-    first_phrase = phrases.pop(0) if keep_first_phrase_p > random.random() else None
+    first_phrase = phrases.pop(0) if KEEP_FIRST_PHRASE_P > random.random() else None
     partial_shuffle(phrases, factor=len(phrases))
     if first_phrase is not None:
         phrases.insert(0, first_phrase)
@@ -307,7 +307,7 @@ def handle_shufbreak(caption: str,
     truncate_after_idx = random.randint(0, len(in_sentences))
 
     for i in range(len(in_sentences)):
-        if shuffle_phrases_within_sentences_p > random.random():
+        if SHUFFLE_PHRASES_WITHIN_SENTENCES_P > random.random():
             in_sentences[i] = shuffle_on_doublebar(in_sentences[i])
         else:
             in_sentences = [s.replace('||', ', ') for s in in_sentences]

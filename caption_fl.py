@@ -151,7 +151,7 @@ def main(args):
 
                 input_ids = lang_x["input_ids"].to(device)
 
-                with torch.cuda.amp.autocast(dtype=dtype), torch.no_grad():
+                with torch.amp.autocast('cuda', dtype=dtype), torch.no_grad():
                     generated_text = model.generate(
                         vision_x=vision_x,
                         lang_x=input_ids,

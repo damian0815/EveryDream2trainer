@@ -18,6 +18,7 @@ import json
 import logging
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
 
 import math
 import os
@@ -139,6 +140,103 @@ class ImageCaption:
 
         return ", ".join(tags)
 
+@dataclass
+class ResolutionOption:
+    """Candidate resolution assignment for one (image, resolution) pair."""
+    resolution: int                 # e.g. 512 or 1024
+    target_wh: list                 # selected aspect-ratio bucket, e.g. [512, 768]
+    unnormalised_weight: float      # from per_resolution_multiply, or 1.0 if absent
+    is_feasible: bool               # True if image is large enough for this resolution
+
+
+class ImageSourceItem:
+    """
+    Wraps one ImageTrainItem (the 'base item') together with per-resolution options.
+
+    Resolution assignment is deferred to shuffle time.  Call make_resolved_item(r) to
+    mutate the base item for resolution r and receive it as a resolved ImageTrainItem
+    ready for training.
+
+    !! MUTATION WARNING !!
+    make_resolved_item() mutates self.item IN PLACE and returns it directly (not a
+    copy).  This is intentional — it avoids heap allocation — but it means:
+
+      1. The returned reference IS self.item.  A subsequent call to make_resolved_item
+         will overwrite self.item's resolution fields AND be visible through any
+         reference previously returned.
+
+      2. The same ImageSourceItem must NOT be passed to make_resolved_item more than
+         once per epoch without deep-copying the source first.  assign_resolutions()
+         in resolution_sampler.py enforces this for multiplier > 1 cases.
+    """
+
+    def __init__(self, item: 'ImageTrainItem', resolution_options: dict, uid: str):
+        self.item = item
+        self.resolution_options: dict[int, ResolutionOption] = resolution_options
+        # Stable source-level identifier used as dict key in multiplier dicts.
+        # Never reassigned after construction, unlike self.item.uid which changes
+        # each time make_resolved_item() is called.
+        self.uid = uid
+
+    # ------------------------------------------------------------------
+    # Attribute delegation — allows DifficultyEstimator, DataLoaderMultiAspect
+    # and other callers to read/write item fields without knowing about the wrapper.
+    # ------------------------------------------------------------------
+
+    @property
+    def multiplier(self): return self.item.multiplier
+    @multiplier.setter
+    def multiplier(self, v): self.item.multiplier = v
+
+    @property
+    def base_multiplier(self): return self.item.base_multiplier
+    @base_multiplier.setter
+    def base_multiplier(self, v): self.item.base_multiplier = v
+
+    @property
+    def caption(self): return self.item.caption
+    @property
+    def pathname(self): return self.item.pathname
+    @property
+    def error(self): return self.item.error
+    @property
+    def image_size(self): return self.item.image_size
+    @property
+    def batch_id(self): return self.item.batch_id
+    @property
+    def cond_dropout(self): return self.item.cond_dropout
+    @cond_dropout.setter
+    def cond_dropout(self, v): self.item.cond_dropout = v
+    @property
+    def shuffle_tags(self): return self.item.shuffle_tags
+    @property
+    def loss_scale(self): return self.item.loss_scale
+    @property
+    def timesteps_range(self): return self.item.timesteps_range
+
+    def is_feasible_for_any_resolution(self) -> bool:
+        """True if at least one resolution is large enough for this image."""
+        return any(opt.is_feasible for opt in self.resolution_options.values())
+
+    def make_resolved_item(self, resolution: int) -> 'ImageTrainItem':
+        """
+        !! MUTATES self.item — see class docstring !!
+
+        Assigns target_wh, is_undersized, uid, and source_resolution on self.item for
+        the chosen resolution, then returns self.item directly (NOT a copy).
+
+        Calling this method a second time on the same instance will overwrite the
+        fields set by the first call, including on any reference previously returned.
+        deep-copy the ImageSourceItem first if you need multiple resolved variants.
+        """
+        opt = self.resolution_options[resolution]
+        self.item.target_wh         = opt.target_wh
+        self.item.is_undersized     = not opt.is_feasible
+        self.item.uid               = uuid.uuid4().hex   # fresh uid per resolution assignment
+        self.item.source_resolution = resolution
+        return self.item
+
+
 class ImageTrainItem:
     """
     image: PIL.Image
@@ -168,6 +266,7 @@ class ImageTrainItem:
         self.cropped_img = None
         self.runt_size = 0
         self.multiplier = multiplier
+        self.base_multiplier = multiplier  # preserved so difficulty schedulers can scale relative to user intent
         self.cond_dropout = cond_dropout
         self.shuffle_tags = shuffle_tags
         self.batch_id = batch_id or DEFAULT_BATCH_ID
@@ -176,6 +275,9 @@ class ImageTrainItem:
         self.target_wh = None
         self.is_runt = False
         self.uid = uuid.uuid4().hex
+        # Set by ImageSourceItem.make_resolved_item(); None for items created
+        # directly via the old ImageTrainItem constructor path.
+        self.source_resolution: int = None
 
         self.image_size = None
         if image is None or len(image) == 0:
@@ -183,7 +285,6 @@ class ImageTrainItem:
         else:
             self.image = image
             self.image_size = image.size
-            #self.target_size = None
         self.mask = None
 
         self.is_undersized = False
@@ -236,7 +337,7 @@ class ImageTrainItem:
         randomly crops the image by a percentage of the image size on each of the four sides
         """
         width, height = image.size
-        max_crop_pixels = int(min(width, height) * crop_jitter)
+        max_crop_pixels = int(min(512, width, height) * crop_jitter)
 
         left_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
         right_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
@@ -337,11 +438,11 @@ class ImageTrainItem:
                 if mask.size[0] != width or mask.size[1] != height:
                     logging.error(f"found a mask at {self.pathname_mask} but it was the wrong size (image size {image.size}, mask size {mask.size}) - ignoring mask")
                     mask = None
-    
+
             img_jitter = min((width-self.target_wh[0])/self.target_wh[0], (height-self.target_wh[1])/self.target_wh[1])
             img_jitter = min(img_jitter, crop_jitter)
             img_jitter = max(img_jitter, 0.0)
-            
+
             uncropped_width, uncropped_height = image.size
             if img_jitter > 0.0:
                 jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
