@@ -332,29 +332,31 @@ class ImageTrainItem:
             pass
         return image
 
-    def _get_random_jitter_amounts(self, image, crop_jitter=0.02):
+    def _get_random_jitter_amounts(self, image, crop_jitter=0.02, rng=None):
         """
         randomly crops the image by a percentage of the image size on each of the four sides
         """
         width, height = image.size
         max_crop_pixels = int(min(512, width, height) * crop_jitter)
 
-        left_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
-        right_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
-        top_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
-        bottom_crop_pixels = int(round(random.uniform(0, max_crop_pixels)))
+        _rng = rng if rng is not None else random
+
+        left_crop_pixels = int(round(_rng.uniform(0, max_crop_pixels)))
+        right_crop_pixels = int(round(_rng.uniform(0, max_crop_pixels)))
+        top_crop_pixels = int(round(_rng.uniform(0, max_crop_pixels)))
+        bottom_crop_pixels = int(round(_rng.uniform(0, max_crop_pixels)))
 
         return left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels
 
-    def _apply_crop_jitter(self, image, crop_jitter=0.02, precomputed_jitter: tuple[int, int, int, int]=None):
+    def _apply_crop_jitter(self, image, crop_jitter=0.02, precomputed_jitter: tuple[int, int, int, int]=None, rng=None):
         """
         crops the image by a percentage of the image size on each of the four sides.
         """
         width, height = image.size
-        if precomputed_jitter is None:
+        if precomputed_jitter is not None:
             left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = precomputed_jitter
         else:
-            left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = self._get_random_jitter_amounts(image, crop_jitter=crop_jitter)
+            left_crop_pixels, right_crop_pixels, top_crop_pixels, bottom_crop_pixels = self._get_random_jitter_amounts(image, crop_jitter=crop_jitter, rng=rng)
 
         # print(f"{left_crop_pixels}, {right_crop_pixels}, {top_crop_pixels}, {bottom_crop_pixels}, ")
 
@@ -382,16 +384,19 @@ class ImageTrainItem:
             print(f"error for debug saving image of {self.pathname}: {e}")
             pass
 
-    def _trim_to_aspect(self, image, target_wh) -> tuple[PIL.Image, tuple[int, int]]:
+    def _trim_to_aspect(self, image, target_wh, rng=None) -> tuple[PIL.Image, tuple[int, int]]:
         try:
             width, height = image.size
             target_aspect = target_wh[0] / target_wh[1] # 0.60
             image_aspect = width / height # 0.5865
             #self._debug_save_image(image, "precrop")
+
+            _rng = rng if rng is not None else random
+
             if image_aspect > target_aspect:
                 target_width = int(height * target_aspect)
                 overwidth = width - target_width
-                l = random.triangular(0, overwidth)
+                l = _rng.triangular(0, overwidth)
                 #print(f"l: {l}, overwidth: {overwidth}")
                 l = max(0, l)
                 l = int(min(l, overwidth))
@@ -402,7 +407,7 @@ class ImageTrainItem:
             elif target_aspect > image_aspect:
                 target_height = int(width / target_aspect)
                 overheight = height - target_height
-                t = random.triangular(0, overheight)
+                t = _rng.triangular(0, overheight)
                 #print(f"t: {t}, overheight: {overheight}")
                 t = max(0, t)
                 t = int(min(t, overheight))
@@ -417,7 +422,7 @@ class ImageTrainItem:
             logging.error(f"fatal error trimming image {self.pathname}: {e}")
             raise e
 
-    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, invert_mask=False, return_crop_info=False
+    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, invert_mask=False, return_crop_info=False, rng=None
                 ) -> typing.Union['ImageTrainItem',
                                   tuple['ImageTrainItem', tuple[int, int, int, int]]]:
         try:
@@ -445,7 +450,7 @@ class ImageTrainItem:
 
             uncropped_width, uncropped_height = image.size
             if img_jitter > 0.0:
-                jitter_amounts = self._get_random_jitter_amounts(image, img_jitter)
+                jitter_amounts = self._get_random_jitter_amounts(image, img_jitter, rng=rng)
                 image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
                 if mask is not None:
                     mask = self._apply_crop_jitter(mask, precomputed_jitter=jitter_amounts)
@@ -453,9 +458,9 @@ class ImageTrainItem:
                 jitter_amounts = (0, 0, 0, 0)
             crop_topleft = (jitter_amounts[0], jitter_amounts[2])
 
-            image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh)
+            image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh, rng=rng)
             if mask is not None:
-                mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh)
+                mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh, rng=rng)
             crop_topleft = (crop_topleft[0] + trim_crop_offset[0], crop_topleft[1] + trim_crop_offset[1])
             cropped_width = image.size[0]
 
@@ -473,7 +478,8 @@ class ImageTrainItem:
             if max(math.log(image.size[1] / uncropped_height), math.log(image.size[0] / uncropped_width)) < -0.1:
                 uncropped_width, uncropped_height = uncropped_width * image_scale_factor, uncropped_height * image_scale_factor
 
-            if random.random() < self.flip.p:
+            _rng = rng if rng is not None else random
+            if _rng.random() < self.flip.p:
                 image = TF.hflip(image)
                 if mask is not None:
                     mask = TF.hflip(mask)

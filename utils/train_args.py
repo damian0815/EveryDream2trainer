@@ -9,9 +9,7 @@ points.  Script-specific args (e.g. --model_id for SANA) are added via the
 
 import argparse
 import json
-import logging
 import random
-
 
 # ---------------------------------------------------------------------------
 # JSON config loading
@@ -500,5 +498,39 @@ def parse_train_args(
     if args.seed == -1:
         args.seed = random.randint(0, 2**30)
 
+    _coerce_resolution_args_to_lists(args)
+
+    if args.optimizer_batch_size is not None:
+        if args.initial_batch_size is None:
+            args.initial_batch_size = args.optimizer_batch_size
+        else:
+            print(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.final_batch_size}")
+        if args.final_batch_size is None:
+            args.final_batch_size = args.optimizer_batch_size
+        else:
+            print(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --final_batch_size {args.final_batch_size}")
+
+
     return args
 
+def _coerce_resolution_args_to_lists(args):
+    if type(args.resolution) is not list:
+        args.resolution = [args.resolution]
+
+    if len(args.resolution_multiplier) > 0 and len(args.resolution_multiplier) != len(args.resolution):
+        raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution {args.resolution} --resolution_multiplier {args.resolution_multiplier})")
+
+    def force_to_resolution_mapped_list_and_validate(value, name):
+        if type(value) is not list:
+            value = [value]
+        if len(value) != len(args.resolution):
+            if len(value) > 1:
+                raise ValueError(
+                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join([str(v) for v in value])})")
+            elif len(value) == 1:
+                # expand to one per resolution
+                value = value * len(args.resolution)
+        return value
+
+    args.max_backward_slice_size = force_to_resolution_mapped_list_and_validate(args.max_backward_slice_size, "max_backward_slice_size")
+    args.forward_slice_size = force_to_resolution_mapped_list_and_validate(args.forward_slice_size, "forward_slice_size")

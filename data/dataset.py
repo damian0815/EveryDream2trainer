@@ -11,6 +11,7 @@ from data.image_train_item import (
     ImageCaption, ImageTrainItem, ImageSourceItem, ResolutionOption,
     check_caption_json, _needs_transpose, DEFAULT_BATCH_ID,
 )
+from data.video_train_item import VideoTrainItem
 import PIL.Image
 from torchvision import transforms
 from utils.fs_helpers import *
@@ -253,9 +254,13 @@ class Dataset:
                 img_cfg = Dataset.__sidecar_cfg(img, fileset)
                 resolved_cfg = ImageConfig.fold([global_cfg, local_cfg, img_cfg])
                 ensured = Dataset.__ensure_caption(resolved_cfg, img)
-                #for m in ensured.main_prompts.keys():
-                #    check_caption_json(m)
                 image_configs[img] = ensured
+
+            for vid in filter(is_video, files):
+                vid_cfg = Dataset.__sidecar_cfg(vid, fileset)
+                resolved_cfg = ImageConfig.fold([global_cfg, local_cfg, vid_cfg])
+                ensured = Dataset.__ensure_caption(resolved_cfg, vid)
+                image_configs[vid] = ensured
 
             return global_cfg
 
@@ -358,41 +363,62 @@ class Dataset:
 
             caption = _build_caption(config)
             abs_path = os.path.abspath(image_path)
-            image_size, error, resolution_options = _compute_resolution_options(
-                abs_path,
-                aspects_per_resolution,
-                config.per_resolution_multiply or {},
-            )
 
-            # Build the base ImageTrainItem via __new__ to avoid re-opening the image
-            # file in __compute_target_width_height.  Resolution-dependent fields
-            # (target_wh, is_undersized, uid, source_resolution) are intentionally left
-            # unset here; they are assigned later by ImageSourceItem.make_resolved_item().
-            base_item = ImageTrainItem.__new__(ImageTrainItem)
-            base_item.caption         = caption
-            base_item.aspects         = []          # not used in multi-resolution path
-            base_item.pathname        = abs_path
-            flip_p                    = config.flip_p or 0.0
-            base_item.flip            = transforms.RandomHorizontalFlip(p=flip_p)
-            base_item.cropped_img     = None
-            base_item.runt_size       = 0
-            mult                      = config.multiply or 1.0
-            base_item.multiplier      = mult
-            base_item.base_multiplier = mult
-            base_item.cond_dropout    = config.cond_dropout
-            base_item.shuffle_tags    = config.shuffle_tags or False
-            base_item.batch_id        = config.batch_id or DEFAULT_BATCH_ID
-            base_item.loss_scale      = config.loss_scale or 1.0
-            base_item.timesteps_range = config.timesteps_range
-            base_item.target_wh       = None        # assigned by make_resolved_item()
-            base_item.is_runt         = False
-            base_item.uid             = uuid.uuid4().hex
-            base_item.source_resolution = None
-            base_item.image_size      = image_size
-            base_item.mask            = None
-            base_item.image           = []
-            base_item.is_undersized   = False       # assigned by make_resolved_item()
-            base_item.error           = error
+            if is_video(image_path):
+                resolution_options, image_size, error = _compute_video_resolution_options(
+                    abs_path, aspects_per_resolution, config.per_resolution_multiply or {},
+                )
+                base_item = VideoTrainItem(
+                    pathname=abs_path,
+                    caption=caption,
+                    target_wh=list(aspects_per_resolution.values())[0][0] if aspects_per_resolution else None,
+                    video_frames=81,
+                    flip_p=config.flip_p or 0.0,
+                    multiplier=config.multiply or 1.0,
+                    cond_dropout=config.cond_dropout,
+                    shuffle_tags=config.shuffle_tags or False,
+                    batch_id=config.batch_id or DEFAULT_BATCH_ID,
+                    loss_scale=config.loss_scale or 1.0,
+                    timesteps_range=config.timesteps_range,
+                )
+                base_item.target_wh       = None  # assigned by make_resolved_item()
+                base_item.is_undersized   = False
+                base_item.runt_size       = 0
+                base_item.source_resolution = None
+                base_item.image_size      = image_size
+                base_item.error           = error
+            else:
+                image_size, error, resolution_options = _compute_image_resolution_options(
+                    abs_path,
+                    aspects_per_resolution,
+                    config.per_resolution_multiply or {},
+                )
+                # Build the base ImageTrainItem via __new__ to avoid re-opening
+                base_item = ImageTrainItem.__new__(ImageTrainItem)
+                base_item.caption         = caption
+                base_item.aspects         = []
+                base_item.pathname        = abs_path
+                flip_p                    = config.flip_p or 0.0
+                base_item.flip            = transforms.RandomHorizontalFlip(p=flip_p)
+                base_item.cropped_img     = None
+                base_item.runt_size       = 0
+                mult                      = config.multiply or 1.0
+                base_item.multiplier      = mult
+                base_item.base_multiplier = mult
+                base_item.cond_dropout    = config.cond_dropout
+                base_item.shuffle_tags    = config.shuffle_tags or False
+                base_item.batch_id        = config.batch_id or DEFAULT_BATCH_ID
+                base_item.loss_scale      = config.loss_scale or 1.0
+                base_item.timesteps_range = config.timesteps_range
+                base_item.target_wh       = None
+                base_item.is_runt         = False
+                base_item.uid             = uuid.uuid4().hex
+                base_item.source_resolution = None
+                base_item.image_size      = image_size
+                base_item.mask            = None
+                base_item.image           = []
+                base_item.is_undersized   = False
+                base_item.error           = error
 
             source_item = ImageSourceItem(
                 item=base_item,
@@ -425,7 +451,7 @@ def _build_caption(config: 'ImageConfig') -> ImageCaption:
     )
 
 
-def _compute_resolution_options(
+def _compute_image_resolution_options(
     pathname: str,
     aspects_per_resolution: dict,
     per_resolution_multiply: dict,
@@ -451,25 +477,54 @@ def _compute_resolution_options(
                 height, width = img.size
             else:
                 width, height = img.size
-            image_size = (width, height)
-            image_aspect = width / height
-            for resolution, aspects in aspects_per_resolution.items():
-                target_wh = min(aspects, key=lambda wh: abs(wh[0] / wh[1] - image_aspect))
-                is_feasible = not (
-                    (width != target_wh[0] and height != target_wh[1])
-                    and (width * height) < (target_wh[0] * 1.02 * target_wh[1] * 1.02)
-                )
-                weight = per_resolution_multiply.get(resolution, 1.0)
-                resolution_options[resolution] = ResolutionOption(
-                    resolution=resolution,
-                    target_wh=target_wh,
-                    unnormalised_weight=weight,
-                    is_feasible=is_feasible,
-                )
+        resolution_options = _compute_resolution_options(width, height, aspects_per_resolution, per_resolution_multiply)
     except Exception as e:
         error = e
     return image_size, error, resolution_options
 
+
+def _compute_video_resolution_options(
+    pathname: str,
+    aspects_per_resolution: dict,
+    per_resolution_multiply: dict,
+) -> tuple:
+    """
+    Compute resolution options for a video file.
+    Uses the first resolution from aspects_per_resolution directly,
+    since videos don't do aspect-ratio bucketing.
+    """
+    import decord
+
+    resolution_options: dict[int, ResolutionOption] = {}
+    image_size = None
+    error = None
+    try:
+        vr = decord.VideoReader(pathname)
+        frame = vr[0].asnumpy()
+        height, width = frame.shape[:2]
+        resolution_options = _compute_resolution_options(width, height, aspects_per_resolution, per_resolution_multiply)
+    except Exception as e:
+        error = e
+    return resolution_options, image_size, error
+
+def _compute_resolution_options(width, height, aspects_per_resolution, per_resolution_multiply):
+    image_size = (width, height)
+    image_aspect = width / height
+    resolution_options = {}
+    for resolution, aspects in aspects_per_resolution.items():
+        target_wh = min(aspects, key=lambda wh: abs(wh[0] / wh[1] - image_aspect))
+        is_feasible = not (
+            (width != target_wh[0] and height != target_wh[1])
+            and (width * height) < (target_wh[0] * 1.02 * target_wh[1] * 1.02)
+        )
+        weight = per_resolution_multiply.get(resolution, 1.0)
+        resolution_options[resolution] = ResolutionOption(
+            resolution=resolution,
+            target_wh=target_wh,
+            unnormalised_weight=weight,
+            is_feasible=is_feasible,
+        )
+    return resolution_options
 
 def select_caption_variants(
     captions_dict: dict[str, list[str]],

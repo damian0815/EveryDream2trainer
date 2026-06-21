@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import copy
+import hashlib
 import logging
 import os
 import statistics
@@ -27,6 +28,7 @@ from typing_extensions import Literal
 
 from data.data_loader import DataLoaderMultiAspect
 from data.image_train_item import ImageTrainItem, check_caption_json
+from data.video_train_item import VideoTrainItem
 import random
 from torchvision import transforms
 from plugins.plugins import PluginRunner
@@ -61,6 +63,7 @@ class EveryDreamBatch(Dataset):
                  invert_masks=False,
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0,
+                 default_motion_score=30,
                  ):
 
         if plugin_runner is None:
@@ -68,6 +71,7 @@ class EveryDreamBatch(Dataset):
             plugin_runner = PluginRunner()
 
         self.contrastive_loss_batch_ids = contrastive_loss_batch_ids or []
+        self.default_motion_score = default_motion_score
         self.data_loader = data_loader
         self.batch_size = data_loader.batch_size
         self.debug_level = debug_level
@@ -126,7 +130,7 @@ class EveryDreamBatch(Dataset):
     def __getitem__(self, i):
         example = {}
 
-        train_item: dict = self.get_image_for_trainer(self.image_train_items[i], self.debug_level)
+        train_item: dict = self.get_image_for_trainer(self.image_train_items[i], self.debug_level, batch_index=i)
         example["pathname"] = train_item["pathname"]
 
         use_imagenet_norm_std = False # done in VAE encode
@@ -155,6 +159,8 @@ class EveryDreamBatch(Dataset):
             example["caption"] = train_item["caption"].get_shuffled_caption(self.seed, keep_tags=self.keep_tags)
         else:
             example["caption"] = train_item["caption"].get_caption()
+        if train_item.get("is_video"):
+            example["caption"] = _inject_motion_score(example["caption"], self.default_motion_score)
         check_caption_json(example["caption"])
 
         if self.random_instance.random() <= self.contrastive_learning_dropout_p:
@@ -163,8 +169,14 @@ class EveryDreamBatch(Dataset):
         if train_item["image"] is None:
             example["image"] = None
         else:
-            example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
-            example["image"] = image_transforms(example["image"]) # range [-1, 1]
+            if train_item.get("is_video"):
+                frames_np = train_item["image"]
+                frames_pt = torch.from_numpy(frames_np).float() / 127.5 - 1.0
+                frames_pt = frames_pt.permute(3, 0, 1, 2)
+                example["image"] = frames_pt
+            else:
+                example["image"] = self.plugin_runner.run_transform_pil_image(train_item["image"])
+                example["image"] = image_transforms(example["image"]) # range [-1, 1]
         if train_item["mask"] is not None:
             mask_transforms = transforms.Compose(
                 [
@@ -207,20 +219,54 @@ class EveryDreamBatch(Dataset):
 
         return example
 
-    def get_image_for_trainer(self, image_train_item: ImageTrainItem, debug_level=0):
+    def get_image_for_trainer(self, image_train_item, debug_level=0, batch_index=0):
         example = {}
         save = debug_level > 2
 
         do_contrastive_learning = (image_train_item.batch_id in self.contrastive_loss_batch_ids)
+
+        path_hash = int(hashlib.md5(image_train_item.pathname.encode()).hexdigest(), 16) & 0x7fffffff
+        rng = random.Random(self.seed ^ path_hash ^ batch_index)
+
+        is_video_item = getattr(image_train_item, 'is_video', False)
+        if is_video_item:
+            crop_jitter = (0.0
+                           if image_train_item.runt_size > 0
+                           else self.crop_jitter)
+            image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(
+                save=save, crop_jitter=crop_jitter, load_mask=False, invert_mask=False,
+                return_crop_info=True, rng=rng,
+            )
+            example["is_video"] = True
+            example["image"] = image_train_tmp.frames
+            example["mask"] = None
+            example["caption"] = image_train_tmp.caption
+            example["cond_dropout"] = image_train_tmp.cond_dropout
+            example["runt_size"] = image_train_tmp.runt_size
+            example["shuffle_tags"] = image_train_tmp.shuffle_tags
+            example["loss_scale"] = image_train_tmp.loss_scale
+            example["batch_id"] = image_train_tmp.batch_id
+            example["do_contrastive_learning"] = do_contrastive_learning
+            example["timesteps_range"] = image_train_tmp.timesteps_range
+            example["pathname"] = image_train_tmp.pathname
+            example["add_time_ids"] = _get_add_time_ids(
+                original_size_hw=(uncropped_h, uncropped_w),
+                target_size_hw=(image_train_item.target_wh[1], image_train_item.target_wh[0]),
+                crops_coords_top_left=(crop_tl_y, crop_tl_x),
+                dtype=torch.float32,
+            )
+            return example
+
         crop_jitter = (0.0
-                       if image_train_item.runt_size > 0 # and do_contrastive_learning
+                       if image_train_item.runt_size > 0
                        else self.crop_jitter)
-        load_mask = (random.random() < self.mask_p)
-        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=load_mask, invert_mask=self.invert_masks, return_crop_info=True)
-        example["image"] = None if image_train_tmp.image is None else image_train_tmp.image.copy() # hack for now to avoid memory leak
-        example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy() # hack for now to avoid memory leak
-        image_train_tmp.image = None # hack for now to avoid memory leak
-        image_train_tmp.mask = None # hack for now to avoid memory leak
+
+        load_mask = (rng.random() < self.mask_p)
+        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=load_mask, invert_mask=self.invert_masks, return_crop_info=True, rng=rng)
+        example["image"] = None if image_train_tmp.image is None else image_train_tmp.image.copy()
+        example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy()
+        image_train_tmp.image = None
+        image_train_tmp.mask = None
         example["caption"] = image_train_tmp.caption
         example["cond_dropout"] = image_train_tmp.cond_dropout
         example["runt_size"] = image_train_tmp.runt_size
@@ -486,3 +532,11 @@ def _get_add_time_ids(
 
         add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
         return add_time_ids
+
+
+def _inject_motion_score(str_caption: str, int_score: int) -> str:
+    """
+    Appends the motion score to a caption string as required by SANA-Video.
+    Example: "A cat baking a cake." -> "A cat baking a cake. motion score: 30."
+    """
+    return f"{str_caption} motion score: {int_score}."

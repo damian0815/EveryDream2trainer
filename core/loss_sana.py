@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 
@@ -52,15 +54,19 @@ def compute_sana_loss(
     y: torch.Tensor,
     y_mask: torch.Tensor,
     timesteps: torch.Tensor,
-    slice_size: int=None
-) -> torch.Tensor:
+    noise: torch.Tensor = None,
+    slice_size: int = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     One flow-matching forward pass through the SANA transformer.
 
+    Supports both 4D latents (B, C, H, W) for images and 5D latents
+    (B, C, F, H, W) for video.
+
     Args:
-        transformer     : SanaTransformer2DModel (the trained component).
+        transformer     : SanaTransformer2DModel or SanaVideoTransformer3DModel
         noise_scheduler : TrainFlowMatchEulerDiscreteScheduler — used for noising.
-        z               : Clean VAE latents,  shape (B, C, H, W).
+        z               : Clean VAE latents,  shape (B, C, H, W) or (B, C, F, H, W).
         y               : Text embeddings,    shape (B, N, C_text).
         y_mask          : Attention mask,     shape (B, N).
         timesteps       : Float timestep values, shape (B,) — produced by
@@ -68,25 +74,36 @@ def compute_sana_loss(
         slice_size      : Max size of internal processing batch slices (saves VRAM)
 
     Returns:
-        Scalar loss Tensor with grad attached.
+        Tuple of (loss_1d, model_pred, target).
+        loss  : full loss, shape (B, C, H, W) or (B, C, F, H, W).
+        model_pred: model prediction, same shape as z.
+        target   : flow-matching target (noise - z), same shape as z.
     """
+    assert z.ndim in (4, 5), f"Expected 4D (image) or 5D (video) latents, got shape {z.shape}"
 
     if slice_size is not None:
-        results = []
+        results_loss = []
+        results_pred = []
+        results_target = []
         for slice_start in range(0, z.shape[0], slice_size):
             slice_end = slice_start + slice_size
-            results.append(compute_sana_loss(
+            loss_s, pred_s, target_s = compute_sana_loss(
                 transformer=transformer,
                 noise_scheduler=noise_scheduler,
                 z=z[slice_start:slice_end],
                 y=y[slice_start:slice_end],
                 y_mask=y_mask[slice_start:slice_end],
                 timesteps=timesteps[slice_start:slice_end],
+                noise=noise[slice_start:slice_end] if noise is not None else None,
                 slice_size=None
-            ))
-        return torch.cat(results, dim=0)
+            )
+            results_loss.append(loss_s)
+            results_pred.append(pred_s)
+            results_target.append(target_s)
+        return torch.cat(results_loss, dim=0), torch.cat(results_pred, dim=0), torch.cat(results_target, dim=0)
 
-    noise = torch.randn_like(z)
+    if noise is None:
+        noise = torch.randn_like(z)
 
     # Noise via the shared training scheduler path:
     # TrainFlowMatchEulerDiscreteScheduler.add_noise → scale_noise
@@ -111,6 +128,6 @@ def compute_sana_loss(
     # Flow-matching velocity target: v = ε − z₀
     target = noise - z
 
-    # return 1D loss per sample (caller sums/averages)
-    mean_dims = list(range(1, len(target.shape)))
-    return F.mse_loss(model_pred.float(), target.float(), reduction='none').mean(dim=mean_dims)
+    # return full loss
+    loss_full = F.mse_loss(model_pred.float(), target.float(), reduction='none')
+    return loss_full, model_pred, target

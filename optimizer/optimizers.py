@@ -288,7 +288,8 @@ class EveryDreamOptimizer:
         else:
             self.scaler = None
 
-        self.load(args.resume_ckpt)
+        if args.resume_ckpt is not None:
+            self.load(args.resume_ckpt)
         if args.optimizer_progressive_unlock:
             self.progressive_unlock = ProgressiveUnlock(
                 optimizer=self.optimizer_unet,
@@ -1034,6 +1035,11 @@ class EveryDreamOptimizer:
         if optimizer_name:
             optimizer_name = optimizer_name.lower()
 
+            if optimizer_name == "adamw8bit_torchao":
+                import torchao
+                opt_class = torchao.optim.AdamW8bit
+                optimizer = opt_class(param_groups, bf16_stochastic_round=True)
+
             if optimizer_name == "lion":
                 from lion_pytorch import Lion
 
@@ -1683,7 +1689,11 @@ def _get_optimizer_norm(optimizer, name: str) -> float | None:
                 if p in optimizer.state:
                     state = optimizer.state[p]
                     if name in state:
-                        norms.append(torch.norm(state[name]).item() ** 2)
+                        s = state[name]
+                        # Dequantize torchao quantized optimizer states before norm computation
+                        if hasattr(s, 'dequantize'):
+                            s = s.dequantize()
+                        norms.append(torch.norm(s).item() ** 2)
         if len(norms) == 0:
             return None
         return sum(norms) ** 0.5

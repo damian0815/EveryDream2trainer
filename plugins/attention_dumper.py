@@ -59,7 +59,7 @@ class AttentionDumperPlugin(BasePlugin):
                                               model_type='unknown',
                                               all_params=[param],
                                               batch_size=1,
-                                              image_save_cb=save_image_cb)
+                                              media_save_cb=save_image_cb)
                     for prompt_index, prompt_name in [(0, 'negative'), (1, 'positive')]: # typically negative, positive
                         for key, map in attention_collector.get_stacked_maps_by_layer(
                             latents_width=param.width//8,

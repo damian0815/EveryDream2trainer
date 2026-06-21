@@ -1,0 +1,27 @@
+{
+  "batch_size": 1,
+  "seed": 555,
+  "cfgs": [6, 3, 0],
+  "scheduler": "dpm++_2m",
+  "num_inference_steps": 10,
+  "show_progress_bars": true,
+  "generate_pretrain_samples": true,
+  "samples": [
+    {
+      "prompt": ,
+      "negative_prompt": "A chaotic sequence with misshapen, deformed limbs in heavy motion blur, sudden disappearance, jump cuts, jerky movements, rapid shot changes, frames out of sync, inconsistent character shapes, temporal artifacts, jitter, and ghosting effects, creating a disorienting visual experience.",
+      "size": [512, 512],
+      "cfgs": [6]
+    },
+    {
+      "random_caption": true,
+      "size": [512, 512],
+      "cfgs": [6]
+    },
+    {
+      "random_caption": true,
+      "size": [416, 256],
+      "cfgs": [6]
+    }
+  ]
+}

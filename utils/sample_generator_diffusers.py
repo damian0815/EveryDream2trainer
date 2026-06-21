@@ -253,7 +253,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                               model_type: str,
                               all_params: list[ImageGenerationParams],
                               batch_size: int,
-                              image_save_cb,
+                              media_save_cb,
                               generator_device='cpu',
                               pbar_update_cb=None,
                               pbar_desc=None,
@@ -262,7 +262,9 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                               flow_match_shift=1,
                               flow_match_shift_dynamic=False,
                               start_offset=0,
-                              show_individual_image_progress_bars=False
+                              show_individual_image_progress_bars=False,
+                              is_video = False
+
                               ):
     extra_cfgs = extra_cfgs or []
     all_params = sorted(all_params, key=lambda x: get_critical_params(x))
@@ -347,66 +349,90 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                             # pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                             #print("updated scheduler with shift", shift)
 
-                        non_sana_kwargs = {} if isinstance(pipe, SanaPipeline) else dict(
+                        extra_kwargs = dict(
+                            use_resolution_binning=False
+                        ) if isinstance(pipe, SanaPipeline) else dict(
                             pooled_prompt_embeds=pooled_embeds,
                             negative_pooled_prompt_embeds=negative_pooled_embeds,
                             guidance_rescale=p0.cfg_rescale_multiplier
                         )
 
-                        images = pipe(prompt=prompt,
-                                      prompt_embeds=embeds,
-                                      negative_prompt=negative_prompt,
-                                      negative_prompt_embeds=negative_embeds,
-                                      generator=generator,
-                                      width=p0.width,
-                                      height=p0.height,
-                                      guidance_scale=cfg,
-                                      num_inference_steps=p0.steps,
-                                      **non_sana_kwargs
-                                      ).images
+                        if False and isinstance(pipe, SanaPipeline):
+                            width = round(p0.width / 32) * 32
+                            height = round(p0.height / 32) * 32
+                        else:
+                            width = p0.width
+                            height = p0.height
 
-                        for image in images:
-                            draw = ImageDraw.Draw(image)
-                            print_msg = f"cfg:{cfg:.1f}"
+                        pipe_kwargs = dict(
+                            prompt=prompt,
+                            prompt_embeds=embeds,
+                            negative_prompt=negative_prompt,
+                            negative_prompt_embeds=negative_embeds,
+                            generator=generator,
+                            width=width,
+                            height=height,
+                            guidance_scale=cfg,
+                            num_inference_steps=p0.steps,
+                            **extra_kwargs,
+                        )
 
-                            l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
-                            text_width = r - l
-                            text_height = b - t
+                        if is_video:
+                            output = pipe(**pipe_kwargs)
+                            video_frames_list = output.frames[0]
+                            batch_images.append(video_frames_list)
+                        else:
+                            images = pipe(**pipe_kwargs).images
+                            for image in images:
+                                draw = ImageDraw.Draw(image)
+                                print_msg = f"cfg:{cfg:.1f}"
 
-                            x = float(image.width - text_width - 10)
-                            y = float(image.height - text_height - 10)
+                                l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
+                                text_width = r - l
+                                text_height = b - t
 
-                            draw.rectangle((x, y, image.width, image.height), fill="white")
-                            draw.text((x, y), print_msg, fill="black", font=font)
+                                x = float(image.width - text_width - 10)
+                                y = float(image.height - text_height - 10)
 
-                        batch_images.append(images)
-                        del images
+                                draw.rectangle((x, y, image.width, image.height), fill="white")
+                                draw.text((x, y), print_msg, fill="black", font=font)
 
-                    for prompt_idx in range(len(batch)):
-                        #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
-                        result = Image.new('RGB', (p0.width * len(cfgs), p0.height))
-                        x_offset = 0
+                            batch_images.append(images)
+                            del images
 
-                        for cfg_idx in range(len(cfgs)):
-                            image = batch_images[cfg_idx][prompt_idx]
-                            result.paste(image, (x_offset, 0))
-                            x_offset += image.width
+                    if is_video:
+                        for prompt_idx in range(len(batch)):
+                            media_save_cb(batch_images[prompt_idx],
+                                          sample_index=base_sample_index+prompt_idx,
+                                          prompt=batch[prompt_idx].prompt,
+                                          pngmetadata=None
+                                          )
+                    else:
+                        for prompt_idx in range(len(batch)):
+                            #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
+                            result = Image.new('RGB', (p0.width * len(cfgs), p0.height))
+                            x_offset = 0
 
-                        metadata = PngInfo()
-                        invokeai_metadata = update_metadata(METADATA_TEMPLATE,
-                                                            model_node_data,
-                                                            batch[prompt_idx])
-                        auto1111_metadata = get_auto1111_md_for_invoke_md(invokeai_metadata)
-                        metadata.add_text("invokeai_metadata", json.dumps(invokeai_metadata))
-                        metadata.add_text("parameters", auto1111_metadata)
+                            for cfg_idx in range(len(cfgs)):
+                                image = batch_images[cfg_idx][prompt_idx]
+                                result.paste(image, (x_offset, 0))
+                                x_offset += image.width
 
-                        image_save_cb(result,
-                                      sample_index=base_sample_index+prompt_idx,
-                                      prompt=batch[prompt_idx].prompt,
-                                      pngmetadata=metadata)
+                            metadata = PngInfo()
+                            invokeai_metadata = update_metadata(METADATA_TEMPLATE,
+                                                                model_node_data,
+                                                                batch[prompt_idx])
+                            auto1111_metadata = get_auto1111_md_for_invoke_md(invokeai_metadata)
+                            metadata.add_text("invokeai_metadata", json.dumps(invokeai_metadata))
+                            metadata.add_text("parameters", auto1111_metadata)
 
-                        del result
-                    del batch_images
+                            media_save_cb(result,
+                                          sample_index=base_sample_index+prompt_idx,
+                                          prompt=batch[prompt_idx].prompt,
+                                          pngmetadata=metadata)
+
+                            del result
+                        del batch_images
                 except Exception as e:
                     traceback.print_exc()
                     print("Error generating batch, skipping. Error:", repr(e))

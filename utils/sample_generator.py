@@ -13,6 +13,7 @@ from colorama import Fore, Style
 from diffusers import (
     StableDiffusionPipeline,
     SanaPipeline,
+    SanaVideoPipeline,
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     DDPMScheduler,
@@ -34,6 +35,7 @@ from compel import CompelForSD
 import traceback
 
 from core.flow_match_model import SDPipelineInferenceFlowMatchEulerDiscreteScheduler
+from model.sana_training_model import SanaTrainingModel
 from model.training_model import TrainingModel
 from core.semaphore_files import check_semaphore_file_and_unlink
 from utils.sample_generator_diffusers import generate_images_diffusers, ImageGenerationParams
@@ -124,6 +126,10 @@ class SampleGenerator:
 
     is_ztsnr: bool
 
+    is_video: bool = False
+    video_frames: int = 81
+    video_fps: int = 16
+
     def __init__(self,
                  log_folder: str,
                  log_writer: SummaryWriter,
@@ -137,7 +143,10 @@ class SampleGenerator:
                  use_xformers: bool = False,
                  use_penultimate_clip_layer: bool = False,
                  is_ztsnr: bool = False,
-                 guidance_rescale: float = 0):
+                 guidance_rescale: float = 0,
+                 is_video: bool = False,
+                 video_frames: int = 81,
+                 video_fps: int = 16):
         self.log_folder = log_folder
         self.log_writer = log_writer
         self.batch_size = batch_size
@@ -149,6 +158,9 @@ class SampleGenerator:
         self.use_penultimate_clip_layer = use_penultimate_clip_layer
         self.guidance_rescale = guidance_rescale
         self.is_ztsnr = is_ztsnr
+        self.is_video = is_video
+        self.video_frames = video_frames
+        self.video_fps = video_fps
 
         self.default_resolution = default_resolution
         self.default_seed = default_seed
@@ -267,7 +279,7 @@ class SampleGenerator:
             print(f" * Generating samples at gs:{global_step} for {len(self.sample_requests)} prompts (subdir: {samples_subdir})")
 
         sample_index = 0
-        with autocast('cuda', enabled=type(pipe) is not SanaPipeline):
+        with autocast('cuda', enabled=type(pipe) not in (SanaPipeline, SanaVideoPipeline)):
             try:
                 do_regular_samples = self.sample_invokeai_info_dicts_json is None or self.append_invokeai_info_dicts
                 if do_regular_samples:
@@ -280,7 +292,7 @@ class SampleGenerator:
                                       desc=f"{Fore.YELLOW}Image samples (batches of {self.batch_size}){Style.RESET_ALL}")
                     if self.use_penultimate_clip_layer:
                         print(f"{Fore.YELLOW}Warning: use_penultimate_clip_layer ignored in samples{Style.RESET_ALL}")
-                    if type(pipe) in (StableDiffusionXLPipeline, SanaPipeline):
+                    if type(pipe) in (StableDiffusionXLPipeline, SanaPipeline, SanaVideoPipeline):
                         print(f"{type(pipe).__name__} -> no Compel")
                         compel = None
                     else:
@@ -312,6 +324,13 @@ class SampleGenerator:
                                 (prompts, negative_prompts) if conditioning is None else (None, None)
                             )
 
+                            if self.is_video:
+                                video_kwargs = dict(frames=self.video_frames)
+                                image_kwargs = {}
+                            else:
+                                video_kwargs = {}
+                                image_kwargs = dict(num_images_per_prompt=1)
+
                             if isinstance(pipe.scheduler, SDPipelineInferenceFlowMatchEulerDiscreteScheduler) and pipe.scheduler.config.use_dynamic_shifting:
                                 image_pixel_count = size[0] * size[1]
                                 # for linear shift, we go from 1 to 3 over 1 megapixel
@@ -321,51 +340,83 @@ class SampleGenerator:
                                 #pipe.scheduler = type(pipe.scheduler).from_config(pipe.scheduler.config, shift=shift)
                                 #print("updated scheduler with shift", shift)
 
-                            non_sana_kwargs = {} if isinstance(pipe, SanaPipeline) else dict(
+                            extra_kwargs = dict(
+                                use_resolution_binning=False
+                            ) if isinstance(pipe, (SanaPipeline, SanaVideoPipeline)) else dict(
                                 pooled_prompt_embeds=pooled_prompt_embeds,
                                 negative_pooled_prompt_embeds=negative_pooled_embeds,
                                 guidance_rescale=self.guidance_rescale
                             )
 
-                            images = pipe(
+                            if isinstance(pipe, (SanaPipeline, SanaVideoPipeline)):
+                                width = round(size[0] / 32) * 32
+                                height = round(size[1] / 32) * 32
+                            else:
+                                width = size[0]
+                                height = size[1]
+
+                            pipe_kwargs = dict(
                                 prompt=prompt,
                                 prompt_embeds=embeds,
                                 negative_prompt=negative_prompt,
                                 negative_prompt_embeds=negative_embeds,
                                 num_inference_steps=self.num_inference_steps,
-                                num_images_per_prompt=1,
                                 guidance_scale=cfg,
                                 generator=generators,
-                                width=size[0],
-                                height=size[1],
-                                **non_sana_kwargs,
-                            ).images
+                                width=width,
+                                height=height,
+                                **image_kwargs,
+                                **extra_kwargs,
+                                **video_kwargs,
+                            )
 
-                            for image in images:
-                                draw = ImageDraw.Draw(image)
-                                print_msg = f"cfg:{cfg:.1f}"
+                            if self.is_video:
+                                output = pipe(**pipe_kwargs)
+                                video_frames_list = output.frames[0]
+                                batch_images.append(video_frames_list)
+                            else:
+                                images = pipe(**pipe_kwargs).images
+                                for image in images:
+                                    draw = ImageDraw.Draw(image)
+                                    print_msg = f"cfg:{cfg:.1f}"
 
-                                l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
-                                text_width = r - l
-                                text_height = b - t
+                                    l, t, r, b = draw.textbbox(xy=(0, 0), text=print_msg, font=font)
+                                    text_width = r - l
+                                    text_height = b - t
 
-                                x = float(image.width - text_width - 10)
-                                y = float(image.height - text_height - 10)
+                                    x = float(image.width - text_width - 10)
+                                    y = float(image.height - text_height - 10)
 
-                                draw.rectangle((x, y, image.width, image.height), fill="white")
-                                draw.text((x, y), print_msg, fill="black", font=font)
+                                    draw.rectangle((x, y, image.width, image.height), fill="black")
+                                    draw.text((x, y), print_msg, fill="white", font=font)
 
-                            batch_images.append(images)
-                            del images
+                                batch_images.append(images)
+                                del images
 
                         del generators
-                        #print("batch_images:", batch_images)
+
+                        if self.is_video:
+                            assert len(batch) == 1
+                            for cfg_idx in range(len(self.cfgs)):
+                                frames_list = batch_images[cfg_idx]
+                                prompt = prompts[0]
+                                self._save_sample_video(
+                                    frames_list,
+                                    sample_index=sample_index,
+                                    global_step=global_step,
+                                    prompt=prompt,
+                                    samples_subdir=samples_subdir,
+                                    suffix=f"_cfg{self.cfgs[cfg_idx]:.1f}"
+                                )
+                            sample_index += 1
+                            del batch_images
+                            pbar.update(1)
+                            continue
 
                         width = size[0] * len(self.cfgs)
                         height = size[1]
 
                         for prompt_idx in range(len(batch)):
-                            #print(f"batch_images[:][{prompt_idx}]: {batch_images[:][prompt_idx]}")
                             result = Image.new('RGB', (width, height))
                             x_offset = 0
 
@@ -433,14 +484,51 @@ class SampleGenerator:
                                       global_step=global_step)
         del tfimage
 
+    def _save_sample_video(
+        self,
+        all_cfg_frames: list,
+        sample_index: int,
+        global_step: int,
+        prompt: str,
+        samples_subdir: str = "samples",
+        suffix: str = ''
+    ):
+        from diffusers.utils import export_to_video
+
+        clean_prompt = clean_filename(prompt)
+        subdir_path = os.path.join(self.log_folder, samples_subdir)
+        os.makedirs(subdir_path, exist_ok=True)
+
+        filepath = f"{subdir_path}/gs{global_step:05}-{sample_index}-{clean_prompt[:100]}{suffix}.mp4"
+        export_to_video(all_cfg_frames, filepath, fps=self.video_fps)
+
+        with open(f"{subdir_path}/gs{global_step:05}-{sample_index}-{clean_prompt[:100]}{suffix}.txt",
+                  "w", encoding='utf-8') as f:
+            f.write(prompt)
+
+        import numpy as np
+        # log the first, mid, and last frames to tensorboard as a quick preview of the video
+        frames_np = [np.array(f) for f in all_cfg_frames]
+        mid_idx = len(frames_np) // 2
+        grid_np = np.vstack([frames_np[0], frames_np[mid_idx], frames_np[-1]])
+        grid_pil = Image.fromarray(grid_np)
+        tfimage = transforms.ToTensor()(grid_pil)
+        tag_prefix = samples_subdir.replace("/", "_").replace("-", "_")
+        self.log_writer.add_image(
+            tag=f"{tag_prefix}_{sample_index}",
+            img_tensor=tfimage,
+            global_step=global_step,
+        )
+
     @torch.no_grad()
-    def create_inference_pipe(self, model_being_trained, diffusers_scheduler_config, flow_match_shift=1, flow_match_shift_dynamic=False):
+    def create_inference_pipe(self, model_being_trained, diffusers_scheduler_config,  flow_match_shift=1, flow_match_shift_dynamic=False):
         """
         creates a pipeline for SD inference
         """
-        if model_being_trained.is_flow_matching and self.scheduler != 'flow-matching':
-            print(f"Warning: model is flow-matching but scheduler is '{self.scheduler}'. Overriding.")
-            self.scheduler = 'flow-matching'
+        if type(model_being_trained) != SanaTrainingModel:
+            if model_being_trained.is_flow_matching and self.scheduler != 'flow-matching':
+                print(f"Warning: model is flow-matching but scheduler is '{self.scheduler}'. Overriding.")
+                self.scheduler = 'flow-matching'
         scheduler = self._create_scheduler(diffusers_scheduler_config, flow_match_shift, flow_match_shift_dynamic)
         pipe = model_being_trained.build_inference_pipeline(scheduler=scheduler)
         if self.use_xformers:
@@ -536,7 +624,7 @@ class SampleGenerator:
                                   model_type='sd-2',
                                   all_params=params,
                                   batch_size=self.batch_size,
-                                  image_save_cb=save_image,
+                                  media_save_cb=save_image,
                                   extra_cfgs=self.cfgs[1:],
                                   index_offset=index_offset,
                                   flow_match_shift=flow_match_shift,

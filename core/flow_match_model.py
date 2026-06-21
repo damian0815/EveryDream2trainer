@@ -63,7 +63,7 @@ class TrainFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         # timestep indices goes from 0 to 999 but self.timesteps goes from 1000 to 1
         # so we need to reverse the indices
         indices_reversed = len(timestep_values) - 1 - timestep_indices.cpu()
-        return timestep_values[indices_reversed]
+        return timestep_values[indices_reversed].to(timestep_indices.device)
 
     def get_sigmas_for_timesteps(self, timesteps: torch.Tensor):
         """ For the given timesteps, get the corresponding sigmas """

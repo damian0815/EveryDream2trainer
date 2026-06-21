@@ -18,6 +18,9 @@ def is_image(file):
         and not any(file.endswith(f".mask{extension}") for extension in extensions)
     )
 
+def is_video(file):
+    return ext(file) in {'.mp4', '.webm', '.avi', '.mov', '.m4v'}
+
 def read_text(file):
     try:
         encodings = ['utf-8', 'iso-8859-1', 'windows-1252', 'latin-1']

@@ -43,6 +43,7 @@ def setup_local_logger(args) -> tuple[str, str]:
         level=logging.INFO,
         format="%(asctime)s %(message)s",
         datefmt="%m/%d/%Y %I:%M:%S %p",
+        force=True
     )
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.addFilter(
@@ -173,10 +174,31 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         log_writer.add_scalar(tag="loss/log_step non-CD", scalar_value=loss_step_non_cd, global_step=global_step)
         #logs["loss/log_step non-CD"] = loss_step_non_cd
     if log_data.loss_preview_image is not None:
-        loss_preview_image_rgb = torchvision.utils.make_grid(
-            log_data.loss_preview_image
+        if log_data.loss_preview_image.shape[1] > 4:
+            # average down to 3 channels (e.g. 32 -> ~10.67 per group, drop the remainder)
+            if len(log_data.loss_preview_image.shape) == 5:
+                B, F, C, H, W = log_data.loss_preview_image.shape
+                n_groups = 3
+                n_groups = 3
+                group_size = C // n_groups
+                loss_preview_image_video_rgb = log_data.loss_preview_image[:, :n_groups * group_size] \
+                    .view(B, F, n_groups, group_size, H, W).mean(dim=3)
+                # drop all but every 10th frame
+                loss_preview_image_video_rgb = loss_preview_image_video_rgb[:, ::10]
+                F = loss_preview_image_video_rgb.shape[1]
+                loss_preview_image_rgb = loss_preview_image_video_rgb.reshape(B * F, n_groups, H, W)
+            else:
+                B, C, H, W = log_data.loss_preview_image.shape
+                n_groups = 3
+                group_size = C // n_groups
+                loss_preview_image_rgb = log_data.loss_preview_image[:, :n_groups * group_size] \
+                    .view(B, n_groups, group_size, H, W).mean(dim=2)
+        else:
+            loss_preview_image_rgb = log_data.loss_preview_image
+        loss_preview_image_rgb_grid = torchvision.utils.make_grid(
+            loss_preview_image_rgb
         )
-        log_writer.add_image(tag="loss/last model_pred and target", img_tensor=loss_preview_image_rgb, global_step=global_step)
+        log_writer.add_image(tag="loss/last model_pred and target", img_tensor=loss_preview_image_rgb_grid, global_step=global_step)
     if args.log_named_parameters_magnitudes:
         def log_named_parameters(model, prefix):
             """Log L2 norms of parameter groups to help debug NaN issues."""

@@ -223,6 +223,7 @@ def get_gpu_memory(nvsmi):
     return gpu_used_mem, gpu_total_mem
 
 
+
 def setup_args(args):
     """
     Sets defaults for missing args (possible if missing from json config)
@@ -284,43 +285,13 @@ def setup_args(args):
 
         logging.info(logging.info(f"{Fore.CYAN} * Activating rated images learning with a target rate of {args.rated_dataset_target_dropout_percent}% {Style.RESET_ALL}"))
 
-    if type(args.resolution) is not list:
-        args.resolution = [args.resolution]
-
-    if len(args.resolution_multiplier) > 0 and len(args.resolution_multiplier) != len(args.resolution):
-        raise ValueError(f"when using --resolution_multiplier, you must pass exactly 1 multiplier per resolution (you passed: --resolution {args.resolution} --resolution_multiplier {args.resolution_multiplier})")
-
-    def force_to_resolution_mapped_list_and_validate(value, name):
-        if type(value) is not list:
-            value = [value]
-        if len(value) != len(args.resolution):
-            if len(value) > 1:
-                raise ValueError(
-                    f"when using --{name}, you must pass exactly 1 max backward slice size per resolution (you passed: --resolution {args.resolution} --{name} {' '.join([str(v) for v in value])})")
-            elif len(value) == 1:
-                # expand to one per resolution
-                value = value * len(args.resolution)
-        return value
-
-    args.max_backward_slice_size = force_to_resolution_mapped_list_and_validate(args.max_backward_slice_size, "max_backward_slice_size")
-    args.forward_slice_size = force_to_resolution_mapped_list_and_validate(args.forward_slice_size, "forward_slice_size")
-
     if type(args.disable_backward_memsafe_resolutions) is not list:
         args.disable_backward_memsafe_resolutions = [args.disable_backward_memsafe_resolutions]
     if args.disable_backward_memsafe_resolutions and any(r not in args.resolution for r in args.disable_backward_memsafe_resolutions):
         raise ValueError(f"when using --disable_backward_memsafe_resolutions, all resolutions passed must be in --resolution (you passed: --resolution {args.resolution} --disable_backward_memsafe_resolutions {args.disable_backward_memsafe_resolutions})")
 
-    if args.optimizer_batch_size is not None:
-        if args.initial_batch_size is None:
-            args.initial_batch_size = args.optimizer_batch_size
-        else:
-            logging.info(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.final_batch_size}")
-        if args.final_batch_size is None:
-            args.final_batch_size = args.optimizer_batch_size
-        else:
-            logging.info(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --final_batch_size {args.final_batch_size}")
-
     return args
+
 
 
 def report_image_train_item_problems(log_folder: str, items: list, batch_size, check_load_all=False, model: TrainingModel=None) -> None:
@@ -875,7 +846,7 @@ def main(args):
 
         # Self-Flow EMA teacher setup (separate from the saves/sampling EMA copy)
         if args.self_flow_p > 0.0:
-            if model.self_flow_teacher_unet is None:
+            if model.self_flow_teacher_module is None:
                 logging.info(
                     f"Self-Flow enabled (p={args.self_flow_p}), creating frozen EMA teacher UNet "
                     f"(decay={args.self_flow_ema_decay})."
@@ -883,15 +854,15 @@ def main(args):
                 with torch.no_grad():
                     sf_teacher = deepcopy(model.unet).to(device, dtype=model.unet.dtype)
                 sf_teacher.requires_grad_(False)
-                model.self_flow_teacher_unet = sf_teacher
+                model.self_flow_teacher_module = sf_teacher
 
                 # Attempt to resume teacher UNet from the checkpoint sidecar
-                sf_teacher_sidecar = os.path.join(args.resume_ckpt, "self_flow_teacher_unet.safetensors")
+                sf_teacher_sidecar = os.path.join(args.resume_ckpt, "self_flow_teacher_module.safetensors")
                 if os.path.exists(sf_teacher_sidecar):
                     logging.info(f"  Loading Self-Flow teacher UNet from {sf_teacher_sidecar}")
                     try:
                         state_dict = safetensors.torch.load_file(sf_teacher_sidecar, device=str(device))
-                        model.self_flow_teacher_unet.load_state_dict(state_dict)
+                        model.self_flow_teacher_module.load_state_dict(state_dict)
                         logging.info("  Self-Flow teacher UNet loaded successfully.")
                     except Exception as e:
                         logging.error(f" * Failed to load Self-Flow teacher UNet from {sf_teacher_sidecar}: {e}. Using fresh deepcopy.")
@@ -1683,12 +1654,12 @@ def main(args):
                                                        ema_device=args.ema_device)
 
                         # Self-Flow EMA teacher update (independent interval from main EMA)
-                        if model.self_flow_teacher_unet is not None:
+                        if model.self_flow_teacher_module is not None:
                             sf_interval = getattr(args, 'self_flow_ema_update_interval', 1)
                             if ((tv.global_step + 1) % sf_interval) == 0:
                                 update_ema(
                                     model.unet,
-                                    model.self_flow_teacher_unet,
+                                    model.self_flow_teacher_module,
                                     args.self_flow_ema_decay,
                                     default_device=device,
                                     ema_device=device,

@@ -70,7 +70,7 @@ def run_accumulation_loop(
     steps_pbar,
     did_step_optimizer_cb: Optional[Callable],
     args: argparse.Namespace,
-    train_progress_01: float = 0.0,
+    train_progress_01,
 ) -> None:
     """
     Model-agnostic nibble/accumulation/backward/optimizer-step loop.
@@ -214,6 +214,7 @@ def run_accumulation_loop(
                         tv.interleaved_bs1_count = 0
                     else:
                         tv.interleaved_bs1_count = None
+
 
             did_step_optimizer_cb()
 
@@ -577,11 +578,11 @@ def _subdivide_batch_part(part, start, end):
 
 
 def choose_effective_batch_size(args, train_progress_01):
-    batch_size = getattr(args, 'batch_size', 1)
-    initial_bs = getattr(args, 'initial_batch_size', None)
-    final_bs = getattr(args, 'final_batch_size', None)
-    alpha = getattr(args, 'batch_size_curriculum_alpha', 1.0)
-    return max(
+    batch_size = args.batch_size
+    initial_bs = args.initial_batch_size
+    final_bs = args.final_batch_size
+    alpha = args.batch_size_curriculum_alpha
+    bs = max(
         1,
         round(
             get_exponential_scaled_value(
@@ -592,6 +593,9 @@ def choose_effective_batch_size(args, train_progress_01):
             )
         ),
     )
+    print(f"chose effective batch size {bs} from initial {initial_bs} final {final_bs} alpha {alpha} train_progress_01 {train_progress_01}")
+
+    return bs
 
 
 def compute_train_process_01(
@@ -1040,7 +1044,7 @@ def _do_model_forward(
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
     do_self_flow = (
-        model.self_flow_teacher_unet is not None
+        model.self_flow_teacher_module is not None
         and random.random() < args.self_flow_p
     )
 
@@ -1110,7 +1114,7 @@ def _do_model_forward(
                 self_flow_s_timesteps=self_flow_s_timesteps_slice,
                 global_step=tv.global_step,
                 debug_teacher=debug_teacher,
-                log_writer=log_writer
+                log_writer=log_writer,
             )
 
             model_pred_all.append(model_pred_result.model_pred)

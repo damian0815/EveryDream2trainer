@@ -484,6 +484,7 @@ def build_self_flow_latents(
     t: torch.Tensor,
     s: torch.Tensor,
     mask_ratio: float,
+    patch_size: int = 2
 ):
     """Build heterogeneously noised student latents and uniformly cleaner teacher latents.
     Student  x_τ    : mask_ratio of spatial locations use noise level s, rest use t.
@@ -492,13 +493,31 @@ def build_self_flow_latents(
     """
     B, C, H, W = latents.shape
     device = latents.device
+
+    # Calculate number of patches (Sequence Length 'N')
+    H_patch, W_patch = H // patch_size, W // patch_size
+    N = H_patch * W_patch
+
     x_t = _get_noisy_latents(latents, noise, noise_scheduler, t, latents_perturbation=0)
     x_s = _get_noisy_latents(latents, noise, noise_scheduler, s, latents_perturbation=0)
-    M = (torch.rand(B, 1, H, W, device=device) < mask_ratio).float()
-    x_tau = (1.0 - M) * x_t + M * x_s
+
+    # 1D Sequence Mask (B, N)
+    mask_1d = (torch.rand((B, N), device=device) < mask_ratio).float()
+
+    # 2D Spatial mask for noising the raw latents (B, 1, H, W)
+    mask_spatial = mask_1d.view(B, 1, H_patch, W_patch)
+    mask_spatial = F.interpolate(mask_spatial, size=(H, W), mode='nearest')
+
+    # Construct the per-token dual-timestep tau for the network (B, N)
+    t_expanded = t.view(B, 1)
+    s_expanded = s.view(B, 1)
+    tau_1d = (1.0 - mask_1d) * t_expanded + mask_1d * s_expanded
+
+    x_tau = (1.0 - mask_spatial) * x_t + mask_spatial * x_s
     tau_min = torch.minimum(t, s)
     x_tau_min = _get_noisy_latents(latents, noise, noise_scheduler, tau_min, latents_perturbation=0)
-    return x_tau, x_tau_min, tau_min
+
+    return x_tau, x_tau_min, tau_min, tau_1d, mask_1d
 
 
 @dataclass
@@ -567,7 +586,7 @@ def get_model_prediction_and_target(
 
         # self-flow feature placeholders
         do_self_flow = (self_flow_s_timesteps is not None
-                  and model.self_flow_teacher_unet is not None)
+                        and model.self_flow_teacher_module is not None)
         if do_self_flow:
             sf_mode = args.self_flow_mode
             sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model, sf_mode)
@@ -760,23 +779,25 @@ def get_model_prediction_and_target(
     # ---- Self-Flow representation learning ----
     self_flow_student_features = None
     self_flow_teacher_features = None
-    sf_teacher_unet = model.self_flow_teacher_unet
-    if self_flow_s_timesteps is not None and sf_teacher_unet is not None:
+    sf_teacher_module = model.self_flow_teacher_module
+    if self_flow_s_timesteps is not None and sf_teacher_module is not None:
         sf_mask_ratio = args.self_flow_mask_ratio
         sf_mode = args.self_flow_mode
 
         # Build heterogeneously noised latents for student and teacher
-        x_tau, x_tau_min, tau_min_ts = build_self_flow_latents(
+        patch_size = getattr(model.unet.config, 'patch_size', 2)
+        x_tau, x_tau_min, tau_min_ts, tau_1d, tau_mask_1d = build_self_flow_latents(
             latents=latents,
             noise=noise,
             noise_scheduler=model.noise_scheduler,
             t=timesteps,
             s=self_flow_s_timesteps,
             mask_ratio=sf_mask_ratio,
+            patch_size=patch_size,
         )
 
         # Resolve the modules to hook for this mode
-        sf_student_module, sf_teacher_module = get_self_flow_modules(model.unet, sf_teacher_unet, sf_mode)
+        sf_student_module, sf_teacher_module = get_self_flow_modules(model.unet, sf_teacher_module, sf_mode)
 
         # --- Student forward: x_τ input, scalar timestep t, capture student module ---
         sf_student_storage = {}
@@ -787,9 +808,9 @@ def get_model_prediction_and_target(
 
         sf_student_handle = sf_student_module.register_forward_hook(_sf_student_hook)
         try:
-            model.unet(
+            model.unet( # automatically routed to `transformer` for SANA
                 x_tau.to(dtype=model.unet.dtype),
-                timesteps.to(model.unet.device, dtype=model.unet.dtype),  # use original t
+                tau_1d.to(model.unet.device, dtype=model.unet.dtype),
                 encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
                 added_cond_kwargs=(
                     conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
@@ -810,12 +831,12 @@ def get_model_prediction_and_target(
         sf_teacher_handle = sf_teacher_module.register_forward_hook(_sf_teacher_hook)
         try:
             with torch.no_grad():
-                sf_teacher_unet(
-                    x_tau_min.to(dtype=sf_teacher_unet.dtype),
-                    tau_min_ts.to(sf_teacher_unet.device, dtype=sf_teacher_unet.dtype),
-                    encoder_hidden_states=conditioning.prompt_embeds.to(dtype=sf_teacher_unet.dtype),
+                sf_teacher_module(
+                    x_tau_min.to(dtype=sf_teacher_module.dtype),
+                    tau_min_ts.to(sf_teacher_module.device, dtype=sf_teacher_module.dtype),
+                    encoder_hidden_states=conditioning.prompt_embeds.to(dtype=sf_teacher_module.dtype),
                     added_cond_kwargs=(
-                        conditioning.get_added_cond_kwargs(dtype=sf_teacher_unet.dtype)
+                        conditioning.get_added_cond_kwargs(dtype=sf_teacher_module.dtype)
                         if model.is_sdxl else None
                     ),
                 )
