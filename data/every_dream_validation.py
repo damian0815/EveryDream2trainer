@@ -973,6 +973,7 @@ class EveryDreamValidator:
             seed=seed,
             name=name,
             crop_jitter=0,
+            rotation_degrees=0,
             plugin_runner=empty_plugin_runner,
             normalize_image=True,
         )

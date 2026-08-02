@@ -69,7 +69,7 @@ from data.every_dream import EveryDreamBatch, build_torch_dataloader, collate_fn
 from data.difficulty_estimator import DifficultyEstimator, TypeAScheduler, TypeBScheduler
 from data.every_dream_validation import EveryDreamValidator, ValidationStepResult
 from data.image_train_item import ImageTrainItem, DEFAULT_BATCH_ID
-from core.log import do_log_step, append_epoch_log, write_batch_schedule, log_args, LogData, setup_local_logger
+from core.log import do_log_step, do_log_step_optimizer, append_epoch_log, write_batch_schedule, log_args, LogData, setup_local_logger
 from core.loss import (
     get_noise,
     get_model_prediction_and_target,
@@ -95,9 +95,9 @@ from model.training_model import (
 from model.teacher import load_teacher_model
 from core.semaphore_files import check_semaphore_file_and_unlink, WANT_SAMPLES_SEMAPHORE_FILE, \
     WANT_VALIDATION_SEMAPHORE_FILE, SAVE_FULL_WITH_OPTIMIZER_SEMAPHORE_FILE, SAVE_FULL_SEMAPHORE_FILE, \
-    SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE, SAVE_FULL_AND_STOP_SEMAPHORE_FILE
-from utils.inference_context import inference_guard
-from utils.isolate_rng import isolate_rng
+    SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE, SAVE_FULL_AND_STOP_SEMAPHORE_FILE, STOP_SEMAPHORE_FILE, \
+    PAUSE_TRAINING_SEMAPHORE_FILE, RESUME_TRAINING_SEMAPHORE_FILE
+from utils.model_offload import unload_model_for_pause, reload_model_for_resume
 from utils.check_git import check_git
 from optimizer.optimizers import EveryDreamOptimizer
 from copy import deepcopy
@@ -106,8 +106,10 @@ import safetensors.torch
 if torch.cuda.is_available():
     from utils.gpu import GPU
 import data.aspects as aspects
-import data.resolver as resolver
+from data.resolve_items import resolve_image_source_items
+from model.ema import update_ema, update_ema_disk
 from utils.sample_generator import SampleGenerator
+from core.sample_generation import generate_samples
 
 from plugins.plugins import PluginRunner
 
@@ -350,7 +352,10 @@ def report_image_train_item_problems(log_folder: str, items: list, batch_size, c
     warn_bucket_dupe_ratio = 0.5
 
     def make_bucket_key(item):
-        return (item.batch_id, int(item.target_wh[0]), int(item.target_wh[1]))
+        return (item.batch_id,
+                getattr(item, 'largest_valid_frame_count', 0),
+                int(item.target_wh[0]),
+                int(item.target_wh[1]))
 
     ar_buckets = set(make_bucket_key(i) for i in items)
     for ar_bucket in ar_buckets:
@@ -367,155 +372,12 @@ def report_image_train_item_problems(log_folder: str, items: list, batch_size, c
                             f"of {effective_multiplier}, which may cause problems. Consider adding {runt_size} or "
                             f"more images with aspect ratio {aspect_ratio_description}{batch_id_description}, or reducing your batch_size.")
 
-def apply_per_path_multiplier(resolved_items: list, per_path_multiplier_json: str):
-    """Apply per-image multipliers loaded from a JSON file.  Works with both
-    ImageTrainItem and ImageSourceItem objects (both expose .multiplier and .pathname)."""
-    applied = 0
-    missing = 0
-    first_missing = []
-    with open(per_path_multiplier_json, "rt") as f:
-        per_path_multipliers = json.load(f)
-    for item in tqdm(resolved_items, desc=f"applying per-path multiplier {os.path.basename(per_path_multiplier_json)}"):
-        realpath = os.path.realpath(item.pathname)
-        try:
-            item.multiplier *= per_path_multipliers[realpath]
-            applied += 1
-        except KeyError:
-            missing += 1
-            if len(first_missing) < 5:
-                first_missing.append(item.pathname)
-    logging.info(f" Applied {applied} multipliers ({missing} missing) from {per_path_multiplier_json}. First 5 missing: {first_missing}")
-
-
-def resolve_image_source_items(
-    args: argparse.Namespace,
-    aspects_per_resolution: dict,
-) -> list:
-    """
-    Resolve training images for all resolutions at once, returning a list of
-    ImageSourceItem objects (one per image, resolution assignment deferred).
-
-    Replaces the old per-resolution resolve_image_train_items loop.
-    """
-    logging.info(f"* Loading images for resolutions: {list(aspects_per_resolution.keys())}")
-    logging.info("  Preloading image metadata (one file-open per image)...")
-
-    source_items = resolver.resolve_sources(args.data_root, args, aspects_per_resolution)
-
-    # Log and remove images that could not be opened
-    for item in source_items:
-        if item.error is not None:
-            logging.error(
-                f"{Fore.LIGHTRED_EX} *** Error opening "
-                f"{Fore.LIGHTYELLOW_EX}{item.pathname}{Fore.LIGHTRED_EX}: "
-                f"{item.error} — skipping.{Style.RESET_ALL}"
-            )
-    source_items = [s for s in source_items if s.error is None]
-
-    if args.data_multiplier_per_path:
-        paths = (
-            [args.data_multiplier_per_path]
-            if isinstance(args.data_multiplier_per_path, str)
-            else args.data_multiplier_per_path
-        )
-        for p in paths:
-            apply_per_path_multiplier(source_items, p)
-
-    if args.skip_undersized_images:
-        pre_count = len(source_items)
-        source_items = [s for s in source_items if s.is_feasible_for_any_resolution()]
-        dropped = pre_count - len(source_items)
-        if dropped:
-            logging.info(
-                f" * Dropped {dropped} images that are undersized at all configured "
-                f"resolutions ({len(source_items)} remaining)."
-            )
-
-    # Drop images with empty JSON captions
-    source_items = _drop_empty_json_caption_sources(source_items)
-
-    logging.info(f" * Found {len(source_items)} valid source images in '{args.data_root}'")
-    gc.collect()
-
-    # Stamp base_multiplier now that all user-configured multiplier changes are done.
-    # DifficultyEstimator schedulers scale relative to this value, not the mutated one.
-    for s in source_items:
-        s.base_multiplier = s.multiplier
-
-    return source_items
-
-
-def _drop_empty_json_caption_sources(source_items: list) -> list:
-    """Remove source items whose caption is a JSON dict with all-empty values."""
-    result = []
-    for item in source_items:
-        caption = item.caption.get_caption()
-        if caption.startswith("<<json>>"):
-            caption_data = json.loads(caption.replace("<<json>>", ""))
-            if caption_data is None or all(
-                v is None or len(v.strip()) == 0 for v in caption_data.values()
-            ):
-                continue
-        result.append(item)
-    dropped = len(source_items) - len(result)
-    if dropped:
-        logging.info(
-            f" * Dropped {dropped} images with empty JSON captions ({len(result)} remaining)."
-        )
-    return result
-
-
 def read_sample_prompts(sample_prompts_file_path: str):
     sample_prompts = []
     with open(sample_prompts_file_path, "r") as f:
         for line in f:
             sample_prompts.append(line.strip())
     return sample_prompts
-
-
-def update_ema(model, ema_model, decay, default_device, ema_device: str):
-    with torch.no_grad():
-        original_model_on_proper_device = model
-        need_to_delete_original = False
-        if torch.device(ema_device) != torch.device(default_device):
-            original_model_on_other_device = deepcopy(model)
-            original_model_on_proper_device = original_model_on_other_device.to(ema_device, dtype=model.dtype)
-            del original_model_on_other_device
-            need_to_delete_original = True
-
-        params: dict[str, torch.nn.Parameter] = dict(original_model_on_proper_device.named_parameters())
-        ema_params: dict[str, torch.nn.Parameter] = dict(ema_model.named_parameters())
-
-        for name in ema_params:
-            #ema_params[name].data.mul_(decay).add_(params[name].data, alpha=1 - decay)
-            ema_params[name].data = ema_params[name] * decay + params[name].data * (1.0 - decay)
-
-        if need_to_delete_original:
-            del(original_model_on_proper_device)
-
-
-def update_ema_disk(model_module: torch.nn.Module, disk_path: str, decay: float) -> None:
-    """
-    Load the EMA state-dict from *disk_path*, apply one EMA step using the
-    current *model_module* named parameters, and write the result back to disk.
-
-    All arithmetic is done in float32 on CPU so VRAM is untouched.
-    Buffers (non-parameter tensors in state_dict) are preserved unchanged.
-    """
-    if not os.path.isfile(disk_path):
-        logging.warning(f"[EMA-disk] working file not found at {disk_path}, skipping update")
-        return
-    with torch.no_grad():
-        ema_state   = safetensors.torch.load_file(disk_path, device="cpu")
-        model_params = {k: v.detach().float().cpu() for k, v in model_module.named_parameters()}
-        updated: dict[str, torch.Tensor] = {}
-        for k, ema_v in ema_state.items():
-            if k in model_params:
-                updated[k] = (ema_v.float() * decay + model_params[k] * (1.0 - decay)).contiguous()
-            else:
-                updated[k] = ema_v.contiguous()   # buffer – keep unchanged
-        safetensors.torch.save_file(updated, disk_path)
-        del ema_state, model_params, updated
 
 
 def _init_ema(model: "TrainingModel", args, device, log_folder: str) -> bool:
@@ -706,6 +568,8 @@ def main(args):
         log_folder = os.path.join(args.logdir, f"{args.project_name}-{log_time}")
 
     args = setup_args(args)
+    from utils.train_args import validate_self_flow_ema_args
+    validate_self_flow_ema_args(args)
     if _is_main:
         print(f" Args:")
         pprint.pprint(vars(args))
@@ -724,6 +588,7 @@ def main(args):
             device = torch.device(f"cuda:{args.gpuid}")
         gpu = GPU(device)
         torch.backends.cudnn.benchmark = True
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     else:
         if torch.backends.mps.is_available():
             device = 'mps'
@@ -734,7 +599,7 @@ def main(args):
 
     # fix a weird issue with dataloader?
     # https://github.com/pytorch/pytorch/issues/973#issuecomment-459398189
-    torch.multiprocessing.set_sharing_strategy("file_system")
+    #torch.multiprocessing.set_sharing_strategy("file_system")
 
     # log_folder = os.path.join(args.logdir, f"{args.project_name}_{log_time}")
 
@@ -844,31 +709,8 @@ def main(args):
             model.text_encoder_ema = None
             model.text_encoder_2_ema = None
 
-        # Self-Flow EMA teacher setup (separate from the saves/sampling EMA copy)
+        # Self-Flow projection head setup (teacher IS the main EMA now)
         if args.self_flow_p > 0.0:
-            if model.self_flow_teacher_module is None:
-                logging.info(
-                    f"Self-Flow enabled (p={args.self_flow_p}), creating frozen EMA teacher UNet "
-                    f"(decay={args.self_flow_ema_decay})."
-                )
-                with torch.no_grad():
-                    sf_teacher = deepcopy(model.unet).to(device, dtype=model.unet.dtype)
-                sf_teacher.requires_grad_(False)
-                model.self_flow_teacher_module = sf_teacher
-
-                # Attempt to resume teacher UNet from the checkpoint sidecar
-                sf_teacher_sidecar = os.path.join(args.resume_ckpt, "self_flow_teacher_module.safetensors")
-                if os.path.exists(sf_teacher_sidecar):
-                    logging.info(f"  Loading Self-Flow teacher UNet from {sf_teacher_sidecar}")
-                    try:
-                        state_dict = safetensors.torch.load_file(sf_teacher_sidecar, device=str(device))
-                        model.self_flow_teacher_module.load_state_dict(state_dict)
-                        logging.info("  Self-Flow teacher UNet loaded successfully.")
-                    except Exception as e:
-                        logging.error(f" * Failed to load Self-Flow teacher UNet from {sf_teacher_sidecar}: {e}. Using fresh deepcopy.")
-                else:
-                    logging.info(f"  No Self-Flow teacher UNet sidecar found at {sf_teacher_sidecar}, using current model snapshot as starting point.")
-
             if model.self_flow_proj_head is None:
                 boc = model.unet.config.block_out_channels  # e.g. [320, 640, 1280, 1280]
                 sf_mode = getattr(args, 'self_flow_mode', 'shallow')
@@ -956,13 +798,6 @@ def main(args):
 
     image_source_items = resolve_image_source_items(args, aspects_per_resolution)
 
-    for s in image_source_items:
-        if s.cond_dropout is None:
-            s.cond_dropout = args.cond_dropout
-    if args.cond_dropout_global is not None:
-        for s in image_source_items:
-            s.cond_dropout *= args.cond_dropout_global
-
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
         validator = EveryDreamValidator(args.validation_config,
@@ -1027,6 +862,7 @@ def main(args):
         cond_dropout_noise_p=args.cond_dropout_noise_p,
         mask_p=mask_p,
         invert_masks=args.invert_masks,
+        rotation_degrees=args.rotation_degrees,
     )
 
     torch.cuda.benchmark = False
@@ -1212,6 +1048,14 @@ def main(args):
     logging.info(f" vae device: {model.vae.device}, precision: {model.vae.dtype}, training: {model.vae.training}")
     logging.info(f" scheduler: {model.noise_scheduler.__class__}")
 
+    if args.anchor_reg_alpha > 0:
+        from core.anchor_reg import capture_base_params
+        device_capture = 'cpu' if args.anchor_reg_cpu_offload else model.device
+        dtype_capture = torch.float32 if args.anchor_reg_cpu_offload else model.dtype
+        model.anchor_base_params = capture_base_params(model, device=device_capture, dtype=dtype_capture)
+        logging.info(f"Captured anchor base params ({len(model.anchor_base_params)} tensors, "
+                     f"device={device_capture}, dtype={dtype_capture})")
+
     # -----------------------------------------------------------------------
     # Phase 3 – DDP module wrapping (trainable modules only)
     # -----------------------------------------------------------------------
@@ -1248,102 +1092,6 @@ def main(args):
         log_data.attention_activation_logger = ActivationLogger(model=model.unet, writer=log_writer)
 
     assert len(train_batch) > 0, "train_batch is empty, check that your data_root is correct"
-
-    def generate_samples(global_step: int, batch: dict|None):
-
-        def _unwrap(m):
-            return m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
-
-        with isolate_rng():
-            sample_generator.reload_config()
-            if batch is not None:
-                flattened_captions_dict = [v
-                                           for _, l in batch["captions"].items()
-                                           for v in l]
-                sample_generator.update_random_captions(flattened_captions_dict)
-
-            torch.cuda.empty_cache()
-
-            ema_active = get_use_ema_decay_training(args)
-            # When EMA is not active, always fall through to the live-model pass
-            # regardless of the flag values so samples are never silently skipped.
-            run_nonema = args.ema_sample_nonema_model or not ema_active
-            run_ema    = args.ema_sample_ema_model and ema_active
-
-            guard_modules = [model.unet, model.text_encoder]
-            if model.text_encoder_2:
-                guard_modules.append(model.text_encoder_2)
-            with inference_guard(*guard_modules):
-                # ── Non-EMA (live model) pass ──────────────────────────────
-                if run_nonema:
-                    logging.info(f" * Generating samples [non-EMA model] at gs:{global_step}")
-                    inference_pipe = sample_generator.create_inference_pipe(
-                        model_being_trained=model,
-                        diffusers_scheduler_config=model.noise_scheduler.config,
-                        flow_match_shift=args.flow_match_shift,
-                        flow_match_shift_dynamic=args.flow_match_shift_dynamic
-                    ).to(device)
-                    sample_generator.generate_samples(inference_pipe, global_step,
-                                                      extra_info="", samples_subdir="samples")
-                    del inference_pipe
-                    torch.cuda.empty_cache()
-
-                # ── EMA pass ───────────────────────────────────────────────
-                if run_ema:
-                    logging.info(f" * Generating samples [EMA model] at gs:{global_step}")
-
-                    if model.ema_working_dir is not None:
-                        # ── Disk EMA: in-place weight swap on the live CUDA model ──
-                        # The live model stays on the GPU throughout; EMA weights are
-                        # loaded from disk and applied in-place, inference runs, then
-                        # the original weights are restored.  No CPU offload needed.
-                        with model.ema_inplace_swap():
-                            ema_pipe = sample_generator.create_inference_pipe(
-                                model_being_trained=model,
-                                diffusers_scheduler_config=model.noise_scheduler.config,
-                                flow_match_shift=args.flow_match_shift,
-                                flow_match_shift_dynamic=args.flow_match_shift_dynamic,
-                            ).to(device)
-                            sample_generator.generate_samples(ema_pipe, global_step,
-                                                              extra_info="", samples_subdir="samples-ema")
-                            del ema_pipe
-                        torch.cuda.empty_cache()
-
-                    else:
-                        # ── In-memory EMA: move live model to CPU, use EMA modules ──
-                        _unwrap(model.unet).to("cpu")
-                        _unwrap(model.text_encoder).to("cpu")
-                        if model.text_encoder_2 is not None:
-                            _unwrap(model.text_encoder_2).to("cpu")
-                        torch.cuda.empty_cache()
-                        try:
-                            ema_pipe = sample_generator.create_ema_inference_pipe(
-                                model_being_trained=model,
-                                diffusers_scheduler_config=model.noise_scheduler.config,
-                                flow_match_shift=args.flow_match_shift,
-                                flow_match_shift_dynamic=args.flow_match_shift_dynamic,
-                            )
-                            if ema_pipe is None:
-                                logging.warning(
-                                    " * EMA sampling requested but no EMA weights found yet, "
-                                    "skipping EMA sample pass"
-                                )
-                            else:
-                                ema_pipe = ema_pipe.to(device)
-                                sample_generator.generate_samples(ema_pipe, global_step,
-                                                                  extra_info="", samples_subdir="samples-ema")
-                                del ema_pipe
-                        finally:
-                            # Always restore the live model to the training device.
-                            torch.cuda.empty_cache()
-                            _unwrap(model.unet).to(device)
-                            _unwrap(model.text_encoder).to(device)
-                            if model.text_encoder_2 is not None:
-                                _unwrap(model.text_encoder_2).to(device)
-
-
-            gc.collect()
-            torch.cuda.empty_cache()
 
     def make_save_path(epoch, global_step, num_trained_samples, prepend=""):
         basename = f"{prepend}{args.project_name}"
@@ -1416,7 +1164,9 @@ def main(args):
     # the sample generator might be configured to generate samples before step 0
     if _is_main and sample_generator.generate_pretrain_samples:
         _, batch = next(enumerate(train_dataloader))
-        generate_samples(global_step=0, batch=batch)
+        generate_samples(model=model, sample_generator=sample_generator, global_step=0, batch=batch,
+                         args=args, device=device, log_folder=log_folder, log_time=log_time,
+                         train_dtype=train_dtype, vae_dtype=vae_dtype)
 
     def make_current_ed_state() -> EveryDreamTrainingState:
         return EveryDreamTrainingState(optimizer=ed_optimizer,
@@ -1447,6 +1197,7 @@ def main(args):
             logging.info(f" * Timestep interval sampling: {len(tv.timestep_intervals)} SNR-based intervals: {tv.timestep_intervals}")
         step = 0
         wants_stop = False
+        wants_pause = False
         force_save_optimizer = False
 
         with ddp_no_sync_ctx(
@@ -1604,12 +1355,22 @@ def main(args):
                             args=args,
                         )
 
-                        ed_optimizer.step_schedulers(tv.global_step)
+                        ed_optimizer.notify_step()
+
+                        log_step_opt = args.log_step_optimizer if args.log_step_optimizer is not None else args.log_step
+                        if (tv.global_step + 1) % log_step_opt == 0:
+                            ed_optimizer.flush_optimizer_logs(tv.global_step)
+                            if _is_main:
+                                do_log_step_optimizer(args, ed_optimizer, log_writer, tv)
 
                         if _is_main:
                             user_wants_samples = check_semaphore_file_and_unlink(WANT_SAMPLES_SEMAPHORE_FILE)
                             if user_wants_samples or sample_generator.should_generate_samples(tv.global_step, local_step=step):
-                                generate_samples(global_step=tv.global_step, batch=full_batch)
+                                generate_samples(model=model, sample_generator=sample_generator,
+                                                 global_step=tv.global_step, batch=full_batch,
+                                                 args=args, device=device, log_folder=log_folder,
+                                                 log_time=log_time, train_dtype=train_dtype,
+                                                 vae_dtype=vae_dtype)
 
                         if get_use_ema_decay_training(args):
                             if ((tv.global_step + 1) % args.ema_update_interval) == 0:
@@ -1653,21 +1414,10 @@ def main(args):
                                                        effective_ema_decay_rate, default_device=device,
                                                        ema_device=args.ema_device)
 
-                        # Self-Flow EMA teacher update (independent interval from main EMA)
-                        if model.self_flow_teacher_module is not None:
-                            sf_interval = getattr(args, 'self_flow_ema_update_interval', 1)
-                            if ((tv.global_step + 1) % sf_interval) == 0:
-                                update_ema(
-                                    model.unet,
-                                    model.self_flow_teacher_module,
-                                    args.self_flow_ema_decay,
-                                    default_device=device,
-                                    ema_device=device,
-                                )
-
                         steps_pbar.update(1)
 
-                        images_per_sec = full_batch['image'].shape[0] / (time.time() - step_start_time)
+                        actual_nonduplicated_images_count = full_batch['runt_size'] if full_batch['runt_size']>0 else full_batch['image'].shape[0]
+                        images_per_sec = actual_nonduplicated_images_count / (time.time() - step_start_time)
                         log_data.images_per_sec_log_step.append(images_per_sec)
 
                         if (tv.global_step + 1) % args.log_step == 0:
@@ -1727,6 +1477,9 @@ def main(args):
                             if check_semaphore_file_and_unlink(SAVE_FULL_WITH_OPTIMIZER_AND_STOP_SEMAPHORE_FILE):
                                 wants_stop = True
                                 force_save_optimizer = True
+                            if check_semaphore_file_and_unlink(PAUSE_TRAINING_SEMAPHORE_FILE):
+                                logging.info("pause_training.semaphore detected — pausing after this step")
+                                wants_pause = True
 
                         def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
                             return (epoch > 0 and epoch % every_n_epochs == 0 and step == 0 and
@@ -1780,6 +1533,40 @@ def main(args):
                             logging.info(f"* Stop requested, stopping")
                             break
 
+                        if wants_pause:
+                            dist_barrier()
+
+                            if _is_main:
+                                save_path = make_save_path(
+                                    epoch, tv.global_step,
+                                    num_trained_samples=tv.total_trained_samples_count,
+                                    prepend="paused-"
+                                )
+                                save_model(save_path,
+                                           global_step=tv.global_step,
+                                           ed_state=make_current_ed_state(),
+                                           save_ckpt_dir=args.save_ckpt_dir,
+                                           yaml_name=None,
+                                           save_full_precision=args.save_full_precision,
+                                           save_optimizer_flag=True,
+                                           save_ckpt=not args.no_save_ckpt,
+                                           plugin_runner=plugin_runner)
+                                logging.info(f"Checkpoint saved to {save_path}")
+
+                            unload_model_for_pause(model)
+                            logging.info("Training paused — create resume_training.semaphore to continue")
+
+                            if _is_main:
+                                while not check_semaphore_file_and_unlink(RESUME_TRAINING_SEMAPHORE_FILE):
+                                    time.sleep(1)
+
+                            dist_barrier()
+
+                            reload_model_for_resume(model, device, train_dtype, vae_dtype, args)
+                            logging.info("Training resumed")
+
+                            wants_pause = False
+
                         if args.max_steps is not None and tv.global_step >= args.max_steps:
                             logging.info(f"* max_steps reached, stopping")
                             break
@@ -1814,6 +1601,7 @@ def main(args):
                     "performance/minutes per epoch", elapsed_epoch_time, tv.global_step
                 )
 
+                from functools import partial as _partial
                 plugin_runner.run_on_epoch_end(epoch=epoch,
                                                global_step=tv.global_step,
                                                project_name=args.project_name,
@@ -1822,7 +1610,17 @@ def main(args):
                                                arg_update_callback=update_arg,
                                                ed_state=make_current_ed_state(),
                                                training_variables=tv,
-                                               sample_generator_cb=generate_samples)
+                                               sample_generator_cb=_partial(
+                                                   generate_samples,
+                                                   model=model,
+                                                   sample_generator=sample_generator,
+                                                   args=args,
+                                                   device=device,
+                                                   log_folder=log_folder,
+                                                   log_time=log_time,
+                                                   train_dtype=train_dtype,
+                                                   vae_dtype=vae_dtype,
+                                               ))
 
                 epoch_pbar.update(1)
                 if epoch < args.max_epochs - 1:
@@ -1900,7 +1698,11 @@ def main(args):
             gc.collect()
             # get samples for random captions
             _, batch = next(enumerate(train_dataloader))
-            generate_samples(global_step=tv.global_step, batch=batch)
+            generate_samples(model=model, sample_generator=sample_generator,
+                             global_step=tv.global_step, batch=batch,
+                             args=args, device=device, log_folder=log_folder,
+                             log_time=log_time, train_dtype=train_dtype,
+                             vae_dtype=vae_dtype)
 
         total_elapsed_time = time.time() - training_start_time
         logging.info(f"{Fore.CYAN}Training complete{Style.RESET_ALL}")

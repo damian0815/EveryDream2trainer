@@ -9,6 +9,7 @@
   "disable_amp": false,
   "disable_textenc_training": true,
   "flip_p": 0.0,
+  "rotation_degrees": 0,
   "gpuid": 0,
   "gradient_checkpointing": true,
   "grad_accum": 1,

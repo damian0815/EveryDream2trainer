@@ -21,6 +21,8 @@ replace_dots_with_commas_p = 0.3
 """
 
 
+DO_SHUFFLE=False
+
 
 SHUFFLE_SENTENCES_P = 0.02
 TOO_LONG_CAPTION_SHUFFLE_SENTENCES_P = 0.5
@@ -34,6 +36,7 @@ TOO_LONG_CAPTION_ROTATE_SENTENCES_P = 0.75
 TRUNCATE_SENTENCES_P = 0
 ENDING_DOT_P = 0.5
 REPLACE_DOTS_WITH_COMMAS_P = 0.02
+
 
 caption_variants = None
 
@@ -104,7 +107,7 @@ class CaptionMungerPlugin(BasePlugin):
         except Exception as e:
             logging.error(f"unable to load json from {captions_json}: {e}")
             raise
-        transformed_json = {k.lower(): (self.transform_caption(v, pathname=pathname)
+        transformed_json = {k.lower(): ( (self.transform_caption(v, pathname=pathname) if DO_SHUFFLE else v)
                                           if (v and len(v.strip())>0)
                                           else None)
                 for k, v in d.items()}

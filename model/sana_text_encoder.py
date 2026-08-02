@@ -62,7 +62,17 @@ def encode_prompts(
                 slice_size=None
             ))
         all_prompt_embeds, all_attn_mask = list(zip(*results))
-        return torch.cat(all_prompt_embeds, dim=0), torch.cat(all_attn_mask, dim=0)
+        max_n = max(e.shape[1] for e in all_prompt_embeds)
+        padded_embeds = []
+        padded_masks = []
+        for embeds, mask in zip(all_prompt_embeds, all_attn_mask):
+            n = embeds.shape[1]
+            if n < max_n:
+                embeds = torch.nn.functional.pad(embeds, (0, 0, 0, max_n - n), value=0.0)
+                mask = torch.nn.functional.pad(mask, (0, max_n - n), value=False)
+            padded_embeds.append(embeds)
+            padded_masks.append(mask)
+        return torch.cat(padded_embeds, dim=0), torch.cat(padded_masks, dim=0)
 
     tokenizer.padding_side = "right"
 
@@ -77,7 +87,7 @@ def encode_prompts(
 
     text_inputs = tokenizer(
         texts,
-        padding="max_length",
+        padding="longest",
         max_length=max_length_all,
         truncation=True,
         add_special_tokens=True,
@@ -99,6 +109,7 @@ def encode_null_prompt(
     device: torch.device,
     *,
     max_sequence_length: int = 300,
+    complex_human_instruction: Optional[list[str]] = None,
     dtype: torch.dtype = torch.bfloat16,
     cache_path: Optional[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -118,7 +129,9 @@ def encode_null_prompt(
     with torch.no_grad():
         null_embeds, null_mask = encode_prompts(
             tokenizer, text_encoder, [""], device,
-            max_sequence_length=max_sequence_length, dtype=dtype,
+            max_sequence_length=max_sequence_length,
+            complex_human_instruction=complex_human_instruction,
+            dtype=dtype,
         )
 
     if cache_path:

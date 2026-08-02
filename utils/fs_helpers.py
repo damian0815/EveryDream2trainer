@@ -16,6 +16,7 @@ def is_image(file):
     return (
         ext(file) in extensions
         and not any(file.endswith(f".mask{extension}") for extension in extensions)
+        and not any(file.endswith(f".dpobad{extension}") for extension in extensions)
     )
 
 def is_video(file):
@@ -27,9 +28,9 @@ def read_text(file):
         for encoding in encodings:
             try:
                 with open(file, encoding=encoding) as f:
-                    str = f.read()
-                    if len(str.strip()) > 0:
-                        return str
+                    contents = f.read()
+                    if len(contents.strip()) > 0:
+                        return contents
                     else:
                         return " "
             except UnicodeDecodeError:

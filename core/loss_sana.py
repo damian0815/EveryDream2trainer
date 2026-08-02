@@ -131,3 +131,115 @@ def compute_sana_loss(
     # return full loss
     loss_full = F.mse_loss(model_pred.float(), target.float(), reduction='none')
     return loss_full, model_pred, target
+
+
+def compute_sana_dpo_loss(
+    policy_transformer: torch.nn.Module,
+    reference_transformer: torch.nn.Module,
+    noise_scheduler,
+    z_good: torch.Tensor,
+    z_bad: torch.Tensor,
+    y: torch.Tensor,
+    y_mask: torch.Tensor,
+    timesteps: torch.Tensor,
+    noise: torch.Tensor,
+    beta: float = 0.1,
+    slice_size: int = None,
+    model_pred_good: torch.Tensor = None,
+    target_good: torch.Tensor = None,
+) -> Tuple[torch.Tensor, dict]:
+    """
+    Diffusion-DPO loss for SANA flow-matching.
+
+    Trains the policy model to prefer good images over bad images using paired
+    preference data. The reference model (frozen EMA) provides a baseline.
+
+    Args:
+        policy_transformer   : trainable transformer
+        reference_transformer: frozen EMA transformer (no grad)
+        noise_scheduler      : TrainFlowMatchEulerDiscreteScheduler
+        z_good               : clean VAE latents for good images, (n, C, H, W)
+        z_bad                : clean VAE latents for bad images,  (n, C, H, W)
+        y                    : text embeddings,     (n, N, C_text)
+        y_mask               : attention mask,      (n, N)
+        timesteps            : float timesteps,     (n,)
+        noise                : shared noise tensor, (n, C, H, W)
+        beta                 : DPO temperature/scale factor
+        slice_size           : max samples per forward slice (saves VRAM)
+        model_pred_good      : precomputed policy-good prediction (avoids duplicate forward)
+        target_good          : precomputed velocity target for good images
+
+    Returns:
+        (loss_1d, info) where loss_1d is shape (n,) and info is a dict of diagnostics.
+    """
+    if slice_size is not None:
+        results_loss = []
+        results_info = {k: [] for k in ("dpo_signal", "err_policy_good", "err_policy_bad",
+                                         "err_ref_good", "err_ref_bad")}
+        for start in range(0, z_good.shape[0], slice_size):
+            end = start + slice_size
+            loss_s, info_s = compute_sana_dpo_loss(
+                policy_transformer, reference_transformer, noise_scheduler,
+                z_good[start:end], z_bad[start:end],
+                y[start:end], y_mask[start:end],
+                timesteps[start:end], noise[start:end],
+                beta=beta, slice_size=None,
+                model_pred_good=model_pred_good[start:end] if model_pred_good is not None else None,
+                target_good=target_good[start:end] if target_good is not None else None,
+            )
+            results_loss.append(loss_s)
+            for k in results_info:
+                results_info[k].append(info_s[k])
+        return (torch.cat(results_loss, dim=0),
+                {k: torch.cat(v, dim=0) for k, v in results_info.items()})
+
+    # Policy forward on good images — reuse if caller already computed it
+    if model_pred_good is not None:
+        pred_policy_good = model_pred_good
+    else:
+        _, pred_policy_good, target_good = compute_sana_loss(
+            policy_transformer, noise_scheduler,
+            z_good, y, y_mask, timesteps, noise=noise,
+        )
+
+    # Policy forward on bad images
+    _, pred_policy_bad, target_bad = compute_sana_loss(
+        policy_transformer, noise_scheduler,
+        z_bad, y, y_mask, timesteps, noise=noise,
+    )
+
+    # Reference forward on good + bad images (frozen, no grad)
+    with torch.no_grad():
+        _, pred_ref_good, _ = compute_sana_loss(
+            reference_transformer, noise_scheduler,
+            z_good, y, y_mask, timesteps, noise=noise,
+        )
+        _, pred_ref_bad, _ = compute_sana_loss(
+            reference_transformer, noise_scheduler,
+            z_bad, y, y_mask, timesteps, noise=noise,
+        )
+
+    # Per-sample MSE errors (reduce over spatial dims)
+    spatial_dims = list(range(1, z_good.ndim))
+
+    err_policy_good = F.mse_loss(pred_policy_good.float(), target_good.float(),
+                                 reduction='none').mean(dim=spatial_dims)
+    err_policy_bad = F.mse_loss(pred_policy_bad.float(), target_bad.float(),
+                                reduction='none').mean(dim=spatial_dims)
+    err_ref_good = F.mse_loss(pred_ref_good.float(), target_good.float(),
+                              reduction='none').mean(dim=spatial_dims)
+    err_ref_bad = F.mse_loss(pred_ref_bad.float(), target_bad.float(),
+                             reduction='none').mean(dim=spatial_dims)
+
+    # DPO signal and loss
+    dpo_signal = -beta * ((err_policy_good - err_ref_good) - (err_policy_bad - err_ref_bad))
+    loss_1d = -F.logsigmoid(dpo_signal)
+
+    info = {
+        "dpo_signal": dpo_signal.detach(),
+        "err_policy_good": err_policy_good.detach(),
+        "err_policy_bad": err_policy_bad.detach(),
+        "err_ref_good": err_ref_good.detach(),
+        "err_ref_bad": err_ref_bad.detach(),
+    }
+    return loss_1d, info

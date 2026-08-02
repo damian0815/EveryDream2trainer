@@ -357,7 +357,7 @@ def generate_images_diffusers(pipe: StableDiffusionPipeline|StableDiffusionXLPip
                             guidance_rescale=p0.cfg_rescale_multiplier
                         )
 
-                        if False and isinstance(pipe, SanaPipeline):
+                        if isinstance(pipe, SanaPipeline):
                             width = round(p0.width / 32) * 32
                             height = round(p0.height / 32) * 32
                         else:

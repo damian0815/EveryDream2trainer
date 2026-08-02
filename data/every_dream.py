@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import copy
+import glob as _glob
 import hashlib
 import logging
 import os
@@ -64,6 +65,8 @@ class EveryDreamBatch(Dataset):
                  contrastive_learning_dropout_p=0,
                  cond_dropout_noise_p=0,
                  default_motion_score=30,
+                 load_dpo_bad=False,
+                 rotation_degrees=0.0,
                  ):
 
         if plugin_runner is None:
@@ -73,6 +76,9 @@ class EveryDreamBatch(Dataset):
         self.contrastive_loss_batch_ids = contrastive_loss_batch_ids or []
         self.default_motion_score = default_motion_score
         self.data_loader = data_loader
+        self.text_encoder_name = ""
+        self.cache_text_embeddings = False
+        self.clean_stale_embeddings = False
         self.batch_size = data_loader.batch_size
         self.debug_level = debug_level
         self.conditional_dropout = conditional_dropout
@@ -101,6 +107,8 @@ class EveryDreamBatch(Dataset):
         self.contrastive_learning_dropout_p = contrastive_learning_dropout_p
         self.cond_dropout_noise_p = cond_dropout_noise_p
         self.random_instance = random.Random(seed)
+        self.load_dpo_bad = load_dpo_bad
+        self.rotation_degrees = rotation_degrees
 
         num_images = len(self.image_train_items)
         logging.info(f" ** Dataset '{name}': {num_images / self.batch_size:.0f} batches, num_images: {num_images}, batch_size: {self.batch_size}")
@@ -132,6 +140,9 @@ class EveryDreamBatch(Dataset):
 
         train_item: dict = self.get_image_for_trainer(self.image_train_items[i], self.debug_level, batch_index=i)
         example["pathname"] = train_item["pathname"]
+        example["_encoder_id"] = self.text_encoder_name
+        example["_cache_text_embeddings"] = self.cache_text_embeddings
+        example["_clean_stale_embeddings"] = self.clean_stale_embeddings
 
         use_imagenet_norm_std = False # done in VAE encode
         if use_imagenet_norm_std:
@@ -159,7 +170,7 @@ class EveryDreamBatch(Dataset):
             example["caption"] = train_item["caption"].get_shuffled_caption(self.seed, keep_tags=self.keep_tags)
         else:
             example["caption"] = train_item["caption"].get_caption()
-        if train_item.get("is_video"):
+        if train_item.get("is_video") and 'motion score:' not in example["caption"].lower():
             example["caption"] = _inject_motion_score(example["caption"], self.default_motion_score)
         check_caption_json(example["caption"])
 
@@ -186,6 +197,10 @@ class EveryDreamBatch(Dataset):
             example["mask"] = mask_transforms(train_item["mask"])
         else:
             example["mask"] = None
+        if train_item.get("dpo_bad") is not None and not train_item.get("is_video"):
+            example["dpo_bad"] = image_transforms(train_item["dpo_bad"])
+        else:
+            example["dpo_bad"] = None
         example["untransformed_caption"] = example["caption"]
         example["cond_dropout"] = train_item["cond_dropout"]
         example["caption"] = self.plugin_runner.run_transform_caption(example["caption"], pathname=example["pathname"])
@@ -228,18 +243,24 @@ class EveryDreamBatch(Dataset):
         path_hash = int(hashlib.md5(image_train_item.pathname.encode()).hexdigest(), 16) & 0x7fffffff
         rng = random.Random(self.seed ^ path_hash ^ batch_index)
 
+        # previous logic: if runt_size > 0, no crop jitter, else use self.crop_jitter
+        # now, though, we always drop non-runts, so we can always use self.crop_jitter
+        #crop_jitter = (0.0
+        #               if image_train_item.runt_size > 0
+        #               else self.crop_jitter)
+        crop_jitter = self.crop_jitter
+
         is_video_item = getattr(image_train_item, 'is_video', False)
         if is_video_item:
-            crop_jitter = (0.0
-                           if image_train_item.runt_size > 0
-                           else self.crop_jitter)
             image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(
                 save=save, crop_jitter=crop_jitter, load_mask=False, invert_mask=False,
                 return_crop_info=True, rng=rng,
             )
             example["is_video"] = True
-            example["image"] = image_train_tmp.frames
+            example["image"] = image_train_tmp.frames.copy()
+            image_train_tmp.frames = None
             example["mask"] = None
+            example["dpo_bad"] = None
             example["caption"] = image_train_tmp.caption
             example["cond_dropout"] = image_train_tmp.cond_dropout
             example["runt_size"] = image_train_tmp.runt_size
@@ -257,16 +278,14 @@ class EveryDreamBatch(Dataset):
             )
             return example
 
-        crop_jitter = (0.0
-                       if image_train_item.runt_size > 0
-                       else self.crop_jitter)
-
         load_mask = (rng.random() < self.mask_p)
-        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=load_mask, invert_mask=self.invert_masks, return_crop_info=True, rng=rng)
-        example["image"] = None if image_train_tmp.image is None else image_train_tmp.image.copy()
-        example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy()
-        image_train_tmp.image = None
-        image_train_tmp.mask = None
+        image_train_tmp, (crop_tl_x, crop_tl_y, uncropped_w, uncropped_h) = image_train_item.hydrate(save=save, crop_jitter=crop_jitter, load_mask=load_mask, invert_mask=self.invert_masks, return_crop_info=True, rng=rng, load_dpo_bad=self.load_dpo_bad, rotation_degrees=self.rotation_degrees)
+        example["image"] = None if image_train_tmp.image is None else image_train_tmp.image.copy() # hack to avoid memory leak
+        example["mask"] = None if image_train_tmp.mask is None else image_train_tmp.mask.copy()    # hack to avoid memory leak
+        example["dpo_bad"] = None if image_train_tmp.dpo_bad_image is None else image_train_tmp.dpo_bad_image.copy()
+        image_train_tmp.image = None # hack to avoid memory leak
+        image_train_tmp.mask = None  # hack to avoid memory leak
+        image_train_tmp.dpo_bad_image = None
         example["caption"] = image_train_tmp.caption
         example["cond_dropout"] = image_train_tmp.cond_dropout
         example["runt_size"] = image_train_tmp.runt_size
@@ -439,6 +458,94 @@ def collapse_captions(batch):
     return captions
 
 
+def _cache_path_for(pathname: str, encoder_id: str, variant: str, caption_text: str) -> str:
+    """Build the on-disk cache path for a single caption embedding."""
+    import hashlib
+    sha = hashlib.sha256(caption_text.encode("utf-8")).hexdigest()[:8]
+    stem, _ = os.path.splitext(pathname)
+    return f"{stem}.{encoder_id}.{variant}.{sha}.embeddings.safetensors"
+
+
+def _load_precomputed_embeddings(
+    pathnames: list[str],
+    captions: dict[str, list[str]],
+    encoder_id: str,
+    device: torch.device,
+    *,
+    delete_stale: bool = False,
+) -> dict[str, list[dict | None]]:
+    """
+    Load cached text embeddings for a batch.
+
+    Returns a dict with the same keys as *captions*. Each value is a list (aligned
+    with *pathnames*) containing either a dict with ``"embeds"`` (``(1, N, C)``)
+    and ``"mask"`` (``(1, N)``) tensors, or ``None`` when no matching cache exists.
+
+    Padding is applied per variant so all entries share the same ``N``.
+    """
+    if not encoder_id:
+        return {k: [None] * len(v) for k, v in captions.items()}
+
+    import safetensors.torch as _st
+
+    result: dict[str, list[dict | None]] = {}
+
+    for variant_key, caption_list in captions.items():
+        entries: list[dict | None] = []
+
+        for pathname, caption_text in zip(pathnames, caption_list):
+            expected_hash = hashlib.sha256(caption_text.encode("utf-8")).hexdigest()[:8]
+            stem, _ = os.path.splitext(pathname)
+            pattern = f"{stem}.{encoder_id}.{variant_key}.*.embeddings.safetensors"
+            hits = _glob.glob(pattern)
+
+            loaded: dict | None = None
+            stale_hits: list[str] = []
+
+            for hit in hits:
+                # extract hash segment (second-to-last dot-segment before extension)
+                parts = os.path.basename(hit).split(".")
+                # stem.encoder_id.variant.hash.embeddings.safetensors
+                # -> ["stem", "encoder_id", "variant", "hash", "embeddings", "safetensors"]
+                hit_hash = parts[-3] if len(parts) >= 4 else ""
+                if hit_hash == expected_hash:
+                    data = _st.load_file(hit, device=str(device))
+                    loaded = {"embeds": data["embeds"], "mask": data["mask"]}
+                    break
+                else:
+                    stale_hits.append(hit)
+
+            if loaded is None:
+                for stale in stale_hits:
+                    logging.warning(
+                        f"Stale embedding cache for {pathname}: "
+                        f"expected hash {expected_hash}, found in {stale}. Recomputing."
+                    )
+                    if delete_stale:
+                        os.remove(stale)
+                entries.append(None)
+            else:
+                entries.append(loaded)
+
+        # — pad to uniform N within this variant —
+        nones = sum(1 for e in entries if e is None)
+        if nones == 0 and entries:
+            max_n = max(e["embeds"].shape[1] for e in entries)
+            for e in entries:
+                n = e["embeds"].shape[1]
+                if n < max_n:
+                    e["embeds"] = torch.nn.functional.pad(
+                        e["embeds"], (0, 0, 0, max_n - n), value=0.0
+                    )
+                    e["mask"] = torch.nn.functional.pad(
+                        e["mask"], (0, max_n - n), value=False
+                    )
+
+        result[variant_key] = entries
+
+    return result
+
+
 def collate_fn(batch):
     """
     Collates batches
@@ -462,6 +569,16 @@ def collate_fn(batch):
     # replace all 'default' with the most common
     captions = collapse_captions(batch)
 
+    if batch[0].get("_cache_text_embeddings", False):
+        img_device = images[0].device if images else torch.device("cpu")
+        encoder_id = batch[0].get("_encoder_id", "")
+        precomputed = _load_precomputed_embeddings(
+            pathnames, captions, encoder_id, img_device,
+            delete_stale=batch[0].get("_clean_stale_embeddings", False),
+        )
+    else:
+        precomputed = {k: [None] * len(v) for k, v in captions.items()}
+
     add_time_ids = torch.cat([example["add_time_ids"] for example in batch])
 
     runt_size = batch[0]["runt_size"]
@@ -480,6 +597,15 @@ def collate_fn(batch):
     else:
         masks = None
 
+    dpo_bads = [example.get("dpo_bad") for example in batch]
+    if any(r is not None for r in dpo_bads):
+        dpo_bads = [r if r is not None else torch.zeros_like(images[i])
+                    for i, r in enumerate(dpo_bads)]
+        dpo_bads = torch.stack(dpo_bads)
+        dpo_bads = dpo_bads.to(memory_format=torch.contiguous_format).float()
+    else:
+        dpo_bads = None
+
     loss_scale = torch.tensor([example.get("loss_scale", 1) for example in batch])
     timesteps_range = [example["timesteps_range"] for example in batch]
     if all(tsr is None for tsr in timesteps_range):
@@ -490,7 +616,9 @@ def collate_fn(batch):
     ret = {
         "image": images,
         "mask": masks,
+        "dpo_bad": dpo_bads,
         "captions": captions,
+        "precomputed_embeddings": precomputed,
         "runt_size": runt_size,
         "loss_scale": loss_scale,
         "do_contrastive_learning": do_contrastive_learning,

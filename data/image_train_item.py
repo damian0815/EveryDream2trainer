@@ -213,6 +213,8 @@ class ImageSourceItem:
     def loss_scale(self): return self.item.loss_scale
     @property
     def timesteps_range(self): return self.item.timesteps_range
+    @property
+    def largest_valid_frame_count(self): return self.item.largest_valid_frame_count
 
     def is_feasible_for_any_resolution(self) -> bool:
         """True if at least one resolution is large enough for this image."""
@@ -289,12 +291,22 @@ class ImageTrainItem:
 
         self.is_undersized = False
         self.error = None
+        self.largest_valid_frame_count = 0
         self.__compute_target_width_height()
 
     @property
     def pathname_mask(self):
         for extension in [".png", ".jpg", ".jpeg", ".bmp", ".jfif", ".webp"]:
             candidate = self.pathname + f".mask{extension}"
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    @property
+    def pathname_dpobad(self):
+        base, _ = os.path.splitext(self.pathname)
+        for extension in [".png", ".jpg", ".jpeg", ".bmp", ".jfif", ".webp"]:
+            candidate = base + f".dpobad{extension}"
             if os.path.exists(candidate):
                 return candidate
         return None
@@ -322,6 +334,19 @@ class ImageTrainItem:
         except SyntaxError as e:
             pass
         return mask
+
+    def load_dpobad(self) -> PIL.Image:
+        if self.pathname_dpobad is None:
+            return None
+        try:
+            image = PIL.Image.open(self.pathname_dpobad).convert('RGB')
+            image = self._try_transpose(image, print_error=False)
+        except OSError as e:
+            logging.error(f"fatal error loading dpobad image {self.pathname_dpobad}: {e}")
+            raise e
+        except SyntaxError:
+            pass
+        return image
 
     
     def _try_transpose(self, image, print_error=False):
@@ -384,45 +409,72 @@ class ImageTrainItem:
             print(f"error for debug saving image of {self.pathname}: {e}")
             pass
 
-    def _trim_to_aspect(self, image, target_wh, rng=None) -> tuple[PIL.Image, tuple[int, int]]:
+    def _get_trim_offsets(self, image, target_wh, rng=None):
+        """Precompute trim offsets without modifying the image."""
         try:
             width, height = image.size
-            target_aspect = target_wh[0] / target_wh[1] # 0.60
-            image_aspect = width / height # 0.5865
-            #self._debug_save_image(image, "precrop")
-
+            target_aspect = target_wh[0] / target_wh[1]
+            image_aspect = width / height
             _rng = rng if rng is not None else random
 
             if image_aspect > target_aspect:
                 target_width = int(height * target_aspect)
                 overwidth = width - target_width
                 l = _rng.triangular(0, overwidth)
-                #print(f"l: {l}, overwidth: {overwidth}")
-                l = max(0, l)
-                l = int(min(l, overwidth))
-                r = width - overwidth + l
-                #print(f"\n_trim_to_aspect actual ar: {image_aspect}, target ar:{target_aspect:.2f}, {image.size}, cropping with box: {l}, 0, {r}, {height}, {self.pathname}")
-                image = image.crop((l, 0, r, height))
-                return image, (l, 0)
+                l = max(0, int(min(l, overwidth)))
+                return (l, 0)
             elif target_aspect > image_aspect:
                 target_height = int(width / target_aspect)
                 overheight = height - target_height
                 t = _rng.triangular(0, overheight)
-                #print(f"t: {t}, overheight: {overheight}")
-                t = max(0, t)
-                t = int(min(t, overheight))
-                b = height - overheight + t
-                #print(f"\n_trim_to_aspect actual ar: {image_aspect}, target ar:{target_aspect:.2f}, {image.size}, cropping with box: 0, {t}, {width}, {b}, {self.pathname}")
-                image = image.crop((0, t, width, b))
-                return image, (0, t)
+                t = max(0, int(min(t, overheight)))
+                return (0, t)
             else:
-                return image, (0, 0)
-
+                return (0, 0)
         except Exception as e:
-            logging.error(f"fatal error trimming image {self.pathname}: {e}")
+            logging.error(f"fatal error computing trim offsets for {self.pathname}: {e}")
             raise e
 
-    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, invert_mask=False, return_crop_info=False, rng=None
+    def _apply_trim(self, image, target_wh, trim_offsets):
+        """Apply precomputed trim offsets to an image."""
+        try:
+            width, height = image.size
+            target_aspect = target_wh[0] / target_wh[1]
+            image_aspect = width / height
+            l, t = trim_offsets
+
+            if image_aspect > target_aspect:
+                target_width = int(height * target_aspect)
+                overwidth = width - target_width
+                r = width - overwidth + l
+                return image.crop((l, 0, r, height)), (l, 0)
+            elif target_aspect > image_aspect:
+                target_height = int(width / target_aspect)
+                overheight = height - target_height
+                b = height - overheight + t
+                return image.crop((0, t, width, b)), (0, t)
+            else:
+                return image, (0, 0)
+        except Exception as e:
+            logging.error(f"fatal error applying trim for {self.pathname}: {e}")
+            raise e
+
+    def _trim_to_aspect(self, image, target_wh, rng=None) -> tuple[PIL.Image, tuple[int, int]]:
+        offsets = self._get_trim_offsets(image, target_wh, rng)
+        return self._apply_trim(image, target_wh, offsets)
+
+
+
+    @staticmethod
+    def _apply_rotation(image: PIL.Image.Image, angle_degrees: float) -> PIL.Image.Image:
+        """
+        Rotate a PIL image by `angle_degrees` (positive = counterclockwise)
+        around its center, using fill color (0, 0, 0) for exposed regions.
+        """
+        return image.rotate(angle_degrees, resample=PIL.Image.BICUBIC, expand=False, fillcolor=(0, 0, 0))
+
+    def hydrate(self, save=False, crop_jitter=0.02, load_mask=False, invert_mask=False, return_crop_info=False, rng=None,
+                load_dpo_bad=False, rotation_degrees=0.0,
                 ) -> typing.Union['ImageTrainItem',
                                   tuple['ImageTrainItem', tuple[int, int, int, int]]]:
         try:
@@ -433,11 +485,52 @@ class ImageTrainItem:
             print(err)
             image = None
         mask = self.load_mask() if load_mask else None
+        dpo_bad_image = self.load_dpobad() if load_dpo_bad else None
 
         if image is None:
             uncropped_width, uncropped_height = self.target_wh
             crop_topleft = (0, 0)
         else:
+            if image is not None and rotation_degrees > 0:
+                width, height = image.size
+                max_angle = _compute_max_rotation_angle(
+                    width, height,
+                    self.target_wh[0], self.target_wh[1],
+                    rotation_degrees,
+                )
+                if max_angle > 0:
+                    _rng = rng if rng is not None else random
+                    angle = _rng.uniform(-max_angle, max_angle)
+                    image = self._apply_rotation(image, angle)
+                    if mask is not None:
+                        mask = self._apply_rotation(mask, angle)
+                    if dpo_bad_image is not None:
+                        dpo_bad_image = self._apply_rotation(dpo_bad_image, angle)
+
+            def _center_crop(img, box):
+                bw, bh = box
+                w, h = img.size
+                left, top = (w - bw) // 2, (h - bh) // 2
+                return img.crop((left, top, left + bw, top + bh))
+
+            if image is not None and rotation_degrees > 0:
+                width, height = image.size
+                max_angle, safe_box = plan_rotation_and_crop(
+                    width, height, self.target_wh[0], self.target_wh[1],
+                    rotation_degrees, min_box_scale=1.0,
+                )
+                if max_angle > 0:
+                    _rng = rng if rng is not None else random
+                    angle = _rng.uniform(-max_angle, max_angle)
+                    image = self._apply_rotation(image, angle)
+                    image = _center_crop(image, safe_box)
+                    if mask is not None:
+                        mask = self._apply_rotation(mask, angle)
+                        mask = _center_crop(mask, safe_box)
+                    if dpo_bad_image is not None:
+                        dpo_bad_image = self._apply_rotation(dpo_bad_image, angle)
+                        dpo_bad_image = _center_crop(dpo_bad_image, safe_box)
+
             width, height = image.size
             if mask is not None:
                 if mask.size[0] != width or mask.size[1] != height:
@@ -454,13 +547,18 @@ class ImageTrainItem:
                 image = self._apply_crop_jitter(image, precomputed_jitter=jitter_amounts)
                 if mask is not None:
                     mask = self._apply_crop_jitter(mask, precomputed_jitter=jitter_amounts)
+                if dpo_bad_image is not None:
+                    dpo_bad_image = self._apply_crop_jitter(dpo_bad_image, precomputed_jitter=jitter_amounts)
             else:
                 jitter_amounts = (0, 0, 0, 0)
             crop_topleft = (jitter_amounts[0], jitter_amounts[2])
 
-            image, trim_crop_offset = self._trim_to_aspect(image, self.target_wh, rng=rng)
+            trim_offsets = self._get_trim_offsets(image, self.target_wh, rng=rng)
+            image, trim_crop_offset = self._apply_trim(image, self.target_wh, trim_offsets)
             if mask is not None:
-                mask, trim_crop_offset = self._trim_to_aspect(mask, self.target_wh, rng=rng)
+                mask, _ = self._apply_trim(mask, self.target_wh, trim_offsets)
+            if dpo_bad_image is not None:
+                dpo_bad_image, _ = self._apply_trim(dpo_bad_image, self.target_wh, trim_offsets)
             crop_topleft = (crop_topleft[0] + trim_crop_offset[0], crop_topleft[1] + trim_crop_offset[1])
             cropped_width = image.size[0]
 
@@ -468,6 +566,8 @@ class ImageTrainItem:
             image = image.resize(self.target_wh)
             if mask:
                 mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
+            if dpo_bad_image is not None:
+                dpo_bad_image = dpo_bad_image.resize(self.target_wh)
 
             # sdxl: add_time_embeds crop tracking
             resized_cropped_width = image.size[0]
@@ -483,14 +583,19 @@ class ImageTrainItem:
                 image = TF.hflip(image)
                 if mask is not None:
                     mask = TF.hflip(mask)
+                if dpo_bad_image is not None:
+                    dpo_bad_image = TF.hflip(dpo_bad_image)
 
             if save:
                 self._debug_save_image(image, "final")
 
             image = np.array(image).astype(np.uint8)
+            if dpo_bad_image is not None:
+                dpo_bad_image = np.array(dpo_bad_image).astype(np.uint8)
 
         self.image = image
         self.mask = mask
+        self.dpo_bad_image = dpo_bad_image
 
         if self.mask is not None:
             self.mask = np.array(self.mask.convert('L')).astype(np.float32) / 255
@@ -583,5 +688,75 @@ def _needs_transpose(image, print_error=False):
         logging.warning(F"Error rotating image: {e} on {self.pathname}, image will be loaded as is, EXIF may be corrupt") if print_error else None
         pass
     return False
+
+
+def _max_ar_box_height(native_w, native_h, ar, angle_deg):
+    """Tallest centered box of aspect ratio ar that survives rotation by angle_deg."""
+    t = math.radians(abs(angle_deg))
+    c, s = math.cos(t), math.sin(t)
+    return min(native_w / (ar * c + s), native_h / (c + ar * s))
+
+def plan_rotation_and_crop(native_w, native_h, target_w, target_h,
+                           max_rotation_deg, min_box_scale=1.0, margin_px=2):
+    """(theta_max, (box_w, box_h)) -- rotate by any |a| <= theta_max, center-crop
+    to box, and you're fill-free. Box keeps the target aspect ratio and is as
+    large as the angle allows, floored at min_box_scale * target."""
+    ar = target_w / target_h
+    floor_h = target_h * min_box_scale
+    theta = max(0.0, float(max_rotation_deg))
+
+    # If the requested angle would shrink the clean box below the floor, back off.
+    if theta > 0.0 and _max_ar_box_height(native_w, native_h, ar, theta) - 2 * margin_px < floor_h:
+        theta = _compute_max_rotation_angle(
+            native_w, native_h,
+            math.ceil(ar * floor_h) + 2 * margin_px,
+            math.ceil(floor_h) + 2 * margin_px,
+            max_degrees=theta,
+        )
+
+    m = 2 * margin_px if theta > 0.0 else 0
+    box_h = max(1, min(int(_max_ar_box_height(native_w, native_h, ar, theta)) - m, native_h))
+    box_w = max(1, min(int(box_h * ar), native_w))
+    return theta, (box_w, box_h)
+
+def _compute_max_rotation_angle(img_w: int, img_h: int, box_w: int, box_h: int, max_degrees: float) -> float:
+    """
+    Compute the maximum safe rotation angle (in degrees) such that a
+    center axis-aligned crop of `box_w x box_h` after rotating the
+    `img_w x img_h` image by that angle contains no border fill.
+
+    The safe-rotation constraints are:
+      box_w * cos(θ) + box_h * sin(θ) ≤ img_w
+      box_h * cos(θ) + box_w * sin(θ) ≤ img_h
+
+    Each is of the form A·cos(θ) + B·sin(θ) ≤ C, which rewrites as
+    R·sin(θ + φ) ≤ C with R = √(A²+B²), φ = atan2(A, B).
+
+    Returns the smaller of the two bound angles, capped at max_degrees.
+    If both constraints are satisfied for all θ in [0, max_degrees],
+    returns max_degrees.
+    """
+    if box_w > img_w or box_h > img_h:
+        return 0.0
+
+    max_rad = math.radians(max_degrees)
+    bounds = []
+
+    for a, b, c in [(box_w, box_h, img_w), (box_h, box_w, img_h)]:
+        r = math.sqrt(a * a + b * b)
+        if c >= r:
+            continue
+        phi = math.atan2(a, b)
+        bound = math.asin(c / r) - phi
+        bounds.append(bound)
+
+    if not bounds:
+        return max_degrees
+
+    result = min(bounds)
+    result_degrees = math.degrees(result)
+    return max(0.0, min(result_degrees, max_degrees))
+
+
 
 DEFAULT_BATCH_ID = "default_batch"

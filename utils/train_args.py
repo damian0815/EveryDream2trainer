@@ -70,7 +70,7 @@ def build_argparser(
     argparser.add_argument("--batch_size", type=int, default=2, help="Batch size (def: 2)")
     argparser.add_argument("--batch_size_curriculum_alpha", type=float, default=0.5,
                            help="curriculum alpha, default=0.5 (rapid (squared) falloff from initial)")
-    argparser.add_argument("--interleave_batch_size_1", action='store_true',
+    argparser.add_argument("--interleave_batch_size_1", action=argparse.BooleanOptionalAction,
                            help="If passed, toggle between batches of BS1 and batches of current_batch_size")
     argparser.add_argument("--interleave_batch_size_1_alpha", type=float, default=0,
                            help="How many BS1 batches to run when interleaving, as a factor of the current batch size")
@@ -105,15 +105,16 @@ def build_argparser(
                            help="optional json file(s) mapping real image paths to an additional multiplier factor")
     argparser.add_argument("--num_dataloader_workers", type=int, default=None,
                            help="number of worker threads for dataloaders")
-    argparser.add_argument("--skip_undersized_images", action='store_true',
+    argparser.add_argument("--skip_undersized_images", action=argparse.BooleanOptionalAction,
                            help="If passed, ignore images that are considered undersized for the training resolution")
+    argparser.add_argument("--use_only_largest_resolution_per_image", action=argparse.BooleanOptionalAction, help="If passed, only use the largest resolution per image when multiple resolutions are available")
     argparser.add_argument("--disable_amp", action=argparse.BooleanOptionalAction, default=False,
                            help="disables automatic mixed precision (def: False)")
     argparser.add_argument("--disable_textenc_training", action=argparse.BooleanOptionalAction, default=False,
                            help="disables training of text encoder (def: False)")
     argparser.add_argument("--disable_unet_training", action=argparse.BooleanOptionalAction, default=False,
                            help="disables training of unet (def: False) NOT RECOMMENDED")
-    argparser.add_argument("--freeze_unet_balanced", action="store_true", default=False,
+    argparser.add_argument("--freeze_unet_balanced", action=argparse.BooleanOptionalAction, default=False,
                            help="If passed, apply a 'balanced' unet freeze strategy")
     argparser.add_argument("--embedding_perturbation", type=float, default=0.0,
                            help="random perturbation of text embeddings (def: 0.0)")
@@ -122,9 +123,13 @@ def build_argparser(
     argparser.add_argument("--flip_p", type=float, default=0.0,
                            help="probability of flipping image horizontally (def: 0.0), not good for specific faces!")
     argparser.add_argument("--crop_jitter", type=float, default=0.02, help="jitter percent of image size when cropping")
+    argparser.add_argument("--rotation_degrees", type=float, default=0.0,
+                           help="maximum rotation augmentation in degrees (def: 0.0 = disabled). "
+                                "Rotation is applied before cropping; the actual angle is clamped "
+                                "to avoid border fill for each image's size relative to the target.")
     argparser.add_argument("--gpuid", type=int, default=0,
                            help="id of gpu to use for training, (def: 0)")
-    argparser.add_argument("--gradient_checkpointing", action="store_true", default=True,
+    argparser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True,
                            help="enable gradient checkpointing to reduce VRAM use (def: True)")
     argparser.add_argument("--grad_accum", type=int, default=1,
                            help="Gradient accumulation factor (def: 1)")
@@ -140,9 +145,13 @@ def build_argparser(
                            help="folder to save logs to (def: logs)")
     argparser.add_argument("--log_step", type=int, default=25,
                            help="How often to log training stats, def: 25")
-    argparser.add_argument("--log_named_parameters_magnitudes", action='store_true',
+    argparser.add_argument("--log_step_optimizer", type=int, default=None,
+                           help="How often to log optimizer metrics (LR, grad scale, "
+                                "grad norms, exp_avg, exp_avg_sq). "
+                                "Defaults to --log_step value if not set.")
+    argparser.add_argument("--log_named_parameters_magnitudes", action=argparse.BooleanOptionalAction,
                            help="If passed, log the magnitudes of all named parameters")
-    argparser.add_argument('--log_attention_activations', action='store_true',
+    argparser.add_argument('--log_attention_activations', action=argparse.BooleanOptionalAction,
                            help='If passed, magnitudes of attention activation modules in the unet')
     argparser.add_argument("--loss_type", type=str, default="mse_huber",
                            help="type of loss / weight (def: mse_huber)",
@@ -169,6 +178,14 @@ def build_argparser(
                            help="Steps to advance the LR during training")
     argparser.add_argument("--lr_num_restarts", type=int, default=1,
                            help="Number of times to (re-)start the LR scheduler, default=1 (no restarts)")
+    argparser.add_argument("--lr_block_fadein_k", type=int, default=0,
+                           help="Number of transformer blocks at the start to "
+                                "logarithmically fade in LR (def: 0 = off). "
+                                "Block i gets LR * 2^(i-k).")
+    argparser.add_argument("--lr_block_fadeout_k", type=int, default=0,
+                           help="Number of transformer blocks at the end to "
+                                "logarithmically fade out LR (def: 0 = off). "
+                                "Block (N-1-i) gets LR * 2^(i-k).")
     argparser.add_argument("--max_epochs", type=int, default=100,
                            help="Maximum number of epochs to train for")
     argparser.add_argument("--max_steps", type=int, default=None,
@@ -366,12 +383,14 @@ def build_argparser(
                            help="Self-Flow: weighting factor γ for the representation loss.")
     argparser.add_argument("--self_flow_mask_ratio", type=float, default=0.25,
                            help="Self-Flow: fraction of spatial latent tokens that use the secondary noise level.")
-    argparser.add_argument("--self_flow_ema_decay", type=float, default=0.9999,
-                           help="Self-Flow: EMA decay rate for the teacher UNet.")
-    argparser.add_argument("--self_flow_ema_update_interval", type=int, default=1,
-                           help="Self-Flow: update the teacher EMA every N optimizer steps.")
     argparser.add_argument("--self_flow_mode", type=str, default='shallow', choices=SELF_FLOW_MODES,
                            help="Self-Flow: extraction-point arrangement.")
+    argparser.add_argument("--self_flow_lr", type=float, default=1e-5,
+                           help="Self-Flow: learning rate for the projection head MLP.")
+    argparser.add_argument("--self_flow_lr_warmup_steps", type=int, default=1000,
+                           help="Self-Flow: linear warmup steps for the MLP LR scheduler.")
+    argparser.add_argument("--self_flow_freeze_steps", type=int, default=0,
+                           help="Self-Flow: after this many global steps, freeze the MLP (0 = never freeze).")
     argparser.add_argument("--contrastive_learning_dropout_p", type=float, default=0,
                            help="Probability to drop (non-LCF/non-CFM) contrastive learning")
     argparser.add_argument("--contrastive_loss_batch_ids", type=str, nargs="*", default=[],
@@ -422,11 +441,15 @@ def build_argparser(
     argparser.add_argument("--lora_alpha", type=int, default=8)
     argparser.add_argument("--test_images", action="store_true",
                            help="check all images by trying to load them")
-    argparser.add_argument("--offload_vae", action="store_true",
+    argparser.add_argument("--offload_vae", action=argparse.BooleanOptionalAction,
                            help="If passed, offload VAE to CPU when not in use")
-    argparser.add_argument("--offload_text_encoder", action="store_true",
+    argparser.add_argument("--offload_text_encoder", action=argparse.BooleanOptionalAction,
                            help="If passed, offload text encoder(s) to CPU when not in use")
-    argparser.add_argument("--no_save_on_error", action="store_true",
+    argparser.add_argument("--cache_text_embeddings", action=argparse.BooleanOptionalAction, default=False,
+                           help="If passed, cache text encoder embeddings to disk for reuse between training runs")
+    argparser.add_argument("--clean_stale_embeddings", action=argparse.BooleanOptionalAction, default=False,
+                           help="If passed, delete stale JIT text embedding cache files instead of just logging them")
+    argparser.add_argument("--no_save_on_error", action=argparse.BooleanOptionalAction,
                            help="If passed, do not save model on error/ctrl-c")
     argparser.add_argument("--clip_vision_model_source", default=None,
                            help="If specified, the vision model to use for text encoder contrastive training")
@@ -434,13 +457,17 @@ def build_argparser(
                            help="If specified, the preprocessor to use for text encoder contrastive training")
     argparser.add_argument("--clip_vision_contrastive_loss_lambda", type=float, default=0.1,
                            help="Lambda scaling factor for contrastive loss between text encoder and CLIP vision model features")
-    argparser.add_argument("--debug_no_load_model", action="store_true",
+    argparser.add_argument("--debug_no_load_model", action=argparse.BooleanOptionalAction,
                            help="If passed, do not load model weights (for testing purposes only)")
-    argparser.add_argument("--debug_teacher", action="store_true", default=False,
+    argparser.add_argument("--debug_teacher", action=argparse.BooleanOptionalAction, default=False,
                            help="If passed, log detailed teacher/student latent stats")
     argparser.add_argument("--debug_log_on_nan", action=argparse.BooleanOptionalAction,
                            help="If specified, use set_detect_anomaly to find NaNs in autograd. Slow.")
-    argparser.add_argument("--debug_save_memory_snapshots", action="store_true", default=False,
+    argparser.add_argument("--log_cuda_memory", action=argparse.BooleanOptionalAction, default=False,
+                           help="Log CUDA allocator stats (alloc_retries, split_retries, "
+                                "allocated/reserved/cached MB) to TensorBoard every log_step "
+                                "under the tag cuda/allocator_pain")
+    argparser.add_argument("--debug_save_memory_snapshots", action=argparse.BooleanOptionalAction, default=False,
                         help="Dump CUDA memory snapshots to <logdir>/memory_snapshots/ "
                              "after model load and at the start of every accumulation loop call. "
                              "Snapshots are .pickle files viewable at https://pytorch.org/memory_viz")
@@ -448,9 +475,21 @@ def build_argparser(
     # mixed_precision is used by train_sana.py but not train.py (which uses disable_amp/force_bfloat16)
     # include it here so SANA JSON configs can set it
     argparser.add_argument("--mixed_precision", type=str, default="bf16",
-                           choices=["bf16", "fp16", "no"],
-                           help="Mixed precision mode for SANA training (bf16/fp16/no). "
-                                "For SD/SDXL use --disable_amp / --force_bfloat16 instead.")
+                            choices=["bf16", "fp16", "no"],
+                            help="Mixed precision mode for SANA training (bf16/fp16/no). "
+                                 "For SD/SDXL use --disable_amp / --force_bfloat16 instead.")
+
+    argparser.add_argument("--anchor_reg_alpha", type=float, default=0.0,
+        help="Anchor regularization strength (0 = disabled). Pulls trainable params "
+             "toward their initial values, preventing catastrophic forgetting. "
+             "Typical range: 1e-4 (soft) to 0.1 (strong). Default: 0 (disabled).")
+    argparser.add_argument("--anchor_reg_cpu_offload", action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Store base parameter copies on CPU to save GPU memory (slower due to transfers).")
+    argparser.add_argument("--dpo_p", type=float, default=0.0,
+        help="Probability of DPO loss per step (0.0 = disabled)")
+    argparser.add_argument("--load_dpo_bad", action=argparse.BooleanOptionalAction, default=False,
+        help="Load .dpobad images during hydration (required for DPO)")
 
     return argparser
 
@@ -504,7 +543,7 @@ def parse_train_args(
         if args.initial_batch_size is None:
             args.initial_batch_size = args.optimizer_batch_size
         else:
-            print(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.final_batch_size}")
+            print(f" * overriding --optimizer_batch_size {args.optimizer_batch_size} with --initial_batch_size {args.initial_batch_size}")
         if args.final_batch_size is None:
             args.final_batch_size = args.optimizer_batch_size
         else:
@@ -512,6 +551,36 @@ def parse_train_args(
 
 
     return args
+
+
+def validate_self_flow_ema_args(args: argparse.Namespace) -> None:
+    """Validate self-flow + EMA argument compatibility.
+
+    When self_flow_p > 0, EMA must be enabled because the self-flow teacher
+    IS the main EMA (they share the same weights).
+    """
+    import logging
+
+    if args.self_flow_p <= 0:
+        return
+
+    # EMA must be enabled
+    has_ema_decay = args.ema_decay_rate is not None
+    has_ema_strength = args.ema_strength_target is not None
+    if not has_ema_decay and not has_ema_strength:
+        raise ValueError(
+            "self_flow_p > 0 requires EMA to be enabled. "
+            "Please set --ema_decay_rate or --ema_strength_target."
+        )
+
+    # Disk-offload EMA not supported with self-flow (ema_inplace_swap per step is too slow)
+    ema_device = getattr(args, 'ema_device', 'cpu')
+    if ema_device == 'disk':
+        raise ValueError(
+            "self_flow_p > 0 is not compatible with --ema_device disk. "
+            "Please use --ema_device cpu or --ema_device cuda."
+        )
+
 
 def _coerce_resolution_args_to_lists(args):
     if type(args.resolution) is not list:

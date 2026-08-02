@@ -9,7 +9,8 @@ from data.dataset import Dataset
 import tqdm
 from colorama import Fore, Style
 
-from data.image_train_item import ImageCaption, ImageTrainItem
+from data.image_train_item import ImageCaption, ImageTrainItem, ImageSourceItem
+
 
 class DataResolver:
     def __init__(self, args: argparse.Namespace, aspects, resolution):
@@ -121,7 +122,7 @@ def resolve_sources(
     value,
     args: argparse.Namespace,
     aspects_per_resolution: dict,
-) -> list:
+) -> list[ImageSourceItem]:
     """
     Like resolve(), but returns a list of ImageSourceItem covering all resolutions
     at once.  Each image file is opened exactly once.

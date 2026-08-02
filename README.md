@@ -88,3 +88,18 @@ Make sure to check out the [tools repo](https://github.com/victorchall/EveryDrea
 [Contributing](doc/CONTRIBUTING.md)
 
 [Citations and references](doc/CITATIONS.md)
+
+## Standalone Sample Generator
+
+`utils/sample_generator.py` can be run standalone (without training) to generate samples from any loaded model.
+
+```bash
+# SD / SDXL
+python utils/sample_generator.py --resume_ckpt <path> --sample_prompts sample_prompts.json --output_dir samples/
+
+# SANA
+python utils/sample_generator.py --model_id Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers --sample_prompts sample_prompts.json --output_dir samples/
+
+# With a JSON config (works for either)
+python utils/sample_generator.py --config train.json --output_dir samples/
+```

@@ -36,6 +36,21 @@ from core.self_flow import get_self_flow_modules, get_self_flow_channels, get_se
 from model.training_model import TrainingModel, Conditioning
 from utils.teacher_debug import log_teacher_debug
 
+
+def _resolve_self_flow_teacher(model: TrainingModel):
+    """Resolve the self-flow teacher module from the main EMA.
+
+    Returns model.unet_ema (SD/SDXL) or model.transformer_ema (SANA).
+    Returns None if no in-memory EMA is available.
+    """
+    if hasattr(model, 'unet_ema') and model.unet_ema is not None:
+        return model.unet_ema
+
+    if hasattr(model, 'transformer_ema') and model.transformer_ema is not None:
+        return model.transformer_ema
+
+    return None
+
 # from train import pyramid_noise_like, compute_snr
 
 
@@ -586,7 +601,7 @@ def get_model_prediction_and_target(
 
         # self-flow feature placeholders
         do_self_flow = (self_flow_s_timesteps is not None
-                        and model.self_flow_teacher_module is not None)
+                        and _resolve_self_flow_teacher(model) is not None)
         if do_self_flow:
             sf_mode = args.self_flow_mode
             sf_student_shape, sf_teacher_shape = get_self_flow_shapes(latents.shape, model, sf_mode)
@@ -779,8 +794,8 @@ def get_model_prediction_and_target(
     # ---- Self-Flow representation learning ----
     self_flow_student_features = None
     self_flow_teacher_features = None
-    sf_teacher_module = model.self_flow_teacher_module
-    if self_flow_s_timesteps is not None and sf_teacher_module is not None:
+    sf_teacher_ref = _resolve_self_flow_teacher(model)
+    if self_flow_s_timesteps is not None and sf_teacher_ref is not None:
         sf_mask_ratio = args.self_flow_mask_ratio
         sf_mode = args.self_flow_mode
 
@@ -796,9 +811,6 @@ def get_model_prediction_and_target(
             patch_size=patch_size,
         )
 
-        # Resolve the modules to hook for this mode
-        sf_student_module, sf_teacher_module = get_self_flow_modules(model.unet, sf_teacher_module, sf_mode)
-
         # --- Student forward: x_τ input, scalar timestep t, capture student module ---
         sf_student_storage = {}
 
@@ -806,7 +818,7 @@ def get_model_prediction_and_target(
             out = output[0] if isinstance(output, tuple) else output
             sf_student_storage['h'] = out
 
-        sf_student_handle = sf_student_module.register_forward_hook(_sf_student_hook)
+        sf_student_handle = model.unet.register_forward_hook(_sf_student_hook)
         try:
             model.unet( # automatically routed to `transformer` for SANA
                 x_tau.to(dtype=model.unet.dtype),
@@ -822,21 +834,24 @@ def get_model_prediction_and_target(
         self_flow_student_features = sf_student_storage.get('h')
 
         # --- Teacher forward: x_{τ_min} input, scalar τ_min, capture teacher module ---
+        # Teacher IS the main EMA (in-memory only; disk-offload is disallowed by validation).
         sf_teacher_storage = {}
 
         def _sf_teacher_hook(module, inp, output):
             out = output[0] if isinstance(output, tuple) else output
             sf_teacher_storage['h'] = out
 
+        # Resolve sub-modules for feature extraction
+        sf_student_module, sf_teacher_module = get_self_flow_modules(model.unet, sf_teacher_ref, sf_mode)
         sf_teacher_handle = sf_teacher_module.register_forward_hook(_sf_teacher_hook)
         try:
             with torch.no_grad():
                 sf_teacher_module(
-                    x_tau_min.to(dtype=sf_teacher_module.dtype),
-                    tau_min_ts.to(sf_teacher_module.device, dtype=sf_teacher_module.dtype),
-                    encoder_hidden_states=conditioning.prompt_embeds.to(dtype=sf_teacher_module.dtype),
+                    x_tau_min.to(dtype=model.unet.dtype),
+                    tau_min_ts.to(model.unet.device, dtype=model.unet.dtype),
+                    encoder_hidden_states=conditioning.prompt_embeds.to(dtype=model.unet.dtype),
                     added_cond_kwargs=(
-                        conditioning.get_added_cond_kwargs(dtype=sf_teacher_module.dtype)
+                        conditioning.get_added_cond_kwargs(dtype=model.unet.dtype)
                         if model.is_sdxl else None
                     ),
                 )

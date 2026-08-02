@@ -16,7 +16,7 @@ import re
 This plugin adds custom tokens to the tokenizer and trains just these tokens, with the rest of the text encoder
 disabled/frozen.
 
-token/initialization config is in textual_inversion.json, same folder as this .py file.
+token/initialization config is in ./textual_inversion.json (in cwd)
 
 For pure Textual Inversion training:
   "disable_textenc_training": false,
@@ -71,20 +71,23 @@ class TextualInversionPlugin(BasePlugin):
             return self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(t))
 
         # check for correctly configured text encoder training
-        num_te_layers = len(self.text_encoder.text_model.encoder.layers)
-        if (optimizer_config is None or
-            'text_encoder_freezing' not in optimizer_config or
-            optimizer_config['text_encoder_freezing'].get('freeze_embeddings') != True or
-            optimizer_config['text_encoder_freezing'].get('freeze_final_layer_norm') != True or
-            optimizer_config['text_encoder_freezing'].get('unfreeze_last_n_layers', num_te_layers) > 0
-        ):
-            required_js_fragment = {"text_encoder_freezing": {"freeze_embeddings": True, "unfreeze_last_n_layers": 0, "freeze_final_layer_norm": True}}
-            logging.error(f" * {Fore.LIGHTRED_EX}Textual Inversion plugin REQUIRES the following json fragment in your optimizer config:{Fore.RESET}")
-            logging.error(f" * {Fore.LIGHTRED_EX}  {json.dumps(required_js_fragment)}{Fore.RESET}")
-            logging.error(f" * {Fore.LIGHTRED_EX}You have:{Fore.RESET}")
-            logging.error(f" * {Fore.LIGHTRED_EX}  " + json.dumps(optimizer_config.get("text_encoder_freezing", {})) + f"{Fore.RESET}")
+        if not hasattr(self.text_encoder, 'text_model'):
+            logging.info(" * text encoder has no text_model, skipping freeze check")
+        else:
+            num_te_layers = len(self.text_encoder.text_model.encoder.layers)
+            if (optimizer_config is None or
+                'text_encoder_freezing' not in optimizer_config or
+                optimizer_config['text_encoder_freezing'].get('freeze_embeddings') != True or
+                optimizer_config['text_encoder_freezing'].get('freeze_final_layer_norm') != True or
+                optimizer_config['text_encoder_freezing'].get('unfreeze_last_n_layers', num_te_layers) > 0
+            ):
+                required_js_fragment = {"text_encoder_freezing": {"freeze_embeddings": True, "unfreeze_last_n_layers": 0, "freeze_final_layer_norm": True}}
+                logging.error(f" * {Fore.LIGHTRED_EX}Textual Inversion plugin REQUIRES the following json fragment in your optimizer config:{Fore.RESET}")
+                logging.error(f" * {Fore.LIGHTRED_EX}  {json.dumps(required_js_fragment)}{Fore.RESET}")
+                logging.error(f" * {Fore.LIGHTRED_EX}You have:{Fore.RESET}")
+                logging.error(f" * {Fore.LIGHTRED_EX}  " + json.dumps(optimizer_config.get("text_encoder_freezing", {})) + f"{Fore.RESET}")
 
-            raise RuntimeError("Misconfigured optimizer config")
+                raise RuntimeError("Misconfigured optimizer config")
 
         self.push_embeddings_apart = self.config.get('push_embeddings_apart', False)
 
@@ -150,7 +153,10 @@ class TextualInversionPlugin(BasePlugin):
                         initializer_tids = get_token_ids(initializer)
                         initializer_weights = [embeddings.weight[i] for i in initializer_tids]
                         for i, t in enumerate(tids_to_initialize):
-                            embeddings.weight.data[t] = initializer_weights[i % len(initializer_weights)]
+                            if i >= len(initializer_weights):
+                                # the rest get random weights
+                                break
+                            embeddings.weight.data[t] = initializer_weights[i]
 
             embedding_len = self.text_encoder.get_input_embeddings().weight.shape[1]
             embedding_offsets_individual = [
@@ -209,11 +215,14 @@ class TextualInversionPlugin(BasePlugin):
     def expand_tokens(self, base_token_text, vector_length) -> list[str]:
         return [f'{base_token_text}.{i}' for i in range(vector_length)]
 
-    def add_parameters(self, text_encoder_parameters: dict, unet_parameters):
+    def add_parameters(self, text_encoder_parameters, unet_parameters):
         if self.lerp_target_weights is None:
-            for p in text_encoder_parameters.values():
-                p: list
-                p.extend([('te_offset', self.embedding_offsets_individual)])
+            offset_entry = ('te_offset', self.embedding_offsets_individual)
+            if isinstance(text_encoder_parameters, dict):
+                for p in text_encoder_parameters.values():
+                    p.extend([offset_entry])
+            else:
+                text_encoder_parameters.append(offset_entry)
         return text_encoder_parameters, unet_parameters
 
     def on_optimizer_backward(self, loss: torch.Tensor, **kwargs):
@@ -359,7 +368,7 @@ def _apply_weight_offsets(
 ) -> torch.Tensor:
     index = training_token_ids
     offset_weight = original_embeddings.weight.index_add(
-        0, index, embedding_offsets_individual
+        0, index, embedding_offsets_individual.to(dtype=original_embeddings.weight.dtype)
     )
     return offset_weight
 

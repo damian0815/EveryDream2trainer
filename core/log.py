@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import sys
+import time
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -77,6 +78,10 @@ class LogData:
     loss_epoch = []
     images_per_sec = []
     images_per_sec_log_step = []
+    images_per_sec_raw = None
+    images_per_sec_smooth = None
+    prev_total_images_processed = 0
+    prev_images_processed_capture_time: float = dataclasses.field(default_factory=time.time)
     timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
     cumulative_timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
     #cumulative_timestep_shifted_coverage: Counter = dataclasses.field(default_factory=Counter)
@@ -85,16 +90,33 @@ class LogData:
 
     attention_activation_logger: ActivationLogger = None
 
+    def update_images_per_sec(self, total_images_processed: int):
+        capture_time = time.time()
+        self.images_per_sec_raw = (total_images_processed - self.prev_total_images_processed) / (capture_time - self.prev_images_processed_capture_time)
+        self.prev_images_processed_capture_time = capture_time
+        self.prev_total_images_processed = total_images_processed
+        if self.images_per_sec_smooth is None:
+            self.images_per_sec_smooth = self.images_per_sec_raw
+        else:
+            self.images_per_sec_smooth = self.images_per_sec_smooth * 0.9 + self.images_per_sec_raw * 0.1
+
+
+def do_log_step_optimizer(args, ed_optimizer, log_writer, tv):
+    """Log optimizer-specific metrics (LR, grad scale) at log_step_optimizer cadence."""
+    global_step = tv.global_step
+    lr_unet = ed_optimizer.get_unet_lr()
+    for tag, lr_value in lr_unet.items():
+        log_writer.add_scalar(tag=f"hyperparameter/{tag}", scalar_value=lr_value, global_step=global_step)
+    lr_textenc = ed_optimizer.get_textenc_lr()
+    log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
+    if args.amp:
+        log_writer.add_scalar(tag="hyperparameter/grad scale", scalar_value=ed_optimizer.get_scale(),
+                              global_step=global_step)
+
 
 def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, model: TrainingModel, tv: TrainingVariables):
     global_step = tv.global_step
 
-    lr_unet = ed_optimizer.get_unet_lr()
-    for tag, lr_value in lr_unet.items():
-        log_writer.add_scalar(tag=f"hyperparameter/{tag}", scalar_value=lr_value, global_step=global_step)
-
-    lr_textenc = ed_optimizer.get_textenc_lr()
-    log_writer.add_scalar(tag="hyperparameter/lr text encoder", scalar_value=lr_textenc, global_step=global_step)
     if tv.timesteps_ranges:
         log_writer.add_scalar(tag="hyperparameter/timestep start", scalar_value=tv.timesteps_ranges[0][0],
                               global_step=global_step)
@@ -104,9 +126,6 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
                           global_step=global_step)
     log_writer.add_scalar(tag="hyperparameter/effective backward size", scalar_value=tv.effective_backward_size,
                           global_step=global_step)
-    if args.amp:
-        log_writer.add_scalar(tag="hyperparameter/grad scale", scalar_value=ed_optimizer.get_scale(),
-                              global_step=global_step)
     if tv.cond_dropouts:
         log_writer.add_scalar(
             tag="hyperparameter/cond dropout",
@@ -122,13 +141,15 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
             global_step=global_step
         )
 
-    images_per_sec_avg = sum(log_data.images_per_sec_log_step) / (len(log_data.images_per_sec_log_step) if log_data.images_per_sec_log_step else 1)
-    log_writer.add_scalar(tag="performance/images per second", scalar_value=images_per_sec_avg, global_step=global_step)
+    log_data.update_images_per_sec(total_images_processed=tv.total_trained_samples_count + tv.backwarded_images_count + tv.accumulated_loss_images_count)
+    log_writer.add_scalar(tag="performance/images per second", scalar_value=log_data.images_per_sec_raw, global_step=global_step)
     log_data.images_per_sec_log_step = []
 
     # For progress bar, use first unet LR or 0 if none
+    lr_unet = ed_optimizer.get_unet_lr()
     lr_unet_for_display = list(lr_unet.values())[0] if lr_unet else 0
-    logs = {"lr_unet": lr_unet_for_display, "lr_te": lr_textenc, "img/s": images_per_sec_avg}
+    lr_textenc = ed_optimizer.get_textenc_lr()
+    logs = {"lr_unet": lr_unet_for_display, "lr_te": lr_textenc, "img/s": log_data.images_per_sec_smooth}
     if len(log_data.loss_log_step) > 0:
         loss_step = sum(log_data.loss_log_step) / len(log_data.loss_log_step)
         log_writer.add_scalar(tag="loss/log_step", scalar_value=loss_step, global_step=global_step)
@@ -177,16 +198,23 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         if log_data.loss_preview_image.shape[1] > 4:
             # average down to 3 channels (e.g. 32 -> ~10.67 per group, drop the remainder)
             if len(log_data.loss_preview_image.shape) == 5:
+                # video
+                """
                 B, F, C, H, W = log_data.loss_preview_image.shape
                 n_groups = 3
-                n_groups = 3
                 group_size = C // n_groups
-                loss_preview_image_video_rgb = log_data.loss_preview_image[:, :n_groups * group_size] \
-                    .view(B, F, n_groups, group_size, H, W).mean(dim=3)
-                # drop all but every 10th frame
-                loss_preview_image_video_rgb = loss_preview_image_video_rgb[:, ::10]
-                F = loss_preview_image_video_rgb.shape[1]
-                loss_preview_image_rgb = loss_preview_image_video_rgb.reshape(B * F, n_groups, H, W)
+                try:
+                    loss_preview_image_video_rgb = log_data.loss_preview_image[:, :n_groups * group_size] \
+                        .view(B, F, n_groups, group_size, H, W).mean(dim=3)
+                    # drop all but every 10th frame
+                    loss_preview_image_video_rgb = loss_preview_image_video_rgb[:, ::10]
+                    F = loss_preview_image_video_rgb.shape[1]
+                    loss_preview_image_rgb = loss_preview_image_video_rgb.reshape(B * F, n_groups, H, W)
+                except RuntimeError as e:
+                    logging.error(f"Error reshaping loss_preview_image for video: {repr(e)}")
+                    loss_preview_image_rgb = None
+                """
+                loss_preview_image_rgb = None
             else:
                 B, C, H, W = log_data.loss_preview_image.shape
                 n_groups = 3
@@ -195,10 +223,11 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
                     .view(B, n_groups, group_size, H, W).mean(dim=2)
         else:
             loss_preview_image_rgb = log_data.loss_preview_image
-        loss_preview_image_rgb_grid = torchvision.utils.make_grid(
-            loss_preview_image_rgb
-        )
-        log_writer.add_image(tag="loss/last model_pred and target", img_tensor=loss_preview_image_rgb_grid, global_step=global_step)
+        if loss_preview_image_rgb is not None:
+            loss_preview_image_rgb_grid = torchvision.utils.make_grid(
+                loss_preview_image_rgb
+            )
+            log_writer.add_image(tag="loss/last model_pred and target", img_tensor=loss_preview_image_rgb_grid, global_step=global_step)
     if args.log_named_parameters_magnitudes:
         def log_named_parameters(model, prefix):
             """Log L2 norms of parameter groups to help debug NaN issues."""
@@ -242,6 +271,29 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
             values.extend([key] * count)
         log_writer.add_histogram('hyperparameter/forward size', np.array(values), global_step)
         #log_data.forward_size_coverage.clear()
+
+    if args.log_cuda_memory and torch.cuda.is_available():
+        stats = torch.cuda.memory_stats()
+        allocated_mb = torch.cuda.memory_allocated() / 1e6
+        reserved_mb = torch.cuda.memory_reserved() / 1e6
+        cached_mb = reserved_mb - allocated_mb
+        log_writer.add_scalar("cuda/allocator_pain/alloc_retries",
+                              stats.get('num_alloc_retries', 0), global_step)
+        log_writer.add_scalar("cuda/allocator_pain/split_retries",
+                              stats.get('num_split_retries', 0), global_step)
+        log_writer.add_scalar("cuda/allocator_pain/allocated_mb",
+                              allocated_mb, global_step)
+        log_writer.add_scalar("cuda/allocator_pain/reserved_mb",
+                              reserved_mb, global_step)
+        log_writer.add_scalar("cuda/allocator_pain/cached_mb",
+                              cached_mb, global_step)
+        log_writer.add_scalar("cuda/allocator_pain/fragmentation_pct",
+                              cached_mb / reserved_mb * 100 if reserved_mb > 0 else 0, global_step)
+        log_writer.add_scalar("cuda/allocator_pain/peak_allocated_mb",
+                              torch.cuda.max_memory_allocated() / 1e6, global_step)
+        log_writer.add_text("cuda/allocator_pain/summary",
+                            torch.cuda.memory_summary(), global_step)
+        torch.cuda.reset_peak_memory_stats()
 
     return logs
 

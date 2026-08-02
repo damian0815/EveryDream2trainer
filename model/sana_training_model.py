@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from argparse import Namespace
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional, Literal
 
 import safetensors
-from diffusers import SanaPipeline
+from diffusers import SanaPipeline, SanaTransformer2DModel
 
 import torch
 import torch.nn as nn
@@ -20,11 +22,20 @@ import torch.nn as nn
 from optimizer.optimizers import EveryDreamOptimizer
 
 
+def _is_dispatched(module: nn.Module) -> bool:
+    """Check if *module* is under accelerate dispatch (device_map or BitsAndBytes).
+
+    When a module is dispatched, calling .to() raises:
+        "You shouldn't move a model that is dispatched using accelerate hooks"
+    """
+    return hasattr(module, '_hf_hook') or getattr(module, 'hf_quantizer', None) is not None
+
+
 @dataclass
 class SanaTrainingModel:
     """Holds all SANA model components for training."""
 
-    transformer: nn.Module                   # SanaTransformer2DModel — sole trained component
+    transformer: SanaTransformer2DModel      # SanaTransformer2DModel — sole trained component
     text_encoder: nn.Module                  # Gemma2 — frozen, not trained
     tokenizer: Any                           # GemmaTokenizerFast — frozen
     vae: nn.Module                           # AutoencoderDC — frozen, not trained
@@ -34,8 +45,9 @@ class SanaTrainingModel:
     max_sequence_length: int = 300           # Gemma token budget
     complex_human_instruction: list = field(default_factory=list)  # optional system-prompt prefix
 
-    transformer_ema: Optional[nn.Module] = None  # reserved for future EMA support
-    self_flow_teacher_transformer: Optional[nn.Module] = None  # initialized if self-flow enabled; used as teacher UNet
+    transformer_ema: Optional[nn.Module] = None  # main EMA shadow weights
+    ema_working_dir: Optional[str] = None         # set by _init_sana_ema when ema_device='disk'
+    teacher_transformer: Optional[nn.Module] = None  # frozen snapshot teacher for distillation
     self_flow_proj_head: Optional[nn.Module] = None
 
     is_video: bool = False  # set to True for SanaVideoPipeline training
@@ -46,12 +58,6 @@ class SanaTrainingModel:
     def unet(self) -> nn.Module:
         """Alias for transformer — satisfies EveryDreamOptimizer's model.unet access."""
         return self.transformer
-
-    # Add this right under your @property def unet(self):
-    @property
-    def self_flow_teacher_unet(self) -> Optional[nn.Module]:
-        """Alias for self_flow_teacher_transformer — satisfies ED2's Self-Flow logic."""
-        return self.self_flow_teacher_transformer
 
     @property
     def text_encoder_2(self):
@@ -110,15 +116,99 @@ class SanaTrainingModel:
             scheduler=inf_scheduler,
         )
 
+    def build_ema_inference_pipeline(self, scheduler=None):
+        """Like build_inference_pipeline but uses the EMA transformer weights.
+
+        Returns None when no EMA weights are available.
+        """
+        if self.transformer_ema is None and self.ema_working_dir is None:
+            return None
+        from diffusers import SanaPipeline, SanaVideoPipeline
+        from core.flow_match_model import SDPipelineInferenceFlowMatchEulerDiscreteScheduler
+
+        transformer = self.transformer_ema if self.transformer_ema is not None else self.transformer
+        inf_scheduler = scheduler or SDPipelineInferenceFlowMatchEulerDiscreteScheduler.from_config(
+            self.noise_scheduler.config
+        )
+        cls = SanaVideoPipeline if self.is_video else SanaPipeline
+        return cls(
+            transformer=transformer,
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            vae=self.vae,
+            scheduler=inf_scheduler,
+        )
+
+    @contextmanager
+    def ema_inplace_swap(self):
+        """Context manager for disk-offload EMA inference.
+
+        Saves live transformer weights to a temporary backup, loads the EMA
+        weights from disk into the live module in-place, yields for inference,
+        then restores the live weights and cleans up the backup.
+        """
+        if self.ema_working_dir is None:
+            raise RuntimeError("ema_inplace_swap requires disk-offload EMA (ema_device='disk')")
+
+        import safetensors.torch as _st
+
+        backup_path = os.path.join(self.ema_working_dir, "transformer_live_backup.safetensors")
+        ema_path = os.path.join(self.ema_working_dir, "transformer_ema.safetensors")
+        restored = False
+
+        try:
+            if os.path.isfile(ema_path):
+                # Step 1: persist live weights
+                logging.info(f"ema_inplace_swap: backing up live transformer → {backup_path}")
+                live_sd = {
+                    k: v.detach().cpu().contiguous()
+                    for k, v in self.transformer.state_dict().items()
+                }
+                _st.save_file(live_sd, backup_path)
+                del live_sd
+
+                # Step 2: load EMA weights in-place
+                target_dtype = next(self.transformer.parameters()).dtype
+                target_device = next(self.transformer.parameters()).device
+                logging.info(f"ema_inplace_swap: applying EMA transformer ({target_dtype} on {target_device})")
+                ema_sd = _st.load_file(ema_path, device="cpu")
+                named_params = dict(self.transformer.named_parameters())
+                with torch.no_grad():
+                    for k, ema_v in ema_sd.items():
+                        if k in named_params:
+                            named_params[k].data.copy_(
+                                ema_v.to(dtype=target_dtype, device=target_device)
+                            )
+                del ema_sd, named_params
+
+            yield  # inference runs here
+
+        finally:
+            # Restore live weights from backup
+            if os.path.isfile(backup_path):
+                target_dtype = next(self.transformer.parameters()).dtype
+                target_device = next(self.transformer.parameters()).device
+                logging.info(f"ema_inplace_swap: restoring live transformer from {backup_path}")
+                live_sd = _st.load_file(backup_path, device="cpu")
+                named_params = dict(self.transformer.named_parameters())
+                with torch.no_grad():
+                    for k, p in named_params.items():
+                        if k in live_sd:
+                            p.data.copy_(live_sd[k].to(dtype=target_dtype, device=target_device))
+                del live_sd, named_params
+                os.unlink(backup_path)
+
     # ---- Device offload helpers -------------------------------------------
 
     def load_vae_to_device(self, device):
-        """Move VAE to *device* (e.g. 'cuda' or 'cpu')."""
-        self.vae.to(device)
+        """Move VAE to *device* (e.g. 'cuda' or 'cpu'). No-op if dispatched by accelerate."""
+        if not _is_dispatched(self.vae):
+            self.vae.to(device)
 
     def load_textenc_to_device(self, device):
-        """Move text encoder to *device* (e.g. 'cuda' or 'cpu')."""
-        self.text_encoder.to(device)
+        """Move text encoder to *device* (e.g. 'cuda' or 'cpu'). No-op if dispatched by accelerate."""
+        if not _is_dispatched(self.text_encoder):
+            self.text_encoder.to(device)
 
 
 def load_sana_model(args: Namespace) -> SanaTrainingModel:
@@ -140,13 +230,14 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
     from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 
     is_video = getattr(args, 'is_video', False)
-    dtype_vae = torch.float32 if is_video else torch.bfloat16
+    #dtype_vae = torch.float32 if is_video else torch.bfloat16
 
     pipe = _load_sana_pipeline(args.model_id, dtype=torch.bfloat16, te_quantization=args.te_quantization, is_video=is_video)
 
     if args.te_quantization == 'none':
         pipe.text_encoder.to(dtype=torch.bfloat16)
-    pipe.vae.to(dtype=dtype_vae)
+    #if not _is_dispatched(pipe.vae):
+    #    pipe.vae.to(dtype=dtype_vae)
 
     for p in pipe.text_encoder.parameters():
         p.requires_grad_(False)
@@ -167,15 +258,56 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
         complex_human_instruction=getattr(args, "complex_human_instruction", []) or [],
         is_video=is_video,
     )
+    if is_video:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            raise ImportError(
+                "SanaVideoPipeline requires imageio-ffmpeg, or you'll get green frames when generating. Install it with: pip install imageio-ffmpeg"
+            )
+
+    if args.anchor_reg_alpha > 0:
+        from core.anchor_reg import capture_base_params
+        device_capture = 'cpu' if args.anchor_reg_cpu_offload else pipe.device
+        dtype_capture = torch.float32 if args.anchor_reg_cpu_offload else pipe.dtype
+        model.anchor_base_params = capture_base_params(pipe.transformer, device=device_capture, dtype=dtype_capture)
+        logging.info(f"Captured anchor base params ({len(model.anchor_base_params)} tensors, "
+                     f"device={device_capture}, dtype={dtype_capture})")
+
+    # Teacher transformer (frozen snapshot for distillation)
+    import copy
+    if args.teacher is not None and len(args.teacher) > 0:
+        model.teacher_transformer = copy.deepcopy(pipe.transformer)
+        print(" * loading teacher from", args.teacher[0])
+        _load_transformer_checkpoint(model.teacher_transformer, args.teacher[0])
+
+    if model.teacher_transformer is not None:
+        model.teacher_transformer.requires_grad_(False)
+        model.teacher_transformer.eval()
+        model.teacher_transformer.to(device=pipe.device, dtype=pipe.dtype)
 
     if args.resume_from is not None:
         logging.info(f" * Resuming from {args.resume_from}")
         _load_transformer_checkpoint(model.transformer, args.resume_from)
 
+    if args.lora_resume is not None:
+        logging.info(f" * Loading LoRA adapter from {args.lora_resume}")
+        pipe.load_lora_weights(args.lora_resume)
+
     if args.self_flow_p > 0:
+        logging.info(f" * Initializing Self-Flow components (p={args.self_flow_p})")
         _inject_self_flow(model=model, pipe=pipe)
         if args.resume_from is not None:
             _try_load_self_flow_state(model, os.path.dirname(args.resume_from))
+
+    # ── Main EMA resume hint ──────────────────────────────────────────────
+    from model.training_model import get_use_ema_decay_training
+    if get_use_ema_decay_training(args) and args.resume_from is not None:
+        ema_sidecar = os.path.join(os.path.dirname(args.resume_from), "transformer_ema.safetensors")
+        if os.path.isfile(ema_sidecar):
+            logging.info(f" * Found EMA sidecar at {ema_sidecar} — will load in _init_sana_ema")
+        else:
+            logging.info(" * No EMA sidecar found — initialising main EMA from current weights")
 
     return model
 
@@ -240,27 +372,18 @@ def _load_sana_pipeline(repo_id, dtype, te_quantization: Literal['none', 'int8',
         )
     else:
         # Standard (non-quantized) SANA loading
-        load_kwargs: dict = {"torch_dtype": torch.float32}
-        pipeline = pipeline_cls.from_pretrained(repo_id, **load_kwargs)
-        # Cast the heavy compute modules to bfloat16 to halve VRAM usage
-        pipeline.vae.to(dtype)
-        pipeline.text_encoder.to(dtype)
-        pipeline.transformer = pipeline.transformer.to(dtype)
+        pipeline = pipeline_cls.from_pretrained(repo_id, torch_dtype=dtype)
 
     return pipeline
 
 
 def _inject_self_flow(model: SanaTrainingModel, pipe: SanaPipeline):
-    import copy
     import types
     from core.self_flow import SelfFlowMLPProjectionHead
 
-    # 1. Initialize EMA Teacher
-    model.self_flow_teacher_transformer = copy.deepcopy(pipe.transformer)
-    model.self_flow_teacher_transformer.requires_grad_(False)
-    model.self_flow_teacher_transformer.eval()
+    # Teacher IS the main EMA — no separate deepcopy needed.
 
-    # 2. Initialize Projection Head (SANA 1.6B hidden size is 2240)
+    # Initialize Projection Head (SANA 1.6B hidden size is 2240)
     embed_dim = getattr(pipe.transformer.config, 'hidden_size', 2240)
     model.self_flow_proj_head = SelfFlowMLPProjectionHead(
         in_channels=embed_dim,
@@ -381,21 +504,29 @@ class BypassSanaBlockTensor(torch.Tensor):
         return ret
 
 
-def save_sana_model(to_folder: str, model: SanaTrainingModel, optimizer: EveryDreamOptimizer, global_step: int, num_samples: int) -> None:
+def save_sana_model(to_folder: str, model: SanaTrainingModel, optimizer: EveryDreamOptimizer, global_step: int, num_samples: int, lora: bool = False) -> None:
     """
     Saves only the transformer (the trained component) as a safetensors file.
     Also writes model_id.txt so the full pipeline can be reconstructed later:
 
         pipe = SanaPipeline.from_pretrained(model_id)
         load_model(pipe.transformer, "transformer_gsNNNN.safetensors")
+
+    When *lora* is True only the LoRA adapter weights are saved instead.
     """
+    if lora:
+        save_sana_lora(model=model, save_path=to_folder)
+        return
+
     from safetensors.torch import save_file
 
     os.makedirs(to_folder, exist_ok=True)
 
     weights_path = os.path.join(to_folder, f"transformer_gs{global_step:05}_n{num_samples:05}.safetensors")
     logging.info(f" * Saving transformer checkpoint to {weights_path}")
-    save_file(model.transformer.state_dict(), weights_path)
+    _sd = model.transformer.state_dict()
+    save_file(_sd, weights_path)
+    del _sd
 
     if optimizer is not None:
         logging.info(f" Saving optimizer state to {to_folder}")
@@ -404,15 +535,59 @@ def save_sana_model(to_folder: str, model: SanaTrainingModel, optimizer: EveryDr
     if model.self_flow_proj_head is not None:
         proj_head_path = os.path.join(to_folder, "self_flow_proj_head.pt")
         logging.info(f" * Saving Self-Flow projection head to {proj_head_path}")
-        torch.save(model.self_flow_proj_head.state_dict(), proj_head_path)
+        _sd = model.self_flow_proj_head.state_dict()
+        torch.save(_sd, proj_head_path)
+        del _sd
 
-    if model.self_flow_teacher_transformer is not None:
-        teacher_path = os.path.join(to_folder, "self_flow_teacher_module.safetensors")
-        logging.info(f" * Saving Self-Flow teacher UNet to {teacher_path}")
-        state_dict = {k: v.cpu().contiguous() for k, v in model.self_flow_teacher_transformer.state_dict().items()}
-        safetensors.torch.save_file(state_dict, teacher_path)
+    # ── Main EMA sidecar (separate from self-flow EMA above) ──────────────
+    if model.transformer_ema is not None:
+        ema_path = os.path.join(to_folder, "transformer_ema.safetensors")
+        logging.info(f" * Saving EMA transformer to {ema_path}")
+        _sd = model.transformer_ema.state_dict()
+        safetensors.torch.save_file(_sd, ema_path)
+        del _sd
+
+    if model.ema_working_dir is not None:
+        _src = os.path.join(model.ema_working_dir, "transformer_ema.safetensors")
+        if os.path.isfile(_src):
+            _dst = os.path.join(to_folder, "transformer_ema.safetensors")
+            shutil.copy2(_src, _dst)
+            logging.info(f" * Copied EMA sidecar (disk-offload): transformer_ema.safetensors")
 
     model_id_path = os.path.join(to_folder, "model_id.txt")
+    with open(model_id_path, "w") as f:
+        f.write(model.model_id)
+
+
+@torch.no_grad()
+def save_sana_lora(model: SanaTrainingModel, save_path: str) -> None:
+    """
+    Save only the LoRA adapter weights for the SANA transformer.
+
+    Uses PEFT's built-in save_lora_weights(), which produces a diffusers-
+    compatible adapter checkpoint that can be loaded via load_lora_weights().
+    Also writes model_id.txt so the base model can be reconstructed later.
+    """
+    if not hasattr(model.transformer, "peft_config"):
+        logging.warning("No LoRA adapters found on transformer — skipping LoRA save")
+        return
+
+    os.makedirs(save_path, exist_ok=True)
+    logging.info(f" * Saving LoRA adapter to {save_path}")
+
+    from peft.utils import get_peft_model_state_dict
+    from diffusers.utils import convert_state_dict_to_diffusers
+
+    transformer_lora_layers = convert_state_dict_to_diffusers(
+        get_peft_model_state_dict(model.transformer)
+    )
+
+    model.build_inference_pipeline().save_lora_weights(
+        save_directory=save_path,
+        transformer_lora_layers=transformer_lora_layers,
+    )
+
+    model_id_path = os.path.join(save_path, "model_id.txt")
     with open(model_id_path, "w") as f:
         f.write(model.model_id)
 
@@ -423,19 +598,12 @@ def save_sana_model(to_folder: str, model: SanaTrainingModel, optimizer: EveryDr
 
 def _try_load_self_flow_state(model: SanaTrainingModel, checkpoint_folder: str) -> None:
     """
-    Attempts to load the Self-Flow teacher UNet and projection head from a checkpoint folder.
-    If the files are not found, logs a warning and continues without raising an error.
+    Attempts to load the Self-Flow projection head from a checkpoint folder.
+    Teacher weights are now the main EMA — no separate loading needed.
     """
     import os
 
-    teacher_path = os.path.join(checkpoint_folder, "self_flow_teacher_module.safetensors")
     proj_head_path = os.path.join(checkpoint_folder, "self_flow_proj_head.pt")
-
-    if os.path.exists(teacher_path):
-        logging.info(f" * Loading Self-Flow teacher UNet from {teacher_path}")
-        _load_transformer_checkpoint(model.self_flow_teacher_transformer, teacher_path)
-    else:
-        logging.warning(f"Self-Flow teacher UNet checkpoint not found at {teacher_path}. Continuing without it.")
 
     if os.path.exists(proj_head_path):
         logging.info(f" * Loading Self-Flow projection head from {proj_head_path}")

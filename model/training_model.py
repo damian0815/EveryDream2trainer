@@ -132,6 +132,8 @@ class TrainingVariables:
     total_trained_samples_count: int = 0
     optimizer_step: int = 0
 
+    last_ema_total_trained_samples_count: int = 0
+
     cond_dropouts: list[float] = field(default_factory=list)
     cond_dropout_count = 0
     non_cond_dropout_count = 0
@@ -334,7 +336,6 @@ class TrainingModel:
     clip_processor = None  # 'Compose'|None = None
 
     # Self-Flow representation learning (set after construction in train.py)
-    self_flow_teacher_module = None   # UNet2DConditionModel|None – frozen EMA copy
     self_flow_proj_head = None      # SelfFlowProjectionHead|None – trainable 1×1 conv
 
     # EMA weights (in-memory mode: cpu or cuda).  None when disk-offload is used or EMA is disabled.
@@ -937,13 +938,9 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
     if ed_state.model.self_flow_proj_head is not None:
         proj_head_path = os.path.join(save_path, "self_flow_proj_head.pt")
         logging.info(f" * Saving Self-Flow projection head to {proj_head_path}")
-        torch.save(ed_state.model.self_flow_proj_head.state_dict(), proj_head_path)
-
-    if ed_state.model.self_flow_teacher_module is not None:
-        teacher_path = os.path.join(save_path, "self_flow_teacher_module.safetensors")
-        logging.info(f" * Saving Self-Flow teacher UNet to {teacher_path}")
-        state_dict = {k: v.cpu().contiguous() for k, v in ed_state.model.self_flow_teacher_module.state_dict().items()}
-        safetensors.torch.save_file(state_dict, teacher_path)
+        _sd = ed_state.model.self_flow_proj_head.state_dict()
+        torch.save(_sd, proj_head_path)
+        del _sd
 
     # ── EMA sidecars ──────────────────────────────────────────────────────────
     # In-memory EMA (cpu / cuda): serialise the live module state_dict.
@@ -956,8 +953,9 @@ def save_model(save_path, ed_state: EveryDreamTrainingState, global_step: int, s
         if _ema_module is not None:
             _ema_path = os.path.join(save_path, f"{_ema_name}.safetensors")
             logging.info(f" * Saving EMA sidecar: {_ema_path}")
-            _state = {k: v.cpu().contiguous() for k, v in _ema_module.state_dict().items()}
-            safetensors.torch.save_file(_state, _ema_path)
+            _sd = _ema_module.state_dict()
+            safetensors.torch.save_file(_sd, _ema_path)
+            del _sd
 
     # Disk-offload EMA: copy the working safetensors files into the checkpoint dir.
     if ed_state.model.ema_working_dir is not None:
@@ -1026,10 +1024,11 @@ def find_last_checkpoint(logdir, is_ema=False, resolve_to_transformer=False):
 
     # look for a file "transformer*.safetensors
     transformer_files = glob.glob(os.path.join(last_ckpt, "transformer_*"))
+    transformer_files = [t for t in transformer_files if not t.endswith('_ema.safetensors')]
     if len(transformer_files) == 0:
         raise ValueError(f"Could not find transformer_* file in last checkpoint dir {last_ckpt}")
     elif len(transformer_files) > 1:
-        raise ValueError(f"Found more than one transformer_* file in last checkpoint dir {last_ckpt}. Specify which one you want explicitly.")
+        raise ValueError(f"Found more than one transformer_* file in last checkpoint dir {last_ckpt}: {[os.path.basename(f) for f in transformer_files]}. Specify which one you want explicitly.")
     else:
         return transformer_files[0]
 

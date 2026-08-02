@@ -71,6 +71,7 @@ def run_accumulation_loop(
     did_step_optimizer_cb: Optional[Callable],
     args: argparse.Namespace,
     train_progress_01,
+    log_writer=None,
 ) -> None:
     """
     Model-agnostic nibble/accumulation/backward/optimizer-step loop.
@@ -195,6 +196,12 @@ def run_accumulation_loop(
 
             ed_optimizer.step_optimizer(tv.global_step, tv, log_data=log_data)
 
+            if args.anchor_reg_alpha > 0 and hasattr(model, 'anchor_base_params'):
+                from core.anchor_reg import apply_anchor_reg
+                mean_dist = apply_anchor_reg(model.transformer, model.anchor_base_params, args.anchor_reg_alpha)
+                if log_writer is not None:
+                    log_writer.add_scalar("loss/anchor_reg", mean_dist, global_step=tv.global_step)
+
             tv.last_effective_batch_size = tv.backwarded_images_count
             tv.total_trained_samples_count += tv.backwarded_images_count
             tv.optimizer_step += 1
@@ -214,7 +221,6 @@ def run_accumulation_loop(
                         tv.interleaved_bs1_count = 0
                     else:
                         tv.interleaved_bs1_count = None
-
 
             did_step_optimizer_cb()
 
@@ -397,8 +403,6 @@ def train_step(
         )
         record_performance_timing("8_model_forward", time.perf_counter() - t_forward_start, num_images)
 
-        loss_scale_variant = loss_scale[:model_forward_result.model_pred.shape[0]]
-
         # Loss computation
         t_loss_start = time.perf_counter()
         loss_1d = _do_loss(
@@ -412,7 +416,7 @@ def train_step(
             tv=tv,
             log_data=log_data,
             log_writer=log_writer,
-            negative_loss_mask=loss_scale_variant < 0,
+            negative_loss_mask=loss_scale < 0,
             args=args,
             verbose=(tv.global_step % 200 == 0),
         )
@@ -446,9 +450,9 @@ def train_step(
 
         # Apply hinge and loss scale
         loss_1d = apply_negative_loss_hinge(
-            loss_1d, (loss_scale_variant < 0).to(loss_1d.device), margin=args.negative_loss_margin
+            loss_1d, (loss_scale < 0).to(loss_1d.device), margin=args.negative_loss_margin
         )
-        loss_1d = loss_1d * loss_scale_variant.abs().to(loss_1d.device)
+        loss_1d = loss_1d * loss_scale.abs().to(loss_1d.device)
 
         log_data.loss_log_step_cd.append(loss_1d[cond_dropout_mask].mean().detach().item())
         log_data.loss_log_step_non_cd.append(loss_1d[~cond_dropout_mask].mean().detach().item())
@@ -536,36 +540,27 @@ def get_nibble_size(tv: TrainingVariables) -> int:
     return max(1, min(permitted_until_optimizer_step, permitted_until_backward_step))
 
 
-def nibble_batch(batch, take_count) -> tuple[dict, dict]:
-    runt_size = batch["runt_size"]
-    current_batch_size = batch["image"].shape[0]
-    non_runt_size = current_batch_size - runt_size
-    assert non_runt_size > 0
+def _get_nonduplicated_batch_size(batch: dict) -> int:
+    if batch["runt_size"] == 0:
+        return batch["image"].shape[0]
+    return batch["runt_size"]
 
-    nibble_size = min(non_runt_size, take_count)
+
+def nibble_batch(batch, take_count) -> tuple[dict, dict]:
+    non_duplicated_count = _get_nonduplicated_batch_size(batch)
+    assert non_duplicated_count > 0
+
+    nibble_size = min(non_duplicated_count, take_count)
     nibble = _subdivide_batch_part(batch, 0, nibble_size)
     nibble["runt_size"] = 0
 
-    remaining_size = non_runt_size - nibble_size
+    remaining_size = non_duplicated_count - nibble_size
     if remaining_size == 0:
         remainder = None
     else:
-        remainder = _subdivide_batch_part(batch, nibble_size, non_runt_size)
+        remainder = _subdivide_batch_part(batch, nibble_size, non_duplicated_count)
         remainder["runt_size"] = 0
     return nibble, remainder
-
-
-def subdivide_batch(batch, current_batch_size, desired_batch_size):
-    if desired_batch_size >= current_batch_size:
-        yield batch
-        return
-    runt_size = batch["runt_size"]
-    non_runt_size = current_batch_size - runt_size
-    for i, offset in enumerate(range(0, non_runt_size, desired_batch_size)):
-        sub_batch = _subdivide_batch_part(batch, offset, offset + desired_batch_size)
-        end = min(current_batch_size, offset + desired_batch_size)
-        sub_batch["runt_size"] = max(0, end - non_runt_size)
-        yield sub_batch
 
 
 def _subdivide_batch_part(part, start, end):
@@ -593,7 +588,7 @@ def choose_effective_batch_size(args, train_progress_01):
             )
         ),
     )
-    print(f"chose effective batch size {bs} from initial {initial_bs} final {final_bs} alpha {alpha} train_progress_01 {train_progress_01}")
+    #print(f"chose effective batch size {bs} from initial {initial_bs} final {final_bs} alpha {alpha} train_progress_01 {train_progress_01}")
 
     return bs
 
@@ -1043,8 +1038,12 @@ def _do_model_forward(
 ) -> ModelForwardReturnType:
     batch_size = timesteps.shape[0]
     do_local_contrastive_flow_loss = (random.random() < args.local_contrastive_flow_loss_p)
+    has_ema_teacher = (
+        (hasattr(model, 'unet_ema') and model.unet_ema is not None)
+        or (hasattr(model, 'transformer_ema') and model.transformer_ema is not None)
+    )
     do_self_flow = (
-        model.self_flow_teacher_module is not None
+        has_ema_teacher
         and random.random() < args.self_flow_p
     )
 
@@ -1344,7 +1343,8 @@ def _do_loss(
             teacher_features=model_forward_result.self_flow_teacher_features,
             proj_head=model.self_flow_proj_head,
         )
-        log_writer.add_scalar("loss/self_flow_rep", l_rep.item(), global_step=tv.global_step)
+        if (tv.global_step + 1) % args.log_step == 0:
+            log_writer.add_scalar("loss/self_flow_rep", l_rep.item(), global_step=tv.global_step)
         loss = loss + args.self_flow_gamma * l_rep
 
     return loss

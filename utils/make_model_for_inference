@@ -1,0 +1,56 @@
+#!/bin/sh
+
+# This script is used to convert a model checkpoint into a format suitable for inference.
+set -e
+
+usage() {
+    echo "Usage: $0 <transformers_file> [<output_path>] [--move]"
+}
+
+BASE_DIFFUSERS_DIR="/workspace/models/Efficient-Large-Model--SANA1.5_1.6B_1024px_diffusers"
+transformers_file="$1"
+transformers_filename=$(basename "$transformers_file")
+if [ "$transformers_filename" = "transformer_ema.safetensors" ]; then
+  transformers_filename=$(basename $(dirname "$transformers_file"))
+fi
+
+do_move=0
+output_path=/workspace/models/for_inference/${transformers_filename%.safetensors}
+if [ "$2" != "" ] && [ "$2" != "--move" ]; then
+  output_path="$2"
+  shift
+  echo "Overriding output path to $output_path"
+fi
+
+if [ "$2" = "--move" ]; then
+  do_move=1
+elif [ "$2" != "" ]; then
+  usage
+  exit 1
+fi
+
+
+if [ ! -e "$transformers_file" ]; then
+    echo ".safetensors transformer file $transformers_file does not exist."
+    exit 1
+fi
+
+if [ -d "$output_path" ]; then
+    echo "Output path $output_path already exists. Please remove it or choose a different path."
+    exit 1
+fi
+
+
+echo "Converting model at $transformers_file to diffusers format and saving to $output_path"
+
+cp -la "$BASE_DIFFUSERS_DIR" "$output_path"
+rm "$output_path/transformer/diffusion_pytorch_model.safetensors"
+transformer_target_path="$output_path/transformer/diffusion_pytorch_model.safetensors"
+if [ "$do_move" = "1" ]; then
+  echo "Moving original .safetensors file to $transformer_target_path"
+  mv "$transformers_file" "$transformer_target_path"
+else
+  cp -la "$transformers_file" "$transformer_target_path"
+fi
+
+echo "Done. Model converted and saved to $output_path"

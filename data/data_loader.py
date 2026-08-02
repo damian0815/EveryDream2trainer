@@ -170,6 +170,7 @@ class DataLoaderMultiAspect():
 
         def _make_bucket_key(image, batch_id_override: str=None):
             return (image.batch_id if batch_id_override is None else batch_id_override,
+                          getattr(image, "largest_valid_frame_count", None),
                           image.target_wh[0],
                           image.target_wh[1])
 
@@ -257,11 +258,12 @@ class DataLoaderMultiAspect():
                 # still runts?
                 final_truncate_count = len(bucket_contents) % batch_size
                 if final_truncate_count > 0:
+                    missing_slots = batch_size - final_truncate_count
                     # we weren't able to fill all runts from unpicked images, so duplicate existing items
-                    logging.warning(f"After top-up from unpicked images, bucket {key} with {len(bucket_contents)} still has {final_truncate_count} runts. These will be filled by duplicating existing items in the bucket, which may cause some overfitting. To avoid this, consider adding more items at aspect ratio {key} or reduce your batch count.")
+                    logging.warning(f"After top-up from unpicked images, bucket {key} with {len(bucket_contents)} items still has {missing_slots} missing images. These will be filled by duplicating existing items in the bucket, which may cause some overfitting. To avoid this, consider adding more items at aspect ratio {key} or reduce your batch count.")
                     runt_bucket_start_offset = len(bucket_contents) - final_truncate_count
                     non_runts = bucket_contents.copy()
-                    for _ in range(batch_size - final_truncate_count):
+                    for _ in range(missing_slots):
                         bucket_contents.append(random.choice(non_runts))
                     for i in range(batch_size):
                         item = copy.deepcopy(bucket_contents[runt_bucket_start_offset + i])

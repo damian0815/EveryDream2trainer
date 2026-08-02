@@ -2,10 +2,11 @@ import os
 import yaml
 import argparse
 
-def count_multiplied_set_helper(root_dir, log_depth, indent=""):
+def count_multiplied_set_helper(root_dir, log_depth, indent="") -> tuple[int, int]:
     if not os.path.isdir(root_dir):
         return 0
-    count = 0
+    premultiplied_count = 0
+    actual_count = 0
     multiply = 1
     for filename in os.listdir(root_dir):
         full_path = os.path.join(root_dir, filename)
@@ -16,13 +17,16 @@ def count_multiplied_set_helper(root_dir, log_depth, indent=""):
                 multiply = config.get('multiply', multiply)
                 #print(f"Found multiply in {filename}: {multiply}")
         elif os.path.isdir(full_path):
-            count += count_multiplied_set_helper(full_path, log_depth-1, indent=indent+"  ")
+            sub_multiplied_count, sub_actual_count = count_multiplied_set_helper(full_path, log_depth-1, indent=indent+"  ")
+            premultiplied_count += sub_multiplied_count
+            actual_count += sub_actual_count
         elif filename.endswith(".txt"):
-            count += 1
+            premultiplied_count += 1
+            actual_count += 1
 
     if log_depth >= 0:
-        print(f'{indent}{int(count*multiply)} (x{multiply})  {root_dir}')
-    return count * multiply
+        print(f'{indent}{int(premultiplied_count*multiply)} (x{multiply}) [{actual_count}] {root_dir}')
+    return premultiplied_count * multiply, actual_count
 
 
 

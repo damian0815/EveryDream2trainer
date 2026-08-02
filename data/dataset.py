@@ -7,6 +7,8 @@ import yaml
 import json
 
 from attrs import define, field
+
+from data import video_train_item
 from data.image_train_item import (
     ImageCaption, ImageTrainItem, ImageSourceItem, ResolutionOption,
     check_caption_json, _needs_transpose, DEFAULT_BATCH_ID,
@@ -23,6 +25,18 @@ DEFAULT_MAX_CAPTION_LENGTH = 2048
 
 def overlay(overlay, base):
     return overlay if overlay is not None else base
+
+def _pts_to_sec(data):
+    if data is None:
+        return None
+    if isinstance(data, (int, float)):
+        return float(data)
+    if isinstance(data, dict):
+        value = data.get("value", 0)
+        timebase = data.get("timebase", 1)
+        return float(value) / float(timebase)
+    return float(data)
+
 
 def safe_set(val):
     if isinstance(val, str):
@@ -68,6 +82,8 @@ class ImageConfig:
     shuffle_tags: bool = False
     loss_scale: float = None
     timesteps_range: tuple[int, int] = None
+    video_start_time: float = None
+    video_end_time: float = None
 
     def merge(self, other):
         if other is None:
@@ -90,6 +106,8 @@ class ImageConfig:
             batch_id=overlay(other.batch_id, self.batch_id),
             loss_scale=overlay(other.loss_scale, self.loss_scale),
             timesteps_range=overlay(other.timesteps_range, self.timesteps_range),
+            video_start_time=overlay(other.video_start_time, self.video_start_time),
+            video_end_time=overlay(other.video_end_time, self.video_end_time),
         )
 
     @classmethod
@@ -98,7 +116,7 @@ class ImageConfig:
             raise ValueError("Cannot parse ImageConfig from None")
         # Parse standard yaml tag file (with options)
         parsed_cfg = ImageConfig(
-            main_prompts=safe_set(data.get("main_prompt")), 
+            main_prompts=safe_set(data.get("main_prompt")),
             rating=data.get("rating"), 
             max_caption_length=data.get("max_caption_length"), 
             tags=safe_set(map(Tag.parse, data.get("tags", []))),
@@ -110,10 +128,14 @@ class ImageConfig:
             batch_id=data.get("batch_id"),
             loss_scale=data.get("loss_scale"),
             timesteps_range=data.get("timesteps_range"),
+            video_start_time=_pts_to_sec(data.get("start_time")),
+            video_end_time=_pts_to_sec(data.get("end_time")),
         )
 
         # Alternatively parse from dedicated `caption` attribute
         if cap_attr := data.get('caption'):
+            if isinstance(cap_attr, dict):
+                cap_attr = "<<json>>" + json.dumps(cap_attr)
             parsed_cfg = parsed_cfg.merge(ImageConfig.parse(cap_attr))
 
         return parsed_cfg
@@ -138,15 +160,7 @@ class ImageConfig:
         if os.path.isfile(text):
             return ImageConfig.from_file(text)
 
-        if text.startswith("<<json>>"):
-            return ImageConfig(main_prompts=text, tags=[])
-        else:
-            split_caption = list(map(str.strip, text.split(",")))
-            main_prompt = ' ' if len(text.strip()) == 0 else split_caption[0]
-            return ImageConfig(
-                main_prompts=main_prompt,
-                tags=map(Tag.parse, split_caption[1:])
-                )
+        return ImageConfig(main_prompts=text, tags=[])
 
     @classmethod    
     def from_file(cls, file: str):
@@ -155,7 +169,7 @@ class ImageConfig:
                 case '.jpg' | '.jpeg' | '.png' | '.bmp' | '.webp' | '.jfif':
                     return ImageConfig(image=file)
                 case ".json":
-                    json_dict = json.load(read_text(file))
+                    json_dict = json.loads(read_text(file))
                     if json_dict is None:
                         logging.warning(f" *** JSON file {file} is empty, treating as no config")
                         return None
@@ -227,7 +241,7 @@ class Dataset:
 
     def __sidecar_cfg(imagepath, fileset):
         cfgs = []
-        for cfgext in ['.txt', '.caption', '.yml', '.yaml']:
+        for cfgext in ['.txt', '.caption', '.yml', '.yaml', '.json']:
             cfgfile = barename(imagepath) + cfgext
             if cfgfile in fileset:
                 cfgs.append(ImageConfig.from_file(fileset[cfgfile]))
@@ -365,7 +379,7 @@ class Dataset:
             abs_path = os.path.abspath(image_path)
 
             if is_video(image_path):
-                resolution_options, image_size, error = _compute_video_resolution_options(
+                resolution_options, image_size, error, lvfc = _compute_video_resolution_options(
                     abs_path, aspects_per_resolution, config.per_resolution_multiply or {},
                 )
                 base_item = VideoTrainItem(
@@ -380,6 +394,9 @@ class Dataset:
                     batch_id=config.batch_id or DEFAULT_BATCH_ID,
                     loss_scale=config.loss_scale or 1.0,
                     timesteps_range=config.timesteps_range,
+                    start_time=config.video_start_time,
+                    end_time=config.video_end_time,
+                    largest_valid_frame_count=lvfc,
                 )
                 base_item.target_wh       = None  # assigned by make_resolved_item()
                 base_item.is_undersized   = False
@@ -493,19 +510,49 @@ def _compute_video_resolution_options(
     Uses the first resolution from aspects_per_resolution directly,
     since videos don't do aspect-ratio bucketing.
     """
-    import decord
+    import av
 
     resolution_options: dict[int, ResolutionOption] = {}
     image_size = None
     error = None
     try:
-        vr = decord.VideoReader(pathname)
-        frame = vr[0].asnumpy()
-        height, width = frame.shape[:2]
+        container = av.open(pathname, options={'fflags': 'ignidx', 'err_detect': 'ignore_err'})
+        stream = container.streams.video[0]
+
+        # --- Read metadata ---
+        avg_fps = float(stream.average_rate) if stream.average_rate else 30.0
+        # stream.frames is fast (comes from container metadata, not decode).
+        # Fallback: estimate from stream.duration × stream.time_base (format-independent).
+        if stream.frames and stream.frames > 0:
+            source_frames = stream.frames
+        elif stream.duration and stream.duration > 0:
+            duration_sec = float(stream.duration * stream.time_base)
+            source_frames = int(duration_sec * avg_fps)
+        else:
+            source_frames = 0
+
+        # --- Read first frame for spatial dimensions ---
+        width = height = None
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                width = frame.width
+                height = frame.height
+                break
+            if width is not None:
+                break
+        container.close()
+        if width is None or height is None:
+            raise ValueError(f"No decodable frames in {pathname}")
+
         resolution_options = _compute_resolution_options(width, height, aspects_per_resolution, per_resolution_multiply)
+
+        # --- Compute largest_valid_frame_count ---
+        from data.video_train_item import largest_valid_frame_count as _lvfc
+        lvfc = _lvfc(source_frames, avg_fps) if source_frames > 0 else 0
     except Exception as e:
         error = e
-    return resolution_options, image_size, error
+        lvfc = 0
+    return resolution_options, image_size, error, lvfc
 
 def _compute_resolution_options(width, height, aspects_per_resolution, per_resolution_multiply):
     image_size = (width, height)

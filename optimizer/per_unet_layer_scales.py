@@ -1,10 +1,15 @@
 import json
+import logging
+import math
 import os
 import re
 from collections import defaultdict
 from typing import Literal
 
 import torch
+
+
+BLOCK_INDEX_RE = re.compile(r'transformer_blocks\.(\d+)\.')
 
 
 class ParamGroupBuilder:
@@ -160,3 +165,61 @@ def get_unet_module_zone(name: str) -> str:
         if is_ff:
             return 'mid__ff'
     return zone
+
+
+def apply_block_fade(param_groups, parameters, fadein_k, fadeout_k, betas, weight_decay):
+    if fadein_k <= 0 and fadeout_k <= 0:
+        return param_groups
+
+    name_to_param = {name: p for name, p in parameters}
+    param_to_name = {id(p): name for name, p in name_to_param.items()}
+
+    new_groups = []
+    for group in param_groups:
+        block_params = defaultdict(list)
+        other_params = []
+
+        for p in group['params']:
+            name = param_to_name.get(id(p), '')
+            m = BLOCK_INDEX_RE.search(name)
+            if m:
+                block_params[int(m.group(1))].append(p)
+            else:
+                other_params.append(p)
+
+        if not block_params:
+            new_groups.append(group)
+            continue
+
+        num_blocks = max(block_params.keys()) + 1
+        base_lr = group['lr']
+
+        scale_by_block = {}
+        for i in block_params:
+            fadein_scale = 2 ** (i - fadein_k) if fadein_k > 0 and i < fadein_k else 1.0
+            fadeout_scale = 2 ** ((num_blocks - 1 - i) - fadeout_k) if fadeout_k > 0 and i >= num_blocks - fadeout_k else 1.0
+            scale_by_block[i] = min(fadein_scale, fadeout_scale)
+
+        scale_to_params = defaultdict(list)
+        for i, params in block_params.items():
+            scale_to_params[scale_by_block[i]].extend(params)
+
+        for scale, params in sorted(scale_to_params.items()):
+            new_groups.append({
+                'name': f"block_fade_{scale:.4g}",
+                'params': params,
+                'lr': base_lr * scale,
+                'betas': betas,
+                'weight_decay': weight_decay,
+            })
+
+        if other_params:
+            new_groups.append({
+                'name': group.get('name', 'non-block'),
+                'params': other_params,
+                'lr': base_lr,
+                'betas': betas,
+                'weight_decay': weight_decay,
+            })
+
+    return new_groups

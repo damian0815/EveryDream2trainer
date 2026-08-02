@@ -3,6 +3,7 @@ import unittest
 import os
 import pathlib
 import tempfile
+from fractions import Fraction
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -12,7 +13,7 @@ DATA_PATH = pathlib.Path('./test/data')
 
 def _video_libs_available():
     try:
-        import decord
+        import av
         import cv2
         return True
     except ImportError:
@@ -25,10 +26,10 @@ def _touch_file(path):
 
 
 def _install_mock_modules():
-    """Insert mock modules for decord and cv2 when real ones are unavailable.
+    """Insert mock modules for av and cv2 when real ones are unavailable.
     Returns a dict of mocked module names for cleanup."""
     mocked = {}
-    for mod_name in ('decord', 'cv2'):
+    for mod_name in ('av', 'cv2'):
         if mod_name not in sys.modules:
             mock = MagicMock()
             sys.modules[mod_name] = mock
@@ -42,21 +43,35 @@ def _cleanup_mock_modules(mocked):
             del sys.modules[mod_name]
 
 
-def _make_mock_vr(path):
-    """Return a mock decord.VideoReader that yields frames sized per-path."""
+def _make_mock_container(path, **kwargs):
+    """Return a mock av container that yields frames sized per-path."""
     path = str(path)
     if 'big' in path:
         w, h, n_frames = 128, 128, 8
     else:
         w, h, n_frames = 64, 64, 16
-    mock_vr = MagicMock()
-    mock_vr.__len__.return_value = n_frames
-    mock_batch = MagicMock()
-    mock_batch.asnumpy.return_value = np.random.randint(
-        0, 256, (min(n_frames, 8), h, w, 3), dtype=np.uint8,
-    )
-    mock_vr.get_batch.return_value = mock_batch
-    return mock_vr
+
+    container = MagicMock()
+    stream = MagicMock()
+    stream.average_rate = Fraction(30, 1)
+    stream.time_base = Fraction(1, 30)
+    container.streams.video = [stream]
+
+    frame_data = np.random.randint(0, 256, (n_frames, h, w, 3), dtype=np.uint8)
+    frames = []
+    for i in range(n_frames):
+        f = MagicMock()
+        f.pts = i
+        f.to_ndarray.return_value = frame_data[i]
+        f.height = h
+        f.width = w
+        frames.append(f)
+
+    packet = MagicMock()
+    packet.decode.return_value = frames
+    container.demux.return_value = [packet]
+
+    return container
 
 
 class TestVideoTrainItem(unittest.TestCase):
@@ -78,8 +93,8 @@ class TestVideoTrainItem(unittest.TestCase):
             self._mocked['cv2'].resize.side_effect = (
                 lambda img, dsize, **kw: np.zeros((dsize[1], dsize[0], 3), dtype=np.uint8)
             )
-        if 'decord' in self._mocked:
-            self._mocked['decord'].VideoReader.side_effect = _make_mock_vr
+        if 'av' in self._mocked:
+            self._mocked['av'].open.side_effect = _make_mock_container
 
     def test_hydrate_shape(self):
         from data.video_train_item import VideoTrainItem

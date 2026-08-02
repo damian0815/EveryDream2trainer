@@ -52,6 +52,7 @@ WEIGHT_DECAY_DEFAULT = 0.01
 LR_DEFAULT = 1e-6
 OPTIMIZER_TE_STATE_FILENAME = "optimizer_te.pt"
 OPTIMIZER_UNET_STATE_FILENAME = "optimizer_unet.pt"
+OPTIMIZER_SELF_FLOW_PROJ_STATE_FILENAME = "optimizer_self_flow_proj.pt"
 SCALER_STATE_FILENAME = "scaler.pt"
 
 
@@ -159,6 +160,8 @@ class EveryDreamOptimizer:
         self.text_encoder = model.text_encoder
         self.text_encoder_2 = model.text_encoder_2
         self.log_writer = log_writer
+        self._opt_log_max: dict[str, float] = {}
+        self._steps_since_optimizer = 0
         self.te_config, self.base_config = self.get_final_optimizer_configs(
             args, optimizer_config
         )
@@ -231,6 +234,19 @@ class EveryDreamOptimizer:
                 )
             else:
                 self.unet_params = []
+
+        if self.is_training_unet:
+            print("unet/transformer parameters training:")
+            for n, p in self.unet.named_parameters():
+                print(f"{' ' if p.requires_grad else '❄️'} {n}")
+            unfrozen_parameter_count = len(
+                [p for p in self.unet.parameters() if p.requires_grad]
+            )
+            if unfrozen_parameter_count == 0:
+                raise ValueError(
+                    "All UNet parameters are frozen, nothing to train! Double-check your freeze config."
+                )
+
         if args.debug_unet_freeze_regex:
             logging.info("--debug_unet_freeze_regex passed - bailing out")
             exit(0)
@@ -238,11 +254,11 @@ class EveryDreamOptimizer:
         self.text_encoder_params, _ = plugin_runner.run_add_parameters(
             self.text_encoder_params, []
         )
-
-        # with torch.no_grad():
-        #    log_action = lambda n, label: logging.info(f"{Fore.LIGHTBLUE_EX} {label} weight normal: {n:.1f}{Style.RESET_ALL}")
-        #    self._log_weight_normal(text_encoder.text_model.encoder.layers.parameters(), "text encoder", log_action)
-        #    self._log_weight_normal(unet.parameters(), "unet", log_action)
+        # If plugins injected TE params (e.g. TI offsets), enable TE optimizer
+        # even when disable_textenc_training is True
+        if self.text_encoder_params and args.disable_textenc_training:
+            self.is_training_te = True
+            logging.info(" * Plugin injected text encoder parameters — enabling TE optimizer")
 
         self.param_group_builder = ParamGroupBuilder(args.optimizer_param_grouping, betas=self.base_config["betas"], weight_decay=self.base_config["weight_decay"], base_lr=self.base_config["lr"])
         if not args.disable_textenc_training:
@@ -253,17 +269,6 @@ class EveryDreamOptimizer:
         self.optimizer_te, self.optimizer_unet = self.create_optimizers(
             args, self.text_encoder_params, self.unet_params
         )
-        # Attach projection head parameters to the unet optimizer so they get trained
-        if model.self_flow_proj_head is not None and self.optimizer_unet is not None:
-            proj_lr = self.base_config.get("lr", 1e-4)
-            self.optimizer_unet.add_param_group({
-                "params": list(model.self_flow_proj_head.parameters()),
-                "lr": proj_lr,
-            })
-            logging.info(
-                f"Self-Flow: added SelfFlowProjectionHead parameters to unet optimizer (lr={proj_lr})."
-            )
-
         if self.optimizer_te is not None:
             self.optimizers.append(self.optimizer_te)
         if self.optimizer_te_2 is not None:
@@ -273,6 +278,39 @@ class EveryDreamOptimizer:
 
         self.lr_schedulers = []
         schedulers = self.create_lr_schedulers(args, optimizer_config)
+
+        # ── Self-Flow projection head: separate small optimizer ──────────────
+        self.optimizer_self_flow_proj = None
+        self.lr_scheduler_self_flow_proj = None
+        self.self_flow_freeze_steps = getattr(args, 'self_flow_freeze_steps', 0)
+
+        if model.self_flow_proj_head is not None:
+            self.optimizer_self_flow_proj = torch.optim.AdamW(
+                model.self_flow_proj_head.parameters(),
+                lr=args.self_flow_lr,
+                weight_decay=0.0,
+            )
+            self.optimizers.append(self.optimizer_self_flow_proj)
+
+            if self.self_flow_freeze_steps > 0:
+                num_self_flow_mlp_training_steps = self.self_flow_freeze_steps
+            else:
+                total = self.epoch_len * self.max_epochs
+                num_self_flow_mlp_training_steps = int(total * 1.5)
+
+            self.lr_scheduler_self_flow_proj = get_scheduler(
+                "cosine",
+                optimizer=self.optimizer_self_flow_proj,
+                num_warmup_steps=args.self_flow_lr_warmup_steps,
+                num_training_steps=num_self_flow_mlp_training_steps,
+            )
+            self.lr_schedulers.append(self.lr_scheduler_self_flow_proj)
+
+            logging.info(
+                f"Self-Flow: created separate AdamW optimizer for MLP "
+                f"(lr={args.self_flow_lr}, warmup={args.self_flow_lr_warmup_steps}, "
+                f"freeze={self.self_flow_freeze_steps})"
+            )
         self.lr_schedulers.extend(schedulers)
 
         self.lr_steering = LRSteering()
@@ -316,6 +354,24 @@ class EveryDreamOptimizer:
     def _log_weight_normal(self, parameters: Generator, label: str, log_action=None):
         total_norm = self._get_norm(parameters, lambda p: p.data)
         log_action(total_norm, label)
+
+    def _track_optimizer_log(self, tag: str, value: float):
+        prev = self._opt_log_max.get(tag, float('-inf'))
+        self._opt_log_max[tag] = prev if prev > value else value
+
+    def flush_optimizer_logs(self, global_step: int):
+        if not self._opt_log_max:
+            return
+        if self.log_writer is None:
+            self._opt_log_max.clear()
+            return
+        for tag, value in self._opt_log_max.items():
+            self.log_writer.add_scalar(tag, value, global_step)
+        self._opt_log_max.clear()
+
+    def notify_step(self):
+        self._steps_since_optimizer += 1
+        self.lr_steering.apply_steering_if_necessary(self.lr_schedulers)
 
     def _get_norm(self, parameters: Generator, param_type):
         total_norm = 0
@@ -439,6 +495,19 @@ class EveryDreamOptimizer:
             for optimizer in self.optimizers:
                 self.scaler.unscale_(optimizer)
 
+        # ── Delayed freeze for Self-Flow MLP ─────────────────────────────────
+        if (self.self_flow_freeze_steps > 0
+                and global_step >= self.self_flow_freeze_steps
+                and self.optimizer_self_flow_proj is not None
+                and not getattr(self, '_self_flow_proj_frozen', False)):
+            for pg in self.optimizer_self_flow_proj.param_groups:
+                for p in pg["params"]:
+                    p.requires_grad_(False)
+            self._self_flow_proj_frozen = True
+            logging.info(
+                f"Self-Flow: frozen MLP projection head at global_step {global_step}"
+            )
+
         # Guard: skip weight update if this rank contributed no gradients this step.
         # This happens when another rank's MAX vote forced a collective step but this
         # rank had not yet accumulated enough images (or is_final_step fired early).
@@ -448,22 +517,19 @@ class EveryDreamOptimizer:
 
         if self.log_grad_norm:
             with torch.no_grad():
-                self.log_writer.add_scalar(
+                self._track_optimizer_log(
                     "optimizer/unet_grad_norm_pre_clip",
                     _get_grad_norm(self.unet.parameters()),
-                    global_step,
                 )
                 if self.optimizer_te is not None:
-                    self.log_writer.add_scalar(
+                    self._track_optimizer_log(
                         "optimizer/te_grad_norm_pre_clip",
                         _get_grad_norm(self.text_encoder.parameters()),
-                        global_step,
                     )
                     if self.text_encoder_2 is not None:
-                        self.log_writer.add_scalar(
+                        self._track_optimizer_log(
                             "optimizer/te2_grad_norm_pre_clip",
                             _get_grad_norm(self.text_encoder_2.parameters()),
-                            global_step,
                         )
 
         if self.clip_grad_norm:
@@ -482,29 +548,26 @@ class EveryDreamOptimizer:
                     )
             if self.log_grad_norm:
                 with torch.no_grad():
-                    self.log_writer.add_scalar(
+                    self._track_optimizer_log(
                         "optimizer/unet_grad_norm_post_clip",
                         _get_grad_norm(self.unet.parameters()),
-                        global_step,
                     )
                     if self.optimizer_te is not None:
-                        self.log_writer.add_scalar(
+                        self._track_optimizer_log(
                             "optimizer/te_grad_norm_post_clip",
                             _get_grad_norm(self.text_encoder.parameters()),
-                            global_step,
                         )
                         if self.text_encoder_2 is not None:
-                            self.log_writer.add_scalar(
+                            self._track_optimizer_log(
                                 "optimizer/te2_grad_norm_post_clip",
                                 _get_grad_norm(self.text_encoder_2.parameters()),
-                                global_step,
                             )
 
         if self.log_grad_norm:
             if self.optimizer_unet is not None:
-                _log_grad_norms(self.optimizer_unet, self.log_writer, optimizer_name='unet', global_step=global_step)
+                _log_grad_norms(self.optimizer_unet, self._track_optimizer_log, optimizer_name='unet', global_step=None)
             if self.optimizer_te is not None:
-                _log_grad_norms(self.optimizer_te, self.log_writer, optimizer_name='te', global_step=global_step)
+                _log_grad_norms(self.optimizer_te, self._track_optimizer_log, optimizer_name='te', global_step=None)
 
         if self.scaler is None:
             for optimizer in self.optimizers:
@@ -522,9 +585,7 @@ class EveryDreamOptimizer:
             self._update_grad_scaler()
 
         if self.log_grad_norm and self.log_writer:
-            log_action = lambda n, label: self.log_writer.add_scalar(
-                label, n, global_step
-            )
+            log_action = lambda n, label: self._track_optimizer_log(label, n)
             with torch.no_grad():
                 if self.is_training_unet:
                     self._log_gradient_normal(
@@ -571,10 +632,10 @@ class EveryDreamOptimizer:
 
         self.zero_grad(set_to_none=True)
 
-    def step_schedulers(self, global_step):
-        self.lr_steering.apply_steering_if_necessary(self.lr_schedulers)
-        for scheduler in self.lr_schedulers:
-            scheduler.step()
+        for _ in range(self._steps_since_optimizer):
+            for scheduler in self.lr_schedulers:
+                scheduler.step()
+        self._steps_since_optimizer = 0
 
     def zero_grad(self, set_to_none=False):
         for optimizer in self.optimizers:
@@ -629,11 +690,19 @@ class EveryDreamOptimizer:
         self._save_optimizer(
             self.scaler, os.path.join(ckpt_path, SCALER_STATE_FILENAME), "scaler"
         ) if self.scaler is not None else None
+        self._save_optimizer(
+            self.optimizer_self_flow_proj,
+            os.path.join(ckpt_path, OPTIMIZER_SELF_FLOW_PROJ_STATE_FILENAME),
+            optimizer_type="adamw",
+        ) if self.optimizer_self_flow_proj is not None else None
 
     def load(self, ckpt_path: str):
         """
         Loads the optimizer states from path
         """
+        # If ckpt_path is a file (e.g. transformer.safetensors), use its parent directory
+        if not os.path.isdir(ckpt_path):
+            ckpt_path = os.path.dirname(ckpt_path)
         te_optimizer_state_path = os.path.join(ckpt_path, OPTIMIZER_TE_STATE_FILENAME)
         unet_optimizer_state_path = os.path.join(
             ckpt_path, OPTIMIZER_UNET_STATE_FILENAME
@@ -666,6 +735,14 @@ class EveryDreamOptimizer:
                 expected_type="scaler",
                 log_label="grad scaler state"
             )
+        proj_state_path = os.path.join(ckpt_path, OPTIMIZER_SELF_FLOW_PROJ_STATE_FILENAME)
+        if os.path.exists(proj_state_path) and self.optimizer_self_flow_proj is not None:
+            self._load_optimizer(
+                self.optimizer_self_flow_proj,
+                proj_state_path,
+                expected_type="adamw",
+                log_label="self-flow projection head optimizer state"
+            )
 
     def create_optimizers(
         self,
@@ -679,7 +756,15 @@ class EveryDreamOptimizer:
         """
 
         if args.disable_textenc_training:
-            optimizer_te = None
+            # Even with TE training disabled, plugins (e.g. textual inversion) may
+            # inject trainable parameters into text_encoder_params. Create a TE
+            # optimizer for those params only.
+            if text_encoder_params:
+                optimizer_te = self._create_optimizer(
+                    "text encoder (plugin params)", args, self.te_config, text_encoder_params
+                )
+            else:
+                optimizer_te = None
         else:
             optimizer_te = self._create_optimizer(
                 "text encoder", args, self.te_config, text_encoder_params
@@ -712,8 +797,8 @@ class EveryDreamOptimizer:
             )
 
         if args.lr_warmup_steps is None:
-            # set warmup to 2% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 3% of max epochs
-            args.lr_warmup_steps = int(args.lr_decay_steps / 50)
+            # set warmup to 10% of decay, if decay was autoset to 150% of max epochs then warmup will end up about 15% of max epochs
+            args.lr_warmup_steps = int(args.lr_decay_steps / 10)
 
         if args.lr_advance_steps is None:
             args.lr_advance_steps = 0
@@ -895,10 +980,14 @@ class EveryDreamOptimizer:
         saved_groups = state_dict.get("param_groups", [])
 
         if len(opt_groups) != len(saved_groups):
-            raise ValueError(
-                f"loaded state dict has {len(saved_groups)} parameter groups "
-                f"but optimizer has {len(opt_groups)}"
+            logging.warning(
+                f"{Fore.LIGHTYELLOW_EX}loaded state dict has {len(saved_groups)} parameter groups "
+                f"but optimizer has {len(opt_groups)}; truncating to first {len(opt_groups)} group(s)."
+                f"{Style.RESET_ALL}"
             )
+            saved_groups = saved_groups[:len(opt_groups)]
+            state_dict = dict(state_dict)
+            state_dict["param_groups"] = saved_groups
 
         mismatched = {
             i for i, (og, sg) in enumerate(zip(opt_groups, saved_groups))
@@ -1026,6 +1115,13 @@ class EveryDreamOptimizer:
             logging.info("* Progressive unlock is enabled, no param groups")
         else:
             param_groups = self.param_group_builder.build_param_groups(parameters=parameters)
+            fadein_k = getattr(args, 'lr_block_fadein_k', 0)
+            fadeout_k = getattr(args, 'lr_block_fadeout_k', 0)
+            if fadein_k > 0 or fadeout_k > 0:
+                from optimizer.per_unet_layer_scales import apply_block_fade
+                param_groups = apply_block_fade(
+                    param_groups, parameters, fadein_k, fadeout_k, betas, weight_decay
+                )
             logging.info("* Optimizer param groups:")
             for pg in param_groups:
                 print(f"   - {pg.get('name', '<none>')}: {len(pg['params'])} params, lr: {pg['lr']}, betas: {pg['betas']}, weight_decay: {pg['weight_decay']}")
@@ -1497,18 +1593,6 @@ class EveryDreamOptimizer:
         for n, p in unet.named_parameters():
             p.requires_grad = not should_freeze(n)
 
-        print("unet parameters training:")
-        for n, p in unet.named_parameters():
-            print(f"{' ' if p.requires_grad else '❄️'} {n}")
-
-        unfrozen_parameter_count = len(
-            [p for p in unet.parameters() if p.requires_grad]
-        )
-        if unfrozen_parameter_count == 0:
-            raise ValueError(
-                "All UNet parameters are frozen, nothing to train! Double-check your unet freeze config."
-            )
-
         return list(
             itertools.chain(
                 [np for np in unet.named_parameters() if np[1].requires_grad]
@@ -1592,7 +1676,7 @@ class EveryDreamOptimizer:
 
     def setup_lora_training(
         self, args, model: "TrainingModel"
-    ) -> tuple[dict[str, list], dict[str, list]]:
+    ) -> tuple[list[tuple[str, torch.nn.Parameter]], list[tuple[str, torch.nn.Parameter]]]:
         if args.disable_textenc_training:
             text_encoder_params = []
         else:
@@ -1628,7 +1712,10 @@ class EveryDreamOptimizer:
         if args.disable_unet_training:
             unet_params = []
         else:
-            if not args.lora_resume:
+            if args.lora_resume:
+                logging.info(" * Resuming LoRA")
+            else:
+                logging.info(" * Building LoraConfig...")
                 unet_lora_config = LoraConfig(
                     r=args.lora_rank,
                     lora_alpha=args.lora_alpha,
@@ -1640,7 +1727,7 @@ class EveryDreamOptimizer:
                 filter(lambda p: p[1].requires_grad, model.unet.named_parameters())
             )
 
-        return {"default": text_encoder_params}, {"default": unet_params}
+        return text_encoder_params, unet_params
 
 
 def log_optimizer(
@@ -1846,34 +1933,30 @@ def _should_freeze_from_regexes(regexes: str, name: str) -> bool:
     return should_freeze
 
 
-def _log_grad_norms(optimizer, writer, optimizer_name, global_step):
+def _log_grad_norms(optimizer, writer_or_tracker, optimizer_name, global_step):
+    track = global_step is None
     for name in "exp_avg", "exp_avg_sq", "s":
         norm = _get_optimizer_norm(optimizer, name)
         if norm is not None:
-            writer.add_scalar(f"optimizer/{optimizer_name}_{name}", norm, global_step)
+            tag = f"optimizer/{optimizer_name}_{name}"
+            if track:
+                writer_or_tracker(tag, norm)
+            else:
+                writer_or_tracker.add_scalar(tag, norm, global_step)
 
     if type(optimizer) is Prodigy:
         for group_idx, group in enumerate(optimizer.param_groups):
-            # Log the final d value (most important)
-            writer.add_scalar(f"optimizer/{optimizer_name}_prodigy_d_group_{group_idx}", group["d"], global_step)
-
-            # Log d_hat to see if clipping is occurring
-            writer.add_scalar(
-                f"optimizer/{optimizer_name}_prodigy_d_hat_group_{group_idx}", group.get("d_hat", group["d"]), global_step
-            )
-
-            # Optionally log the ratio to understand adaptation
+            tags = {
+                f"optimizer/{optimizer_name}_prodigy_d_group_{group_idx}": group["d"],
+                f"optimizer/{optimizer_name}_prodigy_d_hat_group_{group_idx}": group.get("d_hat", group["d"]),
+            }
             if "d_numerator" in group and "d_denom" in group:
-                writer.add_scalar(
-                    f"optimizer/{optimizer_name}_prodigy_d_numerator_group_{group_idx}", group["d_numerator"], global_step
-                )
-                writer.add_scalar(
-                    f"optimizer/{optimizer_name}_prodigy_d_denom_group_{group_idx}", group["d_denom"], global_step
-                )
-
-                # Log the raw ratio
+                tags[f"optimizer/{optimizer_name}_prodigy_d_numerator_group_{group_idx}"] = group["d_numerator"]
+                tags[f"optimizer/{optimizer_name}_prodigy_d_denom_group_{group_idx}"] = group["d_denom"]
                 if group["d_denom"] > 0:
-                    raw_ratio = group["d_numerator"] / group["d_denom"]
-                    writer.add_scalar(
-                        f"optimizer/{optimizer_name}_prodigy_d_raw_ratio_group_{group_idx}", raw_ratio, global_step
-                    )
+                    tags[f"optimizer/{optimizer_name}_prodigy_d_raw_ratio_group_{group_idx}"] = group["d_numerator"] / group["d_denom"]
+            for tag, value in tags.items():
+                if track:
+                    writer_or_tracker(tag, value)
+                else:
+                    writer_or_tracker.add_scalar(tag, value, global_step)

@@ -191,4 +191,4 @@ def compute_self_flow_loss(
     #        # Print this to your console/wandb!
     #        print(f"Self-Flow Sim -> Masked(Hard): {hard_sim:.3f} | Unmasked(Easy): {easy_sim:.3f}")
 
-    return -cos_sim.mean(dim=1)
+    return (1 - cos_sim).mean(dim=1)

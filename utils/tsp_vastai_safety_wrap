@@ -1,7 +1,7 @@
 #! /bin/bash
 
 base_tsp=$(which tsp)
-max_used_gb=190
+max_used_gb=280
 tsp_state_file="$HOME/tsp_state"
 
 # Wrap task spooler executions in vastai space safety checks and store tsp state
