@@ -85,6 +85,9 @@ def encode_prompts(
         texts = captions
         max_length_all = max_sequence_length
 
+    # sana expects lowercase prompts
+    texts = [t.lower() for t in texts]
+
     text_inputs = tokenizer(
         texts,
         padding="longest",

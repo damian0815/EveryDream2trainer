@@ -1039,6 +1039,30 @@ def _check_pipe(pipe):
             logging.warning("** Pipeline config specifies time_cond_proj_dim but this will be ignored")
 
 
+def apply_lora_training_config(args, unet=None, text_encoder=None, text_encoder_2=None) -> None:
+    """Attach fresh LoRA adapters to trainable components at load time.
+    Call only when args.lora is set and args.lora_resume is None; resume instead
+    uses pipe.load_lora_weights(), which attaches the adapter from the file's config."""
+    from peft import LoraConfig
+
+    if not args.disable_textenc_training and text_encoder is not None:
+        text_lora_config = LoraConfig(
+            r=args.lora_rank, lora_alpha=args.lora_alpha, init_lora_weights=True,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        text_encoder.add_adapter(text_lora_config)
+        if text_encoder_2 is not None:
+            text_encoder_2.add_adapter(text_lora_config)
+
+    if not args.disable_unet_training and unet is not None:
+        unet_lora_config = LoraConfig(
+            r=args.lora_rank, lora_alpha=args.lora_alpha, init_lora_weights=True,
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+        unet.add_adapter(unet_lora_config)
+        logging.info(" * Applied LoRA config to unet/transformer")
+
+
 def load_model(args) -> TrainingModel:
     use_ema_dacay_training = get_use_ema_decay_training(args)
 
@@ -1052,8 +1076,16 @@ def load_model(args) -> TrainingModel:
         else:
             pipe = StableDiffusionPipeline.from_pretrained(model_root_folder, variant=args.resume_ckpt_variant)
         _check_pipe(pipe)
-        if args.lora_resume:
-            pipe.load_lora_weights(args.lora_resume)
+        if args.lora:
+            if args.lora_resume:
+                pipe.load_lora_weights(args.lora_resume)
+            else:
+                apply_lora_training_config(
+                    args,
+                    unet=pipe.unet,
+                    text_encoder=pipe.text_encoder,
+                    text_encoder_2=getattr(pipe, "text_encoder_2", None),
+                )
         scheduler = pipe.scheduler
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer
@@ -1093,6 +1125,13 @@ def load_model(args) -> TrainingModel:
                 f"No local file/folder for {args.resume_ckpt}, and no matching huggingface.co repo could be downloaded")
         pipe, model_root_folder, is_sd1attn, yaml = downloaded
         _check_pipe(pipe)
+        if args.lora:
+            apply_lora_training_config(
+                args,
+                unet=pipe.unet,
+                text_encoder=pipe.text_encoder,
+                text_encoder_2=getattr(pipe, "text_encoder_2", None),
+            )
         scheduler = pipe.scheduler
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer

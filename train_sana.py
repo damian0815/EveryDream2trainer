@@ -95,8 +95,10 @@ def _add_sana_args(parser) -> None:
     # Note: required=False here because the value may be supplied via --config JSON.
     # _setup_sana_args() validates that model_id is present.
     parser.add_argument("--model_id", type=str, default=None,
-                        help="HuggingFace hub model ID, e.g. "
+                        help="HuggingFace hub model ID/local path, e.g. "
                              "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers")
+    parser.add_argument("--teacher_model_id", type=str, default=None,
+                        help="HuggingFace hub model ID/local path for teacher transformer (if different to main training model)")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to a saved transformer .safetensors checkpoint to resume from")
     parser.add_argument("--save_every", type=int, default=1000,
@@ -1130,6 +1132,15 @@ def train_sana_loop(
             if args.max_steps is not None and global_step >= args.max_steps:
                 logging.info(f"Reached max_steps={args.max_steps}, stopping.")
                 should_stop = True
+                should_save = True
+
+            def is_first_step_of_save_epoch(every_n_epochs, start_epoch=0):
+                if every_n_epochs is None or every_n_epochs < 1:
+                    return False
+                return (epoch > 0 and epoch % every_n_epochs == 0 and local_step == 0 and
+                        start_epoch <= epoch < args.max_epochs)
+            if is_first_step_of_save_epoch(args.save_every_n_epochs, start_epoch=args.save_ckpts_from_n_epochs):
+                logging.info(f" Saving model, {args.save_every_n_epochs} epochs at step {tv.global_step}")
                 should_save = True
 
             if check_semaphore_file_and_unlink(STOP_SEMAPHORE_FILE):

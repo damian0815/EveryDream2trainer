@@ -24,7 +24,6 @@ from typing import Generator
 import math
 import torch
 from diffusers import UNet2DConditionModel
-from peft import LoraConfig
 import json
 from pathlib import Path
 
@@ -1677,25 +1676,9 @@ class EveryDreamOptimizer:
     def setup_lora_training(
         self, args, model: "TrainingModel"
     ) -> tuple[list[tuple[str, torch.nn.Parameter]], list[tuple[str, torch.nn.Parameter]]]:
-        if args.disable_textenc_training:
-            text_encoder_params = []
-        else:
-            if not args.lora_resume:
-                if (
-                    self.te_freeze_config.get("unfreeze_last_n_layers", None)
-                    is not None
-                ):
-                    raise ValueError("Freezing not supported with LoRA training")
-                text_lora_config = LoraConfig(
-                    r=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
-                    init_lora_weights=True,
-                    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
-                )
-                # print("not adding lora for te")
-                model.text_encoder.add_adapter(text_lora_config)
-                if model.text_encoder_2 is not None:
-                    model.text_encoder_2.add_adapter(text_lora_config)
+        """LoRA adapters are attached at model-load time; collect trainable (adapter) params."""
+        text_encoder_params = []
+        if not args.disable_textenc_training:
             text_encoder_params = list(
                 filter(
                     lambda p: p[1].requires_grad, model.text_encoder.named_parameters()
@@ -1708,25 +1691,11 @@ class EveryDreamOptimizer:
                         model.text_encoder_2.named_parameters(),
                     )
                 )
-
-        if args.disable_unet_training:
-            unet_params = []
-        else:
-            if args.lora_resume:
-                logging.info(" * Resuming LoRA")
-            else:
-                logging.info(" * Building LoraConfig...")
-                unet_lora_config = LoraConfig(
-                    r=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
-                    init_lora_weights=True,
-                    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-                )
-                model.unet.add_adapter(unet_lora_config)
+        unet_params = []
+        if not args.disable_unet_training:
             unet_params = list(
                 filter(lambda p: p[1].requires_grad, model.unet.named_parameters())
             )
-
         return text_encoder_params, unet_params
 
 

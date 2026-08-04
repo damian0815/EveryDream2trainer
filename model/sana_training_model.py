@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from optimizer.optimizers import EveryDreamOptimizer
+from model.training_model import apply_lora_training_config
 
 
 def _is_dispatched(module: nn.Module) -> bool:
@@ -277,8 +278,11 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
     # Teacher transformer (frozen snapshot for distillation)
     import copy
     if args.teacher is not None and len(args.teacher) > 0:
-        model.teacher_transformer = copy.deepcopy(pipe.transformer)
         print(" * loading teacher from", args.teacher[0])
+        if args.teacher_model_id is None:
+            model.teacher_transformer = copy.deepcopy(pipe.transformer)
+        else:
+            model.teacher_transformer = SanaTransformer2DModel.from_pretrained(args.teacher_model_id, subfolder="transformer")
         _load_transformer_checkpoint(model.teacher_transformer, args.teacher[0])
 
     if model.teacher_transformer is not None:
@@ -290,9 +294,12 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
         logging.info(f" * Resuming from {args.resume_from}")
         _load_transformer_checkpoint(model.transformer, args.resume_from)
 
-    if args.lora_resume is not None:
-        logging.info(f" * Loading LoRA adapter from {args.lora_resume}")
-        pipe.load_lora_weights(args.lora_resume)
+    if args.lora:
+        if args.lora_resume is not None:
+            logging.info(f" * Loading LoRA adapter from {args.lora_resume}")
+            pipe.load_lora_weights(args.lora_resume)
+        else:
+            apply_lora_training_config(args, unet=model.transformer)
 
     if args.self_flow_p > 0:
         logging.info(f" * Initializing Self-Flow components (p={args.self_flow_p})")
@@ -578,8 +585,11 @@ def save_sana_lora(model: SanaTrainingModel, save_path: str) -> None:
     from peft.utils import get_peft_model_state_dict
     from diffusers.utils import convert_state_dict_to_diffusers
 
+    if len(model.transformer.peft_config.keys()) != 1:
+        logging.warning(f" * Expected only 1 lora adapter on transformer, but found multiple: {model.transformer.peft_config.keys()}. Saving the first one only.")
+    first_adapter_name = next(iter(model.transformer.peft_config.keys()))
     transformer_lora_layers = convert_state_dict_to_diffusers(
-        get_peft_model_state_dict(model.transformer)
+        get_peft_model_state_dict(model.transformer, adapter_name=first_adapter_name)
     )
 
     model.build_inference_pipeline().save_lora_weights(
@@ -610,7 +620,6 @@ def _try_load_self_flow_state(model: SanaTrainingModel, checkpoint_folder: str) 
         model.self_flow_proj_head.load_state_dict(torch.load(proj_head_path))
     else:
         logging.warning(f"Self-Flow projection head checkpoint not found at {proj_head_path}. Continuing without it.")
-
 
 def _load_transformer_checkpoint(transformer: nn.Module, checkpoint_path: str) -> None:
     """Loads a safetensors checkpoint into the transformer in-place."""

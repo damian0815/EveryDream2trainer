@@ -113,7 +113,7 @@ class PluginRunner:
                 with Timer(warn_seconds=self.step_warn_seconds, label=f'{plugin.__class__.__name__}'):
                     plugin.on_step_end(**kwargs)
             except Exception as e:
-                logging.warning(f"Plugin {plugin.__class__.__name__} raised an exception in on_step_end: {e}")
+                logging.warning(f"Plugin {plugin.__class__.__name__} raised an exception in on_step_end: {repr(e)}")
                 continue
 
     def run_on_optimizer_backward(self, loss: torch.Tensor, **kwargs):
