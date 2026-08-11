@@ -338,9 +338,13 @@ def build_argparser(
                            help="The EMA decay checkpoint to resume from")
     argparser.add_argument("--pyramid_noise_discount", type=float, default=None,
                            help="Enables pyramid noise and use specified discount factor")
-    argparser.add_argument("--batch_share_noise", action="store_true",
+    argparser.add_argument("--batch_share_noise", action=argparse.BooleanOptionalAction,
                            help="All samples in a batch have the same noise")
-    argparser.add_argument("--batch_share_timesteps", action="store_true",
+    argparser.add_argument("--noise_hungarian_match", action=argparse.BooleanOptionalAction,
+                           help="Match noise samples to images via the Hungarian algorithm (SANA only)")
+    argparser.add_argument("--noise_hungarian_pool_size", type=int, default=8,
+                           help="Spatial pool size for the Hungarian noise assignment (SANA only)")
+    argparser.add_argument("--batch_share_timesteps", action=argparse.BooleanOptionalAction,
                            help="All samples in a batch have the same timesteps")
     argparser.add_argument("--teacher", type=str, nargs='*', default=[],
                            help="Teacher model path(s). Pass one or more paths to enable distillation from multiple teachers.")

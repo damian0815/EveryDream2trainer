@@ -86,6 +86,7 @@ from model.training_model import (
     save_model,
     save_model_lora,
     find_last_checkpoint,
+    find_last_lora,
     load_model,
     get_use_ema_decay_training,
     TrainingVariables,
@@ -249,6 +250,10 @@ def setup_args(args):
         logging.info(f"{Fore.LIGHTCYAN_EX} Finding last EMA decay checkpoint in logdir: {args.logdir}{Style.RESET_ALL}")
 
         args.ema_resume_model = find_last_checkpoint(args.logdir, is_ema=True)
+
+    if args.lora_resume == "findlast":
+        logging.info(f"{Fore.LIGHTCYAN_EX} Finding last LoRA checkpoint in logdir: {args.logdir}{Style.RESET_ALL}")
+        args.lora_resume = find_last_lora(args.logdir)
 
     if not args.shuffle_tags:
         args.shuffle_tags = False
@@ -796,7 +801,7 @@ def main(args):
     if any(w != 1.0 for w in global_resolution_weights.values()):
         logging.info(f"* Using global resolution weights: {global_resolution_weights}")
 
-    image_source_items = resolve_image_source_items(args, aspects_per_resolution)
+    image_source_items = resolve_image_source_items(args, aspects_per_resolution, vae_resize_factor=8)
 
     validator = None
     if args.validation_config is not None and args.validation_config != "None":
@@ -1766,8 +1771,8 @@ def _get_safe_forward_size(gpu, device, num_image_pixels: int, is_sdxl: bool) ->
 
     # each forward pass without backward increases vram peak use by ~130000 (230000 for sdxl) bytes per latent pixel
     num_vae_channels = 4
-    vae_scale_factor = 8
-    num_latent_pixels_per_image = num_vae_channels * num_image_pixels // (vae_scale_factor ** 2)
+    vae_resize_factor = 8 # SD
+    num_latent_pixels_per_image = num_vae_channels * num_image_pixels // (vae_resize_factor ** 2)
     memory_required_per_image = (230000 if is_sdxl else 130000) * num_latent_pixels_per_image
     max_safe_forward_size = gpu_free_mem_b // memory_required_per_image
     return max_safe_forward_size

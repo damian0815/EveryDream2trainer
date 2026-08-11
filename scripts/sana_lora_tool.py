@@ -155,7 +155,7 @@ def load_lora_adapter(path):
 
     meta_r, meta_alpha = _lora_metadata_r_alpha(path)
 
-    raw = {}  # module_path -> {"down"/"up": tensor}
+    raw = {}  # module_path -> {"A"/"B": tensor}
     unparsed = []
     for key, tensor in sd.items():
         if LORA_BIAS_RE.search(key):
@@ -167,10 +167,10 @@ def load_lora_adapter(path):
             unparsed.append(key)
             continue
         part = m.group("part")
-        if m.group("dot") == ".":
-            part = "down" if part == "down" else "up"
+        if part in ("down", "A"):
+            part = "A"
         else:
-            part = "A" if part == "A" else "B"
+            part = "B"
         entry = raw.setdefault(m.group("module"), {})
         entry[part] = tensor
 
@@ -330,8 +330,8 @@ def save_lora_adapter(out_dir, adapters, rank, alpha, target_modules, base_id=No
     os.makedirs(out_dir, exist_ok=True)
     state_dict = {}
     for module_path, (A, B) in adapters.items():
-        state_dict[f"transformer.{module_path}.lora.down.weight"] = A
-        state_dict[f"transformer.{module_path}.lora.up.weight"] = B
+        state_dict[f"transformer.{module_path}.lora.down.weight"] = A.contiguous()
+        state_dict[f"transformer.{module_path}.lora.up.weight"] = B.contiguous()
 
     lora_adapter_metadata = {
         "transformer": {
@@ -408,9 +408,9 @@ def cmd_resize(args):
     save_lora_adapter(args.output, new_adapters, args.rank, args.alpha,
                       target_modules=target_modules)
 
-    for module_path, (A, B, r_old, alpha_old) in adapters.items():
+    for (module_path, (A, B, r_old, alpha_old)), new_rank in zip(adapters.items(), used_ranks):
         log.info("resized %s: (rank=%d, alpha=%d) -> (rank=%d, alpha=%d)",
-                 module_path, r_old, alpha_old, B.shape[1], args.alpha)
+                 module_path, r_old, alpha_old, new_rank, args.alpha)
     min_used = min(used_ranks) if used_ranks else 0
     log.info("Resized %d layers to rank %d (min used rank %d)",
              len(new_adapters), args.rank, min_used)

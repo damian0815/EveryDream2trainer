@@ -259,7 +259,8 @@ class ImageTrainItem:
                  shuffle_tags=False,
                  batch_id: str=None,
                  loss_scale: float=None,
-                 timesteps_range: tuple[int]=None
+                 timesteps_range: tuple[int]=None,
+                 vae_resize_factor: int=8,
                  ):
         self.caption = caption
         self.aspects = aspects
@@ -275,6 +276,7 @@ class ImageTrainItem:
         self.loss_scale = 1 if loss_scale is None else loss_scale
         self.timesteps_range = timesteps_range
         self.target_wh = None
+        self.vae_resize_factor = vae_resize_factor
         self.is_runt = False
         self.uid = uuid.uuid4().hex
         # Set by ImageSourceItem.make_resolved_item(); None for items created
@@ -491,22 +493,6 @@ class ImageTrainItem:
             uncropped_width, uncropped_height = self.target_wh
             crop_topleft = (0, 0)
         else:
-            if image is not None and rotation_degrees > 0:
-                width, height = image.size
-                max_angle = _compute_max_rotation_angle(
-                    width, height,
-                    self.target_wh[0], self.target_wh[1],
-                    rotation_degrees,
-                )
-                if max_angle > 0:
-                    _rng = rng if rng is not None else random
-                    angle = _rng.uniform(-max_angle, max_angle)
-                    image = self._apply_rotation(image, angle)
-                    if mask is not None:
-                        mask = self._apply_rotation(mask, angle)
-                    if dpo_bad_image is not None:
-                        dpo_bad_image = self._apply_rotation(dpo_bad_image, angle)
-
             def _center_crop(img, box):
                 bw, bh = box
                 w, h = img.size
@@ -521,7 +507,7 @@ class ImageTrainItem:
                 )
                 if max_angle > 0:
                     _rng = rng if rng is not None else random
-                    angle = _rng.uniform(-max_angle, max_angle)
+                    angle = min(max_angle, max(_rng.gauss(0, rotation_degrees/2), -max_angle))
                     image = self._apply_rotation(image, angle)
                     image = _center_crop(image, safe_box)
                     if mask is not None:
@@ -565,7 +551,7 @@ class ImageTrainItem:
             # resize
             image = image.resize(self.target_wh)
             if mask:
-                mask = mask.resize((self.target_wh[0]//8, self.target_wh[1]//8))
+                mask = mask.resize((self.target_wh[0]//self.vae_resize_factor, self.target_wh[1]//self.vae_resize_factor))
             if dpo_bad_image is not None:
                 dpo_bad_image = dpo_bad_image.resize(self.target_wh)
 

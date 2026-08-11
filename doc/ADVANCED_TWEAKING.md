@@ -246,6 +246,7 @@ For more information, consult the [research paper](https://arxiv.org/abs/2101.08
 - `--ema_sample_nonema_model`: Activate to display samples from the non-ema trained model, mirroring conventional training. They will not be presented by default with EMA decay enabled.
 - `--ema_sample_ema_model`: Turn on to exhibit samples from the EMA model. EMA models will be used for samples generations by default with EMA decay enabled, unless disabled.
 - `--ema_resume_model`: Indicate the EMA decay checkpoint to continue from, working like `--resume_ckpt` but will load EMA model. Using `findlast` will only load EMA version and not regular training.
+- `--lora_resume`: Resume LoRA training from a previously saved LoRA adapter folder. Like `--resume_ckpt`, you can use `findlast` to continue from the most recent LoRA saved in `--logdir`.
 
 ## Notes on tuning EMA.
 

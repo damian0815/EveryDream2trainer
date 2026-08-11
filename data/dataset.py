@@ -349,7 +349,7 @@ class Dataset:
                 raise e
         return items
 
-    def image_source_items(self, aspects_per_resolution: dict) -> list:
+    def image_source_items(self, aspects_per_resolution: dict, vae_resize_factor: int) -> list:
         """
         Create one ImageSourceItem per image, computing resolution options for all
         resolutions in a single pass (one file-open per image).
@@ -428,6 +428,7 @@ class Dataset:
                 base_item.loss_scale      = config.loss_scale or 1.0
                 base_item.timesteps_range = config.timesteps_range
                 base_item.target_wh       = None
+                base_item.vae_resize_factor = vae_resize_factor  # used by the mask
                 base_item.is_runt         = False
                 base_item.uid             = uuid.uuid4().hex
                 base_item.source_resolution = None

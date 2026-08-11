@@ -40,7 +40,7 @@ def apply_per_path_multiplier(resolved_items: list, per_path_multiplier_json: st
 def resolve_image_source_items(
     args: argparse.Namespace,
     aspects_per_resolution: dict,
-    divisible_by: int = 8,
+    vae_resize_factor: int,
 ) -> list:
     """
     Resolve training images for all resolutions at once, returning a list of
@@ -51,7 +51,7 @@ def resolve_image_source_items(
     logging.info(f"* Loading images for resolutions: {list(aspects_per_resolution.keys())}")
     logging.info("  Preloading image metadata (one file-open per image)...")
 
-    source_items = resolver.resolve_sources(args.data_root, args, aspects_per_resolution)
+    source_items = resolver.resolve_sources(args.data_root, args, aspects_per_resolution, vae_resize_factor=vae_resize_factor)
 
     # Log and remove images that could not be opened
     for item in source_items:
@@ -111,21 +111,21 @@ def resolve_image_source_items(
     have_invalid_size = False
     for s in source_items:
         for r, opt in s.resolution_options.items():
-            if opt.target_wh[0] % divisible_by != 0:
+            if opt.target_wh[0] % vae_resize_factor != 0:
                 logging.error(
                     f" * image {s.pathname} at resolution {r} has width {opt.target_wh[0]} "
-                    f"which is not divisible by {divisible_by}"
+                    f"which is not divisible by {vae_resize_factor}"
                 )
                 have_invalid_size = True
-            if opt.target_wh[1] % divisible_by != 0:
+            if opt.target_wh[1] % vae_resize_factor != 0:
                 logging.error(
                     f" * image {s.pathname} at resolution {r} has height {opt.target_wh[1]} "
-                    f"which is not divisible by {divisible_by}"
+                    f"which is not divisible by {vae_resize_factor}"
                 )
                 have_invalid_size = True
     if have_invalid_size:
         raise RuntimeError(
-            f"One or more training images have width or height not divisible by {divisible_by}. "
+            f"One or more training images have width or height not divisible by {vae_resize_factor}. "
             "This is a code error - check the errors above for matching values in "
             "`data/aspects.py` and fix."
         )

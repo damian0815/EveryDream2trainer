@@ -52,12 +52,13 @@ from core.loss import get_multirank_stratified_random_timesteps, build_self_flow
 from core.loss_sana import compute_sana_loss, compute_sana_dpo_loss
 from core.self_flow import get_self_flow_modules, compute_self_flow_loss
 from core.teacher_lambda import get_teacher_lambda
+from core.noise_permutation import do_hungarian_noise_permutation, matched_noise_errors
 from core.flow_match_model import TrainFlowMatchEulerDiscreteScheduler
 from core.log import setup_local_logger, log_args, do_log_step, do_log_step_optimizer, append_epoch_log, LogData
 from data.dataset import select_caption_variants
 from model.sana_training_model import SanaTrainingModel, _is_dispatched, load_sana_model, save_sana_model
 from model.sana_text_encoder import encode_prompts, encode_null_prompt
-from model.training_model import TrainingVariables, find_last_checkpoint, get_use_ema_decay_training
+from model.training_model import TrainingVariables, find_last_checkpoint, find_last_lora, get_use_ema_decay_training
 from model.ema import update_ema, update_ema_disk
 from optimizer.optimizers import EveryDreamOptimizer
 from utils.sample_generator import SampleGenerator
@@ -144,6 +145,9 @@ def _setup_sana_args(args: Namespace) -> Namespace:
 
     if args.resume_from == 'findlast':
         args.resume_from = find_last_checkpoint(args.logdir, resolve_to_transformer=True)
+
+    if args.lora_resume == 'findlast':
+        args.lora_resume = find_last_lora(args.logdir)
 
     # Map sample_steps → used by SampleGenerator as default_sample_steps
     # (shared arg is sample_steps; train_sana historically called it sample_every)
@@ -356,7 +360,7 @@ def build_sana_data_loader(args: Namespace, seed: int, plugin_runner: PluginRunn
     if any(w != 1.0 for w in global_resolution_weights.values()):
         logging.info(f"SANA data: resolution weights: {global_resolution_weights}")
 
-    image_source_items = resolve_image_source_items(args, aspects_per_resolution, divisible_by=32)
+    image_source_items = resolve_image_source_items(args, aspects_per_resolution, vae_resize_factor=32)
 
     data_loader_multi_aspect = DataLoaderMultiAspect(
         image_train_items=image_source_items,
@@ -429,11 +433,7 @@ def _encode_latents(
     with torch.no_grad():
         encoded = model.vae.encode(images.to(device, dtype=vae_dtype))
         latents = encoded.latent if hasattr(encoded, "latent") else encoded.latent_dist.sample()
-    if type(model.vae) is AutoencoderKLWan:
-        scaling_factor = 1
-    else:
-        scaling_factor = model.vae.config.scaling_factor
-    return latents.to(model.dtype) * scaling_factor
+    return latents.to(model.dtype) * model.vae.config.scaling_factor
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +507,30 @@ def train_sana_step(
     )
     if args.offload_text_encoder:
         model.load_textenc_to_device('cpu')
+
+    # Whole-batch VAE encode + noise, so a full-batch Hungarian match is possible.
+    # Attached to full_batch so _subdivide_batch_part slices them per nibble for free.
+    model.load_vae_to_device(device)
+    clean_latents = repeat_with_oom_handling(
+        initial_slice_size=tv.forward_slice_size,
+        callback=lambda sz: _encode_latents(model, full_batch["image"], device, slice_size=sz),
+        oom_log_info=f"OOM gs:{tv.global_step} SANA VAE encode full batch",
+    )
+    if args.offload_vae:
+        model.load_vae_to_device('cpu')
+
+    noise_full = torch.randn_like(clean_latents)
+    if args.noise_hungarian_match:
+        perm = do_hungarian_noise_permutation(
+            clean_latents, noise_full, args.noise_hungarian_pool_size
+        )
+        raw_error, opt_error = matched_noise_errors(clean_latents, noise_full, perm)
+        log_data.extra_data['hungarian_error_sum_raw'] += raw_error
+        log_data.extra_data['hungarian_error_sum_opt'] += opt_error
+        noise_full = noise_full[perm]
+
+    full_batch["clean_latents"] = clean_latents
+    full_batch["noise"] = noise_full
 
     def _save_embedding_to_cache(
         pathname: str, variant: str, embeds: torch.Tensor, mask: torch.Tensor,
@@ -653,15 +677,9 @@ def train_sana_step(
                 os.path.join(getattr(args, '_snapshot_dir', '.'), f"gs{tv.global_step:06d}.pickle")
             )
 
-        # 2. VAE-encode the full batch once, with OOM retry
-        model.load_vae_to_device(device)
-        z = repeat_with_oom_handling(
-            initial_slice_size=tv.forward_slice_size,
-            callback=lambda sz: _encode_latents(model, nibble["image"], device, slice_size=sz),
-            oom_log_info=f"OOM gs:{tv.global_step}/l:{tv.accumulated_loss_images_count} SANA VAE encode",
-        )
-        if args.offload_vae:
-            model.load_vae_to_device('cpu')
+        # 2. Clean latents + noise were precomputed at full-batch scope; the nibble
+        #    machinery already sliced them along dim 0.
+        clean_latents = nibble["clean_latents"]
 
         if args.debug_save_memory_snapshots:
             _dump_memory_snapshot(
@@ -671,15 +689,15 @@ def train_sana_step(
         # 3. Sample stratified flow-matching timesteps for the full batch
         timesteps = _draw_stratified_timesteps(n, tv, model, args, device)
 
-        # Generate noise once, shared by main loss and self-flow
-        noise = torch.randn_like(z)
+        # Noise was precomputed once (and optionally Hungarian-matched) at full-batch scope
+        noise = nibble["noise"]
 
         loss_full, model_pred, target = repeat_with_oom_handling(
             initial_slice_size=tv.forward_slice_size,
             callback=lambda slice_size: compute_sana_loss(
                 model.transformer,
                 model.noise_scheduler,
-                z,
+                clean_latents,
                 y,
                 y_mask,
                 timesteps,
@@ -714,7 +732,7 @@ def train_sana_step(
                 with torch.no_grad():
                     _, teacher_pred, _ = compute_sana_loss(
                         model.teacher_transformer, model.noise_scheduler,
-                        z, y, y_mask, timesteps,
+                        clean_latents, y, y_mask, timesteps,
                         noise=noise,
                         slice_size=tv.forward_slice_size,
                     )
@@ -756,7 +774,7 @@ def train_sana_step(
             patch_size = getattr(model.transformer.config, 'patch_size', 1)
 
             x_tau, x_tau_min, tau_min_ts, tau_1d, tau_mask_1d = build_self_flow_latents(
-                latents=z,
+                latents=clean_latents,
                 noise=noise,
                 noise_scheduler=model.noise_scheduler,
                 t=timesteps,
@@ -824,18 +842,22 @@ def train_sana_step(
             if dpo_mask.any():
                 loss_1d = loss_1d * (~dpo_mask).float()
 
+                if args.offload_vae:
+                    model.load_vae_to_device(device)
                 z_bad = repeat_with_oom_handling(
                     initial_slice_size=tv.forward_slice_size,
                     callback=lambda sz: _encode_latents(
                         model, dpo_bad_images[dpo_mask], device, slice_size=sz),
                     oom_log_info=f"OOM gs:{tv.global_step} DPO VAE encode bad",
                 )
+                if args.offload_vae:
+                    model.load_vae_to_device('cpu')
 
                 dpo_loss_1d, dpo_info = compute_sana_dpo_loss(
                     policy_transformer=model.transformer,
                     reference_transformer=model.transformer_ema,
                     noise_scheduler=model.noise_scheduler,
-                    z_good=z[dpo_mask],
+                    z_good=clean_latents[dpo_mask],
                     z_bad=z_bad,
                     y=y[dpo_mask],
                     y_mask=y_mask[dpo_mask],
@@ -868,7 +890,7 @@ def train_sana_step(
             log_data.timestep_coverage[int(t.item())] += 1
             log_data.cumulative_timestep_coverage[int(t.item())] += 1
 
-        del y, y_mask, z
+        del y, y_mask, clean_latents
 
         return loss_1d
 

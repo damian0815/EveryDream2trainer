@@ -85,10 +85,9 @@ class LogData:
     timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
     cumulative_timestep_coverage: Counter = dataclasses.field(default_factory=Counter)
     #cumulative_timestep_shifted_coverage: Counter = dataclasses.field(default_factory=Counter)
-
     forward_size_coverage: Counter = dataclasses.field(default_factory=Counter)
-
     attention_activation_logger: ActivationLogger = None
+    extra_data: dict[str, float] = dataclasses.field(default_factory=lambda: defaultdict(float))
 
     def update_images_per_sec(self, total_images_processed: int):
         capture_time = time.time()
@@ -294,6 +293,10 @@ def do_log_step(args, ed_optimizer, log_data: LogData, log_folder, log_writer, m
         log_writer.add_text("cuda/allocator_pain/summary",
                             torch.cuda.memory_summary(), global_step)
         torch.cuda.reset_peak_memory_stats()
+
+    for extra_key, extra_value in log_data.extra_data.items():
+        log_writer.add_scalar(f"extra/{extra_key}", extra_value, global_step)
+    log_data.extra_data.clear()
 
     return logs
 

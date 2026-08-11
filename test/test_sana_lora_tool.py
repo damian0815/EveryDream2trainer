@@ -43,8 +43,12 @@ def rel_error(a, b):
 
 class TestSvdExtract(unittest.TestCase):
     def test_reproduces_delta_at_full_rank(self):
+        # delta is genuinely rank-8 (built from B0 @ A0); extracting at rank 8
+        # must recover it to within numerical tolerance
         torch.manual_seed(0)
-        M = torch.randn(24, 12)
+        B0 = torch.randn(24, 8)
+        A0 = torch.randn(8, 12)
+        M = B0 @ A0
         A, B, used = svd_extract(M, rank=8, scaling=2.0)
         self.assertEqual(used, 8)
         approx = 2.0 * (B @ A)
@@ -52,7 +56,9 @@ class TestSvdExtract(unittest.TestCase):
 
     def test_conv_reproduces_delta(self):
         torch.manual_seed(1)
-        M = torch.randn(16, 8, 1, 1)
+        B0 = torch.randn(16, 4)
+        A0 = torch.randn(4, 8)
+        M = (B0 @ A0).unsqueeze(-1).unsqueeze(-1)
         A, B, used = svd_extract(M, rank=4, scaling=3.0)
         self.assertEqual(used, 4)
         self.assertEqual(A.shape, (4, 8, 1, 1))
@@ -87,7 +93,8 @@ class TestBakeExtractRoundTrip(unittest.TestCase):
         recovered, skipped_keys, used = extract_lora_from_state_dicts(
             base_sd, baked, rank=4, alpha=8)
         self.assertEqual(skipped_keys, [])
-        self.assertEqual(used, [4])
+        self.assertEqual(len(used), 2 * len(CORE))
+        self.assertTrue(all(u == 4 for u in used))
         A, B = recovered[module_path]
         approx_delta = compute_delta(A, B, 8 / 4)
         self.assertLess(rel_error(approx_delta, original_delta), 1e-4)
@@ -149,19 +156,16 @@ class TestResize(unittest.TestCase):
         target = compute_delta(A, B, alpha / r)
 
         resized, used = resize_adapter(adapter, rank=16, alpha=16)
-        # SVD of an already-rank-8 matrix at rank 16 yields zeros beyond rank 8
-        self.assertEqual(used, [8])
+        # SVD of an already-rank-8 matrix at rank 16 yields zeros beyond rank 8,
+        # so the effective delta is numerically identical (used == min(16, 20, 10))
+        self.assertEqual(used, [10])
         A2, B2 = resized[module_path]
         approx = compute_delta(A2, B2, 16 / 16)
         self.assertLess(rel_error(approx, target), 1e-4)
 
 
 class TestLoadLoraAdapter(unittest.TestCase):
-    STYLES = {
-        "diffusers": "transformer.transformer_blocks.0.attn1.to_q.lora.{part}.weight",
-        "trainer_unprefixed": "transformer_blocks.0.attn1.to_q.lora.{part}.weight",
-        "peft_wrapped": "transformer.base_model.model.transformer_blocks.0.attn1.to_q.lora_{part}.default.weight",
-    }
+    STYLES = ("diffusers", "trainer_unprefixed", "peft_wrapped")
     MODULE = "transformer_blocks.0.attn1.to_q"
     METADATA = {"transformer": {"r": 4, "lora_alpha": 8, "target_modules": ["attn1.to_q"]}}
 
@@ -169,10 +173,16 @@ class TestLoadLoraAdapter(unittest.TestCase):
         torch.manual_seed(42)
         A = torch.randn(4, 8)
         B = torch.randn(16, 4)
-        key = lambda part: self.STYLES[style].format(part=part)
-        sd = {key("down" if "down" in key("down") else "A"): A,
-              key("up" if "up" in key("up") else "B"): B}
-        sd = {k.replace("down", "down") if "down" in k else k: v for k, v in sd.items()}
+        if style == "peft_wrapped":
+            fmt = "transformer.base_model.model.transformer_blocks.0.attn1.to_q.lora_{part}.default.weight"
+            down, up = "A", "B"
+        elif style == "trainer_unprefixed":
+            fmt = "transformer_blocks.0.attn1.to_q.lora.{part}.weight"
+            down, up = "down", "up"
+        else:
+            fmt = "transformer.transformer_blocks.0.attn1.to_q.lora.{part}.weight"
+            down, up = "down", "up"
+        sd = {fmt.format(part=down): A, fmt.format(part=up): B}
         file_meta = None if metadata is None else {
             "format": "pt",
             "lora_adapter_metadata": json.dumps(metadata, indent=2, sort_keys=True),
@@ -207,11 +217,12 @@ class TestLoadLoraAdapter(unittest.TestCase):
     def test_bias_lora_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "pytorch_lora_weights.safetensors")
-            safetensors.torch.save_file({
+            sd = {
                 "transformer.transformer_blocks.0.attn1.to_q.lora_A.default.weight": torch.zeros(4, 8),
                 "transformer.transformer_blocks.0.attn1.to_q.lora_B.default.weight": torch.zeros(16, 4),
                 "transformer.transformer_blocks.0.attn1.to_q.lora_B.default.bias": torch.zeros(16),
-            })
+            }
+            safetensors.torch.save_file(sd, path)
             with self.assertRaises(ValueError):
                 load_lora_adapter(path)
 
@@ -222,7 +233,7 @@ class TestLoadLoraAdapter(unittest.TestCase):
                 "transformer.transformer_blocks.0.attn1.to_q.lora.down.weight": torch.zeros(4, 8),
                 "transformer.transformer_blocks.0.attn1.to_q.lora.up.weight": torch.zeros(16, 4),
                 "transformer.transformer_blocks.0.attn1.to_q.dora_scale": torch.ones(16),
-            })
+            }, path)
             adapters = load_lora_adapter(path)
             self.assertEqual(len(adapters), 1)
 
@@ -231,7 +242,7 @@ class TestLoadLoraAdapter(unittest.TestCase):
             path = os.path.join(tmp, "pytorch_lora_weights.safetensors")
             safetensors.torch.save_file({
                 "transformer.transformer_blocks.0.attn1.to_q.lora.down.weight": torch.zeros(4, 8),
-            })
+            }, path)
             with self.assertRaises(ValueError):
                 load_lora_adapter(path)
 

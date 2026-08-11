@@ -995,16 +995,18 @@ def save_model_lora(model: TrainingModel, save_path: str):
     convert_diffusers_lora_to_single_file(save_path, civitai_path)
 
 
-def find_last_checkpoint(logdir, is_ema=False, resolve_to_transformer=False):
+def find_last_checkpoint(logdir, is_ema=False, resolve_to_transformer=False,
+                         markers=("model_index.json", "model_id.txt")):
     """
-    Finds the last checkpoint in the logdir, recursively
+    Finds the last checkpoint in the logdir, recursively.
+    `markers` selects which marker files identify a checkpoint directory.
     """
     last_ckpt = None
     last_date = None
 
     for root, dirs, files in os.walk(logdir):
         for file in files:
-            if os.path.basename(file) == "model_index.json" or os.path.basename(file) == 'model_id.txt':
+            if os.path.basename(file) in markers:
 
                 curr_date = os.path.getmtime(os.path.join(root,file))
 
@@ -1031,6 +1033,15 @@ def find_last_checkpoint(logdir, is_ema=False, resolve_to_transformer=False):
         raise ValueError(f"Found more than one transformer_* file in last checkpoint dir {last_ckpt}: {[os.path.basename(f) for f in transformer_files]}. Specify which one you want explicitly.")
     else:
         return transformer_files[0]
+
+
+def find_last_lora(logdir):
+    """
+    Finds the last LoRA adapter checkpoint in the logdir, recursively.
+    LoRA adapter dirs (loadable via pipe.load_lora_weights) are identified by
+    adapter_config.json, written by save_lora_weights.
+    """
+    return find_last_checkpoint(logdir, markers=("adapter_config.json",))
 
 
 def _check_pipe(pipe):

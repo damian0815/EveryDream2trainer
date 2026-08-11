@@ -122,6 +122,7 @@ def resolve_sources(
     value,
     args: argparse.Namespace,
     aspects_per_resolution: dict,
+    vae_resize_factor: int,
 ) -> list[ImageSourceItem]:
     """
     Like resolve(), but returns a list of ImageSourceItem covering all resolutions
@@ -129,22 +130,23 @@ def resolve_sources(
 
     :param value: same as resolve() — a path string, dict, or list.
     :param args: EveryDream configuration namespace.
-    :param aspects_per_resolution: {resolution_int: list of (w, h) buckets}.
+    :param aspects_per_resolution: dict of {resolution_int: list of (w, h) buckets}.
+    :param vae_resize_factor: Resolution downscale for the VAE - 8 for SD, 32 for SANA
     :return: list[ImageSourceItem].
     """
     if isinstance(value, str):
-        return _resolve_sources_root(value, args, aspects_per_resolution)
+        return _resolve_sources_root(value, args, aspects_per_resolution, vae_resize_factor=vae_resize_factor)
 
     if isinstance(value, dict):
         resolver_name = value.get('resolver', None)
         match resolver_name:
             case 'directory' | 'json':
                 return _resolve_sources_root(
-                    value.get('path', None), args, aspects_per_resolution
+                    value.get('path', None), args, aspects_per_resolution, vae_resize_factor=vae_resize_factor
                 )
             case 'multi':
                 return resolve_sources(
-                    value.get('resolvers', []), args, aspects_per_resolution
+                    value.get('resolvers', []), args, aspects_per_resolution, vae_resize_factor=vae_resize_factor
                 )
             case _:
                 raise ValueError(
@@ -154,7 +156,7 @@ def resolve_sources(
     if isinstance(value, list):
         items = []
         for item in value:
-            items += resolve_sources(item, args, aspects_per_resolution)
+            items += resolve_sources(item, args, aspects_per_resolution, vae_resize_factor=vae_resize_factor)
         return items
 
     raise ValueError(f"Unsupported value type for resolve_sources: {type(value)}")
@@ -164,6 +166,7 @@ def _resolve_sources_root(
     path: str,
     args: argparse.Namespace,
     aspects_per_resolution: dict,
+    vae_resize_factor: int,
 ) -> list:
     """Resolve a single data root (directory or JSON file) into ImageSourceItems."""
     if os.path.isfile(path) and path.endswith('.json'):
@@ -173,4 +176,4 @@ def _resolve_sources_root(
         dataset = Dataset.from_path(path)
     else:
         raise ValueError(f"data_root '{path}' is not a valid directory or JSON file.")
-    return dataset.image_source_items(aspects_per_resolution)
+    return dataset.image_source_items(aspects_per_resolution, vae_resize_factor=vae_resize_factor)

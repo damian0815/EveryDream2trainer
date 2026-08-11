@@ -197,11 +197,17 @@ def main():
     from peft.utils import get_peft_model_state_dict
 
     lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(peft_model))
+    # peft's PeftModel wrapper adds a `base_model.model.` segment that diffusers'
+    # load_lora_weights() rejects. Strip it so the adapter matches the trainer's own
+    # save_sana_lora() key format (prefixed keys break load; unprefixed round-trip).
+    lora_state_dict = {
+        k.replace("transformer.base_model.model.", "transformer."): v
+        for k, v in lora_state_dict.items()
+    }
 
     try:
         from diffusers import SanaPipeline
         SanaPipeline.save_lora_weights(save_directory=args.output_dir, transformer_lora_layers=lora_state_dict)
-        # todo: postprocess: state_dict = {k.replace('transformer.base_model.model.', 'transformer.'): v for k,v in state_dict.items()}
         log.info("Saved diffusers-format LoRA adapter to %s", args.output_dir)
     except Exception as e:
         log.warning("SanaPipeline.save_lora_weights failed (%s) — falling back to raw safetensors dump. "
@@ -209,7 +215,7 @@ def main():
                     "model.build_inference_pipeline().save_lora_weights(...) instead, matching your "
                     "own save_sana_lora() implementation.", e)
         import os
-        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirls(args.output_dir, exist_ok=True)
         save_file(lora_state_dict, os.path.join(args.output_dir, "pytorch_lora_weights.safetensors"))
 
 

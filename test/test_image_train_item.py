@@ -4,7 +4,7 @@ import pathlib
 import random
 import PIL.Image as Image
 
-from data.image_train_item import ImageCaption, ImageTrainItem
+from data.image_train_item import ImageCaption, ImageTrainItem, _compute_max_rotation_angle
 from utils.fs_helpers import is_image
 import data.aspects as aspects
 
@@ -215,21 +215,21 @@ class TestDpoSpatialAlignment(unittest.TestCase):
 class TestRotationAugmentation(unittest.TestCase):
 
     def test_compute_max_rotation_angle_unconstrained(self):
-        angle = ImageTrainItem._compute_max_rotation_angle(2000, 2000, 1024, 1024, 30.0)
+        angle = _compute_max_rotation_angle(2000, 2000, 1024, 1024, 30.0)
         self.assertAlmostEqual(angle, 30.0, places=2)
 
     def test_compute_max_rotation_angle_constrained(self):
-        angle = ImageTrainItem._compute_max_rotation_angle(1280, 1280, 1024, 1024, 30.0)
+        angle = _compute_max_rotation_angle(1280, 1280, 1024, 1024, 30.0)
         self.assertAlmostEqual(angle, 17.11, places=1)
         self.assertGreater(angle, 0)
         self.assertLess(angle, 30.0)
 
     def test_compute_max_rotation_angle_too_small(self):
-        angle = ImageTrainItem._compute_max_rotation_angle(1024, 1024, 1024, 1024, 30.0)
+        angle = _compute_max_rotation_angle(1024, 1024, 1024, 1024, 30.0)
         self.assertEqual(angle, 0.0)
 
     def test_compute_max_rotation_angle_crop_larger_than_image(self):
-        angle = ImageTrainItem._compute_max_rotation_angle(512, 512, 1024, 1024, 30.0)
+        angle = _compute_max_rotation_angle(512, 512, 1024, 1024, 30.0)
         self.assertEqual(angle, 0.0)
 
     def test_apply_rotation_preserves_size(self):
