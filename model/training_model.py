@@ -347,6 +347,10 @@ class TrainingModel:
     # None for in-memory EMA modes.
     ema_working_dir: Optional[str] = None
 
+    # LoRA adapter EMA: {comp: {adapter_param_name: tensor}} in-memory EMA state over
+    # the trainable (adapter) params only.  None unless training with --lora + EMA.
+    lora_ema: Optional[dict[str, dict[str, torch.Tensor]]] = None
+
     _is_sdxl_override: Optional[bool] = None
     def set_is_sdxl_override(self, is_sdxl_override: bool):
         """ allow overriding the default "do we have a text enc 2" is_sdxl test """
@@ -994,6 +998,26 @@ def save_model_lora(model: TrainingModel, save_path: str):
     print("saving single file format LoRA to", civitai_path)
     convert_diffusers_lora_to_single_file(save_path, civitai_path)
 
+    # ── LoRA EMA export + sidecar ────────────────────────────────────────────
+    if getattr(model, "lora_ema", None) is not None:
+        from core.lora import build_ema_lora_layers, save_lora_ema_sidecar
+
+        logging.info(f" * Saving LoRA EMA to {save_path}")
+        unet_layers = (build_ema_lora_layers(model.unet, model.lora_ema["unet"])
+                       if "unet" in model.lora_ema else None)
+        te_layers = (
+            build_ema_lora_layers(model.text_encoder, model.lora_ema["text_encoder"])
+            if "text_encoder" in model.lora_ema else None
+        )
+        StableDiffusionPipeline.save_lora_weights(
+            save_directory=save_path,
+            unet_lora_layers=unet_layers,
+            text_encoder_lora_layers=te_layers,
+            safe_serialization=True,
+            weight_name="pytorch_lora_weights_ema.safetensors",
+        )
+        save_lora_ema_sidecar(model, save_path)
+
 
 def find_last_checkpoint(logdir, is_ema=False, resolve_to_transformer=False,
                          markers=("model_index.json", "model_id.txt")):
@@ -1041,7 +1065,10 @@ def find_last_lora(logdir):
     LoRA adapter dirs (loadable via pipe.load_lora_weights) are identified by
     adapter_config.json, written by save_lora_weights.
     """
-    return find_last_checkpoint(logdir, markers=("adapter_config.json",))
+    return find_last_checkpoint(
+        logdir,
+        markers=("adapter_config.json", "model_index.json", "model_id.txt")
+    )
 
 
 def _check_pipe(pipe):

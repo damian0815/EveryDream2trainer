@@ -109,6 +109,7 @@ if torch.cuda.is_available():
 import data.aspects as aspects
 from data.resolve_items import resolve_image_source_items
 from model.ema import update_ema, update_ema_disk
+from core.lora import init_lora_ema, update_lora_ema
 from utils.sample_generator import SampleGenerator
 from core.sample_generation import generate_samples
 
@@ -405,6 +406,12 @@ def _init_ema(model: "TrainingModel", args, device, log_folder: str) -> bool:
     """
     if not get_use_ema_decay_training(args):
         return False
+
+    if args.lora:
+        # Adapter-params-only EMA, always in memory.  The sidecar lives inside
+        # the adapter dir itself, so resume_dir is the lora_resume dir.
+        resume_dir = getattr(args, "lora_resume", None) or ""
+        return init_lora_ema(model, args, device, resume_dir)
 
     resume_dir = getattr(args, "resume_ckpt", None) or ""
 
@@ -713,6 +720,7 @@ def main(args):
             model.unet_ema = None
             model.text_encoder_ema = None
             model.text_encoder_2_ema = None
+            model.lora_ema = None
 
         # Self-Flow projection head setup (teacher IS the main EMA now)
         if args.self_flow_p > 0.0:
@@ -1393,7 +1401,13 @@ def main(args):
                                         """Strip DDP wrapper if present."""
                                         return m.module if isinstance(m, torch.nn.parallel.DistributedDataParallel) else m
 
-                                    if model.ema_working_dir is not None:
+                                    if model.lora_ema is not None:
+                                        # ── Adapter-params-only EMA (LoRA) ──────
+                                        for _comp, _ema_state in model.lora_ema.items():
+                                            update_lora_ema(_unwrap(getattr(model, _comp)), _ema_state,
+                                                           effective_ema_decay_rate, default_device=device,
+                                                           ema_device=args.ema_device)
+                                    elif model.ema_working_dir is not None:
                                         # ── Disk-offload EMA update ──────────────
                                         if not args.disable_unet_training:
                                             _f = os.path.join(model.ema_working_dir, "unet_ema.safetensors")

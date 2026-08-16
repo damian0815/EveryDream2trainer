@@ -248,6 +248,8 @@ For more information, consult the [research paper](https://arxiv.org/abs/2101.08
 - `--ema_resume_model`: Indicate the EMA decay checkpoint to continue from, working like `--resume_ckpt` but will load EMA model. Using `findlast` will only load EMA version and not regular training.
 - `--lora_resume`: Resume LoRA training from a previously saved LoRA adapter folder. Like `--resume_ckpt`, you can use `findlast` to continue from the most recent LoRA saved in `--logdir`.
 
+**LoRA training:** when training with `--lora`, EMA tracks only the adapter weights (the tiny trainable LoRA params) instead of full model copies. Adapter EMA is always kept in memory — `--ema_device: "disk"` is not supported and falls back to `cpu`. At each LoRA save (`--lora_save_every_n_epochs`) the EMA adapters are exported as `pytorch_lora_weights_ema.safetensors` inside the adapter folder, and a small `lora_ema.safetensors` sidecar is written there too so `--lora_resume` (or `--lora_resume findlast`) preserves EMA momentum. Mid-training EMA sampling works the same as full-model EMA (saved under `samples-ema`). Self-flow (`--self_flow_p > 0`) is not compatible with `--lora` because its teacher requires a full-model EMA.
+
 ## Notes on tuning EMA.
 
 The purpose of EMA is to reduce the effect of the data from the tail end of training from having an overly powerful effect on the model.  Normally trainig is stopped abruptly and the final images seen by the trainer may have a stronger effect than images seen earlier in training.  *This may have a similar to lowering the learning rate near the end of training, but is not mathematically equivalent.*  An alternative method to EMA would be to use a cosine learning rate schedule. 

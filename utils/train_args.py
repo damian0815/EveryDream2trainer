@@ -568,6 +568,14 @@ def validate_self_flow_ema_args(args: argparse.Namespace) -> None:
     if args.self_flow_p <= 0:
         return
 
+    # LoRA + self-flow is incompatible: the self-flow teacher requires a
+    # full-model EMA, but LoRA training only maintains adapter-params EMA.
+    if getattr(args, 'lora', False):
+        raise ValueError(
+            "self-flow is not supported with LoRA training "
+            "(self-flow teacher requires a full-model EMA)"
+        )
+
     # EMA must be enabled
     has_ema_decay = args.ema_decay_rate is not None
     has_ema_strength = args.ema_strength_target is not None

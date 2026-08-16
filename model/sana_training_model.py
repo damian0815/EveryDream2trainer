@@ -51,6 +51,10 @@ class SanaTrainingModel:
     teacher_transformer: Optional[nn.Module] = None  # frozen snapshot teacher for distillation
     self_flow_proj_head: Optional[nn.Module] = None
 
+    # LoRA adapter EMA: {comp: {adapter_param_name: tensor}} in-memory EMA state over
+    # the trainable (adapter) params only.  None unless training with --lora + EMA.
+    lora_ema: Optional[dict[str, dict[str, torch.Tensor]]] = None
+
     is_video: bool = False  # set to True for SanaVideoPipeline training
 
     # ---- EveryDreamOptimizer duck-type adapter properties ----------------
@@ -309,12 +313,19 @@ def load_sana_model(args: Namespace) -> SanaTrainingModel:
 
     # ── Main EMA resume hint ──────────────────────────────────────────────
     from model.training_model import get_use_ema_decay_training
-    if get_use_ema_decay_training(args) and args.resume_from is not None:
-        ema_sidecar = os.path.join(os.path.dirname(args.resume_from), "transformer_ema.safetensors")
-        if os.path.isfile(ema_sidecar):
-            logging.info(f" * Found EMA sidecar at {ema_sidecar} — will load in _init_sana_ema")
-        else:
-            logging.info(" * No EMA sidecar found — initialising main EMA from current weights")
+    if get_use_ema_decay_training(args):
+        if args.lora:
+            lora_ema_sidecar = os.path.join(args.lora_resume, "lora_ema.safetensors") if args.lora_resume else None
+            if lora_ema_sidecar and os.path.isfile(lora_ema_sidecar):
+                logging.info(f" * Found LoRA EMA sidecar at {lora_ema_sidecar} — will load in _init_sana_ema")
+            else:
+                logging.info(" * LoRA EMA: no sidecar found — EMA will start toward the identity LoRA start point in _init_sana_ema")
+        elif args.resume_from is not None:
+            ema_sidecar = os.path.join(os.path.dirname(args.resume_from), "transformer_ema.safetensors")
+            if os.path.isfile(ema_sidecar):
+                logging.info(f" * Found EMA sidecar at {ema_sidecar} — will load in _init_sana_ema")
+            else:
+                logging.info(" * No EMA sidecar found — initialising main EMA from current weights")
 
     return model
 
@@ -600,6 +611,22 @@ def save_sana_lora(model: SanaTrainingModel, save_path: str) -> None:
     model_id_path = os.path.join(save_path, "model_id.txt")
     with open(model_id_path, "w") as f:
         f.write(model.model_id)
+
+    # ── LoRA EMA export + sidecar ────────────────────────────────────────────
+    if getattr(model, "lora_ema", None) is not None:
+        from core.lora import build_ema_lora_layers, save_lora_ema_sidecar
+
+        logging.info(f" * Saving LoRA EMA to {save_path}")
+        ema_layers = build_ema_lora_layers(
+            model.transformer, model.lora_ema["transformer"],
+            adapter_name=first_adapter_name,
+        )
+        model.build_inference_pipeline().save_lora_weights(
+            save_directory=save_path,
+            transformer_lora_layers=ema_layers,
+            weight_name="pytorch_lora_weights_ema.safetensors",
+        )
+        save_lora_ema_sidecar(model, save_path)
 
 
 # ---------------------------------------------------------------------------

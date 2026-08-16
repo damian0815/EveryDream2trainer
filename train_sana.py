@@ -60,6 +60,7 @@ from model.sana_training_model import SanaTrainingModel, _is_dispatched, load_sa
 from model.sana_text_encoder import encode_prompts, encode_null_prompt
 from model.training_model import TrainingVariables, find_last_checkpoint, find_last_lora, get_use_ema_decay_training
 from model.ema import update_ema, update_ema_disk
+from core.lora import init_lora_ema, update_lora_ema
 from optimizer.optimizers import EveryDreamOptimizer
 from utils.sample_generator import SampleGenerator
 from core.sample_generation import generate_samples
@@ -229,6 +230,12 @@ def _init_sana_ema(model: SanaTrainingModel, args: Namespace, device: torch.devi
     automatically so accumulated EMA momentum is preserved.
     """
     import shutil
+
+    if args.lora:
+        # Adapter-params-only EMA, always in memory.  The sidecar lives inside
+        # the adapter dir itself, so resume_dir is the lora_resume dir.
+        init_lora_ema(model, args, device, args.lora_resume or "")
+        return
 
     resume_dir = os.path.dirname(args.resume_from) if args.resume_from else ""
 
@@ -1316,6 +1323,7 @@ def main_sana() -> None:
         else:
             model.transformer_ema = None
             model.ema_working_dir = None
+            model.lora_ema = None
 
         if not _is_dispatched(model.transformer):
             model.transformer.to(device)
@@ -1447,7 +1455,15 @@ def _do_post_optimizer_ema_update(model: SanaTrainingModel, tv: TrainingVariable
         steps_since_ema = samples_since_ema / args.batch_size
         if steps_since_ema > args.ema_update_interval:
             effective_ema_decay_rate = args.ema_decay_rate ** samples_since_ema
-            if model.ema_working_dir is not None:
+            if model.lora_ema is not None:
+                # ── Adapter-params-only EMA (LoRA) ──
+                for comp, ema_state in model.lora_ema.items():
+                    update_lora_ema(
+                        getattr(model, comp), ema_state,
+                        effective_ema_decay_rate,
+                        default_device=device, ema_device=args.ema_device,
+                    )
+            elif model.ema_working_dir is not None:
                 _f = os.path.join(model.ema_working_dir, "transformer_ema.safetensors")
                 update_ema_disk(model.transformer, _f, effective_ema_decay_rate)
             else:

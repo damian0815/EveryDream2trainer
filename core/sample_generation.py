@@ -12,6 +12,7 @@ from contextlib import nullcontext
 
 import torch
 
+from core.lora import lora_ema_inplace_swap
 from model.training_model import get_use_ema_decay_training
 from utils.inference_context import inference_guard
 from utils.isolate_rng import isolate_rng
@@ -157,7 +158,45 @@ def generate_samples(
             if run_ema and not needs_external:
                 logging.info(f" * Generating samples [EMA model] at gs:{global_step}")
 
-                if is_sana or model.ema_working_dir is not None:
+                if model.lora_ema is not None:
+                    # ── Adapter-params-only EMA (LoRA): swap adapter weights ──
+                    logging.info(" * Generating samples [EMA LoRA] ...")
+                    with lora_ema_inplace_swap(model):
+                        pipe = sample_generator.create_inference_pipe(
+                            model_being_trained=model,
+                            diffusers_scheduler_config=model.noise_scheduler.config,
+                            flow_match_shift=args.flow_match_shift,
+                            flow_match_shift_dynamic=args.flow_match_shift_dynamic,
+                            use_ema=False,   # live modules now carry EMA adapter weights
+                        )
+                        if not is_sana:
+                            pipe = pipe.to(device)
+                        was_tiling = getattr(pipe.vae, 'use_tiling', None)
+                        if was_tiling is not None:
+                            pipe.vae.enable_tiling()
+                        subdir = "samples-ema"
+                        if is_sana:
+                            project_name = args.project_name or getattr(model, 'model_id', 'sana-model')
+                        else:
+                            project_name = args.project_name
+
+                        sample_generator.generate_samples(
+                            pipe, global_step,
+                            extra_info="", samples_subdir=subdir,
+                            project_name=project_name,
+                            log_time=log_time,
+                            external_model_key=external_model_key,
+                            external_model_save_path=external_model_save_path,
+                        )
+                        if was_tiling is not None:
+                            if was_tiling:
+                                pipe.vae.enable_tiling()
+                            else:
+                                pipe.vae.disable_tiling()
+                    del pipe
+                    torch.cuda.empty_cache()
+
+                elif is_sana or model.ema_working_dir is not None:
                     # Disk-offload OR SANA in-memory EMA
                     if model.ema_working_dir is not None:
                         context = model.ema_inplace_swap()
