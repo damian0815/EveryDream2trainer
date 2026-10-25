@@ -56,7 +56,7 @@ class TestMultiResolutionEpoch(unittest.TestCase):
 
     def _load_sources(self):
         dataset = Dataset.from_path(str(self.tmpdir))
-        return dataset.image_source_items(ASPECTS_PER_RESOLUTION)
+        return dataset.image_source_items(ASPECTS_PER_RESOLUTION, vae_resize_factor=8)
 
     # ------------------------------------------------------------------
     # Tests
@@ -122,7 +122,7 @@ class TestMultiResolutionEpoch(unittest.TestCase):
         )
 
         dataset = Dataset.from_path(str(self.tmpdir))
-        sources = dataset.image_source_items(ASPECTS_PER_RESOLUTION)
+        sources = dataset.image_source_items(ASPECTS_PER_RESOLUTION, vae_resize_factor=8)
         biased_paths = {
             os.path.abspath(str(biased_dir / f"biased_{i:02d}.jpg"))
             for i in range(5)

@@ -178,14 +178,12 @@ def build_argparser(
                            help="Steps to advance the LR during training")
     argparser.add_argument("--lr_num_restarts", type=int, default=1,
                            help="Number of times to (re-)start the LR scheduler, default=1 (no restarts)")
-    argparser.add_argument("--lr_block_fadein_k", type=int, default=0,
-                           help="Number of transformer blocks at the start to "
-                                "logarithmically fade in LR (def: 0 = off). "
-                                "Block i gets LR * 2^(i-k).")
-    argparser.add_argument("--lr_block_fadeout_k", type=int, default=0,
-                           help="Number of transformer blocks at the end to "
-                                "logarithmically fade out LR (def: 0 = off). "
-                                "Block (N-1-i) gets LR * 2^(i-k).")
+    argparser.add_argument("--lr_block_ramps", type=float, nargs="+", default=None,
+                           help="Per-block LR ramp keypoints as (block_index, alpha) pairs, e.g. "
+                                "'--lr_block_ramps 0 0 5 1'. Alpha at each SANA transformer block is "
+                                "linearly interpolated between adjacent keypoints; blocks outside the "
+                                "keypoint range clamp to the nearest alpha. Requires an even number of "
+                                "values. SANA only.")
     argparser.add_argument("--max_epochs", type=int, default=100,
                            help="Maximum number of epochs to train for")
     argparser.add_argument("--max_steps", type=int, default=None,

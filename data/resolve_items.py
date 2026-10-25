@@ -49,7 +49,7 @@ def resolve_image_source_items(
     Replaces the old per-resolution resolve_image_train_items loop.
     """
     logging.info(f"* Loading images for resolutions: {list(aspects_per_resolution.keys())}")
-    logging.info("  Preloading image metadata (one file-open per image)...")
+    logging.info("  Preloading image metadata...")
 
     source_items = resolver.resolve_sources(args.data_root, args, aspects_per_resolution, vae_resize_factor=vae_resize_factor)
 

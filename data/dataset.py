@@ -351,8 +351,7 @@ class Dataset:
 
     def image_source_items(self, aspects_per_resolution: dict, vae_resize_factor: int) -> list:
         """
-        Create one ImageSourceItem per image, computing resolution options for all
-        resolutions in a single pass (one file-open per image).
+        Create one ImageSourceItem per image including feasible resolutions ("resolution options")
 
         :param aspects_per_resolution: maps each resolution integer to its list of
             (w, h) aspect-ratio bucket pairs.

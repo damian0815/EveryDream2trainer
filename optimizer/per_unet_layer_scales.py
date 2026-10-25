@@ -9,9 +9,6 @@ from typing import Literal
 import torch
 
 
-BLOCK_INDEX_RE = re.compile(r'transformer_blocks\.(\d+)\.')
-
-
 class ParamGroupBuilder:
     def __init__(self, optimizer_param_grouping: Literal['zones', 'transformer10x', 'single']|tuple[str, str], betas, weight_decay, base_lr):
         self.param_grouping = optimizer_param_grouping
@@ -167,57 +164,78 @@ def get_unet_module_zone(name: str) -> str:
     return zone
 
 
-def apply_block_fade(param_groups, parameters, fadein_k, fadeout_k, betas, weight_decay):
-    if fadein_k <= 0 and fadeout_k <= 0:
+def parse_lr_block_ramps(values: list[float] | None) -> list[tuple[int, float]]:
+    if values is None:
+        return []
+    if len(values) % 2 != 0:
+        raise ValueError("lr_block_ramps must contain an even number of values (block_index, alpha) pairs")
+    pairs = [(int(values[i]), float(values[i + 1])) for i in range(0, len(values), 2)]
+    indices = [block_index for block_index, _ in pairs]
+    if len(set(indices)) != len(indices):
+        raise ValueError("lr_block_ramps contains duplicate block indices: " + str(indices))
+    return sorted(pairs)
+
+
+def _get_ramp_blockwise_alpha(block_index, ramp_blockwise):
+    # ramp_blockwise is a list of (block_index, alpha) pairs, sorted by block_index
+    if block_index <= ramp_blockwise[0][0]:
+        return ramp_blockwise[0][1]
+    if block_index >= ramp_blockwise[-1][0]:
+        return ramp_blockwise[-1][1]
+    for i in range(len(ramp_blockwise) - 1):
+        if ramp_blockwise[i][0] <= block_index <= ramp_blockwise[i + 1][0]:
+            # Linear interpolation between the two points
+            x0, y0 = ramp_blockwise[i]
+            x1, y1 = ramp_blockwise[i + 1]
+            slope = (y1 - y0) / (x1 - x0)
+            return y0 + slope * (block_index - x0)
+    raise RuntimeError("Block index not in ramp_blockwise range, this should not happen.")
+
+
+def _get_block_index_from_key(key: str, max_block_index: int) -> int:
+    if 'transformer_blocks' in key:
+        return int(key.split('.')[1])
+    elif key == 'scale_shift_table':
+        return 0
+    elif key.startswith('caption_'):
+        return 0
+    elif key.startswith('time_embed') or key.startswith('patch_embed'):
+        return 0
+    elif 'proj_out' in key:
+        return max_block_index
+    else:
+        raise RuntimeError("Unrecognized key, cannot extract block index: " + key)
+
+
+def apply_block_ramps(param_groups, parameters, ramp_blockwise, betas, weight_decay):
+    if not ramp_blockwise:
         return param_groups
 
-    name_to_param = {name: p for name, p in parameters}
-    param_to_name = {id(p): name for name, p in name_to_param.items()}
+    param_to_name = {id(p): name for name, p in parameters}
+    block_names = [name for name, _ in parameters if 'transformer_blocks' in name]
+    if not block_names:
+        return param_groups
+    max_block_index = max(int(name.split('.')[1]) for name in block_names)
 
     new_groups = []
     for group in param_groups:
-        block_params = defaultdict(list)
-        other_params = []
-
-        for p in group['params']:
-            name = param_to_name.get(id(p), '')
-            m = BLOCK_INDEX_RE.search(name)
-            if m:
-                block_params[int(m.group(1))].append(p)
-            else:
-                other_params.append(p)
-
-        if not block_params:
+        if not group['params']:
             new_groups.append(group)
             continue
 
-        num_blocks = max(block_params.keys()) + 1
         base_lr = group['lr']
+        alpha_to_params = defaultdict(list)
+        for p in group['params']:
+            name = param_to_name[id(p)]
+            block_index = _get_block_index_from_key(name, max_block_index)
+            alpha = _get_ramp_blockwise_alpha(block_index, ramp_blockwise)
+            alpha_to_params[alpha].append(p)
 
-        scale_by_block = {}
-        for i in block_params:
-            fadein_scale = 2 ** (i - fadein_k) if fadein_k > 0 and i < fadein_k else 1.0
-            fadeout_scale = 2 ** ((num_blocks - 1 - i) - fadeout_k) if fadeout_k > 0 and i >= num_blocks - fadeout_k else 1.0
-            scale_by_block[i] = min(fadein_scale, fadeout_scale)
-
-        scale_to_params = defaultdict(list)
-        for i, params in block_params.items():
-            scale_to_params[scale_by_block[i]].extend(params)
-
-        for scale, params in sorted(scale_to_params.items()):
+        for alpha, params in sorted(alpha_to_params.items()):
             new_groups.append({
-                'name': f"block_fade_{scale:.4g}",
+                'name': f"block_ramp_{alpha:.4g}",
                 'params': params,
-                'lr': base_lr * scale,
-                'betas': betas,
-                'weight_decay': weight_decay,
-            })
-
-        if other_params:
-            new_groups.append({
-                'name': group.get('name', 'non-block'),
-                'params': other_params,
-                'lr': base_lr,
+                'lr': base_lr * alpha,
                 'betas': betas,
                 'weight_decay': weight_decay,
             })

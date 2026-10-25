@@ -1114,13 +1114,11 @@ class EveryDreamOptimizer:
             logging.info("* Progressive unlock is enabled, no param groups")
         else:
             param_groups = self.param_group_builder.build_param_groups(parameters=parameters)
-            fadein_k = getattr(args, 'lr_block_fadein_k', 0)
-            fadeout_k = getattr(args, 'lr_block_fadeout_k', 0)
-            if fadein_k > 0 or fadeout_k > 0:
-                from optimizer.per_unet_layer_scales import apply_block_fade
-                param_groups = apply_block_fade(
-                    param_groups, parameters, fadein_k, fadeout_k, betas, weight_decay
-                )
+            ramp_values = getattr(args, 'lr_block_ramps', None)
+            if ramp_values:
+                from optimizer.per_unet_layer_scales import apply_block_ramps, parse_lr_block_ramps
+                ramp_blockwise = parse_lr_block_ramps(ramp_values)
+                param_groups = apply_block_ramps(param_groups, parameters, ramp_blockwise, betas, weight_decay)
             logging.info("* Optimizer param groups:")
             for pg in param_groups:
                 print(f"   - {pg.get('name', '<none>')}: {len(pg['params'])} params, lr: {pg['lr']}, betas: {pg['betas']}, weight_decay: {pg['weight_decay']}")
